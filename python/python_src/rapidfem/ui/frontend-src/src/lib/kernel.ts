@@ -198,6 +198,19 @@ export class KernelClient {
 			console.warn('[kernel] reset failed:', e);
 		}
 	}
+
+	/** Send SIGINT to the worker subprocess — the cell-run's `exec` will
+	 *  raise `KeyboardInterrupt`, propagate to the error path, and emit an
+	 *  `error` event back through the normal poll stream. */
+	async interrupt(file: string): Promise<boolean> {
+		try {
+			const r = await post_json<{ ok: boolean }>('/api/cell/interrupt', { file });
+			return !!r.ok;
+		} catch (e) {
+			console.warn('[kernel] interrupt failed:', e);
+			return false;
+		}
+	}
 }
 
 // ── Static-demo replay client ──────────────────────────────────────────

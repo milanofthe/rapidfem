@@ -91,6 +91,14 @@
 	let viewer: ReturnType<typeof MeshViewer> | undefined = $state();
 
 	function on_keydown(e: KeyboardEvent) {
+		// Save (Ctrl/Cmd+S) — handled before any focus-based gates so it works
+		// from inside the editor too, where most edits live.
+		if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey
+			&& (e.key === 's' || e.key === 'S')) {
+			e.preventDefault();
+			void save_now();
+			return;
+		}
 		// Skip when typing in editor / inputs.
 		const tag = (e.target as HTMLElement | null)?.tagName;
 		if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -503,11 +511,26 @@
 		return r.ok ? 'ok' : 'error';
 	}
 
-	function on_reset_kernel() {
+	async function on_reset_kernel() {
 		clear_stale_results();
 		mesh_data = null;
-		get_kernel().reset(active_path ?? '<unnamed>');
+		await get_kernel().reset(active_path ?? '<unnamed>');
 		log_lines = [...log_lines, `[kernel] reset`];
+	}
+
+	/** Wipe kernel state, then run every cell top-to-bottom. The combined
+	 *  flow you almost always want after a non-trivial edit. */
+	async function on_restart_and_run_all() {
+		await on_reset_kernel();
+		await notebook?.run_all_cells();
+	}
+
+	/** SIGINT the worker subprocess — raises KeyboardInterrupt inside the
+	 *  running cell, which surfaces as an error event through the normal
+	 *  poll stream. */
+	async function on_interrupt() {
+		const ok = await get_kernel().interrupt(active_path ?? '<unnamed>');
+		log_lines = [...log_lines, ok ? `[kernel] interrupt sent` : `[kernel] interrupt failed`];
 	}
 
 	// Debounced save on edits. No auto-exec — Shift+Enter / Run All does that.
@@ -528,6 +551,28 @@
 			}
 		}, 600);
 	});
+
+	let saved_pulse = $state(false);
+	let saved_pulse_t: ReturnType<typeof setTimeout> | null = null;
+
+	/** Flush the debounce timer and persist immediately. Triggered by
+	 *  Ctrl/Cmd+S and the toolbar Save button. */
+	async function save_now() {
+		if (!active_path || IS_STATIC_MODE) return;
+		if (dirty_save_t) {
+			clearTimeout(dirty_save_t);
+			dirty_save_t = null;
+		}
+		try {
+			await writeFile(active_path, code);
+			dirty = false;
+			saved_pulse = true;
+			if (saved_pulse_t) clearTimeout(saved_pulse_t);
+			saved_pulse_t = setTimeout(() => { saved_pulse = false; }, 900);
+		} catch (e) {
+			log_lines = [...log_lines, `[save] ${e}`];
+		}
+	}
 
 	function geometryToMeshData(p: import('$lib/api').GeometryPayload): MeshData {
 		const phys_names = new Map<number, string>();
@@ -583,6 +628,7 @@
 		{#if active_path}
 			<span class="active-file has-tip">
 				{active_path}{dirty ? ' •' : ''}
+				{#if saved_pulse}<span class="saved-badge">saved</span>{/if}
 				<span class="tip right">{workdir}</span>
 			</span>
 		{:else}
@@ -642,6 +688,10 @@
 							Restart Kernel
 							<span class="tip">{IS_STATIC_MODE ? 'Disabled in static demo' : 'Wipe namespace + gmsh state'}</span>
 						</button>
+						<button class="primary subtle has-tip" onclick={on_restart_and_run_all} disabled={IS_STATIC_MODE}>
+							Restart & Run All
+							<span class="tip">{IS_STATIC_MODE ? 'Disabled in static demo' : 'Reset kernel then run every cell'}</span>
+						</button>
 					</div>
 					<div class="editor-wrap">
 						<Notebook
@@ -650,6 +700,7 @@
 							file_path={active_path ?? '<unnamed>'}
 							readonly={IS_STATIC_MODE}
 							onRunCell={on_run_cell}
+							onInterrupt={on_interrupt}
 						/>
 					</div>
 					<Resizer vertical onStart={on_output_drag_start} onDelta={on_output_resize} />
@@ -888,6 +939,22 @@
 		font-family: var(--font-mono);
 		font-size: var(--fs-xs);
 		cursor: default;
+	}
+	header .saved-badge {
+		margin-left: var(--space-sm);
+		padding: 1px 6px;
+		font-size: 9px;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+		color: var(--accent);
+		background: var(--accent-dim);
+		border: 1px solid var(--accent);
+		animation: saved-fade 0.9s ease-out forwards;
+	}
+	@keyframes saved-fade {
+		0%   { opacity: 1; }
+		70%  { opacity: 1; }
+		100% { opacity: 0; }
 	}
 	header .workdir-only {
 		color: var(--text-dim);

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import traceback
@@ -149,6 +150,17 @@ def initialize() -> None:
     except Exception:
         pass
 
+    # Restore Python's default SIGINT handler — gmsh.initialize() installs
+    # one that suppresses the signal, but we want SIGINT to raise
+    # KeyboardInterrupt inside the current cell so the parent can interrupt
+    # a long-running solve.
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError):
+        # `signal.signal` is main-thread only; we're in the main thread but
+        # guard for unexpected sandbox restrictions.
+        pass
+
     _initialized = True
     send({"type": "ready"})
 
@@ -220,11 +232,11 @@ def run_cell(msg_id: str, code: str) -> None:
 
 def main() -> None:
     while True:
-        msg = read_message()
-        if msg is None:
-            return  # parent closed stdin → exit
-        t = msg.get("type")
         try:
+            msg = read_message()
+            if msg is None:
+                return  # parent closed stdin → exit
+            t = msg.get("type")
             if t == "init":
                 initialize()
             elif t == "cell-run":
@@ -234,6 +246,10 @@ def main() -> None:
                 send({"type": "reset-ack"})
             else:
                 send({"type": "error", "error": f"Unknown message type: {t!r}"})
+        except KeyboardInterrupt:
+            # SIGINT outside the cell-run exec — nothing to stop. Ignore and
+            # carry on; inside cell-run the exception is caught by run_cell.
+            continue
         except Exception as e:
             send({
                 "type": "error",

@@ -14,9 +14,17 @@
 		status = 'idle' as 'idle' | 'running' | 'ok' | 'error',
 		kind = 'code' as 'code' | 'markdown',
 		readonly = false,
+		can_move_up = true,
+		can_move_down = true,
 		onRun,
 		onRunAllBelow,
+		onInterrupt,
 		onFocus,
+		onMoveUp,
+		onMoveDown,
+		onDuplicate,
+		onInsertBelow,
+		onDelete,
 		focused = false,
 	}: {
 		index: number;
@@ -24,9 +32,17 @@
 		status?: 'idle' | 'running' | 'ok' | 'error';
 		kind?: 'code' | 'markdown';
 		readonly?: boolean;
+		can_move_up?: boolean;
+		can_move_down?: boolean;
 		onRun: () => void;
 		onRunAllBelow?: () => void;
+		onInterrupt?: () => void;
 		onFocus?: () => void;
+		onMoveUp?: () => void;
+		onMoveDown?: () => void;
+		onDuplicate?: () => void;
+		onInsertBelow?: () => void;
+		onDelete?: () => void;
 		focused?: boolean;
 	} = $props();
 
@@ -196,17 +212,44 @@
 <div class="cell" class:focused class:markdown={kind === 'markdown'} bind:this={cell_root}>
 	<div class="cell-head">
 		{#if kind === 'code'}
-			<button class="run" onclick={onRun} disabled={status === 'running' || readonly} title={readonly ? 'Run disabled (static demo)' : 'Run cell (Shift+Enter)'}>
-				{#if status === 'running'}
-					<svg width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 6"><animateTransform attributeName="transform" type="rotate" from="0 6 6" to="360 6 6" dur="0.9s" repeatCount="indefinite"/></circle></svg>
-				{:else}
+			{#if status === 'running'}
+				<button
+					class="run run-stop"
+					onclick={() => onInterrupt?.()}
+					disabled={readonly || !onInterrupt}
+					title="Interrupt cell (SIGINT to kernel)"
+					aria-label="Interrupt cell"
+				>
+					<svg width="10" height="10" viewBox="0 0 10 10"><rect x="2" y="2" width="6" height="6" fill="currentColor"/></svg>
+				</button>
+			{:else}
+				<button class="run" onclick={onRun} disabled={readonly} title={readonly ? 'Run disabled (static demo)' : 'Run cell (Shift+Enter)'}>
 					<svg width="10" height="10" viewBox="0 0 10 10"><polygon points="2,1 9,5 2,9" fill="currentColor"/></svg>
-				{/if}
-			</button>
+				</button>
+			{/if}
 			<span class="idx">In [{index + 1}]</span>
 			<span class="status" class:ok={status === 'ok'} class:err={status === 'error'}>
 				{#if status === 'ok'}✓{:else if status === 'error'}!{/if}
 			</span>
+			{#if !readonly}
+				<div class="cell-actions">
+					<button class="ca" title="Move up" disabled={!can_move_up} aria-label="Move up" onclick={() => onMoveUp?.()}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="2,6 5,3 8,6"/></svg>
+					</button>
+					<button class="ca" title="Move down" disabled={!can_move_down} aria-label="Move down" onclick={() => onMoveDown?.()}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="2,4 5,7 8,4"/></svg>
+					</button>
+					<button class="ca" title="Duplicate" aria-label="Duplicate" onclick={() => onDuplicate?.()}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.5" y="3.5" width="5" height="5"/><path d="M3.5,3.5 V1.5 H8.5 V6.5 H6.5"/></svg>
+					</button>
+					<button class="ca" title="Insert cell below" aria-label="Insert below" onclick={() => onInsertBelow?.()}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M5,2 V8 M2,5 H8"/></svg>
+					</button>
+					<button class="ca ca-del" title="Delete cell" aria-label="Delete" onclick={() => onDelete?.()}>
+						<svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5,2.5 L7.5,7.5 M7.5,2.5 L2.5,7.5"/></svg>
+					</button>
+				</div>
+			{/if}
 		{:else}
 			<span class="kind-tag">MD</span>
 			<span class="idx">Markdown</span>
@@ -261,6 +304,8 @@
 	}
 	.run:hover { background: var(--accent-dim); border-color: var(--accent); }
 	.run:disabled { cursor: default; opacity: 0.6; }
+	.run.run-stop { color: #d9513c; border-color: #d9513c; }
+	.run.run-stop:hover { background: rgba(217, 81, 60, 0.18); border-color: #d9513c; }
 	.idx {
 		color: var(--text-dim);
 		font-family: var(--font-mono);
@@ -271,10 +316,45 @@
 		font-size: var(--fs-xs);
 		color: var(--text-dim);
 		font-weight: 700;
-		margin-left: auto;
 	}
 	.status.ok { color: var(--accent); }
 	.status.err { color: var(--accent); text-decoration: underline; }
+
+	.cell-actions {
+		margin-left: auto;
+		display: inline-flex;
+		gap: 2px;
+		opacity: 0;
+		transition: opacity var(--transition);
+	}
+	/* Reveal actions whenever the cell is hovered or focused — fully hidden
+	 * otherwise so the toolbar doesn't fight the editor for attention. */
+	.cell:hover .cell-actions,
+	.cell.focused .cell-actions { opacity: 1; }
+	.ca {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
+		padding: 0;
+		background: transparent;
+		border: 1px solid var(--border);
+		color: var(--text-muted);
+		cursor: pointer;
+		text-transform: none;
+		letter-spacing: 0;
+		font-weight: normal;
+		transition: color var(--transition), border-color var(--transition), background var(--transition);
+	}
+	.ca:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+	.ca:disabled { opacity: 0.35; cursor: default; }
+	.ca-del:hover:not(:disabled) {
+		color: var(--accent);
+		border-color: var(--accent);
+		background: rgba(217, 81, 60, 0.18);
+	}
+
 	.cell-body { background: var(--bg-mid); }
 
 	.cell.markdown { border: 0; background: transparent; }

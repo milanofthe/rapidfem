@@ -27,7 +27,9 @@ HTTP API:
 from __future__ import annotations
 
 import json
+import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -176,6 +178,31 @@ class Session:
         except Exception:
             pass
 
+    def interrupt(self) -> bool:
+        """Raise `KeyboardInterrupt` inside the worker's running cell.
+
+        Sends SIGINT to the subprocess — the worker's main-thread default
+        handler converts that into a `KeyboardInterrupt`, which propagates
+        out of `exec()` and is caught by the cell-run error path, emitting
+        an `error` event to the client.
+
+        Returns False on Windows (no clean equivalent for non-console
+        children) or if the process is already dead.
+        """
+        if not self.is_alive():
+            return False
+        # Windows: subprocess.CREATE_NEW_PROCESS_GROUP + CTRL_BREAK_EVENT is the
+        # usual workaround but our worker isn't a console process — skip for
+        # now and let the caller fall back to `kill()` if it really needs to
+        # stop a runaway cell.
+        if os.name == "nt":
+            return False
+        try:
+            self.process.send_signal(signal.SIGINT)
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
     # ── Event queue ───────────────────────────────────────────────────────
 
     def poll(self, timeout: float) -> list[dict]:
@@ -296,6 +323,17 @@ def register(app: Flask) -> None:
             return jsonify({"ok": True})
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.post("/api/cell/interrupt")
+    def api_cell_interrupt():
+        body = request.get_json(silent=True) or {}
+        file_key = body.get("file", "<unnamed>")
+        with _sessions_lock:
+            session = _sessions.get(file_key)
+        if session is None:
+            return jsonify({"ok": False, "error": "no active kernel"}), 404
+        ok = session.interrupt()
+        return jsonify({"ok": bool(ok)})
 
     @app.delete("/api/kernel")
     def api_kernel_delete():

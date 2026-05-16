@@ -5,6 +5,8 @@ Entry point registered via pyproject.toml [project.scripts].
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -95,6 +97,70 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_frontend_src() -> Path | None:
+    """Locate the SvelteKit source tree shipped with editable installs.
+
+    Returns the absolute path to ``frontend-src/`` if it exists and looks
+    like an npm package (`package.json` present). The folder is **not**
+    included in published wheels — only the prebuilt ``frontend/dist/`` is
+    — so `rapidfem demo` is a dev-only command.
+    """
+    import rapidfem
+    pkg = Path(rapidfem.__file__).resolve().parent
+    candidate = pkg / "ui" / "frontend-src"
+    if (candidate / "package.json").is_file():
+        return candidate
+    return None
+
+
+def _cmd_demo(args: argparse.Namespace) -> int:
+    """Run the SvelteKit dev server in static-demo mode.
+
+    Mirrors what the GH-Pages build does (`VITE_STATIC_MODE=1`) so the
+    landing page + bundled `<fem-viewer>` cards are visible locally for
+    UI work — without touching the production `frontend/dist/` bundle
+    that `rapidfem serve` ships.
+    """
+    frontend_src = _find_frontend_src()
+    if frontend_src is None:
+        print(
+            "error: 'rapidfem demo' needs a source checkout (`pip install -e .`).\n"
+            "       No frontend-src found next to the installed package.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if not (frontend_src / "node_modules").is_dir():
+        print(
+            f"rapidfem demo — installing npm dependencies in {frontend_src}",
+            file=sys.stderr,
+        )
+        rc = subprocess.call(["npm", "install"], cwd=frontend_src)
+        if rc != 0:
+            print("error: npm install failed", file=sys.stderr)
+            return rc
+
+    env = {**os.environ, "VITE_STATIC_MODE": "1"}
+    cmd = ["npm", "run", "dev", "--", "--port", str(args.port), "--strictPort"]
+    if not args.no_browser:
+        cmd.append("--open")
+    print(
+        f"rapidfem demo — Vite dev server (static-demo mode) "
+        f"on http://127.0.0.1:{args.port}/  · Ctrl+C to stop",
+        file=sys.stderr,
+    )
+    try:
+        return subprocess.call(cmd, cwd=frontend_src, env=env)
+    except FileNotFoundError:
+        print(
+            "error: `npm` not found on PATH. Install Node.js to use `rapidfem demo`.",
+            file=sys.stderr,
+        )
+        return 2
+    except KeyboardInterrupt:
+        return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rapidfem",
@@ -119,6 +185,21 @@ def _build_parser() -> argparse.ArgumentParser:
     s.add_argument("--debug", action="store_true", help="Flask debug mode + hot reload")
     s.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
     s.set_defaults(func=_cmd_serve)
+
+    d = sub.add_parser(
+        "demo",
+        help="run the SvelteKit dev server in static-demo mode (dev-only)",
+        description=(
+            "Spin up the Vite dev server with VITE_STATIC_MODE=1 so the "
+            "landing page + <fem-viewer> demo cards are visible locally. "
+            "Requires a source checkout and Node.js — only useful for UI "
+            "development. Does not touch the bundled `frontend/dist/` that "
+            "`rapidfem serve` ships."
+        ),
+    )
+    d.add_argument("--port", type=int, default=5173, help="Vite dev port (default: 5173)")
+    d.add_argument("--no-browser", action="store_true", help="do not open a browser tab")
+    d.set_defaults(func=_cmd_demo)
 
     return p
 

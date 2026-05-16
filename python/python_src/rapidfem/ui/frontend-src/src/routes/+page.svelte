@@ -150,10 +150,12 @@
 <style>
 	/* Notebook's palette + scale (global vars from app.css) — but a
 	 * lifted mid-gray bg so the tiles read as cards instead of floating
-	 * voids on the viewer-dark default. */
+	 * voids on the viewer-dark default. Fixed viewport height with flex
+	 * column so the header stays anchored at the top, the footer at the
+	 * bottom, and `.landing` scrolls internally — matches rapidpassives. */
 	.page {
 		background: #1c1c21;
-		min-height: 100vh;
+		height: 100vh;
 		display: flex;
 		flex-direction: column;
 	}

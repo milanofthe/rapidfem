@@ -545,29 +545,44 @@ export function volume_energy_range(values: Float32Array): {
 	log_range: number;
 	field_range: { min: number; max: number; decades: number };
 } {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	const RANGE_PERCENTILE = 0.99;
-	const energies: number[] = [];
+	// Subsample so a 7M-voxel 192³ buffer doesn't spend 500 ms on the main
+	// thread building + sorting a JS Array. Stride 8 still leaves ~870k
+	// samples at 192³ — more than enough to estimate the 99th percentile
+	// robustly. At 256³ stride 8 keeps the sample at ~2M which is fine.
+	const STRIDE = 8;
 	const n = values.length / 4;
-	for (let i = 0; i < n; i++) {
+	// Pre-allocate worst-case typed buffer; trim before sort. Typed-array
+	// sort is order-of-magnitude faster than JS Array.sort with a
+	// comparator because it skips per-element boxing and the user closure.
+	const energies = new Float32Array(Math.ceil(n / STRIDE));
+	let count = 0;
+	for (let i = 0; i < n; i += STRIDE) {
 		const off = i * 4;
 		if (values[off + 3] <= 0) continue;
 		const e2 = 0.5 * (values[off] + values[off + 1]);
-		if (e2 > 0) energies.push(e2);
+		if (e2 > 0) energies[count++] = e2;
 	}
-	if (energies.length === 0) {
+	if (count === 0) {
 		return {
 			log_floor: 0,
 			log_range: 1,
 			field_range: { min: 1, max: 1, decades: 0 },
 		};
 	}
-	energies.sort((a, b) => a - b);
-	const lo_idx = Math.min(energies.length - 1, Math.floor(energies.length * (1 - RANGE_PERCENTILE)));
-	const hi_idx = Math.min(energies.length - 1, Math.floor(energies.length * RANGE_PERCENTILE));
-	const e_max = Math.sqrt(energies[hi_idx]);
-	const e_min = Math.max(Math.sqrt(energies[lo_idx]), e_max * 1e-3);
+	const trimmed = energies.subarray(0, count);
+	trimmed.sort();
+	const lo_idx = Math.min(count - 1, Math.floor(count * (1 - RANGE_PERCENTILE)));
+	const hi_idx = Math.min(count - 1, Math.floor(count * RANGE_PERCENTILE));
+	const e_max = Math.sqrt(trimmed[hi_idx]);
+	const e_min = Math.max(Math.sqrt(trimmed[lo_idx]), e_max * 1e-3);
 	const log_max = Math.log10(e_max);
 	const log_min = Math.log10(e_min);
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] energy_range n=${count} ${dt.toFixed(1)} ms`);
+	}
 	return {
 		log_floor: log_min,
 		log_range: Math.max(log_max - log_min, 0.5),

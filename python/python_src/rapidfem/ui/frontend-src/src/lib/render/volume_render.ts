@@ -254,6 +254,7 @@ export function uploadVolumeData(
 	min: [number, number, number],
 	max: [number, number, number],
 ): void {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	if (!buf.texture) {
 		buf.texture = gl.createTexture();
 	}
@@ -274,6 +275,10 @@ export function uploadVolumeData(
 	buf.min = [...min];
 	buf.max = [...max];
 	buf.uploaded = true;
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] gl.texImage3D N=${resolution} ${(data.byteLength / 1048576).toFixed(1)} MB ${dt.toFixed(1)} ms`);
+	}
 }
 
 export function clearVolumeData(buf: VolumeBuffers): void {

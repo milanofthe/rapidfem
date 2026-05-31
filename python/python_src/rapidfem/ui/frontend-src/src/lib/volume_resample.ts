@@ -30,7 +30,11 @@
  */
 import type { MeshData } from './msh';
 
-const DEFAULT_RESOLUTION = 128;
+// 96³ keeps the build under 200 ms on a 25k-tet mesh and the GPU upload at
+// ~13.5 MB. 128³ looked marginally crisper but cost 2.4× the build time and
+// 2.4× the memory; not worth it for the live viewer. Embeds default to 96
+// already; this aligns the in-app viewer with that.
+const DEFAULT_RESOLUTION = 96;
 const TET_OUTSIDE = 0xffffffff;
 
 /** Geometric cache: which tet contains each voxel and at what bary weights.
@@ -57,6 +61,7 @@ export function volume_build_static(
 	mesh: MeshData,
 	resolution: number = DEFAULT_RESOLUTION,
 ): VolumeGridStatic {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	const N = resolution;
 	const n_voxels = N * N * N;
 	const tet_indices = new Uint32Array(n_voxels);
@@ -137,33 +142,48 @@ export function volume_build_static(
 		const m21 = (ay * cx - ax * cy) * inv_det;
 		const m22 = (ax * by - ay * bx) * inv_det;
 
+		// Inner-loop accelerator: λ_i is linear in (wx, wy, wz), so over a
+		// constant-y/z slab the only term that changes with ix is m·k·dx.
+		// Pre-compute the per-step deltas, then march l1/l2/l3 by addition
+		// only — three add+compare per voxel instead of nine mult+add.
+		const dl1 = m00 * dx;
+		const dl2 = m01 * dx;
+		const dl3 = m02 * dx;
+		const wx_start = min[0] + (ix_lo + 0.5) * dx - p[0];
+
 		for (let iz = iz_lo; iz <= iz_hi; iz++) {
 			const wz = min[2] + (iz + 0.5) * dz - p[2];
 			for (let iy = iy_lo; iy <= iy_hi; iy++) {
 				const wy = min[1] + (iy + 0.5) * dy - p[1];
 				const base_yz = (iz * N + iy) * N;
+				let l1 = m00 * wx_start + m10 * wy + m20 * wz;
+				let l2 = m01 * wx_start + m11 * wy + m21 * wz;
+				let l3 = m02 * wx_start + m12 * wy + m22 * wz;
 				for (let ix = ix_lo; ix <= ix_hi; ix++) {
-					const wx = min[0] + (ix + 0.5) * dx - p[0];
-					const l1 = m00 * wx + m10 * wy + m20 * wz;
-					if (l1 < 0 || l1 > 1) continue;
-					const l2 = m01 * wx + m11 * wy + m21 * wz;
-					if (l2 < 0 || l2 > 1) continue;
-					const l3 = m02 * wx + m12 * wy + m22 * wz;
-					if (l3 < 0 || l3 > 1) continue;
-					const l0 = 1 - l1 - l2 - l3;
-					if (l0 < 0) continue;
-					const voxel = base_yz + ix;
-					tet_indices[voxel] = t;
-					const off = voxel * 4;
-					bary[off + 0] = l0;
-					bary[off + 1] = l1;
-					bary[off + 2] = l2;
-					bary[off + 3] = l3;
+					if (l1 >= 0 && l1 <= 1 && l2 >= 0 && l2 <= 1 && l3 >= 0 && l3 <= 1) {
+						const l0 = 1 - l1 - l2 - l3;
+						if (l0 >= 0) {
+							const voxel = base_yz + ix;
+							tet_indices[voxel] = t;
+							const off = voxel * 4;
+							bary[off + 0] = l0;
+							bary[off + 1] = l1;
+							bary[off + 2] = l2;
+							bary[off + 3] = l3;
+						}
+					}
+					l1 += dl1;
+					l2 += dl2;
+					l3 += dl3;
 				}
 			}
 		}
 	}
 
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] build_static N=${N} n_tets=${n_tets} ${dt.toFixed(1)} ms`);
+	}
 	return { tet_indices, bary, resolution: N, min, max };
 }
 
@@ -176,6 +196,7 @@ export function volume_eval_phasor(
 	mesh: MeshData,
 	field_abc: Float32Array,
 ): Float32Array {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	const N = grid.resolution;
 	const n_voxels = N * N * N;
 	const out = new Float32Array(n_voxels * 4);
@@ -210,6 +231,10 @@ export function volume_eval_phasor(
 			l2 * field_abc[i2 + 2] + l3 * field_abc[i3 + 2];
 		out[off + 3] = 1.0;
 	}
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] eval_phasor N=${N} ${dt.toFixed(1)} ms`);
+	}
 	return out;
 }
 
@@ -224,6 +249,7 @@ export function volume_eval_scalar(
 	mesh: MeshData,
 	scalar: Float32Array,
 ): Float32Array {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	const N = grid.resolution;
 	const n_voxels = N * N * N;
 	const out = new Float32Array(n_voxels * 4);
@@ -253,6 +279,10 @@ export function volume_eval_scalar(
 		out[off + 1] = s2;
 		out[off + 2] = 0;
 		out[off + 3] = 1.0;
+	}
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] eval_scalar N=${N} ${dt.toFixed(1)} ms`);
 	}
 	return out;
 }

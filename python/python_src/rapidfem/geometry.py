@@ -649,6 +649,7 @@ class Geometry:
     """
 
     def __init__(self, *, maxh: float | None = None, scale: float = 1.0,
+                 grading: bool = True,
                  name: str = "rapidfem"):
         if not gmsh.isInitialized():
             gmsh.initialize()
@@ -677,6 +678,16 @@ class Geometry:
         self._entities: list[_Entity] = []  # all named-or-trackable entities
         self._owns_gmsh = True  # we'll finalize on close
         self._maxh = maxh                   # global mesh size cap (USER units)
+        # Soft size grading from boundary into the bulk. When True (default),
+        # `Mesh.MeshSizeExtendFromBoundary` is enabled in `mesh()` so the fine
+        # boundary sizes (e.g. a 0.5 mm substrate next to a 10 mm air cap)
+        # ramp gradually into the interior instead of HXT placing the full
+        # 10 mm tet right against the 0.5 mm interface. Costs a moderate tet
+        # count increase (~15-30%) in the transition zone but kills the
+        # "giant air tets visible in the field viz" artefact and produces a
+        # better-conditioned solve. Pass `grading=False` to recover the old
+        # behaviour for benchmarks or specific mesh-count budgets.
+        self._grading = bool(grading)
         # Object-API state: physics registry + post-mesh tag maps.
         self._physics: list = []            # rapidfem.physics.* instances
         self._material_tags: dict[int, int] = {}  # id(Material) -> phys group tag
@@ -2366,14 +2377,17 @@ class Geometry:
             )
             # Without ExtendFromBoundary, HXT-Delaunay treats the
             # background field as a soft hint and barely refines the
-            # interior. For point-driven refinement the boundary sizes
-            # (= field values near the embedded points) must propagate
-            # inward, so leave it ON. For pure per-entity threshold
-            # refinement (no embeds) keep the old behaviour to avoid
-            # regressing existing demos.
+            # interior — and lets neighbouring tets across an interface
+            # jump by an order of magnitude (e.g. 0.5 mm substrate next
+            # to 10 mm air). With grading ON the boundary sizes propagate
+            # smoothly inward, killing those extreme-size transitions at
+            # the cost of ~15-30% more tets in the air. Point-driven
+            # refinement always needs this propagation (the embedded
+            # points are how the field reaches the bulk in the first
+            # place), so it overrides the user's grading toggle.
             gmsh.option.setNumber(
                 "Mesh.MeshSizeExtendFromBoundary",
-                1 if refinement_has_embed else 0,
+                1 if (self._grading or refinement_has_embed) else 0,
             )
 
         # Curvature-based sizing: gmsh disables this by default. Turning it

@@ -9,6 +9,16 @@
  */
 
 import { canvas as canvasTheme } from '$lib/theme';
+import {
+	createVolumeProgram,
+	createVolumeBuffers,
+	uploadVolumeData,
+	clearVolumeData,
+	disposeVolume,
+	renderVolume,
+	type VolumeProgram,
+	type VolumeBuffers,
+} from './volume_render';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -62,27 +72,15 @@ export interface GLState {
 	lineProgram: WebGLProgram;
 	uLineMVP: WebGLUniformLocation;
 	uLineColor: WebGLUniformLocation;
-	pointProgram: WebGLProgram;
-	uPointMVP: WebGLUniformLocation;
-	uPointZFlip: WebGLUniformLocation;
-	uPointScale: WebGLUniformLocation;
-	uPointPhase: WebGLUniformLocation;
-	uPointRangeFloor: WebGLUniformLocation;
-	uPointRangeSpan: WebGLUniformLocation;
-	uPointLogScale: WebGLUniformLocation;
+	volumeProgram: VolumeProgram;
+	volumeBuffers: VolumeBuffers;
+	volumePhase: number;
+	volumeRangeFloor: number;
+	volumeRangeSpan: number;
+	volumeLogScale: number;
+	volumeOpacity: number;
 	meshes: Mesh[];
 	lineMeshes: LineMesh[];
-	/** Volumetric field point cloud. Two interleaved float-3 attributes:
-	 *  position (x, y, z) and (A, B, C) phasor terms per sample. */
-	pointCloud: {
-		vao: WebGLVertexArrayObject;
-		buffers: WebGLBuffer[];
-		count: number;
-	} | null;
-	pointPhase: number;
-	pointRangeFloor: number;
-	pointRangeSpan: number;
-	pointLogScale: number;
 	bbox: { min: [number, number, number]; max: [number, number, number] };
 }
 
@@ -158,75 +156,6 @@ precision highp float;
 uniform vec3 uColor;
 out vec4 fragColor;
 void main() { fragColor = vec4(uColor, 1.0); }`;
-
-// ── Volumetric field as a gl.POINTS sprite cloud ──
-//
-// Each field sample is one gl.POINTS sprite, sized in *screen pixels* with a
-// clamp so the cloud stays performant at any zoom: small enough to never
-// flood fill rate, large enough to stay visible at typical distances. The
-// fragment shader emits a soft round disc that fades into the colour ramp.
-//
-// Blending is additive (ONE, ONE) with depth test OFF — every point adds
-// brightness, nothing is occluded, and you see *through* the whole volume
-// rather than just the front slab. That's what gives the cloud its
-// volumetric glow.
-//
-// (A, B, C) are phasor terms; the shader composites |E(t)|² per frame
-// against a phase uniform for the wave animation.
-const POINT_VS = `#version 300 es
-precision highp float;
-layout(location=0) in vec3 aPos;
-layout(location=1) in vec3 aABC;           // (A, B, C) phasor terms
-uniform mat4 uMVP;
-uniform float uZFlip;
-uniform float uPointScale;                 // base size in pixels at unit clip-w
-uniform float uPhase;                      // current ωt in radians
-uniform float uRangeFloor;                 // log10(|E|min) (log) or |E|min (lin)
-uniform float uRangeSpan;                  // log10(max/min) (log) or (|E|max−|E|min) (lin)
-uniform float uLogScale;                   // 1.0 = log color mapping, 0.0 = linear
-out float vScalar;
-void main() {
-	vec3 pos = aPos;
-	pos.z *= uZFlip;
-	gl_Position = uMVP * vec4(pos, 1.0);
-
-	// |E(t)|² = A cos²(ωt) + B sin²(ωt) − 2 C cos·sin
-	float c = cos(uPhase);
-	float s = sin(uPhase);
-	float e2 = aABC.x * c * c + aABC.y * s * s - 2.0 * aABC.z * c * s;
-	float mag = sqrt(max(e2, 0.0));
-	float norm_log = (log(max(mag, 1e-30)) / 2.302585093 - uRangeFloor) / max(uRangeSpan, 1e-9);
-	float norm_lin = (mag - uRangeFloor) / max(uRangeSpan, 1e-9);
-	vScalar = clamp(mix(norm_lin, norm_log, uLogScale), 0.0, 1.0);
-
-	float w = max(gl_Position.w, 1e-6);
-	gl_PointSize = clamp(uPointScale / w * (0.4 + 0.6 * vScalar), 4.0, 96.0);
-}`;
-
-const POINT_FS = `#version 300 es
-precision highp float;
-in float vScalar;
-out vec4 fragColor;
-vec3 inferno(float t) {
-	t = clamp(t, 0.0, 1.0);
-	const vec3 c0 = vec3(0.0002, 0.0016, -0.0194);
-	const vec3 c1 = vec3(0.1065, 0.5639, 3.9327);
-	const vec3 c2 = vec3(11.6024, -3.972, -15.9423);
-	const vec3 c3 = vec3(-41.7039, 17.4363, 44.354);
-	const vec3 c4 = vec3(77.1629, -33.4023, -81.8073);
-	const vec3 c5 = vec3(-71.319, 32.6261, 73.2095);
-	const vec3 c6 = vec3(25.1311, -12.2426, -23.0703);
-	return c0 + t*(c1 + t*(c2 + t*(c3 + t*(c4 + t*(c5 + t*c6)))));
-}
-void main() {
-	vec2 uv = gl_PointCoord * 2.0 - 1.0;
-	float r2 = dot(uv, uv);
-	if (r2 > 1.0) discard;
-	float falloff = pow(1.0 - r2, 2.0);
-	vec3 col = inferno(vScalar);
-	// Additive: low-field points fade out, hotspots accumulate brightness.
-	fragColor = vec4(col * (vScalar * falloff), 1.0);
-}`;
 
 // ─── GL helpers ─────────────────────────────────────────────────────
 
@@ -337,7 +266,8 @@ export function initGL(canvas: HTMLCanvasElement): GLState | null {
 
 	const program = linkProgram(gl, VS, FS);
 	const lineProgram = linkProgram(gl, LINE_VS, LINE_FS);
-	const pointProgram = linkProgram(gl, POINT_VS, POINT_FS);
+	const volumeProgram = createVolumeProgram(gl);
+	const volumeBuffers = createVolumeBuffers(gl);
 
 	const bg = hexToRgb(canvasTheme.bg);
 	gl.clearColor(bg[0], bg[1], bg[2], 1);
@@ -361,21 +291,15 @@ export function initGL(canvas: HTMLCanvasElement): GLState | null {
 		lineProgram,
 		uLineMVP: gl.getUniformLocation(lineProgram, 'uMVP')!,
 		uLineColor: gl.getUniformLocation(lineProgram, 'uColor')!,
-		pointProgram,
-		uPointMVP: gl.getUniformLocation(pointProgram, 'uMVP')!,
-		uPointZFlip: gl.getUniformLocation(pointProgram, 'uZFlip')!,
-		uPointScale: gl.getUniformLocation(pointProgram, 'uPointScale')!,
-		uPointPhase: gl.getUniformLocation(pointProgram, 'uPhase')!,
-		uPointRangeFloor: gl.getUniformLocation(pointProgram, 'uRangeFloor')!,
-		uPointRangeSpan: gl.getUniformLocation(pointProgram, 'uRangeSpan')!,
-		uPointLogScale: gl.getUniformLocation(pointProgram, 'uLogScale')!,
+		volumeProgram,
+		volumeBuffers,
+		volumePhase: 0,
+		volumeRangeFloor: -30,
+		volumeRangeSpan: 6,
+		volumeLogScale: 0,
+		volumeOpacity: 1.0,
 		meshes: [],
 		lineMeshes: [],
-		pointCloud: null,
-		pointPhase: 0,
-		pointRangeFloor: -30,
-		pointRangeSpan: 6,
-		pointLogScale: 0,
 		bbox: { min: [0, 0, 0], max: [0, 0, 0] }
 	};
 }
@@ -390,18 +314,15 @@ export function disposeGL(state: GLState): void {
 		gl.deleteVertexArray(m.vao);
 		for (const b of m.buffers) gl.deleteBuffer(b);
 	}
-	if (state.pointCloud) {
-		gl.deleteVertexArray(state.pointCloud.vao);
-		for (const b of state.pointCloud.buffers) gl.deleteBuffer(b);
-	}
+	disposeVolume(gl, state.volumeProgram, state.volumeBuffers);
 	gl.deleteProgram(state.program);
 	gl.deleteProgram(state.lineProgram);
-	gl.deleteProgram(state.pointProgram);
 }
 
-/** Drop surface and line meshes. The point cloud has its own lifecycle
- *  (setPointCloud manages its GL resources) and survives a rebuild so the
- *  field viz stays visible when the user toggles Geometry / Mesh layers. */
+/** Drop surface and line meshes. The volume cloud has its own lifecycle
+ *  (setVolumeData / clearVolume manage its GL resources) and survives a
+ *  rebuild so the field viz stays visible when the user toggles Geometry
+ *  or Mesh layers. */
 export function clearMeshes(state: GLState): void {
 	const { gl } = state;
 	for (const m of state.meshes) {
@@ -416,59 +337,51 @@ export function clearMeshes(state: GLState): void {
 	state.lineMeshes = [];
 }
 
-/** Replace the volumetric field point cloud.
+/** Upload (or replace) the volumetric field as a 3D RGBA32F texture.
  *
- *  positions: [x,y,z,...] per sample in METERS
- *  abc:       [A,B,C,...] per sample — phasor terms for |E(t)|² animation
- *
- *  Pure additive point-sprite cloud — no draw order, no sorting, no σ. */
-export function setPointCloud(
+ *  `voxels` is the packed `(A, B, C, occ)` buffer produced by
+ *  `volume_eval_phasor` (FD) or `volume_eval_scalar` (TD). Resolution is the
+ *  cubic grid edge length (data.length must equal 4·N³). min/max are the
+ *  world-space BBox the grid covers. */
+export function setVolumeData(
 	state: GLState,
-	positions: Float32Array,
-	abc: Float32Array,
+	voxels: Float32Array,
+	resolution: number,
+	min: [number, number, number],
+	max: [number, number, number],
 ): void {
-	const { gl } = state;
-	if (state.pointCloud) {
-		gl.deleteVertexArray(state.pointCloud.vao);
-		for (const b of state.pointCloud.buffers) gl.deleteBuffer(b);
-		state.pointCloud = null;
+	if (voxels.length === 0 || resolution === 0) {
+		clearVolumeData(state.volumeBuffers);
+		return;
 	}
-	const count = positions.length / 3;
-	if (count === 0) return;
+	uploadVolumeData(state.gl, state.volumeBuffers, voxels, resolution, min, max);
+}
 
-	const vao = gl.createVertexArray()!;
-	gl.bindVertexArray(vao);
-	const posBuf = gl.createBuffer()!;
-	gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
-	gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
-	gl.enableVertexAttribArray(0);
-	gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-	const abcBuf = gl.createBuffer()!;
-	gl.bindBuffer(gl.ARRAY_BUFFER, abcBuf);
-	gl.bufferData(gl.ARRAY_BUFFER, abc, gl.STATIC_DRAW);
-	gl.enableVertexAttribArray(1);
-	gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-	gl.bindVertexArray(null);
-	gl.bindBuffer(gl.ARRAY_BUFFER, null);
-
-	state.pointCloud = { vao, buffers: [posBuf, abcBuf], count };
+/** Clear the volume texture (e.g. when the user turns the field off). */
+export function clearVolume(state: GLState): void {
+	clearVolumeData(state.volumeBuffers);
 }
 
 /** Set the field colour-mapping range. floor/span are interpreted per mode:
- *  log → (log10(|E|min), log10(max/min)); lin → (|E|min, |E|max−|E|min). */
-export function setPointRange(state: GLState, floor: number, span: number): void {
-	state.pointRangeFloor = floor;
-	state.pointRangeSpan = span;
+ *  log → (log10(|F|min), log10(max/min)); lin → (|F|min, |F|max−|F|min). */
+export function setVolumeRange(state: GLState, floor: number, span: number): void {
+	state.volumeRangeFloor = floor;
+	state.volumeRangeSpan = span;
 }
 
-/** Colour-mapping mode for the field point cloud. */
-export function setPointScaleMode(state: GLState, mode: 'log' | 'lin'): void {
-	state.pointLogScale = mode === 'log' ? 1 : 0;
+/** Colour-mapping mode for the volume field. */
+export function setVolumeScaleMode(state: GLState, mode: 'log' | 'lin'): void {
+	state.volumeLogScale = mode === 'log' ? 1 : 0;
 }
 
 /** Update the time phase (call from requestAnimationFrame for the wave anim). */
-export function setPointPhase(state: GLState, phase: number): void {
-	state.pointPhase = phase;
+export function setVolumePhase(state: GLState, phase: number): void {
+	state.volumePhase = phase;
+}
+
+/** Global opacity multiplier for the volume (1.0 = default). */
+export function setVolumeOpacity(state: GLState, opacity: number): void {
+	state.volumeOpacity = opacity;
 }
 
 /** Add a triangle group with a single color. positions and normals must
@@ -624,31 +537,24 @@ export function render3D(
 		}
 	}
 
-	// Volumetric field point cloud — additive blending, depth test off,
-	// so every sample adds brightness and you see *through* the whole
-	// volume rather than just the front slab.
-	if (state.pointCloud && state.pointCloud.count > 0) {
-		gl.useProgram(state.pointProgram);
-		gl.uniformMatrix4fv(state.uPointMVP, false, vp);
-		gl.uniform1f(state.uPointZFlip, zFlip);
-		const dx = state.bbox.max[0] - state.bbox.min[0];
-		const dy = state.bbox.max[1] - state.bbox.min[1];
-		const xy = Math.max(dx, dy, 1e-9);
-		// Base size in pixels at unit clip-w, scaled by scene XY extent.
-		gl.uniform1f(state.uPointScale, xy * 0.4);
-		gl.uniform1f(state.uPointPhase, state.pointPhase);
-		gl.uniform1f(state.uPointRangeFloor, state.pointRangeFloor);
-		gl.uniform1f(state.uPointRangeSpan, state.pointRangeSpan);
-		gl.uniform1f(state.uPointLogScale, state.pointLogScale);
-		gl.disable(gl.DEPTH_TEST);
-		gl.depthMask(false);
-		gl.enable(gl.BLEND);
-		gl.blendFunc(gl.ONE, gl.ONE);
-		gl.bindVertexArray(state.pointCloud.vao);
-		gl.drawArrays(gl.POINTS, 0, state.pointCloud.count);
-		gl.disable(gl.BLEND);
-		gl.depthMask(true);
-		gl.enable(gl.DEPTH_TEST);
+	// Volumetric field as a 3D-texture raycaster. Draws the mesh-BBox cube
+	// (back faces only) and integrates front-to-back through the volume in
+	// the fragment shader. Depth test off, premultiplied-alpha blend over
+	// the prior scene.
+	if (state.volumeBuffers.uploaded) {
+		renderVolume(
+			gl,
+			state.volumeProgram,
+			state.volumeBuffers,
+			vp,
+			eye,
+			zFlip,
+			state.volumePhase,
+			state.volumeRangeFloor,
+			state.volumeRangeSpan,
+			state.volumeLogScale,
+			state.volumeOpacity,
+		);
 	}
 	gl.bindVertexArray(null);
 }

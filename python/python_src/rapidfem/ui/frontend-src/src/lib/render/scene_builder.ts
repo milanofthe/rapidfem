@@ -20,10 +20,14 @@
  */
 
 import {
-	addMesh, addLineMesh, setBBox, setPointCloud,
+	addMesh, addLineMesh, setBBox, clearVolume,
 	type GLState,
 } from './canvas3d';
 import { buildVolumeBoundaries, buildTriSoupF64 } from './mesh_scene';
+import {
+	volume_build_static, volume_eval_phasor, volume_energy_range,
+} from '../volume_resample';
+import type { MeshData } from '../msh';
 
 // ── Mesh-payload contract ────────────────────────────────────────────
 
@@ -222,181 +226,66 @@ export function buildScene(
 	return { faceTags, wireTag };
 }
 
-/** Convenience: wipe the field point cloud. Callers use this when toggling
+/** Convenience: wipe the field volume. Callers use this when toggling
  *  out of field mode. */
 export function clearFieldCloud(state: GLState): void {
-	setPointCloud(state, new Float32Array(0), new Float32Array(0));
+	clearVolume(state);
 }
 
-// ── Volumetric field point sampling ──────────────────────────────────
+// ── Volumetric field resampling ───────────────────────────────────────
 //
-// Same algorithm as `$lib/viz.ts` (the sampler the in-app MeshViewer uses),
-// but in-line and synchronous for the embed which doesn't carry a worker.
-// Two-stage draw: tet ∝ vol·w_max[t], then uniform-barycentric proposal
-// inside the tet accepted with prob w(x)/w_max[t]. Marginal density per
-// unit volume is the piecewise-linear w(x) — no density jumps at shared
-// tet faces (the "visible tet edges" artifact of the old per-tet-mean
-// weighting). See `viz.ts` for the full derivation.
+// Replacement for the old `sampleFieldCloud` point-cloud sampler. Builds the
+// per-voxel `(A, B, C, occ)` buffer the new volume raycaster consumes. The
+// pipeline is shared with the in-app viewer (`volume_resample.ts`); this
+// helper just adapts the embed's `SceneMesh` (`tets` as a plain `number[]`)
+// into the strict `MeshData` shape the resampler expects.
 
-/** Energy coverage floor — matches `viz.ts:ENERGY_FLOOR`. Close to 1 means
- *  almost-uniform spatial coverage with only a small linear bias toward
- *  high-energy regions; see `viz.ts` for the full derivation. */
-const ENERGY_FLOOR = 0.7;
-
-function buildTetVolumes(mesh: SceneMesh): Float64Array {
-	const tets = mesh.tets;
-	const nodes = mesh.nodes;
-	const n = tets.length / 4;
-	const vols = new Float64Array(n);
-	for (let t = 0; t < n; t++) {
-		const a = tets[t * 4], b = tets[t * 4 + 1],
-		      c = tets[t * 4 + 2], d = tets[t * 4 + 3];
-		const ax = nodes[a * 3], ay = nodes[a * 3 + 1], az = nodes[a * 3 + 2];
-		const bx = nodes[b * 3], by = nodes[b * 3 + 1], bz = nodes[b * 3 + 2];
-		const cx = nodes[c * 3], cy = nodes[c * 3 + 1], cz = nodes[c * 3 + 2];
-		const dx = nodes[d * 3], dy = nodes[d * 3 + 1], dz = nodes[d * 3 + 2];
-		const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
-		const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
-		const e3x = dx - ax, e3y = dy - ay, e3z = dz - az;
-		const det = e1x * (e2y * e3z - e2z * e3y)
-		          - e1y * (e2x * e3z - e2z * e3x)
-		          + e1z * (e2x * e3y - e2y * e3x);
-		vols[t] = Math.abs(det) / 6;
-	}
-	return vols;
+function sceneToMeshData(m: SceneMesh): MeshData {
+	const nodes = m.nodes instanceof Float64Array
+		? m.nodes
+		: new Float64Array(m.nodes as ArrayLike<number>);
+	const tets = m.tets instanceof Uint32Array ? m.tets : new Uint32Array(m.tets);
+	return {
+		nodes,
+		tris: new Uint32Array(0),
+		tri_phys: new Int32Array(0),
+		tets,
+		tet_phys: new Int32Array(0),
+		phys_names: new Map(),
+		phys_dim: new Map(),
+		bbox: m.bbox,
+	};
 }
 
-function bsearchCdf(cdf: Float64Array, target: number): number {
-	let lo = 0, hi = cdf.length - 1;
-	while (lo < hi) {
-		const mid = (lo + hi) >>> 1;
-		if (cdf[mid] < target) lo = mid + 1;
-		else hi = mid;
-	}
-	return lo;
-}
-
-/** Uniform barycentric weights for a tetrahedron (sorted-triple trick). */
-function uniformBary(out: [number, number, number, number]): void {
-	let s = Math.random();
-	let t = Math.random();
-	let u = Math.random();
-	if (s > t) [s, t] = [t, s];
-	if (t > u) [t, u] = [u, t];
-	if (s > t) [s, t] = [t, s];
-	out[0] = s;
-	out[1] = t - s;
-	out[2] = u - t;
-	out[3] = 1 - u;
-}
-
-/** Energy-weighted random sampling of N field points, with (A, B, C) phasor
- *  coefficients interpolated by barycentric weights. Same output shape
- *  `viz.ts:viz_sample` produces (plus maxE2/minE2 the embed uses for its
- *  colour range) — drop the positions / abc straight into `setPointCloud`. */
-export function sampleFieldCloud(
+/** Resample a per-node `(A, B, C)` field onto a regular 3D grid and return
+ *  the packed RGBA32F voxel buffer plus the world-space BBox and a robust
+ *  colour range. The embed treats this output as its cached field artefact
+ *  (one entry per `(freq, port, resolution)` key). */
+export function buildVolumeCloud(
 	mesh: SceneMesh,
 	fieldAbc: number[] | Float32Array,
-	n: number,
-): { positions: Float32Array; abc: Float32Array; maxE2: number; minE2: number } {
-	const vols = buildTetVolumes(mesh);
-	const tets = mesh.tets;
-	const nodes = mesh.nodes;
-	const nTets = vols.length;
-	const nNodes = fieldAbc.length / 3;
-
-	// Per-node time-averaged energy e_i = 0.5·(A_i + B_i).
-	const eNode = new Float64Array(nNodes);
-	let eGlobalMax = 0;
-	for (let i = 0; i < nNodes; i++) {
-		const e = 0.5 * (fieldAbc[i * 3] + fieldAbc[i * 3 + 1]);
-		const ec = e > 0 ? e : 0;
-		eNode[i] = ec;
-		if (ec > eGlobalMax) eGlobalMax = ec;
-	}
-	if (eGlobalMax <= 0) {
-		return {
-			positions: new Float32Array(0),
-			abc: new Float32Array(0),
-			maxE2: 1, minE2: 1,
-		};
-	}
-	const invEGlobal = 1 / eGlobalMax;
-
-	// w(x) = ENERGY_FLOOR + (1−ENERGY_FLOOR)·e(x)/e_global_max  is affine in
-	// the barycentric coords, so w_max inside a tet = w at its hottest corner.
-	const wMaxTet = new Float64Array(nTets);
-	for (let t = 0; t < nTets; t++) {
-		let em = 0;
-		for (let k = 0; k < 4; k++) {
-			const en = eNode[tets[t * 4 + k]];
-			if (en > em) em = en;
-		}
-		wMaxTet[t] = ENERGY_FLOOR + (1 - ENERGY_FLOOR) * em * invEGlobal;
-	}
-
-	// Tet-pick CDF: weight = vol · w_max_tet.
-	const cdf = new Float64Array(nTets);
-	let acc = 0;
-	for (let t = 0; t < nTets; t++) {
-		acc += vols[t] * wMaxTet[t];
-		cdf[t] = acc;
-	}
-	const totalWeight = acc || 1;
-
-	const MAX_PROPOSALS = 64;
-	const positions = new Float32Array(n * 3);
-	const abc = new Float32Array(n * 3);
-	const w: [number, number, number, number] = [0, 0, 0, 0];
-	for (let i = 0; i < n; i++) {
-		const ti = bsearchCdf(cdf, Math.random() * totalWeight);
-		const a = tets[ti * 4], b = tets[ti * 4 + 1],
-		      c = tets[ti * 4 + 2], d = tets[ti * 4 + 3];
-		const ea = eNode[a], eb = eNode[b], ec_ = eNode[c], ed = eNode[d];
-		const wmax = wMaxTet[ti];
-
-		for (let attempt = 0; attempt < MAX_PROPOSALS; attempt++) {
-			uniformBary(w);
-			const eLocal = w[0] * ea + w[1] * eb + w[2] * ec_ + w[3] * ed;
-			const wLocal = ENERGY_FLOOR + (1 - ENERGY_FLOOR) * eLocal * invEGlobal;
-			if (Math.random() * wmax <= wLocal) break;
-		}
-		positions[i * 3] = (
-			w[0] * nodes[a * 3] + w[1] * nodes[b * 3] +
-			w[2] * nodes[c * 3] + w[3] * nodes[d * 3]
-		);
-		positions[i * 3 + 1] = (
-			w[0] * nodes[a * 3 + 1] + w[1] * nodes[b * 3 + 1] +
-			w[2] * nodes[c * 3 + 1] + w[3] * nodes[d * 3 + 1]
-		);
-		positions[i * 3 + 2] = (
-			w[0] * nodes[a * 3 + 2] + w[1] * nodes[b * 3 + 2] +
-			w[2] * nodes[c * 3 + 2] + w[3] * nodes[d * 3 + 2]
-		);
-		const A = w[0] * fieldAbc[a * 3]     + w[1] * fieldAbc[b * 3]     + w[2] * fieldAbc[c * 3]     + w[3] * fieldAbc[d * 3];
-		const B = w[0] * fieldAbc[a * 3 + 1] + w[1] * fieldAbc[b * 3 + 1] + w[2] * fieldAbc[c * 3 + 1] + w[3] * fieldAbc[d * 3 + 1];
-		const C = w[0] * fieldAbc[a * 3 + 2] + w[1] * fieldAbc[b * 3 + 2] + w[2] * fieldAbc[c * 3 + 2] + w[3] * fieldAbc[d * 3 + 2];
-		abc[i * 3] = A; abc[i * 3 + 1] = B; abc[i * 3 + 2] = C;
-	}
-	// Robust colormap range from the per-node energy distribution — see
-	// the matching helper in `viz.ts`. Avoids the embed's auto-range
-	// getting locked onto a single port-edge outlier.
-	const { minE2, maxE2 } = nodeEnergyPercentile(fieldAbc);
-	return { positions, abc, maxE2, minE2 };
-}
-
-/** 99th/1st percentile of per-node `|F|² ≈ (A + B)/2`. */
-function nodeEnergyPercentile(fieldAbc: number[] | Float32Array): { minE2: number; maxE2: number } {
-	const nNodes = fieldAbc.length / 3;
-	const energies: number[] = [];
-	for (let ni = 0; ni < nNodes; ni++) {
-		const e2 = 0.5 * (fieldAbc[ni * 3] + fieldAbc[ni * 3 + 1]);
-		if (e2 > 0) energies.push(e2);
-	}
-	if (energies.length === 0) return { minE2: 1, maxE2: 1 };
-	energies.sort((a, b) => a - b);
-	const last = energies.length - 1;
-	const lo = energies[Math.min(last, Math.floor(energies.length * 0.01))];
-	const hi = energies[Math.min(last, Math.floor(energies.length * 0.99))];
-	return { minE2: lo, maxE2: hi };
+	resolution = 128,
+): {
+	voxels: Float32Array;
+	resolution: number;
+	min: [number, number, number];
+	max: [number, number, number];
+	maxE2: number;
+	minE2: number;
+} {
+	const md = sceneToMeshData(mesh);
+	const f = fieldAbc instanceof Float32Array
+		? fieldAbc
+		: new Float32Array(fieldAbc as ArrayLike<number>);
+	const grid = volume_build_static(md, resolution);
+	const voxels = volume_eval_phasor(grid, md, f);
+	const range = volume_energy_range(voxels);
+	return {
+		voxels,
+		resolution: grid.resolution,
+		min: grid.min,
+		max: grid.max,
+		maxE2: range.field_range.max * range.field_range.max,
+		minE2: range.field_range.min * range.field_range.min,
+	};
 }

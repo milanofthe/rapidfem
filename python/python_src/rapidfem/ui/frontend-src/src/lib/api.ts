@@ -230,4 +230,9 @@ export interface TdTrajectoryPayload {
 	frames_h: number[][];
 }
 
-export { viz_load_mesh, viz_sample, viz_sample_static, viz_eval_static, viz_scalar_range } from './viz';
+// Note: the old `viz` point-cloud sampler API is gone — the field viz now
+// runs through `volume_resample` and the canvas3d volume raycaster.
+export {
+	volume_build_static, volume_eval_phasor, volume_eval_scalar,
+	volume_energy_range,
+} from './volume_resample';

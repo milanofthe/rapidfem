@@ -2,7 +2,8 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import {
 		initGL, disposeGL, clearMeshes, addMesh, addLineMesh, setBBox,
-		setPointCloud, setPointPhase, setPointRange, setPointScaleMode,
+		setVolumeData, setVolumePhase, setVolumeRange, setVolumeScaleMode,
+		setVolumeOpacity, clearVolume,
 		render3D, fitCamera, setTagVisible,
 		type GLState, type Camera
 	} from '$lib/render/canvas3d';
@@ -10,15 +11,14 @@
 	import type { MeshData } from '$lib/msh';
 	import type { TdTrajectoryPayload } from '$lib/api';
 	import { palette } from '$lib/theme';
-	import { viz_load_mesh, viz_sample, viz_sample_static, viz_eval_static } from '$lib/api';
+	import {
+		volume_build_static, volume_eval_phasor, volume_eval_scalar,
+		volume_energy_range,
+		type VolumeGridStatic,
+	} from '$lib/volume_resample';
 
-	const EMPTY_F32 = new Float32Array(0);
-	// Decade span of the time-domain field cloud's logarithmic colour scale.
+	// Decade span of the time-domain field volume's logarithmic colour scale.
 	const TD_LOG_DECADES = 3;
-	// Runtime sample-count ceiling for the time-domain field cloud — the
-	// density slider (1…10) maps to point_density/10 · TD_TARGET_MAX points,
-	// so the slider tops out at FD-parity (~500k).
-	const TD_TARGET_MAX = 500000;
 
 	let {
 		mesh = null as MeshData | null,
@@ -367,24 +367,10 @@
 		return out;
 	}
 
-	/** Phasor-buffer encoding of a per-point magnitude for the point shader.
-	 *  The shader composites |E(t)|² = A·cos²φ + B·sin²φ − 2C·cosφ·sinφ;
-	 *  feeding (s², s², 0) makes that collapse to s² for every phase, so a
-	 *  time-domain snapshot reuses the frequency-domain cloud unchanged. */
-	function td_abc_from_mag(mag: Float32Array): Float32Array {
-		const n = mag.length;
-		const abc = new Float32Array(n * 3);
-		for (let i = 0; i < n; i++) {
-			const s2 = mag[i] * mag[i];
-			abc[i * 3] = s2;
-			abc[i * 3 + 1] = s2;
-		}
-		return abc;
-	}
-
-	/** A `MeshData`-shaped view onto a trajectory's DG-corner mesh, so the
-	 *  runtime sampler (`viz_load_mesh`) can cache it. Only `nodes` / `tets`
-	 *  / `bbox` matter to the sampler — the rest are empty placeholders. */
+	/** A `MeshData`-shaped view onto a trajectory's DG-corner mesh so the
+	 *  volume resampler can build its (tet_idx, bary) cache from it. Only
+	 *  `nodes` / `tets` / `bbox` are used downstream — the rest are empty
+	 *  placeholders. */
 	function traj_mesh(traj: TdTrajectoryPayload): MeshData {
 		return {
 			nodes: new Float64Array(traj.nodes as unknown as ArrayLike<number>),
@@ -613,7 +599,7 @@
 				hex('#3a3a44'), -1,
 			);
 		} else {
-			setPointCloud(gl_state, EMPTY_F32, EMPTY_F32);
+			clearVolume(gl_state);
 			field_range = null;
 		}
 
@@ -814,66 +800,72 @@
 		else if (wireframe) camera = fitCamera(wireframe.bbox.min, wireframe.bbox.max);
 	});
 
-	// Upload the active mode's mesh to the viz cache once per change. The
-	// sampler then holds the nodes+tets+volumes and `viz_sample` /
-	// `viz_sample_static` only do the cheap random-sampling pass per density
-	// tick. The viz module owns a single cache, so a TD trajectory loads its
-	// OWN DG-corner mesh here (not the FD `mesh`).
-	let viz_mesh_ready_for: MeshData | TdTrajectoryPayload | null = $state(null);
+	// Build the per-voxel (tet_idx, bary) cache for the active mesh — shared
+	// between the FD `volume_eval_phasor` and TD `volume_eval_scalar` paths.
+	// Heavy enough (~hundreds of ms for a 25k-tet mesh at 128³) that we yield
+	// to the UI thread with a microtask before kicking it off, so a fresh
+	// mesh-load doesn't freeze the canvas.
+	let volume_cache: {
+		key: MeshData | TdTrajectoryPayload;
+		mesh: MeshData;
+		grid: VolumeGridStatic;
+	} | null = $state(null);
 	$effect(() => {
 		const traj = td_trajectory;
 		const m = mesh;
-		// Whenever the source changes (file load, regen), drop the old GPU
-		// splat cloud immediately. Otherwise the previous file's field samples
-		// linger in their old coordinates until the sampler finishes.
 		if (gl_state) {
-			setPointCloud(gl_state, EMPTY_F32, EMPTY_F32);
+			clearVolume(gl_state);
 			field_range = null;
 		}
-		viz_mesh_ready_for = null;
-		// A TD trajectory takes priority — it owns the point cloud, and its
-		// DG-corner mesh is what the runtime sampler must draw from.
-		const target = traj ? traj_mesh(traj) : m;
+		volume_cache = null;
 		const key: MeshData | TdTrajectoryPayload | null = traj ?? m;
-		if (!target || !key) return;
-		viz_load_mesh(target).then(() => { viz_mesh_ready_for = key; })
-			.catch((e) => console.error('viz_load_mesh', e));
+		if (!key) return;
+		const target = traj ? traj_mesh(traj) : m;
+		if (!target) return;
+		// Yield once so the canvas can paint the new mesh before the build.
+		queueMicrotask(() => {
+			if ((td_trajectory ?? mesh) !== key) return;
+			const grid = volume_build_static(target);
+			volume_cache = { key, mesh: target, grid };
+		});
 	});
 
-	// Async point-cloud sampling: re-runs whenever `show_field`, `field`, or
-	// `point_density` change. Old samples are replaced atomically when the
-	// worker returns. A monotonically-increasing token guards against
-	// out-of-order responses (e.g. user drags slider faster than the worker
-	// can answer).
-	let viz_sample_token = 0;
+	// FD volume upload: re-runs whenever the field changes. Resampling a 128³
+	// volume from a 25k-tet mesh runs in ~50 ms on the main thread — fast
+	// enough for synchronous evaluation.
 	$effect(() => {
-		const ready = viz_mesh_ready_for;
+		const cache = volume_cache;
 		const f = field;
-		const dens = point_density;
 		const want = show_field;
-		if (!gl_state || !ready || !want || !f) return;
-		const total_pts = Math.max(500, Math.round(dens * 50000));
-		const my_token = ++viz_sample_token;
-		viz_sample(f, total_pts).then((r) => {
-			if (my_token !== viz_sample_token || !gl_state) return;
-			field_range = r.field_range;
-			last_range = r;
-			apply_scale_mode(gl_state, scale_mode, r);
-			setPointCloud(gl_state, r.positions, r.abc);
-			schedule_render();
-		}).catch((e) => console.error('viz_sample', e));
+		if (!gl_state || !cache || !want || !f) return;
+		if (cache.key !== mesh) return;          // active cache is for TD, skip FD path
+		const voxels = volume_eval_phasor(cache.grid, cache.mesh, f);
+		const range = volume_energy_range(voxels);
+		field_range = range.field_range;
+		last_range = range;
+		apply_scale_mode(gl_state, scale_mode, range);
+		setVolumeData(gl_state, voxels, cache.grid.resolution, cache.grid.min, cache.grid.max);
+		schedule_render();
 	});
 
-	// Reapply colormap range without resampling when the user flips Lin/Log.
+	// Density slider is now an opacity multiplier on the volume (1…10 → 0.1…2.0).
+	$effect(() => {
+		const dens = point_density;
+		if (!gl_state) return;
+		setVolumeOpacity(gl_state, Math.max(0.05, dens * 0.2));
+		schedule_render();
+	});
+
+	// Reapply colormap range without re-resampling when the user flips Lin/Log.
 	let last_range: { log_floor: number; log_range: number; field_range: { min: number; max: number } } | null = null;
 	function apply_scale_mode(
 		gl: GLState,
 		mode: 'log' | 'lin',
 		r: { log_floor: number; log_range: number; field_range: { min: number; max: number } },
 	) {
-		setPointScaleMode(gl, mode);
-		if (mode === 'log') setPointRange(gl, r.log_floor, r.log_range);
-		else setPointRange(gl, r.field_range.min, r.field_range.max - r.field_range.min);
+		setVolumeScaleMode(gl, mode);
+		if (mode === 'log') setVolumeRange(gl, r.log_floor, r.log_range);
+		else setVolumeRange(gl, r.field_range.min, r.field_range.max - r.field_range.min);
 	}
 	$effect(() => {
 		const mode = scale_mode;
@@ -890,14 +882,14 @@
 		const want = show_field && animate_field;
 		if (anim_raf != null) { cancelAnimationFrame(anim_raf); anim_raf = null; }
 		if (!want || !gl_state) {
-			if (gl_state) { setPointPhase(gl_state, 0); schedule_render(); }
+			if (gl_state) { setVolumePhase(gl_state, 0); schedule_render(); }
 			return;
 		}
 		const t0 = performance.now();
 		const tick = () => {
 			if (!gl_state) return;
 			const t = (performance.now() - t0) * 0.001;
-			setPointPhase(gl_state, t * 2 * Math.PI * anim_speed);
+			setVolumePhase(gl_state, t * 2 * Math.PI * anim_speed);
 			schedule_render();
 			anim_raf = requestAnimationFrame(tick);
 		};
@@ -905,22 +897,14 @@
 	});
 
 	// ── Time-domain field animation ────────────────────────────────────
-	// `td_trajectory` carries an energy-weighted point cloud (sampled the
-	// same way as the frequency-domain field viz) plus a per-frame |E|/|H|
+	// `td_trajectory` carries a DG-corner mesh plus a per-frame |E|/|H|
 	// magnitude. The notebook page owns the time slider / play loop and
 	// feeds the frame index through `td_frame`; this just renders it.
-	// A trajectory is "in TD field mode" only while the Field toggle is on —
-	// the cloud, its colourbar and its channel toolbar all ride that switch.
+	// A trajectory is "in TD field mode" only while the Field toggle is on.
 	const in_td_mode = $derived(td_trajectory != null && show_field);
-	// A static sample of the trajectory's DG-corner mesh — positions plus the
-	// recorded tet index / barycentric weights so any per-frame field can be
-	// interpolated cheaply by `viz_eval_static`. Re-sampled only on a
-	// trajectory or density change; fixed across the animation.
-	let td_sample: { positions: Float32Array; tet: Uint32Array; bary: Float32Array } | null = $state(null);
 
 	// Per-node E-field magnitudes for the active trajectory frame, rescaled
-	// from the quantised 0…1000 ints. Cached per (traj, frame, channel) so
-	// the per-frame upload below stays a cheap interpolation.
+	// from the quantised 0…1000 ints.
 	function td_node_field(traj: TdTrajectoryPayload, frame: number, channel: 'E' | 'H'): Float32Array {
 		const frames = channel === 'H' ? traj.frames_h : traj.frames_e;
 		const row = frames[Math.max(0, Math.min(frames.length - 1, frame))] ?? [];
@@ -930,82 +914,33 @@
 		return out;
 	}
 
-	// Per-node peak |E| over all frames — the density driver for the runtime
-	// energy-weighted sampler (the cloud follows where the field is strong at
-	// any point in the animation, so it doesn't churn between frames).
-	function td_peak_weight(traj: TdTrajectoryPayload): Float32Array {
-		const frames = traj.frames_e;
-		const n_node = traj.n_node || (frames[0]?.length ?? 0);
-		const w = new Float32Array(n_node);
-		const scale = traj.field_max.E / 1000;
-		for (const row of frames) {
-			for (let i = 0; i < n_node && i < row.length; i++) {
-				const v = row[i] * scale;
-				if (v > w[i]) w[i] = v;
-			}
-		}
-		return w;
-	}
-
-	// Re-sample the trajectory cloud at runtime — like the FD `viz_sample`
-	// path — whenever the trajectory, density slider, or mesh-cache readiness
-	// changes. A token guards against out-of-order async returns.
-	let td_sample_token = 0;
-	$effect(() => {
-		const traj = td_trajectory;
-		const ready = viz_mesh_ready_for;
-		const want = show_field;
-		const dens = point_density;
-		// No trajectory, or the Field toggle is off: drop the cloud.
-		if (gl_state && (!traj || !want)) setPointCloud(gl_state, EMPTY_F32, EMPTY_F32);
-		if (!traj || !want) {
-			td_sample = null;
-			if (traj) needs_rebuild = true;
-			schedule_render();
-			return;
-		}
-		// Wait for the trajectory's own DG-corner mesh to be cached.
-		if (ready !== traj) return;
-		const k = Math.max(500, Math.round((dens / 10) * TD_TARGET_MAX));
-		const my_token = ++td_sample_token;
-		viz_sample_static(td_peak_weight(traj), k).then((r) => {
-			if (my_token !== td_sample_token) return;
-			td_sample = r;
-			needs_rebuild = true;
-			// Do NOT refit the camera here: this effect re-runs on every
-			// density-slider change, and refitting would reset the viewport
-			// mid-interaction. The initial fit is handled by the payload-change
-			// effect above (same as the FD field path).
-			schedule_render();
-		}).catch((e) => console.error('viz_sample_static', e));
-	});
-
-	// Upload the current frame's magnitude as a static-scalar point cloud.
-	// Positions / tet / bary are fixed across frames — this is just a cheap
-	// `viz_eval_static` interpolation plus the (s², s², 0) abc encoding.
+	// Per-frame TD volume upload. The static grid is built once per trajectory
+	// by the shared volume_cache effect; here we just evaluate the per-node
+	// scalar onto the cached (tet_idx, bary) lookup and push the result.
 	$effect(() => {
 		const traj = td_trajectory;
 		const frame = td_frame;
 		const ch = td_channel;
-		const samp = td_sample;
+		const cache = volume_cache;
 		const mode = scale_mode;
-		if (!gl_state || !traj || !samp) return;
-		const mag = viz_eval_static(td_node_field(traj, frame, ch), samp.tet, samp.bary);
-		const abc = td_abc_from_mag(mag);
+		const want = show_field;
+		if (gl_state && (!traj || !want)) clearVolume(gl_state);
+		if (!gl_state || !traj || !cache || !want) return;
+		if (cache.key !== traj) return;          // active cache is for FD, skip TD path
+		const scalar = td_node_field(traj, frame, ch);
+		const voxels = volume_eval_scalar(cache.grid, cache.mesh, scalar);
 		const fmax = ch === 'H' ? traj.field_max.H : traj.field_max.E;
-		setPointScaleMode(gl_state, mode);
+		setVolumeScaleMode(gl_state, mode);
 		if (mode === 'log') {
-			// floor / span are (log10(min), decades) in log mode — a fixed
-			// decade window below the per-channel peak.
-			setPointRange(
+			setVolumeRange(
 				gl_state,
 				Math.log10(Math.max(fmax, 1e-30)) - TD_LOG_DECADES,
 				TD_LOG_DECADES,
 			);
 		} else {
-			setPointRange(gl_state, 0, fmax);
+			setVolumeRange(gl_state, 0, fmax);
 		}
-		setPointCloud(gl_state, samp.positions, abc);
+		setVolumeData(gl_state, voxels, cache.grid.resolution, cache.grid.min, cache.grid.max);
 		schedule_render();
 	});
 

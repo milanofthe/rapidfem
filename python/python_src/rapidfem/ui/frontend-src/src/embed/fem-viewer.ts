@@ -22,18 +22,18 @@
  *   field-mode      'lin' or 'log' (default 'lin')
  *   field-freq      frequency index for field display (default last)
  *   field-port      port index for field display (default 0)
- *   field-samples   N random points sampled in the volume (default 8000;
- *                   bump for full-page embeds, drop for tiny thumbnails)
+ *   field-resolution  Cubic grid edge length for the volume raycaster
+ *                     (default 96; 128 for full-page embeds; min 32)
  */
 
 import {
 	initGL, disposeGL, createCamera, clearMeshes, setTagVisible,
-	setPointCloud, setPointRange, setPointScaleMode,
+	setVolumeData, setVolumeRange, setVolumeScaleMode, clearVolume,
 	render3D, fitCamera,
 	type Camera, type GLState,
 } from '../lib/render/canvas3d';
 import {
-	buildScene, clearFieldCloud, sampleFieldCloud, WIRE_TAG,
+	buildScene, clearFieldCloud, buildVolumeCloud, WIRE_TAG,
 } from '../lib/render/scene_builder';
 import {
 	checkBinHeader, isBinRef, resolveFields, resolveGeoRefs, type BinRef,
@@ -130,14 +130,17 @@ class FemViewerElement extends HTMLElement {
 	private resObs: ResizeObserver | null = null;
 	private faceTags: number[] = [];        // populated by buildScene
 	private fieldCloudCache = new Map<string, {
-		positions: Float32Array; abc: Float32Array;
+		voxels: Float32Array;
+		resolution: number;
+		min: [number, number, number];
+		max: [number, number, number];
 		maxE2: number; minE2: number;
 	}>();
 
 	static get observedAttributes() {
 		return ['src', 'width', 'height', 'rotate', 'cycle', 'mode', 'interactive',
 		        'transparent', 'speed', 'theta', 'phi',
-		        'field-mode', 'field-freq', 'field-port', 'field-samples'];
+		        'field-mode', 'field-freq', 'field-port', 'field-resolution'];
 	}
 
 	connectedCallback() {
@@ -219,8 +222,8 @@ class FemViewerElement extends HTMLElement {
 	attributeChangedCallback(name: string, _old: string | null, val: string | null) {
 		if (!this.mounted) return;
 		if (name === 'src' && val) void this.load(val);
-		else if (name === 'field-samples') {
-			this.fieldCloudCache.clear();   // sample count changed → invalidate
+		else if (name === 'field-resolution') {
+			this.fieldCloudCache.clear();   // resolution changed → invalidate
 			this.applyPhaseInstant(this.resolvePhase());
 			this.needsRender = true;
 		}
@@ -366,9 +369,7 @@ class FemViewerElement extends HTMLElement {
 
 	private applyField() {
 		if (!this.glState || !this.mesh) return;
-		const clear = () => {
-			if (this.glState) setPointCloud(this.glState, new Float32Array(0), new Float32Array(0));
-		};
+		const clear = () => { if (this.glState) clearVolume(this.glState); };
 		if (!this.hasField || !this.fields) { clear(); return; }
 		const fi = Math.min(parseInt(this.getAttribute('field-freq') || '-1', 10), this.fields.length - 1);
 		const fIdx = fi >= 0 ? fi : this.fields.length - 1;
@@ -376,25 +377,25 @@ class FemViewerElement extends HTMLElement {
 		const row = this.fields[fIdx];
 		const arr = row && row[pIdx];
 		if (!arr) { clear(); return; }
-		const n = Math.max(500, parseInt(this.getAttribute('field-samples') || '8000', 10));
+		// Default 96³ for embeds keeps GPU memory in check on multi-card
+		// landing pages (96³ × 16 B ≈ 14 MB per viewer). Bump for full-page
+		// embeds via `field-resolution`.
+		const N = Math.max(32, parseInt(this.getAttribute('field-resolution') || '96', 10));
 
-		// Cache the sampled cloud per (freq, port, n) — cycle re-enters
-		// field phase every CYCLE_HOLD_S × 3 seconds; re-sampling 5–50 k
-		// random points each time is wasted work when the inputs match.
-		const key = `${fIdx}|${pIdx}|${n}`;
+		const key = `${fIdx}|${pIdx}|${N}`;
 		let cached = this.fieldCloudCache.get(key);
 		if (!cached) {
-			cached = sampleFieldCloud(this.mesh, arr, n);
+			cached = buildVolumeCloud(this.mesh, arr, N);
 			this.fieldCloudCache.set(key, cached);
 		}
-		setPointCloud(this.glState, cached.positions, cached.abc);
+		setVolumeData(this.glState, cached.voxels, cached.resolution, cached.min, cached.max);
 		const mode = (this.getAttribute('field-mode') || 'lin') === 'log' ? 'log' as const : 'lin' as const;
-		setPointScaleMode(this.glState, mode);
+		setVolumeScaleMode(this.glState, mode);
 		if (mode === 'log') {
 			const log_max = Math.log10(Math.sqrt(Math.max(cached.maxE2, 1e-30)));
-			setPointRange(this.glState, log_max - 4, 4);
+			setVolumeRange(this.glState, log_max - 4, 4);
 		} else {
-			setPointRange(this.glState, 0, Math.sqrt(Math.max(cached.maxE2, 1e-30)));
+			setVolumeRange(this.glState, 0, Math.sqrt(Math.max(cached.maxE2, 1e-30)));
 		}
 	}
 

@@ -71,7 +71,7 @@
 	// q_factor is null when the mode is lossless (Q = ∞) — the Python side
 	// can't put `Infinity` in valid JSON.
 	let mode_q_factors = $state<(number | null)[]>([]);
-	let field_density = $state(3);
+	let field_density = $state(5);
 	let field_scale_mode = $state<'log' | 'lin'>('lin');
 	let active_channel_raw = $derived<FieldChannelData>(
 		field_channel === 'J' ? fields_j_raw :

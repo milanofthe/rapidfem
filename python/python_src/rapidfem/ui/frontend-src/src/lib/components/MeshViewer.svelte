@@ -13,13 +13,23 @@
 	import { palette } from '$lib/theme';
 	import {
 		volume_eval_phasor, volume_eval_scalar,
-		volume_energy_range, DEFAULT_RESOLUTION as VOLUME_RESOLUTION,
+		volume_energy_range,
 		type VolumeGridStatic,
 	} from '$lib/volume_resample';
 	import { volume_build_static_async } from '$lib/volume_async';
 
 	// Decade span of the time-domain field volume's logarithmic colour scale.
 	const TD_LOG_DECADES = 3;
+
+	// Cycle order for the volume-resolution toolbar button. 192³ is the
+	// crisp-end cap: the build still completes in ~70 ms behind the worker
+	// pool, but the GPU upload is ~110 MB and that's the most we want to
+	// charge a casual user without an explicit opt-in.
+	const RESOLUTION_CYCLE = [64, 96, 128, 192] as const;
+	function next_resolution(r: 64 | 96 | 128 | 192): 64 | 96 | 128 | 192 {
+		const idx = RESOLUTION_CYCLE.indexOf(r);
+		return RESOLUTION_CYCLE[(idx + 1) % RESOLUTION_CYCLE.length];
+	}
 
 	let {
 		mesh = null as MeshData | null,
@@ -32,6 +42,7 @@
 		available_channels = ['E'] as ('E' | 'J' | 'H')[],
 		point_density = 5,
 		scale_mode = $bindable('lin' as 'log' | 'lin'),
+		volume_resolution = $bindable(128 as 64 | 96 | 128 | 192),
 		animate_field = false,
 		anim_speed = 1,
 		// Time-domain field animation: a TdTrajectory point cloud, the frame
@@ -52,6 +63,7 @@
 		available_channels?: ('E' | 'J' | 'H')[];
 		point_density?: number;
 		scale_mode?: 'log' | 'lin';
+		volume_resolution?: 64 | 96 | 128 | 192;
 		animate_field?: boolean;
 		anim_speed?: number;
 		td_trajectory?: TdTrajectoryPayload | null;
@@ -824,7 +836,7 @@
 		const target = traj ? traj_mesh(traj) : m;
 		if (!target) return;
 		const my_token = ++volume_build_token;
-		volume_build_static_async(target, VOLUME_RESOLUTION).then((grid) => {
+		volume_build_static_async(target, volume_resolution).then((grid) => {
 			if (my_token !== volume_build_token) return;
 			volume_cache = { key, mesh: target, grid };
 		}).catch((e) => console.error('volume_build_static_async', e));
@@ -1172,6 +1184,13 @@
 				<span class="tip">{scale_mode === 'log' ? 'Switch to linear scale' : 'Switch to log scale'}</span>
 				{scale_mode}
 			</button>
+			<button
+				class="tb tb-label tb-scale"
+				onclick={() => (volume_resolution = next_resolution(volume_resolution))}
+			>
+				<span class="tip">Volume grid resolution (cycle)</span>
+				{volume_resolution}
+			</button>
 		{/if}
 		{#if in_td_mode}
 			<span class="tb-sep" aria-hidden="true"></span>
@@ -1191,6 +1210,13 @@
 			>
 				<span class="tip">{scale_mode === 'log' ? 'Switch to linear scale' : 'Switch to log scale'}</span>
 				{scale_mode}
+			</button>
+			<button
+				class="tb tb-label tb-scale"
+				onclick={() => (volume_resolution = next_resolution(volume_resolution))}
+			>
+				<span class="tip">Volume grid resolution (cycle)</span>
+				{volume_resolution}
 			</button>
 		{/if}
 	</div>

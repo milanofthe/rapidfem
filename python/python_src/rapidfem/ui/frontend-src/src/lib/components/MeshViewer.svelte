@@ -11,22 +11,24 @@
 	import type { MeshData } from '$lib/msh';
 	import type { TdTrajectoryPayload } from '$lib/api';
 	import { palette } from '$lib/theme';
+	import { volume_energy_range } from '$lib/volume_resample';
 	import {
-		volume_eval_phasor, volume_eval_scalar,
-		volume_energy_range,
-		type VolumeGridStatic,
-	} from '$lib/volume_resample';
-	import { volume_build_static_async } from '$lib/volume_async';
+		volume_build_static_async,
+		volume_eval_phasor_async,
+		volume_eval_scalar_async,
+		type VolumeCacheHandle,
+	} from '$lib/volume_async';
 
 	// Decade span of the time-domain field volume's logarithmic colour scale.
 	const TD_LOG_DECADES = 3;
 
-	// Cycle order for the volume-resolution toolbar button. 192³ is the
-	// crisp-end cap: the build still completes in ~70 ms behind the worker
-	// pool, but the GPU upload is ~110 MB and that's the most we want to
-	// charge a casual user without an explicit opt-in.
-	const RESOLUTION_CYCLE = [64, 96, 128, 192] as const;
-	function next_resolution(r: 64 | 96 | 128 | 192): 64 | 96 | 128 | 192 {
+	// Cycle order for the volume-resolution toolbar button. 256³ tops out at
+	// ~256 MB GPU memory and ~200 ms build through the worker pool, which is
+	// still within reach for a modern dGPU; bumping further hits browser
+	// memory caps so we leave 256 as the ceiling.
+	const RESOLUTION_CYCLE = [64, 96, 128, 192, 256] as const;
+	type Resolution = (typeof RESOLUTION_CYCLE)[number];
+	function next_resolution(r: Resolution): Resolution {
 		const idx = RESOLUTION_CYCLE.indexOf(r);
 		return RESOLUTION_CYCLE[(idx + 1) % RESOLUTION_CYCLE.length];
 	}
@@ -42,7 +44,7 @@
 		available_channels = ['E'] as ('E' | 'J' | 'H')[],
 		point_density = 5,
 		scale_mode = $bindable('lin' as 'log' | 'lin'),
-		volume_resolution = $bindable(128 as 64 | 96 | 128 | 192),
+		volume_resolution = $bindable(128 as 64 | 96 | 128 | 192 | 256),
 		animate_field = false,
 		anim_speed = 1,
 		// Time-domain field animation: a TdTrajectory point cloud, the frame
@@ -63,7 +65,7 @@
 		available_channels?: ('E' | 'J' | 'H')[];
 		point_density?: number;
 		scale_mode?: 'log' | 'lin';
-		volume_resolution?: 64 | 96 | 128 | 192;
+		volume_resolution?: 64 | 96 | 128 | 192 | 256;
 		animate_field?: boolean;
 		anim_speed?: number;
 		td_trajectory?: TdTrajectoryPayload | null;
@@ -813,19 +815,19 @@
 		else if (wireframe) camera = fitCamera(wireframe.bbox.min, wireframe.bbox.max);
 	});
 
-	// Build the per-voxel (tet_idx, bary) cache for the active mesh — shared
-	// between the FD `volume_eval_phasor` and TD `volume_eval_scalar` paths.
-	// The build runs in a Web Worker so the canvas stays smooth even at
-	// 128³ / 192³ resolutions where the synchronous path would drop frames.
+	// Worker-pool handle for the active mesh's partitioned (tet_idx, bary)
+	// lookup. The buffers themselves live in the pool workers; this handle
+	// just carries the metadata needed to dispatch evals + upload the GPU
+	// texture. Re-built whenever the mesh or resolution changes.
 	let volume_cache: {
 		key: MeshData | TdTrajectoryPayload;
-		mesh: MeshData;
-		grid: VolumeGridStatic;
+		handle: VolumeCacheHandle;
 	} | null = $state(null);
 	let volume_build_token = 0;
 	$effect(() => {
 		const traj = td_trajectory;
 		const m = mesh;
+		const res = volume_resolution;
 		if (gl_state) {
 			clearVolume(gl_state);
 			field_range = null;
@@ -836,27 +838,31 @@
 		const target = traj ? traj_mesh(traj) : m;
 		if (!target) return;
 		const my_token = ++volume_build_token;
-		volume_build_static_async(target, volume_resolution).then((grid) => {
+		volume_build_static_async(target, res).then((handle) => {
 			if (my_token !== volume_build_token) return;
-			volume_cache = { key, mesh: target, grid };
+			volume_cache = { key, handle };
 		}).catch((e) => console.error('volume_build_static_async', e));
 	});
 
-	// FD volume upload: re-runs whenever the field changes. Resampling a 128³
-	// volume from a 25k-tet mesh runs in ~50 ms on the main thread — fast
-	// enough for synchronous evaluation.
+	// FD eval: dispatch the phasor field to the pool, stitch on response,
+	// upload to GPU. Async + token-guarded so a fast freq-slider drag drops
+	// stale evals without ever reaching `setVolumeData`.
+	let fd_eval_token = 0;
 	$effect(() => {
 		const cache = volume_cache;
 		const f = field;
 		const want = show_field;
 		if (!gl_state || !cache || !want || !f) return;
 		if (cache.key !== mesh) return;          // active cache is for TD, skip FD path
-		const voxels = volume_eval_phasor(cache.grid, cache.mesh, f);
-		const range = volume_energy_range(voxels);
-		field_range = range.field_range;
-		last_range = range;                       // triggers the mode effect below
-		setVolumeData(gl_state, voxels, cache.grid.resolution, cache.grid.min, cache.grid.max);
-		schedule_render();
+		const my_token = ++fd_eval_token;
+		volume_eval_phasor_async(cache.handle, f).then((voxels) => {
+			if (my_token !== fd_eval_token || !gl_state) return;
+			const range = volume_energy_range(voxels);
+			field_range = range.field_range;
+			last_range = range;                       // triggers the mode effect below
+			setVolumeData(gl_state, voxels, cache.handle.resolution, cache.handle.min, cache.handle.max);
+			schedule_render();
+		}).catch((e) => console.error('volume_eval_phasor_async', e));
 	});
 
 	// Density slider is now an opacity multiplier on the volume (1…10 → 0.1…2.0).
@@ -932,9 +938,11 @@
 		return out;
 	}
 
-	// Per-frame TD volume upload. The static grid is built once per trajectory
-	// by the shared volume_cache effect; here we just evaluate the per-node
-	// scalar onto the cached (tet_idx, bary) lookup and push the result.
+	// Per-frame TD volume upload. The pool's static partitions are built
+	// once per trajectory; here we dispatch the per-frame scalar to the
+	// pool, stitch the slabs, and push the result. Token-guarded so a
+	// fast-playing animation that overruns one eval drops the stale frame.
+	let td_eval_token = 0;
 	$effect(() => {
 		const traj = td_trajectory;
 		const frame = td_frame;
@@ -946,20 +954,23 @@
 		if (!gl_state || !traj || !cache || !want) return;
 		if (cache.key !== traj) return;          // active cache is for FD, skip TD path
 		const scalar = td_node_field(traj, frame, ch);
-		const voxels = volume_eval_scalar(cache.grid, cache.mesh, scalar);
 		const fmax = ch === 'H' ? traj.field_max.H : traj.field_max.E;
-		setVolumeScaleMode(gl_state, mode);
-		if (mode === 'log') {
-			setVolumeRange(
-				gl_state,
-				Math.log10(Math.max(fmax, 1e-30)) - TD_LOG_DECADES,
-				TD_LOG_DECADES,
-			);
-		} else {
-			setVolumeRange(gl_state, 0, fmax);
-		}
-		setVolumeData(gl_state, voxels, cache.grid.resolution, cache.grid.min, cache.grid.max);
-		schedule_render();
+		const my_token = ++td_eval_token;
+		volume_eval_scalar_async(cache.handle, scalar).then((voxels) => {
+			if (my_token !== td_eval_token || !gl_state) return;
+			setVolumeScaleMode(gl_state, mode);
+			if (mode === 'log') {
+				setVolumeRange(
+					gl_state,
+					Math.log10(Math.max(fmax, 1e-30)) - TD_LOG_DECADES,
+					TD_LOG_DECADES,
+				);
+			} else {
+				setVolumeRange(gl_state, 0, fmax);
+			}
+			setVolumeData(gl_state, voxels, cache.handle.resolution, cache.handle.min, cache.handle.max);
+			schedule_render();
+		}).catch((e) => console.error('volume_eval_scalar_async', e));
 	});
 
 	// Colourbar range for the time-domain cloud — a fixed 0…max scale held

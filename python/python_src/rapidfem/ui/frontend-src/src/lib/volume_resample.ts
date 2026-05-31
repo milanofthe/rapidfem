@@ -336,6 +336,105 @@ export function volume_build_static_partition(
 }
 
 /**
+ * Z-slab variant of `volume_eval_phasor` — fills the slab's voxel buffer
+ * using the partition's cached (tet_idx, bary) lookup. Used by the pool
+ * workers; the main thread stitches the slabs back into one full volume
+ * before uploading to the GPU.
+ */
+export function volume_eval_phasor_partition(
+	partition: VolumeGridPartition,
+	mesh: MeshData,
+	field_abc: Float32Array,
+): Float32Array {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
+	const N = partition.resolution;
+	const slab = partition.iz_end - partition.iz_start;
+	const n_voxels = N * N * slab;
+	const out = new Float32Array(n_voxels * 4);
+	if (!field_abc || field_abc.length === 0) return out;
+
+	const tets = mesh.tets;
+	const tet_indices = partition.tet_indices;
+	const bary = partition.bary;
+
+	for (let v = 0; v < n_voxels; v++) {
+		const t = tet_indices[v];
+		if (t === TET_OUTSIDE) continue;
+		const base = t * 4;
+		const i0 = tets[base + 0] * 3;
+		const i1 = tets[base + 1] * 3;
+		const i2 = tets[base + 2] * 3;
+		const i3 = tets[base + 3] * 3;
+		const bo = v * 4;
+		const l0 = bary[bo + 0];
+		const l1 = bary[bo + 1];
+		const l2 = bary[bo + 2];
+		const l3 = bary[bo + 3];
+		const off = v * 4;
+		out[off + 0] =
+			l0 * field_abc[i0]     + l1 * field_abc[i1]     +
+			l2 * field_abc[i2]     + l3 * field_abc[i3];
+		out[off + 1] =
+			l0 * field_abc[i0 + 1] + l1 * field_abc[i1 + 1] +
+			l2 * field_abc[i2 + 1] + l3 * field_abc[i3 + 1];
+		out[off + 2] =
+			l0 * field_abc[i0 + 2] + l1 * field_abc[i1 + 2] +
+			l2 * field_abc[i2 + 2] + l3 * field_abc[i3 + 2];
+		out[off + 3] = 1.0;
+	}
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] eval_phasor_partition iz=[${partition.iz_start},${partition.iz_end}) ${dt.toFixed(1)} ms`);
+	}
+	return out;
+}
+
+/** Z-slab variant of `volume_eval_scalar`. */
+export function volume_eval_scalar_partition(
+	partition: VolumeGridPartition,
+	mesh: MeshData,
+	scalar: Float32Array,
+): Float32Array {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
+	const N = partition.resolution;
+	const slab = partition.iz_end - partition.iz_start;
+	const n_voxels = N * N * slab;
+	const out = new Float32Array(n_voxels * 4);
+	if (!scalar || scalar.length === 0) return out;
+
+	const tets = mesh.tets;
+	const tet_indices = partition.tet_indices;
+	const bary = partition.bary;
+
+	for (let v = 0; v < n_voxels; v++) {
+		const t = tet_indices[v];
+		if (t === TET_OUTSIDE) continue;
+		const base = t * 4;
+		const n0 = tets[base + 0];
+		const n1 = tets[base + 1];
+		const n2 = tets[base + 2];
+		const n3 = tets[base + 3];
+		const bo = v * 4;
+		const s =
+			bary[bo + 0] * scalar[n0] +
+			bary[bo + 1] * scalar[n1] +
+			bary[bo + 2] * scalar[n2] +
+			bary[bo + 3] * scalar[n3];
+		const s2 = s * s;
+		const off = v * 4;
+		out[off + 0] = s2;
+		out[off + 1] = s2;
+		out[off + 2] = 0;
+		out[off + 3] = 1.0;
+	}
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] eval_scalar_partition iz=[${partition.iz_start},${partition.iz_end}) ${dt.toFixed(1)} ms`);
+	}
+	return out;
+}
+
+/**
  * Fill an RGBA32F voxel buffer with `(A, B, C, occ)` from a per-node phasor
  * field. One call per frequency change in the FD pipeline.
  */

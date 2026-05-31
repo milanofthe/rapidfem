@@ -995,9 +995,9 @@
 								</span>
 							</label>
 							<label class="field-ctrl">
-								<span class="lbl">Density</span>
+								<span class="lbl">Opacity</span>
 								<input class="slider" type="range" min="1" max="10" step="1" bind:value={field_density} />
-								<span class="val">{(field_density * 50).toLocaleString()}k pts</span>
+								<span class="val">{(field_density * 0.2).toFixed(1)}×</span>
 							</label>
 							{#if active_channel_data && active_channel_data[field_freq_idx] && active_channel_data[field_freq_idx]!.length > 1}
 								<div class="field-ctrl">
@@ -1035,9 +1035,9 @@
 								</span>
 							</label>
 							<label class="field-ctrl">
-								<span class="lbl">Density</span>
+								<span class="lbl">Opacity</span>
 								<input class="slider" type="range" min="1" max="10" step="1" bind:value={field_density} />
-								<span class="val">{(field_density * 50).toLocaleString()}k pts</span>
+								<span class="val">{(field_density * 0.2).toFixed(1)}×</span>
 							</label>
 						</div>
 					{/if}

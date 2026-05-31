@@ -44,15 +44,22 @@ export function volume_build_static_async(
 ): Promise<VolumeGridStatic> {
 	const w = ensure_worker();
 	const id = next_id++;
+	// Detach from any Svelte $state proxy the caller might be holding by
+	// allocating fresh typed arrays. structuredClone cannot serialize a
+	// proxy-wrapped TypedArray and throws DataCloneError. The copies are
+	// then transferred (zero-copy across the wire); the main thread keeps
+	// its originals for the eval pass.
+	const nodes = new Float64Array(mesh.nodes);
+	const tets = new Uint32Array(mesh.tets);
+	const bbox = {
+		min: [mesh.bbox.min[0], mesh.bbox.min[1], mesh.bbox.min[2]] as [number, number, number],
+		max: [mesh.bbox.max[0], mesh.bbox.max[1], mesh.bbox.max[2]] as [number, number, number],
+	};
 	return new Promise((resolve) => {
 		pending.set(id, resolve);
-		w.postMessage({
-			request_id: id,
-			kind: 'build',
-			nodes: mesh.nodes,
-			tets: mesh.tets,
-			bbox: mesh.bbox,
-			resolution,
-		});
+		w.postMessage(
+			{ request_id: id, kind: 'build', nodes, tets, bbox, resolution },
+			[nodes.buffer, tets.buffer],
+		);
 	});
 }

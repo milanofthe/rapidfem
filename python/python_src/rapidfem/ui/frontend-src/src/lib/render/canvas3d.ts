@@ -299,7 +299,7 @@ export function initGL(canvas: HTMLCanvasElement): GLState | null {
 		volumeRangeSpan: 6,
 		volumeLogScale: 0,
 		volumeOpacity: 1.0,
-		volumeSmoothing: 0.6,
+		volumeSmoothing: 0.0,
 		meshes: [],
 		lineMeshes: [],
 		bbox: { min: [0, 0, 0], max: [0, 0, 0] }

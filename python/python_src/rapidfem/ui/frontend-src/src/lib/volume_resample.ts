@@ -38,6 +38,17 @@ import type { MeshData } from './msh';
 export const DEFAULT_RESOLUTION = 128;
 const TET_OUTSIDE = 0xffffffff;
 
+// Tolerance for the barycentric inside test. A voxel centre that lies
+// exactly on a tet face computes one λᵢ ≈ 0, and the FP roundoff biases it
+// either positive or negative. With strict `≥ 0` tests, *both* adjacent
+// tets can reject the same voxel because their roundoff swings in opposite
+// directions — the voxel falls into a one-voxel-wide hole at the face,
+// which renders as a hard "tet edge" stripe in the volume. Allowing a
+// tiny negative λ closes that crack: the face voxel ends up assigned to
+// whichever tet's scatter pass ran last, and since the P1 field is C⁰ on
+// the face both tets give the same interpolated value anyway.
+const BARY_EPS = 1e-5;
+
 /** Geometric cache: which tet contains each voxel and at what bary weights.
  *  Field-independent so it survives any field swap on the same mesh. */
 export interface VolumeGridStatic {
@@ -161,9 +172,11 @@ export function volume_build_static(
 				let l2 = m01 * wx_start + m11 * wy + m21 * wz;
 				let l3 = m02 * wx_start + m12 * wy + m22 * wz;
 				for (let ix = ix_lo; ix <= ix_hi; ix++) {
-					if (l1 >= 0 && l1 <= 1 && l2 >= 0 && l2 <= 1 && l3 >= 0 && l3 <= 1) {
+					if (l1 >= -BARY_EPS && l1 <= 1 + BARY_EPS &&
+					    l2 >= -BARY_EPS && l2 <= 1 + BARY_EPS &&
+					    l3 >= -BARY_EPS && l3 <= 1 + BARY_EPS) {
 						const l0 = 1 - l1 - l2 - l3;
-						if (l0 >= 0) {
+						if (l0 >= -BARY_EPS) {
 							const voxel = base_yz + ix;
 							tet_indices[voxel] = t;
 							const off = voxel * 4;
@@ -308,9 +321,11 @@ export function volume_build_static_partition(
 				let l2 = m01 * wx_start + m11 * wy + m21 * wz;
 				let l3 = m02 * wx_start + m12 * wy + m22 * wz;
 				for (let ix = ix_lo; ix <= ix_hi; ix++) {
-					if (l1 >= 0 && l1 <= 1 && l2 >= 0 && l2 <= 1 && l3 >= 0 && l3 <= 1) {
+					if (l1 >= -BARY_EPS && l1 <= 1 + BARY_EPS &&
+					    l2 >= -BARY_EPS && l2 <= 1 + BARY_EPS &&
+					    l3 >= -BARY_EPS && l3 <= 1 + BARY_EPS) {
 						const l0 = 1 - l1 - l2 - l3;
-						if (l0 >= 0) {
+						if (l0 >= -BARY_EPS) {
 							const voxel = base_yz + ix;
 							tet_indices[voxel] = t;
 							const off = voxel * 4;

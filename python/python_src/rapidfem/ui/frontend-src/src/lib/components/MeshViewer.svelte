@@ -12,10 +12,11 @@
 	import type { TdTrajectoryPayload } from '$lib/api';
 	import { palette } from '$lib/theme';
 	import {
-		volume_build_static, volume_eval_phasor, volume_eval_scalar,
-		volume_energy_range,
+		volume_eval_phasor, volume_eval_scalar,
+		volume_energy_range, DEFAULT_RESOLUTION as VOLUME_RESOLUTION,
 		type VolumeGridStatic,
 	} from '$lib/volume_resample';
+	import { volume_build_static_async } from '$lib/volume_async';
 
 	// Decade span of the time-domain field volume's logarithmic colour scale.
 	const TD_LOG_DECADES = 3;
@@ -802,14 +803,14 @@
 
 	// Build the per-voxel (tet_idx, bary) cache for the active mesh — shared
 	// between the FD `volume_eval_phasor` and TD `volume_eval_scalar` paths.
-	// Heavy enough (~hundreds of ms for a 25k-tet mesh at 128³) that we yield
-	// to the UI thread with a microtask before kicking it off, so a fresh
-	// mesh-load doesn't freeze the canvas.
+	// The build runs in a Web Worker so the canvas stays smooth even at
+	// 128³ / 192³ resolutions where the synchronous path would drop frames.
 	let volume_cache: {
 		key: MeshData | TdTrajectoryPayload;
 		mesh: MeshData;
 		grid: VolumeGridStatic;
 	} | null = $state(null);
+	let volume_build_token = 0;
 	$effect(() => {
 		const traj = td_trajectory;
 		const m = mesh;
@@ -822,12 +823,11 @@
 		if (!key) return;
 		const target = traj ? traj_mesh(traj) : m;
 		if (!target) return;
-		// Yield once so the canvas can paint the new mesh before the build.
-		queueMicrotask(() => {
-			if ((td_trajectory ?? mesh) !== key) return;
-			const grid = volume_build_static(target);
+		const my_token = ++volume_build_token;
+		volume_build_static_async(target, VOLUME_RESOLUTION).then((grid) => {
+			if (my_token !== volume_build_token) return;
 			volume_cache = { key, mesh: target, grid };
-		});
+		}).catch((e) => console.error('volume_build_static_async', e));
 	});
 
 	// FD volume upload: re-runs whenever the field changes. Resampling a 128³
@@ -842,8 +842,7 @@
 		const voxels = volume_eval_phasor(cache.grid, cache.mesh, f);
 		const range = volume_energy_range(voxels);
 		field_range = range.field_range;
-		last_range = range;
-		apply_scale_mode(gl_state, scale_mode, range);
+		last_range = range;                       // triggers the mode effect below
 		setVolumeData(gl_state, voxels, cache.grid.resolution, cache.grid.min, cache.grid.max);
 		schedule_render();
 	});
@@ -856,8 +855,14 @@
 		schedule_render();
 	});
 
-	// Reapply colormap range without re-resampling when the user flips Lin/Log.
-	let last_range: { log_floor: number; log_range: number; field_range: { min: number; max: number } } | null = null;
+	// Lin/Log toggle reactivity. `last_range` is $state so flipping the mode
+	// or finishing a fresh FD eval both re-fire this effect without dragging
+	// the 18 ms resample pass along — the mode flip only re-applies the
+	// shader uniforms.
+	let last_range: {
+		log_floor: number; log_range: number;
+		field_range: { min: number; max: number };
+	} | null = $state(null);
 	function apply_scale_mode(
 		gl: GLState,
 		mode: 'log' | 'lin',
@@ -869,8 +874,9 @@
 	}
 	$effect(() => {
 		const mode = scale_mode;
-		if (!gl_state || !last_range) return;
-		apply_scale_mode(gl_state, mode, last_range);
+		const r = last_range;
+		if (!gl_state || !r) return;
+		apply_scale_mode(gl_state, mode, r);
 		schedule_render();
 	});
 

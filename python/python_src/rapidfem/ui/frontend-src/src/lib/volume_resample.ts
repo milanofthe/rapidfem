@@ -34,7 +34,7 @@ import type { MeshData } from './msh';
 // ~13.5 MB. 128³ looked marginally crisper but cost 2.4× the build time and
 // 2.4× the memory; not worth it for the live viewer. Embeds default to 96
 // already; this aligns the in-app viewer with that.
-const DEFAULT_RESOLUTION = 96;
+export const DEFAULT_RESOLUTION = 96;
 const TET_OUTSIDE = 0xffffffff;
 
 /** Geometric cache: which tet contains each voxel and at what bary weights.

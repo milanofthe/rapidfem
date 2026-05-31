@@ -79,6 +79,7 @@ export interface GLState {
 	volumeRangeSpan: number;
 	volumeLogScale: number;
 	volumeOpacity: number;
+	volumeSmoothing: number;
 	meshes: Mesh[];
 	lineMeshes: LineMesh[];
 	bbox: { min: [number, number, number]; max: [number, number, number] };
@@ -298,6 +299,7 @@ export function initGL(canvas: HTMLCanvasElement): GLState | null {
 		volumeRangeSpan: 6,
 		volumeLogScale: 0,
 		volumeOpacity: 1.0,
+		volumeSmoothing: 0.6,
 		meshes: [],
 		lineMeshes: [],
 		bbox: { min: [0, 0, 0], max: [0, 0, 0] }
@@ -382,6 +384,13 @@ export function setVolumePhase(state: GLState, phase: number): void {
 /** Global opacity multiplier for the volume (1.0 = default). */
 export function setVolumeOpacity(state: GLState, opacity: number): void {
 	state.volumeOpacity = opacity;
+}
+
+/** Mip-LOD bias for the volume sampler. 0 = sharp (mip 0 only); 1.0 ≈ one
+ *  full mip level blurred. Use to hide P1 gradient discontinuities at tet
+ *  faces in coarse-mesh regions. */
+export function setVolumeSmoothing(state: GLState, smoothing: number): void {
+	state.volumeSmoothing = smoothing;
 }
 
 /** Add a triangle group with a single color. positions and normals must
@@ -554,6 +563,7 @@ export function render3D(
 			state.volumeRangeSpan,
 			state.volumeLogScale,
 			state.volumeOpacity,
+			state.volumeSmoothing,
 		);
 	}
 	gl.bindVertexArray(null);

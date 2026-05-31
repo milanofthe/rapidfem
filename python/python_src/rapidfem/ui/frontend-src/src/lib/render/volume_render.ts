@@ -48,6 +48,7 @@ uniform float uRangeSpan;
 uniform float uLogScale;
 uniform float uOpacity;
 uniform float uStepSize;
+uniform float uSmoothing;       // mip-LOD bias: 0 = sharp, 1.0 = one mip blurred
 out vec4 fragColor;
 
 // Inferno LUT, same one used by the point-cloud shader.
@@ -105,7 +106,7 @@ void main() {
 	vec4 dst = vec4(0.0);
 	for (int i = 0; i < 512; i++) {
 		if (i >= n_steps) break;
-		vec4 vox = texture(uVolume, p);
+		vec4 vox = texture(uVolume, p, uSmoothing);
 		if (vox.a > 0.0) {
 			float mag2 = max(vox.r * c2 + vox.g * s2 - vox.b * cs2, 0.0);
 			float mag = sqrt(mag2);
@@ -142,6 +143,7 @@ export interface VolumeProgram {
 	uLogScale: WebGLUniformLocation;
 	uOpacity: WebGLUniformLocation;
 	uStepSize: WebGLUniformLocation;
+	uSmoothing: WebGLUniformLocation;
 }
 
 export interface VolumeBuffers {
@@ -194,6 +196,7 @@ export function createVolumeProgram(gl: WebGL2RenderingContext): VolumeProgram {
 		uLogScale: gl.getUniformLocation(program, 'uLogScale')!,
 		uOpacity: gl.getUniformLocation(program, 'uOpacity')!,
 		uStepSize: gl.getUniformLocation(program, 'uStepSize')!,
+		uSmoothing: gl.getUniformLocation(program, 'uSmoothing')!,
 	};
 }
 
@@ -245,7 +248,11 @@ export function createVolumeBuffers(gl: WebGL2RenderingContext): VolumeBuffers {
 	};
 }
 
-/** Upload (or replace) the 3D texture from packed RGBA32F voxels. */
+/** Upload (or replace) the 3D texture from packed RGBA32F voxels. Generates
+ *  a mip chain so the raycaster can sample a slightly blurred level via the
+ *  shader's LOD-bias uniform — that hides the P1 gradient discontinuities
+ *  at tet faces (otherwise visible as colour-rate "folds" in coarse-mesh
+ *  regions) without doing a separate smoothing pass. */
 export function uploadVolumeData(
 	gl: WebGL2RenderingContext,
 	buf: VolumeBuffers,
@@ -259,9 +266,12 @@ export function uploadVolumeData(
 		buf.texture = gl.createTexture();
 	}
 	gl.bindTexture(gl.TEXTURE_3D, buf.texture);
-	const filter = buf.linear_float ? gl.LINEAR : gl.NEAREST;
-	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, filter);
-	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, filter);
+	const min_filter = buf.linear_float
+		? gl.LINEAR_MIPMAP_LINEAR
+		: gl.NEAREST_MIPMAP_NEAREST;
+	const mag_filter = buf.linear_float ? gl.LINEAR : gl.NEAREST;
+	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, min_filter);
+	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, mag_filter);
 	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 	gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
@@ -270,6 +280,7 @@ export function uploadVolumeData(
 		resolution, resolution, resolution, 0,
 		gl.RGBA, gl.FLOAT, data,
 	);
+	if (buf.linear_float) gl.generateMipmap(gl.TEXTURE_3D);
 	gl.bindTexture(gl.TEXTURE_3D, null);
 	buf.resolution = resolution;
 	buf.min = [...min];
@@ -277,7 +288,7 @@ export function uploadVolumeData(
 	buf.uploaded = true;
 	if (typeof performance !== 'undefined') {
 		const dt = performance.now() - t_start;
-		console.log(`[volume] gl.texImage3D N=${resolution} ${(data.byteLength / 1048576).toFixed(1)} MB ${dt.toFixed(1)} ms`);
+		console.log(`[volume] gl.texImage3D + mips N=${resolution} ${(data.byteLength / 1048576).toFixed(1)} MB ${dt.toFixed(1)} ms`);
 	}
 }
 
@@ -311,6 +322,7 @@ export function renderVolume(
 	range_span: number,
 	log_scale: number,
 	opacity: number,
+	smoothing: number,
 ): void {
 	if (!buf.uploaded || !buf.texture) return;
 	gl.useProgram(program.program);
@@ -325,6 +337,7 @@ export function renderVolume(
 	gl.uniform1f(program.uLogScale, log_scale);
 	gl.uniform1f(program.uOpacity, opacity);
 	gl.uniform1f(program.uStepSize, 1.0 / Math.max(buf.resolution, 1));
+	gl.uniform1f(program.uSmoothing, smoothing);
 	gl.activeTexture(gl.TEXTURE0);
 	gl.bindTexture(gl.TEXTURE_3D, buf.texture);
 	gl.uniform1i(program.uVolume, 0);

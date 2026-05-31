@@ -30,11 +30,12 @@
  */
 import type { MeshData } from './msh';
 
-// 96³ keeps the build under 200 ms on a 25k-tet mesh and the GPU upload at
-// ~13.5 MB. 128³ looked marginally crisper but cost 2.4× the build time and
-// 2.4× the memory; not worth it for the live viewer. Embeds default to 96
-// already; this aligns the in-app viewer with that.
-export const DEFAULT_RESOLUTION = 96;
+// 128³ is the in-app default now that the build is dispatched to a 4-way
+// worker pool — partitioned by z-slice, each worker handles a quarter of
+// the volume, ~25-30 ms total at this resolution. Memory is 32 MB on the
+// GPU side. Embeds stay at 96³ in `scene_builder` for the multi-card
+// landing perf budget.
+export const DEFAULT_RESOLUTION = 128;
 const TET_OUTSIDE = 0xffffffff;
 
 /** Geometric cache: which tet contains each voxel and at what bary weights.
@@ -185,6 +186,153 @@ export function volume_build_static(
 		console.log(`[volume] build_static N=${N} n_tets=${n_tets} ${dt.toFixed(1)} ms`);
 	}
 	return { tet_indices, bary, resolution: N, min, max };
+}
+
+/** Partial result from one worker in the build pool. Covers the slab
+ *  `iz ∈ [iz_start, iz_end)`. Output arrays are sized for the slab only. */
+export interface VolumeGridPartition {
+	tet_indices: Uint32Array;       // length N · N · (iz_end - iz_start)
+	bary: Float32Array;             // length N · N · (iz_end - iz_start) · 4
+	resolution: number;
+	iz_start: number;
+	iz_end: number;
+	min: [number, number, number];
+	max: [number, number, number];
+}
+
+/**
+ * Z-slab variant of `volume_build_static`. Each worker in the pool runs
+ * this on its assigned `[iz_start, iz_end)` range and returns the partial
+ * buffers; the main thread stitches them together into the full grid.
+ */
+export function volume_build_static_partition(
+	mesh: MeshData,
+	resolution: number,
+	iz_start: number,
+	iz_end: number,
+): VolumeGridPartition {
+	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
+	const N = resolution;
+	const slab_height = iz_end - iz_start;
+	const n_partial = N * N * slab_height;
+	const tet_indices = new Uint32Array(n_partial);
+	tet_indices.fill(TET_OUTSIDE);
+	const bary = new Float32Array(n_partial * 4);
+
+	const n_tets = mesh.tets.length / 4;
+	const empty_min: [number, number, number] = [...mesh.bbox.min];
+	const empty_max: [number, number, number] = [...mesh.bbox.max];
+	if (n_tets === 0) {
+		return { tet_indices, bary, resolution: N, iz_start, iz_end, min: empty_min, max: empty_max };
+	}
+
+	const pad_frac = 0.5 / N;
+	const min: [number, number, number] = [0, 0, 0];
+	const max: [number, number, number] = [0, 0, 0];
+	for (let k = 0; k < 3; k++) {
+		const span = mesh.bbox.max[k] - mesh.bbox.min[k];
+		const pad = span * pad_frac;
+		min[k] = mesh.bbox.min[k] - pad;
+		max[k] = mesh.bbox.max[k] + pad;
+	}
+	const inv_dx = N / (max[0] - min[0]);
+	const inv_dy = N / (max[1] - min[1]);
+	const inv_dz = N / (max[2] - min[2]);
+	const dx = 1 / inv_dx;
+	const dy = 1 / inv_dy;
+	const dz = 1 / inv_dz;
+
+	const { nodes, tets } = mesh;
+	const p = new Float64Array(12);
+
+	for (let t = 0; t < n_tets; t++) {
+		const i0 = tets[t * 4 + 0];
+		const i1 = tets[t * 4 + 1];
+		const i2 = tets[t * 4 + 2];
+		const i3 = tets[t * 4 + 3];
+
+		for (let k = 0; k < 3; k++) {
+			p[0 + k] = nodes[i0 * 3 + k];
+			p[3 + k] = nodes[i1 * 3 + k];
+			p[6 + k] = nodes[i2 * 3 + k];
+			p[9 + k] = nodes[i3 * 3 + k];
+		}
+
+		const xmin = Math.min(p[0], p[3], p[6], p[9]);
+		const xmax = Math.max(p[0], p[3], p[6], p[9]);
+		const ymin = Math.min(p[1], p[4], p[7], p[10]);
+		const ymax = Math.max(p[1], p[4], p[7], p[10]);
+		const zmin = Math.min(p[2], p[5], p[8], p[11]);
+		const zmax = Math.max(p[2], p[5], p[8], p[11]);
+		const ix_lo = Math.max(0, Math.floor((xmin - min[0]) * inv_dx));
+		const ix_hi = Math.min(N - 1, Math.floor((xmax - min[0]) * inv_dx));
+		const iy_lo = Math.max(0, Math.floor((ymin - min[1]) * inv_dy));
+		const iy_hi = Math.min(N - 1, Math.floor((ymax - min[1]) * inv_dy));
+		// Clip the tet's z-range to this partition's slab so workers don't
+		// duplicate work or trample each other's outputs.
+		const iz_lo = Math.max(iz_start, Math.floor((zmin - min[2]) * inv_dz));
+		const iz_hi = Math.min(iz_end - 1, Math.floor((zmax - min[2]) * inv_dz));
+		if (iz_lo > iz_hi || ix_lo > ix_hi || iy_lo > iy_hi) continue;
+
+		const ax = p[3] - p[0], ay = p[4] - p[1], az = p[5] - p[2];
+		const bx = p[6] - p[0], by = p[7] - p[1], bz = p[8] - p[2];
+		const cx = p[9] - p[0], cy = p[10] - p[1], cz = p[11] - p[2];
+		const det =
+			ax * (by * cz - bz * cy) -
+			ay * (bx * cz - bz * cx) +
+			az * (bx * cy - by * cx);
+		if (Math.abs(det) < 1e-30) continue;
+		const inv_det = 1 / det;
+		const m00 = (by * cz - bz * cy) * inv_det;
+		const m01 = (az * cy - ay * cz) * inv_det;
+		const m02 = (ay * bz - az * by) * inv_det;
+		const m10 = (bz * cx - bx * cz) * inv_det;
+		const m11 = (ax * cz - az * cx) * inv_det;
+		const m12 = (az * bx - ax * bz) * inv_det;
+		const m20 = (bx * cy - by * cx) * inv_det;
+		const m21 = (ay * cx - ax * cy) * inv_det;
+		const m22 = (ax * by - ay * bx) * inv_det;
+
+		const dl1 = m00 * dx;
+		const dl2 = m01 * dx;
+		const dl3 = m02 * dx;
+		const wx_start = min[0] + (ix_lo + 0.5) * dx - p[0];
+
+		for (let iz = iz_lo; iz <= iz_hi; iz++) {
+			const wz = min[2] + (iz + 0.5) * dz - p[2];
+			const iz_local = iz - iz_start;
+			for (let iy = iy_lo; iy <= iy_hi; iy++) {
+				const wy = min[1] + (iy + 0.5) * dy - p[1];
+				const base_yz = (iz_local * N + iy) * N;
+				let l1 = m00 * wx_start + m10 * wy + m20 * wz;
+				let l2 = m01 * wx_start + m11 * wy + m21 * wz;
+				let l3 = m02 * wx_start + m12 * wy + m22 * wz;
+				for (let ix = ix_lo; ix <= ix_hi; ix++) {
+					if (l1 >= 0 && l1 <= 1 && l2 >= 0 && l2 <= 1 && l3 >= 0 && l3 <= 1) {
+						const l0 = 1 - l1 - l2 - l3;
+						if (l0 >= 0) {
+							const voxel = base_yz + ix;
+							tet_indices[voxel] = t;
+							const off = voxel * 4;
+							bary[off + 0] = l0;
+							bary[off + 1] = l1;
+							bary[off + 2] = l2;
+							bary[off + 3] = l3;
+						}
+					}
+					l1 += dl1;
+					l2 += dl2;
+					l3 += dl3;
+				}
+			}
+		}
+	}
+
+	if (typeof performance !== 'undefined') {
+		const dt = performance.now() - t_start;
+		console.log(`[volume] build_partition N=${N} iz=[${iz_start},${iz_end}) ${dt.toFixed(1)} ms`);
+	}
+	return { tet_indices, bary, resolution: N, iz_start, iz_end, min, max };
 }
 
 /**

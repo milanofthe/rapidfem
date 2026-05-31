@@ -544,15 +544,15 @@
 		log_lines = [...log_lines,
 			` [trajectory] nodes=${node_len ?? 'unresolved'} `
 			+ `frames=${frm_len < 0 ? 'unresolved' : frm_len}`];
-		// Surface the field cloud on load; the Geometry / Mesh toggles (now
-		// available for trajectories too) compose the cavity back in.
+		// Land on the trajectory view but let the user opt into the field
+		// animation explicitly — auto-enabling Field at load kicks a
+		// 128³ resample (~150 ms per frame) before they've even decided
+		// they want to see it, which felt intrusive on the TD timeline
+		// scrubber.
 		td_trajectory_payload = payload;
 		td_frame = 0;
-		td_playing = true;
-		// The trajectory IS a field animation: same defaults as an FD field
-		// view (geometry on, field on, mesh off), the frame slider rides
-		// along with the Field toggle.
-		show_field = true;
+		td_playing = false;
+		show_field = false;
 		show_geometry = true;
 		show_wireframe = false;
 		display = 'view3d';

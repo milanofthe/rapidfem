@@ -940,37 +940,51 @@
 
 	// Per-frame TD volume upload. The pool's static partitions are built
 	// once per trajectory; here we dispatch the per-frame scalar to the
-	// pool, stitch the slabs, and push the result. Token-guarded so a
-	// fast-playing animation that overruns one eval drops the stale frame.
+	// pool, stitch the slabs, and push the result. `scale_mode` is *not*
+	// read here — the dedicated TD-mode effect below applies range uniforms
+	// without waiting for another eval round-trip.
 	let td_eval_token = 0;
 	$effect(() => {
 		const traj = td_trajectory;
 		const frame = td_frame;
 		const ch = td_channel;
 		const cache = volume_cache;
-		const mode = scale_mode;
 		const want = show_field;
 		if (gl_state && (!traj || !want)) clearVolume(gl_state);
 		if (!gl_state || !traj || !cache || !want) return;
 		if (cache.key !== traj) return;          // active cache is for FD, skip TD path
 		const scalar = td_node_field(traj, frame, ch);
-		const fmax = ch === 'H' ? traj.field_max.H : traj.field_max.E;
 		const my_token = ++td_eval_token;
 		volume_eval_scalar_async(cache.handle, scalar).then((voxels) => {
 			if (my_token !== td_eval_token || !gl_state) return;
-			setVolumeScaleMode(gl_state, mode);
-			if (mode === 'log') {
-				setVolumeRange(
-					gl_state,
-					Math.log10(Math.max(fmax, 1e-30)) - TD_LOG_DECADES,
-					TD_LOG_DECADES,
-				);
-			} else {
-				setVolumeRange(gl_state, 0, fmax);
-			}
 			setVolumeData(gl_state, voxels, cache.handle.resolution, cache.handle.min, cache.handle.max);
 			schedule_render();
 		}).catch((e) => console.error('volume_eval_scalar_async', e));
+	});
+
+	// TD Lin/Log toggle reactivity — split out from the eval so the toggle
+	// applies range uniforms instantly instead of waiting for another
+	// scalar-eval round-trip (50+ ms at high resolutions). Same pattern as
+	// the FD mode effect on `last_range`, but the TD range comes from the
+	// trajectory's per-channel `field_max` (constant across frames).
+	$effect(() => {
+		const traj = td_trajectory;
+		const ch = td_channel;
+		const mode = scale_mode;
+		const want = show_field;
+		if (!gl_state || !traj || !want) return;
+		const fmax = ch === 'H' ? traj.field_max.H : traj.field_max.E;
+		setVolumeScaleMode(gl_state, mode);
+		if (mode === 'log') {
+			setVolumeRange(
+				gl_state,
+				Math.log10(Math.max(fmax, 1e-30)) - TD_LOG_DECADES,
+				TD_LOG_DECADES,
+			);
+		} else {
+			setVolumeRange(gl_state, 0, fmax);
+		}
+		schedule_render();
 	});
 
 	// Colourbar range for the time-domain cloud — a fixed 0…max scale held

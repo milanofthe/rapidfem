@@ -547,41 +547,61 @@ export function volume_energy_range(values: Float32Array): {
 } {
 	const t_start = typeof performance !== 'undefined' ? performance.now() : 0;
 	const RANGE_PERCENTILE = 0.99;
-	// Subsample so a 7M-voxel 192³ buffer doesn't spend 500 ms on the main
-	// thread building + sorting a JS Array. Stride 8 still leaves ~870k
-	// samples at 192³ — more than enough to estimate the 99th percentile
-	// robustly. At 256³ stride 8 keeps the sample at ~2M which is fine.
 	const STRIDE = 8;
 	const n = values.length / 4;
-	// Pre-allocate worst-case typed buffer; trim before sort. Typed-array
-	// sort is order-of-magnitude faster than JS Array.sort with a
-	// comparator because it skips per-element boxing and the user closure.
-	const energies = new Float32Array(Math.ceil(n / STRIDE));
-	let count = 0;
+	// Free log-binning via IEEE float bit pattern: for positive floats the
+	// top 11 bits (8 exponent + 3 high mantissa) form a monotone-with-value
+	// index in [0, 2048). That's 8 sub-bins per octave, plenty for a
+	// percentile estimator. Two integer ops per voxel — replaces a 200 ms
+	// Float32Array.sort with a ~5 ms single pass at 256³.
+	const N_BINS = 2048;
+	const hist = new Uint32Array(N_BINS);
+	const view_f32 = new Float32Array(1);
+	const view_u32 = new Uint32Array(view_f32.buffer);
+	let total = 0;
 	for (let i = 0; i < n; i += STRIDE) {
 		const off = i * 4;
 		if (values[off + 3] <= 0) continue;
 		const e2 = 0.5 * (values[off] + values[off + 1]);
-		if (e2 > 0) energies[count++] = e2;
+		if (e2 > 0) {
+			view_f32[0] = e2;
+			const bin = (view_u32[0] >>> 20) & 0x7ff;
+			hist[bin]++;
+			total++;
+		}
 	}
-	if (count === 0) {
+	if (total === 0) {
 		return {
 			log_floor: 0,
 			log_range: 1,
 			field_range: { min: 1, max: 1, decades: 0 },
 		};
 	}
-	const trimmed = energies.subarray(0, count);
-	trimmed.sort();
-	const lo_idx = Math.min(count - 1, Math.floor(count * (1 - RANGE_PERCENTILE)));
-	const hi_idx = Math.min(count - 1, Math.floor(count * RANGE_PERCENTILE));
-	const e_max = Math.sqrt(trimmed[hi_idx]);
-	const e_min = Math.max(Math.sqrt(trimmed[lo_idx]), e_max * 1e-3);
+	const lo_target = total * (1 - RANGE_PERCENTILE);
+	const hi_target = total * RANGE_PERCENTILE;
+	let acc = 0;
+	let lo_bin = 0;
+	let hi_bin = N_BINS - 1;
+	let found_lo = false;
+	for (let b = 0; b < N_BINS; b++) {
+		acc += hist[b];
+		if (!found_lo && acc >= lo_target) { lo_bin = b; found_lo = true; }
+		if (acc >= hi_target) { hi_bin = b; break; }
+	}
+	// Decode bin → representative e² value at the mid of the bin.
+	const bin_to_e2 = (b: number): number => {
+		const exp = b >>> 3;            // 0..255
+		const mant_top = b & 7;         // 0..7
+		// IEEE positive float: value = (1 + mant/8 + 0.5/8) × 2^(exp − 127)
+		return (1 + (mant_top + 0.5) / 8) * Math.pow(2, exp - 127);
+	};
+	const e_max = Math.sqrt(bin_to_e2(hi_bin));
+	const e_min = Math.max(Math.sqrt(bin_to_e2(lo_bin)), e_max * 1e-3);
 	const log_max = Math.log10(e_max);
 	const log_min = Math.log10(e_min);
 	if (typeof performance !== 'undefined') {
 		const dt = performance.now() - t_start;
-		console.log(`[volume] energy_range n=${count} ${dt.toFixed(1)} ms`);
+		console.log(`[volume] energy_range total=${total} ${dt.toFixed(1)} ms`);
 	}
 	return {
 		log_floor: log_min,

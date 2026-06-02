@@ -2281,7 +2281,8 @@ class ProblemTD:
 
     # -- model-order reduction --------------------------------------------
     def macromodel(self, *, r=120, sprim=False, shift_freq_hz=None,
-                   shift_freqs_hz=None, n_shift_steps=2):
+                   shift_freqs_hz=None, n_shift_steps=2,
+                   gmres_max_iter=None, gmres_tol=None):
         """Build a compact MIMO macromodel of the modal-port network.
 
         Block-Krylov projection of the matrix-free operator seeded by all
@@ -2314,6 +2315,15 @@ class ProblemTD:
         n_shift_steps : int
             Per-port ``(sigma_k I - A)^{-1}`` applications per shift
             (default 2).
+        gmres_max_iter : int, optional
+            Cap on the matrix-free GMRES iterations per shift-invert solve
+            (shift builds only). The default suits a low-spectral-radius
+            operator (order 1); raise it (e.g. 150-400) for a larger,
+            higher-order operator whose wider imaginary spectrum needs a
+            bigger Krylov basis to converge — this is the knob that lets
+            the multipole ROM reach the in-band physics at order 2.
+        gmres_tol : float, optional
+            Relative residual tolerance for that GMRES (shift builds only).
 
         Returns
         -------
@@ -2358,6 +2368,8 @@ class ProblemTD:
         )
         native = self._op.macromodel(
             int(r), bool(sprim), omegas_op, int(n_shift_steps),
+            None if gmres_max_iter is None else int(gmres_max_iter),
+            None if gmres_tol is None else float(gmres_tol),
         )
         m = TdMacroModel(native, self.c)
         _log(

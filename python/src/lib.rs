@@ -1648,16 +1648,33 @@ impl PyTdOperator {
     /// regime), where plain impulse-Krylov cannot reach the in-band
     /// physics. Mutually exclusive with `sprim`.
     ///
+    /// `gmres_max_iter` / `gmres_tol` (shift-invert builds only) cap the
+    /// matrix-free GMRES that applies `(σ_k I − A)⁻¹` per shift. The
+    /// defaults (`GMRES_SHIFT_MAX_ITER` / `GMRES_SHIFT_TOL`) suit a
+    /// low-spectral-radius operator (order 1, coarse mesh); a larger,
+    /// higher-order operator has a wider imaginary spectrum where GMRES
+    /// needs a bigger Krylov basis to converge — raise `gmres_max_iter`
+    /// (e.g. 150–400) so the multipole ROM reaches the in-band physics
+    /// at order 2.
+    ///
     /// Requires at least one port carrying a waveguide mode; pure
     /// absorbing-only ports are silently skipped.
-    #[pyo3(signature = (r, sprim = false, shift_omegas_op = None, n_shift_steps = 2))]
+    #[pyo3(signature = (r, sprim = false, shift_omegas_op = None, n_shift_steps = 2, gmres_max_iter = None, gmres_tol = None))]
     fn macromodel(
         &self,
         r: usize,
         sprim: bool,
         shift_omegas_op: Option<Vec<f64>>,
         n_shift_steps: usize,
+        gmres_max_iter: Option<usize>,
+        gmres_tol: Option<f64>,
     ) -> PyResult<PyMacroModel> {
+        use rapidfem_td::constants::{
+            GMRES_SHIFT_MAX_ITER, GMRES_SHIFT_TOL, MACROMODEL_DEFLATION_TOL,
+        };
+        let gm = gmres_max_iter.unwrap_or(GMRES_SHIFT_MAX_ITER);
+        let gt = gmres_tol.unwrap_or(GMRES_SHIFT_TOL);
+        let dt = MACROMODEL_DEFLATION_TOL;
         let inner = match (sprim, shift_omegas_op) {
             (true, Some(_)) => {
                 return Err(PyRuntimeError::new_err(
@@ -1673,12 +1690,12 @@ impl PyTdOperator {
                     ));
                 }
                 if omegas.len() == 1 {
-                    rapidfem_td::macromodel::MacroModel::build_shift_invert(
-                        &self.op, omegas[0], r,
+                    rapidfem_td::macromodel::MacroModel::build_shift_invert_with(
+                        &self.op, omegas[0], r, gm, gt, dt,
                     )
                 } else {
-                    rapidfem_td::macromodel::MacroModel::build_multi_shift(
-                        &self.op, &omegas, n_shift_steps,
+                    rapidfem_td::macromodel::MacroModel::build_multi_shift_with(
+                        &self.op, &omegas, n_shift_steps, gm, gt, dt,
                     )
                 }
             }

@@ -101,6 +101,46 @@ def build_wr90_scaled(length_mm, maxh_mm):
     return g, np.linspace(9.0e9, 11.0e9, 2)
 
 
+def build_patch(maxh_scale=1.0):
+    """Edge-fed microstrip patch on FR-4 with a full PML enclosure — a genuinely
+    BULKY 3D radiation problem (large air box, 5 PML slabs), where the global
+    factor fill-in is severe and DD is meaningful. 1 lumped port -> S11."""
+    SUB_W, SUB_L, SUB_H, ER = 60 * MM, 60 * MM, 1.6 * MM, 4.4
+    PATCH_W, PATCH_L = 38 * MM, 29 * MM
+    FEED_W = 1.5 * MM
+    PAD_XY, PAD_Z, PML_T = 25 * MM, 60 * MM, 20 * MM
+    maxh = rf.lambda_maxh(f_max=2.8e9) * maxh_scale
+    tw, tl, air_top = SUB_W + 2 * PAD_XY, SUB_L + 2 * PAD_XY, SUB_H + PAD_Z
+    XO, YO = tw / 2, tl / 2
+    g = rf.Geometry(maxh=maxh)
+    fr4 = rf.Dielectric(er=ER, maxh=1.5 * SUB_H)
+    pml_air = rf.Air(maxh=2 * maxh)
+    air = g.box(tw, tl, air_top, position=(-XO, -YO, 0), material=rf.Air())
+    pxp = g.box(PML_T, tl + 2 * PML_T, air_top, position=(XO, -YO - PML_T, 0), material=pml_air)
+    pxm = g.box(PML_T, tl + 2 * PML_T, air_top, position=(-XO - PML_T, -YO - PML_T, 0), material=pml_air)
+    pyp = g.box(tw, PML_T, air_top, position=(-XO, YO, 0), material=pml_air)
+    pym = g.box(tw, PML_T, air_top, position=(-XO, -YO - PML_T, 0), material=pml_air)
+    pzp = g.box(tw + 2 * PML_T, tl + 2 * PML_T, PML_T, position=(-XO - PML_T, -YO - PML_T, air_top), material=pml_air)
+    sub = g.box(SUB_W, SUB_L, SUB_H, position=(-SUB_W / 2, -SUB_L / 2, 0), material=fr4)
+    patch = g.xy_plate(PATCH_W, PATCH_L, position=(-PATCH_W / 2, -PATCH_L / 2, SUB_H))
+    feed = g.plate(p0=(-FEED_W / 2, -PATCH_L / 2, 0), width=(FEED_W, 0, 0), height=(0, 0, SUB_H))
+    g.fragment(air, pxp, pxm, pyp, pym, pzp, sub, patch, feed)
+    rf.LumpedPort(feed, direction=(0, 0, 1), z0=50.0)
+    rf.PEC(patch, sub.faces.min(axis="z"))
+    rf.PML(pxp, direction=(1, 0, 0), inner_face=XO, thickness=PML_T)
+    rf.PML(pxm, direction=(-1, 0, 0), inner_face=-XO, thickness=PML_T)
+    rf.PML(pyp, direction=(0, 1, 0), inner_face=YO, thickness=PML_T)
+    rf.PML(pym, direction=(0, -1, 0), inner_face=-YO, thickness=PML_T)
+    rf.PML(pzp, direction=(0, 0, 1), inner_face=air_top, thickness=PML_T)
+    rf.PEC(*pxp.faces.outer, *pxm.faces.outer, *pyp.faces.outer, *pym.faces.outer, *pzp.faces.outer)
+    g.auto_refine_features(base_maxh=maxh)
+    g.mesh(optimize=False)
+    return g, np.linspace(2.2e9, 2.6e9, 2)
+
+
+CASES.update({"patch": lambda: build_patch(1.0), "patch_fine": lambda: build_patch(0.7)})
+
+
 # Larger parametric cases — run ONE at a time, foreground.
 CASES.update({
     "wr90_a": lambda: build_wr90_scaled(120.0, 4.0),

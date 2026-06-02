@@ -184,13 +184,17 @@ class ProblemFD:
         tetrahedra in the mesh used by the last assembled solver
     """
 
-    def __init__(self, geometry: Geometry):
+    def __init__(self, geometry: Geometry, *, n_subdomains: int = 1):
         if geometry._last_mesh is None:
             raise ValueError(
                 "geometry not meshed yet — call g.mesh() before constructing a ProblemFD")
         self._geometry = geometry
         self._mesh_bytes, _ = geometry._last_mesh
         self._native: _NativeSimulation | None = None  # cached after first analysis
+        # >1 solves the FD sweep by primal Schur-complement domain decomposition
+        # (memory-bounded: factorizes per-subdomain interior blocks instead of
+        # the global matrix; see GH issue #12). 1 keeps the monolithic solve.
+        self._n_subdomains = int(n_subdomains)
 
     # ── Analyses ──────────────────────────────────────────────────────────
 
@@ -476,6 +480,10 @@ class ProblemFD:
 
         freqs_str = ", ".join(_f64(f) for f in frequencies)
         parts.append(f"[frequency]\nvalues = [{freqs_str}]\n")
+
+        # Schur-complement domain decomposition for the FD solve (issue #12).
+        if getattr(self, "_n_subdomains", 1) > 1:
+            parts.append(f"[solver]\nn_subdomains = {int(self._n_subdomains)}\n")
 
         # Collect volume entities targeted by PML — they get a [[pml]] block
         # and must NOT also generate a [[materials]] entry (the PML carries

@@ -99,11 +99,21 @@ def test_wr90_te10_transmission(report):
     print(f"  |S11| max over band: {s11_max:.4f}")
     print(f"  max(|S11|^2+|S21|^2): {pass_max:.4f}")
 
+    # Reciprocity: a passive non-gyrotropic 2-port has a symmetric
+    # S-matrix (S12 = S21). The FD solve is reciprocal to machine
+    # precision (measured ~9e-15), so a 1e-9 gate never false-fails yet
+    # catches any real asymmetry (e.g. a broken port-renormalisation path).
+    recip = float(np.max(np.abs(s[:, 0, 1] - s[:, 1, 0])))
+    print(f"  reciprocity max|S12-S21|: {recip:.2e}")
+
     # Gates: matched lossless guide.
     assert s21_min > 0.97, f"|S21| dropped to {s21_min:.4f} in the passband"
     assert s11_max < 0.05, f"|S11| rose to {s11_max:.4f} in the passband"
     assert pass_max <= 1.05, f"passivity {pass_max:.4f} above 1.05"
+    assert recip < 1e-9, f"reciprocity max|S12-S21| = {recip:.2e} above 1e-9"
 
+    report.metric("reciprocity max|S12-S21|", recip, bound=1e-9,
+                  detail="lossless reciprocal 2-port -> symmetric S")
     report.metric("min |S21| (passband)", s21_min, lower=0.97,
                   detail="lossless matched TE10 guide -> ~1")
     report.metric("max |S11| (passband)", s11_max, bound=0.05,
@@ -291,10 +301,15 @@ def test_coax_tem_matched_50ohm(report):
     # metric rather than asserted — the matched-line |S11| gate is what
     # actually exercises the solver's port-impedance computation: a wrong
     # port Z0 would mismatch the line and lift |S11|.)
+    recip = float(np.max(np.abs(s[:, 0, 1] - s[:, 1, 0])))
+    print(f"  reciprocity max|S12-S21|: {recip:.2e}")
     assert s11_max < 0.05, f"|S11| up to {s11_max:.4f} (expected matched)"
     assert s21_min > 0.95, f"|S21| down to {s21_min:.4f} (expected ~1)"
     assert pass_max <= 1.05, f"passivity {pass_max:.4f} above 1.05"
+    assert recip < 1e-9, f"reciprocity max|S12-S21| = {recip:.2e} above 1e-9"
 
+    report.metric("reciprocity max|S12-S21|", recip, bound=1e-9,
+                  detail="lossless reciprocal 2-port -> symmetric S")
     report.metric("analytic Z0", z0_analytic, ref=50.0, atol=2.0, unit="ohm",
                   detail="60 ln(ro/ri), air coax")
     report.metric("max |S11| (matched)", s11_max, bound=0.05,
@@ -319,4 +334,88 @@ def test_coax_tem_matched_50ohm(report):
             ["min |S21|", s21_min, ">= 0.95"],
             ["max |S11|^2+|S21|^2", pass_max, "<= 1.05"],
         ],
+    )
+
+
+# -----------------------------------------------------------------------------
+# 4. Eigenfrequency accuracy + stability under mesh refinement (Nedelec-2 FD).
+# -----------------------------------------------------------------------------
+
+@slow
+def test_cavity_eigenfreq_accuracy_under_refinement(report):
+    """A non-degenerate rectangular PEC cavity (a != b != d) so the lowest
+    (1,1,0) mode is isolated and trackable across mesh densities.
+
+    This gates the *accuracy and refinement stability* of the FD Nedelec-2
+    eigensolver, not an asymptotic convergence rate. With second-order edge
+    elements the eigenfrequency error already sits at a ~1e-4 floor at the
+    coarsest usable mesh, so the observable mesh-to-mesh variation is mesh
+    *generation* noise, not an O(h^3) discretisation trend — asserting a
+    convergence order here would be fabricating a result. Instead we gate
+    that every mesh in the 1.8-5.0 mm range lands within 3e-4 of the
+    closed-form resonance (measured max ~1e-4). A cubic cavity is avoided on
+    purpose: its (1,1,0) mode is 3-fold degenerate and the triple splits
+    unpredictably with tet-mesh asymmetry.
+    """
+    a, b, d = 28.0 * MM, 20.0 * MM, 16.0 * MM
+    f_110 = 0.5 * C * math.sqrt((1.0 / a) ** 2 + (1.0 / b) ** 2)
+    f_101 = 0.5 * C * math.sqrt((1.0 / a) ** 2 + (1.0 / d) ** 2)
+    report.note(
+        f"Non-degenerate rectangular PEC cavity {a/MM:.0f} x {b/MM:.0f} x "
+        f"{d/MM:.0f} mm. Lowest analytic mode (1,1,0) = {f_110/1e9:.4f} GHz, "
+        f"next (1,0,1) = {f_101/1e9:.4f} GHz (well separated, so the tracked "
+        "mode is isolated). The Nedelec-2 eigenfrequency must stay within "
+        "3e-4 of analytic across maxh = 1.8-5.0 mm. This gates accuracy and "
+        "refinement stability; the asymptotic O(h^3) rate is not observable "
+        "because the error is already floor-limited at the coarsest mesh."
+    )
+
+    maxhs = [5.0 * MM, 3.5 * MM, 2.5 * MM, 1.8 * MM]
+    rows, errs, tets = [], [], []
+    for maxh in maxhs:
+        g = rf.Geometry(maxh=maxh)
+        box = g.box(a, b, d, material=rf.Air())
+        rf.PEC(*box.faces.unassigned)
+        g.mesh()
+        prob = rf.ProblemFD(g)
+        modes = prob.eigenmode(target_frequency=f_110, n_modes=8)
+        cand = [m.frequency_hz for m in modes if m.frequency_hz > 0.3 * f_110]
+        f = min(cand, key=lambda x: abs(x - f_110))  # track nearest analytic
+        err = abs(f - f_110) / f_110
+        errs.append(err)
+        tets.append(prob.n_tets)
+        rows.append([maxh / MM, prob.n_tets, f / 1e9, err])
+        print(f"  maxh={maxh/MM:.2f}mm tets={prob.n_tets:6d} "
+              f"f={f/1e9:.6f} GHz relerr={err:.3e}")
+
+    err_max = float(max(errs))
+    print(f"  max rel. eigenfreq error over all meshes: {err_max:.3e}")
+
+    # Accuracy gate: every mesh within 3e-4 of analytic (measured max ~1e-4).
+    assert err_max < 3e-4, (
+        f"eigenfreq error {err_max:.3e} exceeds 3e-4 on some mesh"
+    )
+    # Structural check: the next mode is well separated, so we really did
+    # track an isolated (non-degenerate) mode rather than a split pair.
+    assert f_101 / f_110 > 1.1, "mode separation too small (degeneracy risk)"
+
+    report.metric("analytic (1,1,0) freq", f_110, unit="Hz",
+                  detail="0.5 c sqrt((1/a)^2+(1/b)^2)")
+    report.metric("max eigenfreq rel. error", err_max, bound=3e-4,
+                  detail="max over maxh = 1.8-5.0 mm")
+    report.metric("mode separation (1,0,1)/(1,1,0)", f_101 / f_110, lower=1.1,
+                  detail="confirms the tracked mode is isolated")
+    report.plot_xy(
+        [r[0] for r in rows],
+        {"rel. eigenfreq error": errs},
+        xlabel="maxh  [mm]",
+        ylabel="|f - f_analytic| / f_analytic",
+        title="cavity eigenfreq error vs mesh size",
+        logy=True,
+        caption="error floor-limited near 1e-4 (Nedelec-2); stays < 3e-4",
+    )
+    report.table(
+        "eigenfrequency vs mesh density",
+        ["maxh [mm]", "tets", "f [GHz]", "rel. error"],
+        rows,
     )

@@ -222,6 +222,7 @@ impl Simulation {
             &frequencies,
             self.materials_opt(),
             self.pml_opt(),
+            self.config.solver.n_subdomains.max(1),
         )?;
         let solve_time_s = t0.elapsed().as_secs_f64();
 

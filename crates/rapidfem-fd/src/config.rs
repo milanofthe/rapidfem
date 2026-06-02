@@ -324,7 +324,14 @@ pub struct PecConfig {
 pub struct SolverConfig {
     #[serde(default = "default_solver_prefer")]
     pub prefer: String,
+    /// Number of Schur-complement DD subdomains for the FD sweep. 1 (default)
+    /// keeps the monolithic factorization; >1 partitions the mesh and solves
+    /// by primal Schur DD (memory-bounded, issue #12).
+    #[serde(default = "default_n_subdomains")]
+    pub n_subdomains: usize,
 }
+
+fn default_n_subdomains() -> usize { 1 }
 
 #[derive(Deserialize, Default)]
 pub struct OutputConfig {

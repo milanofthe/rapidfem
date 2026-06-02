@@ -301,9 +301,14 @@ pub fn frequency_sweep(
     frequencies: &[f64],
     materials: Option<&[crate::materials::Material]>,
 ) -> Result<Vec<SolveResult>, String> {
-    frequency_sweep_with_pml(mesh, basis, ports, port_tri_indices, pec_tri_indices, frequencies, materials, None)
+    frequency_sweep_with_pml(mesh, basis, ports, port_tri_indices, pec_tri_indices, frequencies, materials, None, 1)
 }
 
+/// `n_subdomains > 1` switches the per-frequency solve from a monolithic
+/// factorization to primal Schur-complement domain decomposition (issue #12):
+/// the mesh is partitioned once (frequency-independent), and each frequency is
+/// solved by `schur::schur_solve`, bounding peak memory by the largest
+/// subdomain interior block rather than the global factor.
 pub fn frequency_sweep_with_pml(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -313,6 +318,7 @@ pub fn frequency_sweep_with_pml(
     frequencies: &[f64],
     materials: Option<&[crate::materials::Material]>,
     pml_regions: Option<&[crate::materials::PmlRegion]>,
+    n_subdomains: usize,
 ) -> Result<Vec<SolveResult>, String> {
     // Detect if any material is frequency-dependent — if so, K must be rebuilt every frequency
     let materials_dispersive = materials
@@ -357,6 +363,22 @@ pub fn frequency_sweep_with_pml(
     let n_free = free_dofs.len();
     let mut dof_to_free = vec![usize::MAX; basis.n_field];
     for (fi, &d) in free_dofs.iter().enumerate() { dof_to_free[d] = fi; }
+
+    // Schur DD: partition the mesh once (frequency-independent). `None` keeps
+    // the monolithic path.
+    let schur_class: Option<Vec<crate::solver::schur::DofClass>> = if n_subdomains > 1 {
+        use crate::solver::schur;
+        let centroids = schur::tet_centroids(mesh);
+        let part = schur::partition_rcb(&centroids, n_subdomains);
+        let cls = schur::classify_free_dofs(mesh, basis, &free_dofs, &part);
+        let n_if = cls.iter().filter(|c| matches!(c, schur::DofClass::Interface)).count();
+        eprintln!(
+            "  Schur DD: {} subdomains, {} interface DOFs ({:.1}% of {} free)",
+            n_subdomains, n_if, 100.0 * n_if as f64 / n_free as f64, n_free);
+        Some(cls)
+    } else {
+        None
+    };
 
     let ac_base = crate::coefficients::AreaCoeffCache::new();
     let gauss_points = crate::quadrature::gaus_quad_tri(4);
@@ -469,20 +491,32 @@ pub fn frequency_sweep_with_pml(
             coo_vals.push(val);
         }
 
-        // Factor (symbolic once via `factorize`, then `refactorize` per freq
-        // reusing the sparsity pattern) and solve via the backend-agnostic
-        // SparseSolver trait.
-        if first_factor {
-            solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
-            first_factor = false;
+        // Free-indexed RHS (shared by both solve paths).
+        let rhs_free: Vec<Vec<C64>> = port_bvecs
+            .iter()
+            .map(|bvec| free_dofs.iter().map(|&d| bvec[d]).collect())
+            .collect();
+
+        // Solve: Schur DD when partitioned, else the monolithic factorization
+        // (symbolic once via `factorize`, then `refactorize` reusing the
+        // sparsity pattern across the sweep).
+        let sols_free: Vec<Vec<C64>> = if let Some(cls) = &schur_class {
+            crate::solver::schur::schur_solve(
+                n_free, &coo_rows, &coo_cols, &coo_vals, &rhs_free, cls,
+                crate::solver::SolverChoice::from_env(),
+            )?
         } else {
-            solver.refactorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
-        }
+            if first_factor {
+                solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
+                first_factor = false;
+            } else {
+                solver.refactorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
+            }
+            rhs_free.iter().map(|b| solver.solve(b)).collect::<Result<_, _>>()?
+        };
 
         let mut solutions = Vec::new();
-        for bvec in &port_bvecs {
-            let b_free: Vec<C64> = free_dofs.iter().map(|&d| bvec[d]).collect();
-            let x_free = solver.solve(&b_free)?;
+        for x_free in &sols_free {
             let mut x_full = vec![C64::new(0.0, 0.0); n_field];
             for (fi_d, &d) in free_dofs.iter().enumerate() {
                 x_full[d] = x_free[fi_d];
@@ -493,7 +527,7 @@ pub fn frequency_sweep_with_pml(
         eprintln!(
             "  f={:>8.4e} Hz [{:>2}/{:>2}]  {:>6.1}ms  {}",
             freq, fi + 1, frequencies.len(), t_freq.elapsed().as_secs_f64() * 1e3,
-            solver.name(),
+            if schur_class.is_some() { "schur-dd" } else { solver.name() },
         );
         results.push(SolveResult { solutions, n_field });
     }

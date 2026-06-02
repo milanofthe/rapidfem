@@ -111,3 +111,44 @@ fn test_schur_matches_monolithic_wr90() {
     }
     eprintln!("Schur DD == monolithic on WR-90: PASS");
 }
+
+/// End-to-end: the production sweep path (`frequency_sweep_with_pml`) wired
+/// through `n_subdomains` must produce the same physical fields whether solved
+/// monolithically or by Schur DD.
+#[test]
+fn test_schur_sweep_pipeline_wired() {
+    use rapidfem_fd::assembly::frequency_sweep_with_pml;
+    let mesh = load_mesh(WR90_MESH).expect("load WR-90 mesh");
+    let basis = Nedelec2Basis::new(&mesh);
+    let port1_tris = mesh.tris_for_tag(3).to_vec();
+    let port2_tris = mesh.tris_for_tag(4).to_vec();
+    let pec_tris = mesh.tris_for_tag(1).to_vec();
+    let cs1 = CoordinateSystem::new(
+        [0.01143, 0.0, 0.00508], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]);
+    let cs2 = CoordinateSystem::new(
+        [0.01143, 0.03, 0.00508], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]);
+    let port1 = RectWaveguide { port_number: 1, power: 1.0, mode: (1, 0), er: 1.0,
+        polarization: 1.0, dims: (22.86e-3, 10.16e-3), cs: cs1 };
+    let port2 = RectWaveguide { port_number: 2, power: 1.0, mode: (1, 0), er: 1.0,
+        polarization: 1.0, dims: (22.86e-3, 10.16e-3), cs: cs2 };
+    let ports: Vec<&dyn rapidfem_fd::port::Port> = vec![&port1, &port2];
+    let port_tris: Vec<&[usize]> = vec![&port1_tris, &port2_tris];
+    let freqs = [9.0e9, 11.0e9];
+
+    let mono = frequency_sweep_with_pml(
+        &mesh, &basis, &ports, &port_tris, &pec_tris, &freqs, None, None, 1).unwrap();
+    let schur = frequency_sweep_with_pml(
+        &mesh, &basis, &ports, &port_tris, &pec_tris, &freqs, None, None, 4).unwrap();
+
+    for fi in 0..freqs.len() {
+        for p in 0..mono[fi].solutions.len() {
+            let rel = rel_l2(&mono[fi].solutions[p], &schur[fi].solutions[p]);
+            assert!(schur[fi].solutions[p].iter().all(|v| v.norm().is_finite()), "non-finite schur field");
+            eprintln!("  f={:.1e} port{p}: ||schur-mono||/||mono|| = {rel:.3e}", freqs[fi]);
+            // Same physical field; they differ only by the ill-conditioning
+            // sensitivity (Schur is the more accurate solve), well under 1%.
+            assert!(rel < 1e-2, "f={} port{p}: sweep fields diverge {rel:.3e}", freqs[fi]);
+        }
+    }
+    eprintln!("Schur DD sweep pipeline wired: PASS");
+}

@@ -243,6 +243,143 @@ fn givens(a: C64, b: C64) -> (f64, C64) {
     }
 }
 
+/// Neumann-Neumann interface preconditioner data: for each subdomain a local
+/// interface index list (local→global) and a factorized LOCAL Schur complement
+/// `S_s` on that subdomain's interface DOFs, plus the global multiplicity of
+/// each interface DOF (how many subdomains touch it) for the partition of unity.
+struct NnPrecond {
+    local_iface: Vec<Vec<usize>>,             // per subdomain: global iface idx
+    s_solver: Vec<Option<Box<dyn super::SparseSolver>>>, // factorized S_s
+    mult: Vec<f64>,                            // per global iface DOF
+}
+
+/// Build the Neumann-Neumann preconditioner. Captures the per-subdomain
+/// interior correction that `K_ΓΓ` alone misses (the reason plain-`K_ΓΓ` GMRES
+/// stalls on bulky 3D). Cost: Σ_s |Γ_s| interior back-solves + small dense
+/// local factorizations — no global dense S.
+fn build_nn_precond(
+    k: usize,
+    n_iface: usize,
+    n_int: &[usize],
+    kgg: &Coo,
+    kig: &[Coo],
+    kgi: &[Coo],
+    isolv: &mut [Box<dyn super::SparseSolver>],
+    choice: SolverChoice,
+) -> Result<NnPrecond, String> {
+    // Per-subdomain local interface set Γ_s = interface DOFs adjacent to s.
+    let mut local_iface: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut g2l: Vec<Vec<usize>> = Vec::with_capacity(k); // global→local (MAX if absent)
+    let mut mult = vec![0.0f64; n_iface];
+    for s in 0..k {
+        let mut present = vec![false; n_iface];
+        for &c in &kig[s].cols {
+            present[c] = true;
+        }
+        for &r in &kgi[s].rows {
+            present[r] = true;
+        }
+        let mut gl = Vec::new();
+        let mut map = vec![usize::MAX; n_iface];
+        for g in 0..n_iface {
+            if present[g] {
+                map[g] = gl.len();
+                gl.push(g);
+                mult[g] += 1.0;
+            }
+        }
+        local_iface.push(gl);
+        g2l.push(map);
+    }
+
+    // Build + factorize each local Schur complement S_s (dense, small).
+    let mut s_solver: Vec<Option<Box<dyn super::SparseSolver>>> = Vec::with_capacity(k);
+    for s in 0..k {
+        let m = local_iface[s].len();
+        if m == 0 || n_int[s] == 0 {
+            s_solver.push(None);
+            continue;
+        }
+        // K_IΓ^s columns keyed by GLOBAL interface index.
+        let mut kig_cols: Vec<Vec<(usize, C64)>> = vec![Vec::new(); n_iface];
+        for i in 0..kig[s].rows.len() {
+            kig_cols[kig[s].cols[i]].push((kig[s].rows[i], kig[s].vals[i]));
+        }
+        let mut sd = vec![C64::new(0.0, 0.0); m * m];
+        // K_ΓΓ restricted to Γ_s.
+        for i in 0..kgg.rows.len() {
+            let (rg, cg) = (kgg.rows[i], kgg.cols[i]);
+            let (rl, cl) = (g2l[s][rg], g2l[s][cg]);
+            if rl != usize::MAX && cl != usize::MAX {
+                sd[rl * m + cl] += kgg.vals[i];
+            }
+        }
+        // − K_ΓI^s (K_II^s)^{-1} K_IΓ^s restricted to Γ_s, column by column.
+        for jl in 0..m {
+            let jg = local_iface[s][jl];
+            let col = &kig_cols[jg];
+            if col.is_empty() {
+                continue;
+            }
+            let mut b = vec![C64::new(0.0, 0.0); n_int[s]];
+            for &(ir, val) in col {
+                b[ir] += val;
+            }
+            let w = isolv[s].solve(&b)?;
+            for t in 0..kgi[s].rows.len() {
+                let rl = g2l[s][kgi[s].rows[t]];
+                if rl != usize::MAX {
+                    sd[rl * m + jl] -= kgi[s].vals[t] * w[kgi[s].cols[t]];
+                }
+            }
+        }
+        // Factorize S_s via the backend (dense-as-sparse: emit all entries).
+        let mut sr = Vec::new();
+        let mut sc = Vec::new();
+        let mut sv = Vec::new();
+        for i in 0..m {
+            for j in 0..m {
+                let v = sd[i * m + j];
+                if i == j || v != C64::new(0.0, 0.0) {
+                    sr.push(i);
+                    sc.push(j);
+                    sv.push(v);
+                }
+            }
+        }
+        let mut solver = pick(choice);
+        solver.factorize(m, &sr, &sc, &sv)
+            .map_err(|e| format!("local Schur S_{s} factorize failed: {e}"))?;
+        s_solver.push(Some(solver));
+    }
+    Ok(NnPrecond { local_iface, s_solver, mult })
+}
+
+/// Apply the Neumann-Neumann preconditioner: M^{-1} r = Σ_s R_s^T D_s S_s^{-1} D_s R_s r,
+/// with D_s the inverse-multiplicity partition of unity.
+fn nn_apply(nn: &mut NnPrecond, r: &[C64]) -> Vec<C64> {
+    let n_iface = r.len();
+    let mut out = vec![C64::new(0.0, 0.0); n_iface];
+    for s in 0..nn.local_iface.len() {
+        let solver = match nn.s_solver[s].as_mut() {
+            Some(sv) => sv,
+            None => continue,
+        };
+        let gl = &nn.local_iface[s];
+        let m = gl.len();
+        let mut rs = vec![C64::new(0.0, 0.0); m];
+        for (jl, &jg) in gl.iter().enumerate() {
+            rs[jl] = r[jg] / C64::new(nn.mult[jg], 0.0);
+        }
+        if let Ok(ws) = solver.solve(&rs) {
+            for (jl, &jg) in gl.iter().enumerate() {
+                out[jg] += ws[jl] / C64::new(nn.mult[jg], 0.0);
+            }
+        }
+    }
+    out
+}
+
 /// Right-preconditioned restarted GMRES for `op(x) = b`, preconditioner
 /// `prec(v) ≈ A^{-1} v`. Returns `(x, total_iters, final_rel_resid)`.
 /// `op`/`prec` are `FnMut` so they can hold the (mutable) subdomain solvers.
@@ -488,14 +625,12 @@ pub fn schur_solve(
         .unwrap_or(crate::constants::SCHUR_EXPLICIT_INTERFACE_MAX);
     let use_gmres = n_iface > explicit_max;
     let mut iface_solver: Option<Box<dyn super::SparseSolver>> = None; // dense-S path
-    let mut precond: Option<Box<dyn super::SparseSolver>> = None;      // K_ΓΓ for GMRES
+    let mut nn_precond: Option<NnPrecond> = None;                      // GMRES preconditioner
 
     if n_iface > 0 && use_gmres {
-        let mut m = pick(choice);
-        m.factorize(n_iface, &kgg.rows, &kgg.cols, &kgg.vals)
-            .map_err(|e| format!("interface preconditioner (K_GG) factorize failed: {e}"))?;
-        precond = Some(m);
-        eprintln!("  Schur: matrix-free interface GMRES (n_iface={n_iface}, K_GG-preconditioned)");
+        nn_precond = Some(build_nn_precond(
+            k, n_iface, &n_int, &kgg, &kig, &kgi, &mut isolv, choice)?);
+        eprintln!("  Schur: matrix-free interface GMRES (n_iface={n_iface}, Neumann-Neumann preconditioned)");
     } else if n_iface > 0 {
         // Dense S = K_ΓΓ − Σ_s K_ΓI^(s) (K_II^(s))^{-1} K_IΓ^(s), column by column.
         let mut s_dense = vec![C64::new(0.0, 0.0); n_iface * n_iface];
@@ -597,8 +732,8 @@ pub fn schur_solve(
                 }
                 acc
             };
-            let pc = precond.as_mut().unwrap();
-            let mut prec = |v: &[C64]| -> Vec<C64> { pc.solve(v).expect("Schur precond solve") };
+            let nn = nn_precond.as_mut().unwrap();
+            let mut prec = |v: &[C64]| -> Vec<C64> { nn_apply(nn, v) };
             let (xg, iters, resid) = gmres_solve(
                 &mut op,
                 &mut prec,

@@ -91,8 +91,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--no-rust", action="store_true",
                         help="skip the cargo-test Rust bridge")
-    parser.add_argument("--rust-crates", nargs="+", default=None,
-                        help="restrict the Rust bridge to these crates")
+    parser.add_argument("--rust-crates", default=None,
+                        help="comma-separated crates for the Rust bridge "
+                             "(e.g. rapidfem-core,rapidfem-fd). A greedy "
+                             "nargs list would swallow trailing pytest paths.")
     parser.add_argument("--rust-timeout", type=int, default=None,
                         help="per-crate cargo timeout in seconds")
     parser.add_argument("--html", default=DEFAULT_HTML,
@@ -116,7 +118,10 @@ def main(argv=None) -> int:
         sys.path.insert(0, os.path.join(REPO_ROOT, "python", "tests"))
         from report import rust_bridge
 
-        crates = args.rust_crates or rust_bridge.DEFAULT_CRATES
+        crates = (
+            [c.strip() for c in args.rust_crates.split(",") if c.strip()]
+            if args.rust_crates else rust_bridge.DEFAULT_CRATES
+        )
         timeout = args.rust_timeout or rust_bridge.DEFAULT_TIMEOUT
         _run_rust_bridge(crates, args.rust_json, timeout)
         merge = args.rust_json

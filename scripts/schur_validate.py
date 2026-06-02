@@ -7,6 +7,7 @@ differ by the ill-conditioning sensitivity (~1e-3), but the projected
 S-parameters are robust and must match to a few 1e-3. Run locally, never CI.
 """
 import math
+import time
 import numpy as np
 import rapidfem as rf
 
@@ -88,25 +89,50 @@ def build_microstrip():
 CASES = {"wr90": build_wr90, "coax": build_coax, "iris": build_iris, "microstrip": build_microstrip}
 
 
-def run(name, builder, k=4):
+def build_wr90_scaled(length_mm, maxh_mm):
+    """WR-90 of a given length / mesh size — a controllable knob to scale DOFs."""
+    a, b, L = 22.86 * MM, 10.16 * MM, length_mm * MM
+    g = rf.Geometry(maxh=maxh_mm * MM)
+    air = g.box(a, b, L, position=(-a / 2, -b / 2, 0), material=rf.Air())
+    rf.RectWaveguidePort(air.faces.min(axis="z"))
+    rf.RectWaveguidePort(air.faces.max(axis="z"))
+    rf.PEC(*air.faces.unassigned)
+    g.mesh()
+    return g, np.linspace(9.0e9, 11.0e9, 2)
+
+
+# Larger parametric cases — run ONE at a time, foreground.
+CASES.update({
+    "wr90_a": lambda: build_wr90_scaled(120.0, 4.0),
+    "wr90_b": lambda: build_wr90_scaled(220.0, 3.4),
+    "wr90_c": lambda: build_wr90_scaled(320.0, 3.0),
+})
+
+
+def run(name, builder, k=8):
+    import time
     g, freqs = builder()
-    s_mono = np.asarray(rf.ProblemFD(g).sweep(freqs).sparams)
+    t0 = time.perf_counter()
+    pm = rf.ProblemFD(g)
+    s_mono = np.asarray(pm.sweep(freqs).sparams)
+    t_mono = time.perf_counter() - t0
+    n_dof = pm.n_dofs
+    t1 = time.perf_counter()
     s_schur = np.asarray(rf.ProblemFD(g, n_subdomains=k).sweep(freqs).sparams)
+    t_schur = time.perf_counter() - t1
     dmax = float(np.max(np.abs(s_mono - s_schur)))
-    print(f"[{name}] max|S_mono - S_schur(k={k})| = {dmax:.3e}")
-    # also print |S11|,|S21| both ways at mid band for a sanity look
-    mid = len(freqs) // 2
-    print(f"   mid f={freqs[mid]/1e9:.2f}GHz  mono |S11|={abs(s_mono[mid,0,0]):.4f} "
-          f"|S21|={abs(s_mono[mid,1,0]):.4f}  schur |S11|={abs(s_schur[mid,0,0]):.4f} "
-          f"|S21|={abs(s_schur[mid,1,0]):.4f}")
-    return dmax
+    print(f"[{name}] n_dof={n_dof} k={k} max|dS|={dmax:.3e} "
+          f"t_mono={t_mono:.1f}s t_schur={t_schur:.1f}s")
+    return dmax, n_dof
 
 
 if __name__ == "__main__":
     import sys
-    sel = sys.argv[1:] or list(CASES)
+    args = [a for a in sys.argv[1:] if not a.startswith("k=")]
+    kopt = next((int(a[2:]) for a in sys.argv[1:] if a.startswith("k=")), 8)
+    sel = args or ["wr90", "coax"]
     worst = 0.0
     for name in sel:
-        d = run(name, CASES[name])
+        d, _ = run(name, CASES[name], k=kopt)
         worst = max(worst, d)
-    print(f"=== worst max|dS| across cases = {worst:.3e} ===")
+    print(f"=== worst max|dS| across selected cases = {worst:.3e} ===")

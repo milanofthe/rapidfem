@@ -38,7 +38,7 @@ slow = pytest.mark.slow
 # -----------------------------------------------------------------------------
 
 @slow
-def test_wr90_cavity_operator_propagator_energy():
+def test_wr90_cavity_operator_propagator_energy(report):
     """Realistic 30 mm cubic PEC cavity. Central flux makes the energy
     strictly conserved so the field-energy invariant is a clean gate;
     the homogeneous evolution lets `step`, `stepper`, and `transient`
@@ -46,6 +46,13 @@ def test_wr90_cavity_operator_propagator_energy():
     checked against each other. The CFL probe and explicit integrator
     are exercised on the same cavity.
     """
+    report.note(
+        "30 mm cubic PEC cavity under central flux. Checks the exported "
+        "operators against each other (state_space vs rhs vs jacobian), "
+        "the strict energy conservation of central flux over a 100-step "
+        "transient, the propagator equivalence of step / stepper / "
+        "transient, and the CFL probe plus explicit integrator path."
+    )
     side = 30.0 * MM
 
     g = rf.Geometry(maxh=side / 4)
@@ -56,6 +63,7 @@ def test_wr90_cavity_operator_propagator_energy():
     ptd = rf.ProblemTD(g, order=1, flux="central")
     n = ptd.n_dof
     print(f"  cavity DOFs: {n}")
+    report.metric("cavity DOFs", n, detail="state-vector length [E,H]")
 
     # `state_space` / `rhs` / `jacobian` consistency.
     a = ptd.state_space()
@@ -70,11 +78,20 @@ def test_wr90_cavity_operator_propagator_energy():
     rel = diff / float(np.linalg.norm(dy_rhs).clip(1e-30))
     print(f"  ||A·y - rhs(y)|| rel: {rel:.3e}")
     assert rel < 1e-10, f"state_space vs rhs mismatch: {rel:.3e}"
+    report.metric(
+        "state_space vs rhs rel. diff", rel, bound=1e-10,
+        detail="||A·y - rhs(y)|| / ||rhs(y)|| on a random y",
+    )
 
     j = ptd.jacobian()
     assert j.shape == a.shape
     # jacobian == state_space (constant linear system).
-    assert (j != a).nnz == 0, "jacobian() must equal state_space()"
+    n_diff = (j != a).nnz
+    assert n_diff == 0, "jacobian() must equal state_space()"
+    report.metric(
+        "jacobian vs state_space nonzero diffs", n_diff, bound=0,
+        detail="entries where jacobian() differs from state_space()",
+    )
 
     # `field_energy` strictly conserved under central flux. Drive with a
     # localised pulse and watch the energy over a transient.
@@ -95,6 +112,22 @@ def test_wr90_cavity_operator_propagator_energy():
     # the accumulator over 100 steps stays well under 1e-8.
     assert drift < 1e-6, (
         f"central-flux energy drift {drift:.3e} above 1e-6"
+    )
+    times_ps = np.arange(traj.shape[0]) * dt * 1e12
+    report.plot_xy(
+        times_ps,
+        {"field energy / E(0)": np.asarray(e_series) / e0},
+        xlabel="time  [ps]",
+        ylabel="E(t) / E(0)",
+        title="central-flux energy conservation",
+        caption=(
+            f"Normalised field energy over {steps} steps; central flux "
+            f"conserves it to a max drift of {drift:.2e}."
+        ),
+    )
+    report.metric(
+        "max energy drift", drift, bound=1e-6,
+        detail="max|E(t) - E(0)| / E(0) over the transient",
     )
 
     # `step` vs `stepper` vs `transient`: chain `steps` calls of each
@@ -117,11 +150,23 @@ def test_wr90_cavity_operator_propagator_energy():
     assert rel_stepper < 1e-8, (
         f"stepper vs transient mismatch: {rel_stepper:.3e}"
     )
+    report.metric(
+        "step vs transient rel. diff", rel_step, bound=1e-8,
+        detail="chained step() calls vs transient(), final state",
+    )
+    report.metric(
+        "stepper vs transient rel. diff", rel_stepper, bound=1e-8,
+        detail="chained stepper() calls vs transient(), final state",
+    )
 
     # `cfl_dt` returns a positive finite dt.
     dt_cfl = ptd.cfl_dt()
     print(f"  cfl_dt: {dt_cfl*1e12:.3f} ps")
     assert np.isfinite(dt_cfl) and dt_cfl > 0
+    report.metric(
+        "cfl_dt", dt_cfl, lower=0.0, unit="s",
+        detail=f"explicit-integrator CFL limit = {dt_cfl*1e12:.3f} ps",
+    )
 
     # `step_explicit` runs stably at sub-CFL dt.
     y_e = y0.copy()
@@ -129,6 +174,10 @@ def test_wr90_cavity_operator_propagator_energy():
     for _ in range(20):
         y_e = ptd.step_explicit(y_e, h_explicit)
     assert np.all(np.isfinite(y_e)), "explicit integrator diverged"
+    report.metric(
+        "explicit-integrator final |y|", float(np.linalg.norm(y_e)),
+        detail="20 step_explicit() calls at 0.5·cfl_dt stay finite",
+    )
 
 
 
@@ -137,12 +186,18 @@ def test_wr90_cavity_operator_propagator_energy():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_cavity_resonances_lowest_mode():
+def test_cavity_resonances_lowest_mode(report):
     """`resonances()` does a dense eigvals on the sparse `A`, so it
     only scales to small problems. Use a coarse cube and check the
     lowest cavity mode lands within a factor of two of analytic
     (the discrete spectrum drifts with mesh).
     """
+    report.note(
+        "Coarse 3x3x3 cubic cavity (upwind flux) so the dense eigenvalue "
+        "solve in resonances(n=8) stays affordable. The discrete spectrum "
+        "drifts with the mesh, so we only require an analytic-like (1,1,0) "
+        "mode to appear within 50% of the analytic frequency."
+    )
     side = 30.0 * MM
     # ProblemTD.box uses structured_box directly: an explicit cell
     # count keeps the dense eigenvalue solve in resonances()
@@ -162,6 +217,10 @@ def test_cavity_resonances_lowest_mode():
     assert n < 8000, (
         f"cavity too large for dense resonances() ({n} DOFs)"
     )
+    report.metric(
+        "tiny cavity DOFs", n, bound=8000,
+        detail="dense resonances() only affordable below ~8000 DOFs",
+    )
 
     f_analytic = 0.5 * C * math.sqrt(2.0) / side
     res = ptd.resonances(n=8)
@@ -178,6 +237,35 @@ def test_cavity_resonances_lowest_mode():
         f"no TD resonance within 50% of analytic "
         f"f={f_analytic/1e9:.3f} GHz; got {[f/1e9 for f in res]}"
     )
+    res_arr = np.asarray(res, dtype=float)
+    report.metric(
+        "analytic (1,1,0) freq", f_analytic, unit="Hz",
+        detail="0.5 c sqrt(2) / side",
+    )
+    report.metric(
+        "closest TD resonance", closest, ref=f_analytic, tol=0.5, unit="Hz",
+        detail="nearest resonances() eigvalue to the (1,1,0) mode",
+    )
+    report.table(
+        "resonances() vs analytic",
+        ["mode", "f [GHz]", "rel. error vs (1,1,0)"],
+        [["analytic (1,1,0)", f_analytic / 1e9, 0.0]]
+        + [
+            [f"TD #{k}", f / 1e9, abs(f - f_analytic) / f_analytic]
+            for k, f in enumerate(res_arr)
+        ],
+    )
+    report.plot_complex_plane(
+        {"resonances(n=8)": res_arr / 1e9,
+         "analytic (1,1,0)": np.array([f_analytic / 1e9])},
+        title="TD resonance frequencies",
+        xlabel="frequency  [GHz]",
+        ylabel="(imag part = 0)",
+        caption=(
+            f"Closest TD resonance {closest/1e9:.3f} GHz vs analytic "
+            f"{f_analytic/1e9:.3f} GHz ({err:.1%} off)."
+        ),
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -185,13 +273,21 @@ def test_cavity_resonances_lowest_mode():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_dispersive_debye_inclusion_runs_stably():
+def test_dispersive_debye_inclusion_runs_stably(report):
     """Air cavity with a Debye-dispersive block in the centre. The Debye
     auxiliary-polarisation ADE adds an appended P-block to the state
     vector; the test exercises that the geometry pipeline wires Debye
     materials end-to-end and that the dispersive transient stays
     bounded with the upwind flux's dissipation.
     """
+    report.note(
+        "30 mm air cavity with a 10 mm water-like Debye block "
+        "(er_inf=4.6, er_static=78, tau=8 ps). The Debye ADE appends a "
+        "per-tet polarisation P-block to the [E,H] state, so the "
+        "dispersive n_dof must exceed a plain-dielectric reference. The "
+        "dispersive transient must stay finite and bounded under the "
+        "upwind flux's dissipation."
+    )
     side = 30.0 * MM
     block = 10.0 * MM
 
@@ -235,6 +331,17 @@ def test_dispersive_debye_inclusion_runs_stably():
         f"Debye should append a P-block beyond [E,H]: "
         f"dispersive n_dof = {n}, reference n_dof = {ptd_ref.n_dof}"
     )
+    report.metric(
+        "dispersive n_dof", n, lower=float(ptd_ref.n_dof) + 1.0,
+        detail=f"must exceed reference (no Debye) n_dof = {ptd_ref.n_dof}",
+    )
+    report.table(
+        "state-vector sizing",
+        ["build", "n_dof"],
+        [["plain dielectric (er=4.6)", ptd_ref.n_dof],
+         ["Debye dispersive", n],
+         ["appended P-block", n - ptd_ref.n_dof]],
+    )
 
     # Propagate a pulse, check finiteness and that Debye losses cause
     # monotonic energy decay vs the lossless reference.
@@ -242,13 +349,31 @@ def test_dispersive_debye_inclusion_runs_stably():
     y0[ptd.probe_dof(
         (side * 0.5, side * 0.5, side * 0.5), field="E", component="z"
     )] = 1.0
-    traj = ptd.transient(y0, dt=2e-12, steps=120, device="cpu")
+    dt_disp = 2e-12
+    traj = ptd.transient(y0, dt=dt_disp, steps=120, device="cpu")
     assert np.all(np.isfinite(traj)), "dispersive transient must be finite"
     e0 = ptd.field_energy(y0)
-    e_max = max(ptd.field_energy(traj[k]) for k in range(traj.shape[0]))
+    e_series = np.array([ptd.field_energy(traj[k]) for k in range(traj.shape[0])])
+    e_max = float(e_series.max())
     print(f"  dispersive max E: {e_max:.4g} (init {e0:.4g})")
     assert e_max < 2.0 * e0, (
         f"dispersive run grew energy by {e_max/e0:.3f}x"
+    )
+    times_ps = np.arange(traj.shape[0]) * dt_disp * 1e12
+    report.plot_xy(
+        times_ps,
+        {"field energy / E(0)": e_series / e0},
+        xlabel="time  [ps]",
+        ylabel="E(t) / E(0)",
+        title="Debye-dispersive energy decay",
+        caption=(
+            "Debye losses plus upwind dissipation keep the energy bounded "
+            f"(peak {e_max/e0:.3f}x the initial energy)."
+        ),
+    )
+    report.metric(
+        "dispersive energy growth", e_max / e0, bound=2.0,
+        detail="max field_energy(t) / field_energy(0)",
     )
 
 
@@ -257,12 +382,19 @@ def test_dispersive_debye_inclusion_runs_stably():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_pml_absorbs_outgoing_pulse():
+def test_pml_absorbs_outgoing_pulse(report):
     """A straight WR-90 section with a single PML slab at one end. Drive
     a pulse from the source side toward the PML; with a working PML the
     pulse decays into the slab and does not return as a reflection.
     Tests the rf.PML registration on a meaningful geometry.
     """
+    report.note(
+        "Straight WR-90 section terminated by a single 30 mm PML slab "
+        "(PEC backstop on its far end). A 10 GHz Gaussian pulse is driven "
+        "from the source end toward the PML. A working PML drains the wave "
+        "so the source-side probe tail falls well below the peak; a "
+        "perfectly reflecting end-cap would leave the tail near the peak."
+    )
     a_wg, b_wg = 22.86 * MM, 10.16 * MM
     guide_l = 80.0 * MM
     pml_t = 30.0 * MM
@@ -316,6 +448,25 @@ def test_pml_absorbs_outgoing_pulse():
     assert tail < 0.3 * peak, (
         f"PML absorbed only weakly: tail / peak = {tail/peak:.3f}"
     )
+    report.plot_xy(
+        np.asarray(times) * 1e12,
+        {"|E_y| at probe": sig},
+        xlabel="time  [ps]",
+        ylabel="|probe response|",
+        title="PML absorption of outgoing pulse",
+        caption=(
+            f"Peak {peak:.3g}, tail (last 50 steps) {tail:.3g}; "
+            f"tail/peak = {tail/peak:.2e}."
+        ),
+    )
+    report.metric(
+        "probe peak", peak, lower=0.0,
+        detail="max |E_y| at the source-side probe",
+    )
+    report.metric(
+        "PML tail / peak ratio", tail / peak, bound=0.3,
+        detail="last-50-step max / peak; low means strong absorption",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -323,10 +474,15 @@ def test_pml_absorbs_outgoing_pulse():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_export_vtk_writes_a_paraview_pvd():
+def test_export_vtk_writes_a_paraview_pvd(report):
     """Free transient on a cube, export trajectory to VTK, verify the
     .pvd file plus per-snapshot .vtu files exist and are non-empty.
     """
+    report.note(
+        "Free transient on a 20 mm cube exported via export_vtk(). Verifies "
+        "the ParaView .pvd collection file is written and non-empty and that "
+        "one .vtu/.vtk snapshot per timestep lands beside it."
+    )
     side = 20.0 * MM
     g = rf.Geometry(maxh=side / 4)
     air = g.box(side, side, side, material=rf.Air())
@@ -346,7 +502,8 @@ def test_export_vtk_writes_a_paraview_pvd():
             times=np.arange(traj.shape[0]) * 3e-12,
         )
         assert os.path.exists(pvd), f"PVD file {pvd} not written"
-        assert os.path.getsize(pvd) > 0, "PVD is empty"
+        pvd_size = os.path.getsize(pvd)
+        assert pvd_size > 0, "PVD is empty"
         # Per-snapshot vtu / vtk files should be in the same directory.
         sibs = [
             f for f in os.listdir(os.path.dirname(pvd))
@@ -357,6 +514,19 @@ def test_export_vtk_writes_a_paraview_pvd():
             f"got {len(sibs)} in {os.path.dirname(pvd)}"
         )
         print(f"  export_vtk wrote {len(sibs)} snapshot files")
+        report.metric(
+            "PVD file size", pvd_size, lower=1.0, unit="bytes",
+            detail="ParaView collection file must be non-empty",
+        )
+        report.metric(
+            "snapshot files written", len(sibs),
+            lower=float(traj.shape[0] - 1),
+            detail=f"one .vtu/.vtk per timestep ({traj.shape[0]} steps)",
+        )
+        report.note(
+            f"export_vtk() wrote the .pvd plus {len(sibs)} per-snapshot "
+            f"files for a {traj.shape[0]}-frame trajectory."
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -364,12 +534,19 @@ def test_export_vtk_writes_a_paraview_pvd():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_ode_interface_is_scipy_solve_ivp_compatible():
+def test_ode_interface_is_scipy_solve_ivp_compatible(report):
     """`ptd.ode()` returns a `TdODE` with `rhs(t, y)` and `jacobian()`
     matching the scipy.integrate.solve_ivp signature. Drive a short
     integration and check it agrees with `ptd.transient` on the same
     initial condition.
     """
+    report.note(
+        "ptd.ode() exposes rhs(t, y) / jacobian() in the "
+        "scipy.integrate.solve_ivp signature. A short RK45 integration "
+        "(rtol=1e-7) of the same initial condition must agree with "
+        "ptd.transient's matrix-free exponential propagator to several "
+        "digits."
+    )
     pytest.importorskip("scipy.integrate")
     from scipy.integrate import solve_ivp
 
@@ -412,4 +589,13 @@ def test_ode_interface_is_scipy_solve_ivp_compatible():
     # agree to several digits.
     assert rel < 1e-4, (
         f"scipy RK45 vs transient: rel diff {rel:.3e} above 1e-4"
+    )
+    report.metric("ODE n_dof", n, detail="state-vector length [E,H]")
+    report.metric(
+        "scipy solve_ivp success", 1.0 if sol.success else 0.0, lower=1.0,
+        detail="RK45 integration reported success",
+    )
+    report.metric(
+        "scipy RK45 vs transient rel. diff", rel, bound=1e-4,
+        detail="||y_scipy - y_td|| / ||y_td|| at the final time",
     )

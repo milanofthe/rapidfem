@@ -21,13 +21,23 @@ slow = pytest.mark.slow
 
 
 @slow
-def test_iris_filter_sparams_td_matches_fd():
+def test_iris_filter_sparams_td_matches_fd(report):
     """Three-iris X-band filter: TD vs FD across 8-12 GHz. Geometry
     mirrors `fd_iris_filter.py`. The iris bandpass response makes
     this a stricter test than the matched-line WR-90 case — wrong
     internal-PEC wiring would smear the resonances or shift the
     passband.
     """
+    report.note(
+        "Three inductive irises in a WR-90 waveguide forming an X-band "
+        "bandpass around 10 GHz, with internal PEC iris plates and "
+        "rectangular TE10 ports. TD sparams (1000 steps x 3 ps) vs FD "
+        "sweep over 8.5-11.5 GHz (7 points). Resonance positions of a "
+        "Chebyshev iris filter drift a few percent under coarse mesh, so "
+        "the gates assert the band shape: deep stopband |S11| (<=9 GHz), "
+        "passband |S21| peak (>=10.5 GHz), passivity, and a mean-deviation "
+        "bound rather than pointwise |S| values."
+    )
     a, b = 22.86 * MM, 10.16 * MM
     apertures = [10.0 * MM, 8.0 * MM, 10.0 * MM]
     spacing = 15.0 * MM
@@ -124,3 +134,31 @@ def test_iris_filter_sparams_td_matches_fd():
     print(f"  mean |S21| TD vs FD: {mean_d21:.3f}")
     assert mean_d11 < 0.20, f"mean |S11| dev {mean_d11:.3f} above 20%"
     assert mean_d21 < 0.20, f"mean |S21| dev {mean_d21:.3f} above 20%"
+
+    report.plot_sparams(
+        freqs,
+        {"TD": s_td, "FD": s_fd},
+        entries=[(1, 1), (2, 1)],
+        title="WR-90 iris filter S-parameters TD vs FD",
+        caption="solid = TD, dashed = FD; three-iris X-band bandpass",
+    )
+    report.metric("stopband min |S11| TD", float(s11_td[stop].min()),
+                  lower=0.85, detail="|S11| (TD) for f <= 9 GHz")
+    report.metric("stopband min |S11| FD", float(s11_fd[stop].min()),
+                  lower=0.85, detail="|S11| (FD) for f <= 9 GHz")
+    report.metric("passband max |S21| TD", float(s21_td[pas].max()),
+                  lower=0.5, detail="|S21| (TD) for f >= 10.5 GHz")
+    report.metric("passband max |S21| FD", float(s21_fd[pas].max()),
+                  lower=0.5, detail="|S21| (FD) for f >= 10.5 GHz")
+    report.metric("passivity max |S|^2 (TD)", float(total.max()),
+                  bound=1.15, detail="|S11|^2 + |S21|^2, TD")
+    report.metric("mean |S11| dev TD vs FD", mean_d11, bound=0.20,
+                  detail="mean over band of ||S11_td| - |S11_fd||")
+    report.metric("mean |S21| dev TD vs FD", mean_d21, bound=0.20,
+                  detail="mean over band of ||S21_td| - |S21_fd||")
+    report.table(
+        "iris filter |S| over band",
+        ["f (GHz)", "|S11| TD", "|S11| FD", "|S21| TD", "|S21| FD"],
+        [[f / 1e9, s11_td[k], s11_fd[k], s21_td[k], s21_fd[k]]
+         for k, f in enumerate(freqs)],
+    )

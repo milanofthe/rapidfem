@@ -29,12 +29,18 @@ slow = pytest.mark.slow
 # -----------------------------------------------------------------------------
 
 @slow
-def test_cavity_mode_matches_analytic_and_fd():
+def test_cavity_mode_matches_analytic_and_fd(report):
     """The lowest (1,1,0) mode of a cubic PEC cavity, computed two
     ways: FD Nédélec eigensolver and TD broadband-pulse spectral peak.
     Both must hit the analytic value within a few tenths of a percent.
     Mirrors `td_fd_crossvalidation.py`.
     """
+    report.note(
+        "Lowest (1,1,0) mode of a 30 mm cubic PEC cavity. The analytic "
+        "resonance is compared against the FD Nedelec eigensolver and "
+        "the TD broadband-pulse spectral peak. Both numerical paths must "
+        "land within 1% of the analytic value."
+    )
     side = 30.0 * MM
     f_analytic = 0.5 * C * math.sqrt(2.0) / side
 
@@ -86,17 +92,55 @@ def test_cavity_mode_matches_analytic_and_fd():
     assert err_fd < 0.01, f"FD error {err_fd:.3%} above 1%"
     assert err_td < 0.01, f"TD error {err_td:.3%} above 1%"
 
+    report.metric("analytic (1,1,0) freq", f_analytic, unit="Hz",
+                  detail="0.5 c sqrt(2) / side")
+    report.metric("FD eigensolver freq", fd_f, ref=f_analytic, tol=0.01,
+                  unit="Hz")
+    report.metric("TD spectral-peak freq", td_f, ref=f_analytic, tol=0.01,
+                  unit="Hz")
+    report.metric("FD rel. error", err_fd, bound=0.01,
+                  detail="|fd - analytic| / analytic")
+    report.metric("TD rel. error", err_td, bound=0.01,
+                  detail="|td - analytic| / analytic")
+    report.table(
+        "mode frequencies",
+        ["method", "f [GHz]", "rel. error"],
+        [
+            ["analytic", f_analytic / 1e9, 0.0],
+            ["FD", fd_f / 1e9, err_fd],
+            ["TD", td_f / 1e9, err_td],
+        ],
+    )
+    report.plot_xy(
+        freq[band] / 1e9,
+        {"|FFT(probe E_z)|": spec[band]},
+        xlabel="frequency  [GHz]",
+        ylabel="|spectrum|",
+        title="TD probe spectrum",
+        logy=True,
+        caption=(
+            f"Peak at {td_f/1e9:.4f} GHz vs analytic "
+            f"{f_analytic/1e9:.4f} GHz."
+        ),
+    )
+
 
 # -----------------------------------------------------------------------------
 # 2. Transfer-function spectrum recovers analytic cavity modes.
 # -----------------------------------------------------------------------------
 
 @slow
-def test_cavity_transfer_function_finds_modes():
+def test_cavity_transfer_function_finds_modes(report):
     """Broadband-driven cavity, RFT transfer function H(f) = R/G; the
     peaks of |H| must line up with analytic rectangular-cavity modes
     in the chosen band. Mirrors `td_transfer_function.py` but asserts.
     """
+    report.note(
+        "Broadband-driven 40 mm cubic cavity. The RFT transfer function "
+        "H(f) = R/G is peak-detected over 3-10 GHz and every peak must "
+        "match an analytic rectangular-cavity mode within 3% (mesh "
+        "discretisation plus RFT bin width)."
+    )
     side = 40.0 * MM
     g = rf.Geometry(maxh=side / 7)
     air = g.box(side, side, side, material=rf.Air())
@@ -142,6 +186,23 @@ def test_cavity_transfer_function_finds_modes():
     print(f"  TD peaks:   {[f'{f/1e9:.2f}' for f in peaks_hz]} GHz")
     print(f"  analytic:   {[f'{f/1e9:.2f}' for f in in_band]} GHz")
     assert len(peaks_hz) >= 2, "expected at least 2 in-band peaks"
+
+    report.plot_xy(
+        freqs / 1e9,
+        {"|H(f)|": mag},
+        xlabel="frequency  [GHz]",
+        ylabel="|H(f)|",
+        title="cavity transfer function |H(f)|",
+        logy=True,
+        caption=(
+            f"{len(peaks_hz)} in-band peaks detected over 3-10 GHz; "
+            f"{len(in_band)} analytic modes in band."
+        ),
+    )
+    report.metric("in-band TF peaks", len(peaks_hz), lower=2,
+                  detail="local maxima of |H| above 10% of band max")
+
+    match_rows = []
     for p in peaks_hz:
         closest = min(in_band, key=lambda f: abs(f - p))
         err = abs(p - closest) / closest
@@ -149,6 +210,21 @@ def test_cavity_transfer_function_finds_modes():
             f"peak {p/1e9:.3f} GHz {err:.2%} from nearest analytic "
             f"{closest/1e9:.3f} GHz"
         )
+        report.metric(
+            f"peak {p/1e9:.3f} GHz", p, ref=closest, tol=0.03, unit="Hz",
+            detail=f"nearest analytic mode {closest/1e9:.3f} GHz",
+        )
+        match_rows.append([p / 1e9, closest / 1e9, err])
+    report.table(
+        "TD peak vs nearest analytic mode",
+        ["TD peak [GHz]", "analytic [GHz]", "rel. error"],
+        match_rows,
+    )
+    report.table(
+        "analytic in-band modes",
+        ["mode [GHz]"],
+        [[f / 1e9] for f in in_band],
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -156,11 +232,17 @@ def test_cavity_transfer_function_finds_modes():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_wr90_sparams_td_matches_fd():
+def test_wr90_sparams_td_matches_fd(report):
     """Straight WR-90 hollow waveguide with rectangular TE_10 modal
     ports at both ends. TD `sparams` vs FD `sweep` must agree to a
     few percent across the X-band. Mirrors `td_waveguide_sparams.py`.
     """
+    report.note(
+        "Straight 300 mm WR-90 hollow waveguide with rectangular TE10 "
+        "modal ports at both ends. TD sparams (1500 steps x 3 ps) vs FD "
+        "sweep over the 8-12 GHz X-band; max |S11| and |S21| deviation "
+        "must stay below 5%."
+    )
     a_wg, b_wg = 22.86 * MM, 10.16 * MM
     length = 300.0 * MM
     freqs = np.linspace(8.0e9, 12.0e9, 9)
@@ -193,6 +275,38 @@ def test_wr90_sparams_td_matches_fd():
     print(f"  max |S21| dev TD vs FD: {d21:.3f}")
     assert d11 < 0.05, f"|S11| deviation {d11:.3f} above 5%"
     assert d21 < 0.05, f"|S21| deviation {d21:.3f} above 5%"
+
+    report.plot_sparams(
+        freqs,
+        {"TD": s_td, "FD": s_fd},
+        entries=[(1, 1), (2, 1)],
+        caption="solid = TD, dashed = FD",
+        title="WR-90 S-parameters TD vs FD",
+    )
+    report.metric("max |S11| dev TD vs FD", d11, bound=0.05,
+                  detail="max over band of ||S11_td| - |S11_fd||")
+    report.metric("max |S21| dev TD vs FD", d21, bound=0.05,
+                  detail="max over band of ||S21_td| - |S21_fd||")
+
+    # Passivity: largest singular value of S(f) per frequency (<= 1 for a
+    # lossless reciprocal 2-port; mild numerical overshoot is expected).
+    sigma_td = np.array([np.linalg.svd(s_td[k], compute_uv=False).max()
+                         for k in range(len(freqs))])
+    sigma_fd = np.array([np.linalg.svd(s_fd[k], compute_uv=False).max()
+                         for k in range(len(freqs))])
+    report.metric("max sigma_max(S_TD)", float(sigma_td.max()), bound=1.15,
+                  detail="passivity proxy, TD")
+    report.plot_passivity(freqs, sigma_td,
+                          title="WR-90 passivity  sigma_max(S_TD)",
+                          caption="TD; passive bound at 1.0")
+    report.table(
+        "max deviation summary",
+        ["quantity", "max dev", "bound"],
+        [
+            ["|S11| TD vs FD", d11, 0.05],
+            ["|S21| TD vs FD", d21, 0.05],
+        ],
+    )
 
 
 # -----------------------------------------------------------------------------

@@ -26,7 +26,7 @@ slow = pytest.mark.slow
 # -----------------------------------------------------------------------------
 
 @slow
-def test_coax_line_transmits_tem():
+def test_coax_line_transmits_tem(report):
     """A straight matched 50 ohm coaxial air-line driven at port 0 with
     a matched coax port at port 1. Inner-conductor and outer-shield
     surfaces are PEC; end caps are coax ports. The TEM mode is
@@ -35,6 +35,14 @@ def test_coax_line_transmits_tem():
     `fd_coax_step.py` geometry pattern; covers the Python coax wiring
     on top of the Rust C1 gate.
     """
+    report.note(
+        "Straight matched 50 ohm air-filled coax line (ri=1.50 mm, "
+        "ro=3.45 mm, length 20 mm) with coax ports on both end caps and "
+        "PEC inner/outer conductors. The TEM mode is dispersionless, so "
+        "across 3-7 GHz the reflection |S11| must stay near zero and the "
+        "transmission |S21| near unity. Covers the Python coax wiring on "
+        "top of the Rust C1 gate."
+    )
     r_inner = 1.50 * MM
     r_outer = 3.45 * MM            # ~50 ohm air coax
     length = 20.0 * MM
@@ -67,6 +75,23 @@ def test_coax_line_transmits_tem():
     print(f"  coax |S21|: min {s21.min():.3f} max {s21.max():.3f}")
     assert s11.max() < 0.2, f"coax reflection too high: {s11.max():.3f}"
     assert s21.min() > 0.7, f"coax transmission too low: {s21.min():.3f}"
+
+    report.plot_sparams(
+        freqs,
+        {"TD": s},
+        entries=[(1, 1), (2, 1)],
+        title="Coax line S-parameters",
+        caption="matched 50 ohm air coax, TEM transmission",
+    )
+    report.metric("max |S11|", float(s11.max()), bound=0.2,
+                  detail="coax reflection across 3-7 GHz")
+    report.metric("min |S21|", float(s21.min()), lower=0.7,
+                  detail="coax transmission across 3-7 GHz")
+    report.table(
+        "coax |S| over band",
+        ["f (GHz)", "|S11|", "|S21|"],
+        [[f / 1e9, s11[k], s21[k]] for k, f in enumerate(freqs)],
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -181,12 +206,20 @@ def test_floquet_unit_cell_transmits_plane_wave():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_wave_port_matches_analytic_te10():
+def test_wave_port_matches_analytic_te10(report):
     """A rectangular WR-90-style guide driven by a numerically-solved
     WavePort must reproduce the analytic RectWaveguidePort TE10 result:
     same cutoff and matching S-parameters above cutoff. This validates
     the 2D cross-section eigensolve end to end (eigenmode -> sampled
     (e_t, h_t) profile -> injection / extraction)."""
+    report.note(
+        "WR-90-style hollow guide (a=22.86 mm, b=10.16 mm, length 40 mm) "
+        "driven by a numerically-solved scalar WavePort vs the analytic "
+        "RectWaveguidePort. Validates the 2D cross-section eigensolve end "
+        "to end: the eigenmode cutoff must land on the analytic TE10 "
+        "f_c = c/(2a), and |S21|/|S11| must track the analytic port "
+        "across 8-11 GHz (above the 6.56 GHz cutoff)."
+    )
     a, b, length = 22.86 * MM, 10.16 * MM, 40.0 * MM
     freqs = np.linspace(8e9, 11e9, 4)  # above the 6.56 GHz TE10 cutoff
 
@@ -211,6 +244,9 @@ def test_wave_port_matches_analytic_te10():
         f"WavePort cutoff {fc_wave/1e9:.3f} GHz off from "
         f"analytic {fc_analytic/1e9:.3f} GHz"
     )
+    report.metric("WavePort f_c", fc_wave, unit="Hz",
+                  ref=fc_analytic, tol=0.03,
+                  detail="eigensolve cutoff vs analytic TE10 c/(2a)")
 
     s_w = ptd_w.sparams(freqs, dt=1.0e-12, steps=600, verbose=False).sparams
     s_a = rf.ProblemTD(build(False), order=2, flux="upwind").sparams(
@@ -233,6 +269,25 @@ def test_wave_port_matches_analytic_te10():
     assert d21 < 0.08, f"|S21| wave vs analytic deviates {d21:.3f}"
     assert d11 < 0.05, f"|S11| wave vs analytic deviates {d11:.3f}"
 
+    report.plot_sparams(
+        freqs,
+        {"WavePort": s_w, "analytic TE10": s_a},
+        entries=[(1, 1), (2, 1)],
+        title="Scalar WavePort vs analytic TE10",
+        caption="solid = numerical WavePort, dashed = analytic RectWaveguidePort",
+    )
+    report.metric("max |S21| dev wave vs analytic", d21, bound=0.08,
+                  detail="max over band of ||S21_wave| - |S21_analytic||")
+    report.metric("max |S11| dev wave vs analytic", d11, bound=0.05,
+                  detail="max over band of ||S11_wave| - |S11_analytic||")
+    report.table(
+        "scalar WavePort vs analytic |S| over band",
+        ["f (GHz)", "|S21| wave", "|S21| analytic",
+         "|S11| wave", "|S11| analytic"],
+        [[f / 1e9, s21_w[k], s21_a[k], s11_w[k], s11_a[k]]
+         for k, f in enumerate(freqs)],
+    )
+
 
 # -----------------------------------------------------------------------------
 # 5. WavePort vector path - inhomogeneous-capable hybrid solve, validated on a
@@ -240,13 +295,21 @@ def test_wave_port_matches_analytic_te10():
 # -----------------------------------------------------------------------------
 
 @slow
-def test_wave_port_vector_path_matches_analytic_te10():
+def test_wave_port_vector_path_matches_analytic_te10(report):
     """The full-vector hybrid wave-port solve (WavePort(f0=...), the path
     that also handles inhomogeneous microstrip-class cross-sections) on a
     hollow WR-90 guide must reproduce the analytic TE10 transmission. The
     transmission |S21| (the Issue #10 metric) tracks tightly; |S11| carries
     a wider budget for the edge-element profile recovery (area-averaged to
     nodes), which is less sharp than the scalar gradient profile."""
+    report.note(
+        "Full-vector hybrid WavePort solve (WavePort(f0=...), the path "
+        "that also handles inhomogeneous microstrip-class cross-sections) "
+        "on a hollow WR-90 guide vs the analytic RectWaveguidePort. The "
+        "transmission |S21| (the Issue #10 metric) must track the analytic "
+        "mode tightly (within 0.05) across 8.5-9.5 GHz; reflection |S11| "
+        "carries a wider budget for the edge-element profile recovery."
+    )
     a, b, length = 22.86 * MM, 10.16 * MM, 40.0 * MM
     f0 = 9e9
     freqs = np.linspace(8.5e9, 9.5e9, 3)
@@ -282,3 +345,22 @@ def test_wave_port_vector_path_matches_analytic_te10():
     # Reflection is in the same ballpark (edge-element profile-recovery
     # budget); both are low-reflection.
     assert s11_v.max() < 0.30, f"vector |S11| too high: {s11_v.max():.3f}"
+
+    report.plot_sparams(
+        freqs,
+        {"vector WavePort": s_v, "analytic TE10": s_a},
+        entries=[(1, 1), (2, 1)],
+        title="Vector hybrid WavePort vs analytic TE10",
+        caption="solid = vector WavePort, dashed = analytic RectWaveguidePort",
+    )
+    report.metric("max |S21| dev vector vs analytic", d21, bound=0.05,
+                  detail="Issue #10 metric: max ||S21_vec| - |S21_analytic||")
+    report.metric("max |S11| vector", float(s11_v.max()), bound=0.30,
+                  detail="vector reflection (edge-element profile-recovery budget)")
+    report.table(
+        "vector WavePort vs analytic |S| over band",
+        ["f (GHz)", "|S21| vec", "|S21| analytic",
+         "|S11| vec", "|S11| analytic"],
+        [[f / 1e9, s21_v[k], s21_a[k], s11_v[k], s11_a[k]]
+         for k, f in enumerate(freqs)],
+    )

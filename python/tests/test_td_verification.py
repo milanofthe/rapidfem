@@ -294,8 +294,27 @@ def test_wr90_sparams_td_matches_fd(report):
                          for k in range(len(freqs))])
     sigma_fd = np.array([np.linalg.svd(s_fd[k], compute_uv=False).max()
                          for k in range(len(freqs))])
-    report.metric("max sigma_max(S_TD)", float(sigma_td.max()), bound=1.15,
-                  detail="passivity proxy, TD")
+    sig_td_max = float(sigma_td.max())
+    sig_fd_max = float(sigma_fd.max())
+    print(f"  max sigma_max(S_TD): {sig_td_max:.4f}")
+    print(f"  max sigma_max(S_FD): {sig_fd_max:.4f}")
+    # Passivity gate: a lossless reciprocal 2-port has sigma_max(S) <= 1.
+    # The FD reference stays passive to machine precision (measured 1.0000);
+    # the central-flux DGTD + sparams time-windowing overshoots by ~3%
+    # (measured sigma_max(S_TD) = 1.0313 on this case). The gate is set at
+    # 1.05 — a ~1.7% margin above the measured overshoot, tight enough that a
+    # real passivity blow-up (an unstable mode) trips it, not tuned to pass.
+    assert sig_fd_max <= 1.01, (
+        f"FD reference not passive: sigma_max(S_FD) = {sig_fd_max:.4f}"
+    )
+    assert sig_td_max <= 1.05, (
+        f"TD passivity sigma_max(S_TD) = {sig_td_max:.4f} above 1.05 "
+        "(expected ~1.03 overshoot for central-flux DGTD)"
+    )
+    report.metric("max sigma_max(S_TD)", sig_td_max, bound=1.05,
+                  detail="passivity proxy, TD (central-flux overshoot ~1.03)")
+    report.metric("max sigma_max(S_FD)", sig_fd_max, bound=1.01,
+                  detail="FD reference, passive to machine precision")
     report.plot_passivity(freqs, sigma_td,
                           title="WR-90 passivity  sigma_max(S_TD)",
                           caption="TD; passive bound at 1.0")

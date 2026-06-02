@@ -224,3 +224,49 @@ pub const PERIODIC_MATCH_REL_TOL: Field = 1e-9;
 /// guarded so the matcher's tolerance never collapses to zero. A pair this
 /// close in absolute terms is effectively coincident.
 pub const PERIODIC_MATCH_ABS_FLOOR: Field = 1e-12;
+
+// ── Macromodel / model-order reduction ────────────────────────────────────
+
+/// Block-Krylov deflation tolerance: a candidate block column whose
+/// residual norm after orthogonalisation falls below this is dropped (its
+/// direction is already in the subspace) and the build proceeds with
+/// one column fewer. Distinct from [`KRYLOV_TOL`] (the propagator
+/// a-posteriori estimate) and [`ARNOLDI_BREAKDOWN`] (the single-vector
+/// exponential-propagator breakdown), because the block-Krylov
+/// deflation is a different event, measured on the raw residual norm
+/// of a candidate block column rather than the matvec a-posteriori
+/// estimate.
+pub const MACROMODEL_DEFLATION_TOL: Accum = 1e-10;
+
+/// Default block-Krylov order `r` for the macromodel build when the
+/// caller does not pick one explicitly. Tens to a few hundred is the
+/// regime the impulse-Krylov macromodel lives in (see
+/// `docs/td-macromodel-plan.md`); 80 is a reasonable midpoint that
+/// covers a handful of resonances on a matched two-port test case.
+/// Separate from [`KRYLOV_CHUNK`] (the per-sub-step exponential cap),
+/// since the macromodel build is one-shot and not sub-stepped.
+pub const MACROMODEL_DEFAULT_R: usize = 80;
+
+/// Stride of the interleaved `[E, H]` block in the time-domain state
+/// layout `y[(e*Np + i)*6 + c]`: components `c = 0..3` are the three
+/// electric-field components at the node, components `c = 3..6` the
+/// three magnetic-field components. Used by the SPRIM-style E/H mask
+/// in [`crate::macromodel`] to project a state vector onto its E-part
+/// or H-part for structure-preserving block-Krylov.
+pub const TD_STATE_BLOCK_STRIDE: usize = 6;
+
+/// Relative residual tolerance for the matrix-free complex GMRES that
+/// solves the shifted system `(sigma I - A) x = b` inside the
+/// shift-invert macromodel build
+/// ([`crate::macromodel::MacroModel::build_shift_invert`]). Loose by
+/// design: the shift-invert step's output is then re-orthogonalised
+/// against the basis, so a GMRES residual at `~1e-6` is amply tighter
+/// than the orthogonalisation drift.
+pub const GMRES_SHIFT_TOL: Accum = 1.0e-6;
+
+/// Maximum GMRES iterations per shift-invert solve before restart.
+/// Larger keeps the Arnoldi basis bigger (more memory, fewer restarts);
+/// smaller restarts more often and costs more matvecs at hard
+/// frequencies. 60 is a healthy default for the small spectral region
+/// around a single shift in a Maxwell macromodel.
+pub const GMRES_SHIFT_MAX_ITER: usize = 60;

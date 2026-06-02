@@ -10,6 +10,7 @@ edition = "2024"
 doctest = false
 
 [dependencies]
+num-complex = "0.4.6"
 opencl3 = { version = "0.12.3", optional = true }
 rapidfem-core = { path = "../rapidfem-core" }
 rayon = "1.11.0"

@@ -1503,6 +1503,7 @@ name = "rapidfem-td"
 version = "0.1.0"
 dependencies = [
  "faer",
+ "num-complex 0.4.6",
  "opencl3",
  "rapidfem-core",
  "rayon",

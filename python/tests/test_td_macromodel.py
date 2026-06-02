@@ -21,32 +21,31 @@ waveguide against the frequency-domain solver (`ProblemFD.sweep`), and
 that the `state_space()` export is a lossless realisation of
 `evaluate()`.
 
-HONEST SCOPE / KNOWN LIMIT (read before trusting a green run)
--------------------------------------------------------------
+SPECTRAL RADIUS vs the GMRES cap
+--------------------------------
 The shift-invert inside `build_multi_shift` solves `(j*omega I - A) x = b`
-with a matrix-free complex GMRES whose iteration cap is hard-wired in the
-native extension (`GMRES_SHIFT_MAX_ITER`, currently 60, no preconditioner)
-and is NOT reachable from Python. For a skew-symmetric DG operator the
-shift `j*omega` sits in the middle of the imaginary spectrum, so GMRES
-convergence degrades sharply as the spectral radius `rho(A)` grows. In
-practice the multipole ROM reproduces the in-band transmission only when
-`rho(A)` is modest enough that the 60-iteration GMRES converges:
+with a matrix-free complex GMRES (single cycle, no restart, no
+preconditioner). For a skew-symmetric DG operator the shift `j*omega`
+sits in the middle of the imaginary spectrum, so GMRES needs a Krylov
+basis large enough to resolve it; that basis size is the iteration cap
+`gmres_max_iter`, now reachable from Python
+(`macromodel(..., gmres_max_iter=...)`). Its default
+(`GMRES_SHIFT_MAX_ITER`) suits a modest spectral radius; as `rho(A)`
+grows the cap must grow too:
 
-- order=1 on a coarse/short guide (rho(A) modest): the multipole ROM
-  tracks FD |S21| to ~2% across 9-12 GHz -- the physics carries, and that
-  is what these tests gate.
-- order=2 on the same geometry (n_dof ~ 80k, rho(A) ~3x larger): GMRES no
-  longer converges in 60 iters, the shift-invert vectors degrade to
-  near-noise, and |S21| collapses back toward 0. The multipole does NOT
-  trip in that regime with the as-built extension.
+- order=1, coarse/short guide (rho(A) modest): the default cap converges;
+  the multipole ROM tracks FD |S21| to ~2% across 9-12 GHz. These tests
+  run here for speed.
+- order=2, same geometry (n_dof ~ 240k, rho(A) ~3x larger): the default
+  cap (60) does NOT converge and |S21| collapses to ~0; raising the cap
+  (~250) restores convergence and |S21| returns to ~0.99
+  (`test_multipole_rom_order2_needs_larger_gmres_cap`).
 
-So the test deliberately runs the order=1 regime where the method is
-physically validated. The |S21| gate is honest (~3%); the |S11| gate is
-intentionally loose because the ROM carries a spurious reflection floor
-of ~0.1-0.2 that FD (|S11| ~ 1e-3) does not -- documented in the metrics
-rather than tolerance-tuned away. If a future build raises the GMRES cap
-or adds a preconditioner, the order=2 path and a tighter |S11| gate
-should become reachable.
+The |S21| gate is honest (~3%); the |S11| gate is intentionally loose
+because the ROM carries a spurious reflection floor of ~0.1-0.2 that FD
+(|S11| ~ 1e-3) does not -- documented in the metrics rather than
+tolerance-tuned away. A tighter |S11| gate awaits a passivity-preserving
+(SPRIM) projection of the multi-shift basis.
 """
 from __future__ import annotations
 
@@ -384,4 +383,62 @@ def test_multipole_rom_passivity(report):
     assert np.all(np.isfinite(sigma_max))
     assert smax < SIGMA_MAX_BOUND, (
         f"sigma_max(S) overshoot {smax:.4f} exceeds {SIGMA_MAX_BOUND}"
+    )
+
+
+@slow
+def test_multipole_rom_order2_needs_larger_gmres_cap(report):
+    """At order=2 the larger spectral radius needs a bigger GMRES basis.
+
+    Regression gate for the exposed `gmres_max_iter` knob: on the same
+    WR-90 guide at order=2 the default shift-invert GMRES cap (60) fails to
+    converge and the multipole ROM's in-band |S21| collapses to ~0;
+    raising the cap restores the physics (|S21| ~ 1). This is the order=2
+    path that the module docstring promises the knob unlocks.
+    """
+    report.note(
+        "Order=2 WR-90: the multipole shift-invert GMRES needs a Krylov "
+        "basis large enough to resolve the mid-spectrum shift. With the "
+        "default cap (60) the in-band |S21| collapses to ~0; raising "
+        "gmres_max_iter to 250 recovers TE10 transmission (|S21| ~ 1). "
+        "Demonstrates the gmres_max_iter knob."
+    )
+
+    g = _build_geometry()
+    ptd = rf.ProblemTD(g, order=2, flux="upwind")
+    report.metric("order-2 n_dof", ptd.n_dof, detail="state DOFs at order 2")
+
+    mm_lo = ptd.macromodel(
+        r=R_REQUEST, shift_freqs_hz=SHIFTS_HZ, n_shift_steps=N_SHIFT_STEPS,
+        gmres_max_iter=60,
+    )
+    s21_lo = np.abs(mm_lo.sweep(BAND)[:, 1, 0])
+
+    mm_hi = ptd.macromodel(
+        r=R_REQUEST, shift_freqs_hz=SHIFTS_HZ, n_shift_steps=N_SHIFT_STEPS,
+        gmres_max_iter=250,
+    )
+    s_hi = mm_hi.sweep(BAND)
+    s21_hi = np.abs(s_hi[:, 1, 0])
+    print(f"  order=2 |S21| in-band: cap60 max={s21_lo.max():.3f}  "
+          f"cap250 min={s21_hi.min():.3f}")
+
+    report.plot_xy(
+        BAND / 1e9,
+        {"cap=60 (default)": s21_lo, "cap=250": s21_hi},
+        xlabel="frequency [GHz]", ylabel="|S21|",
+        title="order=2 multipole ROM: GMRES cap vs in-band |S21|",
+        caption="default cap collapses to ~0; the raised cap recovers |S21|~1",
+    )
+    report.metric("|S21| max (cap=60)", float(s21_lo.max()), bound=0.2,
+                  detail="default cap fails to converge at order 2")
+    report.metric("|S21| min in-band (cap=250)", float(s21_hi.min()),
+                  lower=0.90,
+                  detail="raised cap recovers physical TE10 transmission")
+
+    assert s21_lo.max() < 0.2, (
+        f"order=2 default-cap |S21| unexpectedly non-zero: {s21_lo.max():.3f}"
+    )
+    assert s21_hi.min() > 0.90, (
+        f"order=2 raised-cap |S21| did not recover: min {s21_hi.min():.3f}"
     )

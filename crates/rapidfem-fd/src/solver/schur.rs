@@ -212,6 +212,137 @@ impl Coo {
     }
 }
 
+#[inline]
+fn norm2(v: &[C64]) -> f64 {
+    v.iter().map(|c| c.norm_sqr()).sum::<f64>().sqrt()
+}
+
+/// Conjugate dot product `<a, b> = Σ conj(a_i) b_i` (Arnoldi inner product).
+#[inline]
+fn cdot(a: &[C64], b: &[C64]) -> C64 {
+    let mut s = C64::new(0.0, 0.0);
+    for i in 0..a.len() {
+        s += a[i].conj() * b[i];
+    }
+    s
+}
+
+/// Complex Givens rotation zeroing the 2nd component of `[a; b]`. Returns
+/// `(c, s)` with `c` real, applied as `x1' = c·x1 + s·x2`,
+/// `x2' = -conj(s)·x1 + c·x2`.
+#[inline]
+fn givens(a: C64, b: C64) -> (f64, C64) {
+    let (na, nb) = (a.norm(), b.norm());
+    if nb == 0.0 {
+        (1.0, C64::new(0.0, 0.0))
+    } else if na == 0.0 {
+        (0.0, b.conj() / C64::new(nb, 0.0))
+    } else {
+        let denom = (na * na + nb * nb).sqrt();
+        (na / denom, (b.conj() * a / C64::new(na, 0.0)) / C64::new(denom, 0.0))
+    }
+}
+
+/// Right-preconditioned restarted GMRES for `op(x) = b`, preconditioner
+/// `prec(v) ≈ A^{-1} v`. Returns `(x, total_iters, final_rel_resid)`.
+/// `op`/`prec` are `FnMut` so they can hold the (mutable) subdomain solvers.
+fn gmres_solve(
+    op: &mut dyn FnMut(&[C64]) -> Vec<C64>,
+    prec: &mut dyn FnMut(&[C64]) -> Vec<C64>,
+    b: &[C64],
+    tol: f64,
+    restart: usize,
+    max_outer: usize,
+) -> (Vec<C64>, usize, f64) {
+    let n = b.len();
+    let zero = C64::new(0.0, 0.0);
+    let bnorm = norm2(b);
+    let mut x = vec![zero; n];
+    if bnorm == 0.0 {
+        return (x, 0, 0.0);
+    }
+    let mut total = 0usize;
+    for _outer in 0..max_outer {
+        let sx = op(&x);
+        let mut r: Vec<C64> = (0..n).map(|i| b[i] - sx[i]).collect();
+        let beta = norm2(&r);
+        if beta <= tol * bnorm {
+            return (x, total, beta / bnorm);
+        }
+        let mut v: Vec<Vec<C64>> = Vec::with_capacity(restart + 1);
+        let mut z: Vec<Vec<C64>> = Vec::with_capacity(restart);
+        let inv_beta = C64::new(1.0 / beta, 0.0);
+        for c in r.iter_mut() {
+            *c *= inv_beta;
+        }
+        v.push(r);
+        let mut h = vec![vec![zero; restart]; restart + 1];
+        let mut cs = vec![0.0f64; restart];
+        let mut sn = vec![zero; restart];
+        let mut gbar = vec![zero; restart + 1];
+        gbar[0] = C64::new(beta, 0.0);
+        let mut jused = 0usize;
+        for j in 0..restart {
+            total += 1;
+            let zj = prec(&v[j]);
+            let mut w = op(&zj);
+            z.push(zj);
+            for i in 0..=j {
+                let hij = cdot(&v[i], &w);
+                h[i][j] = hij;
+                for t in 0..n {
+                    w[t] -= hij * v[i][t];
+                }
+            }
+            let hnext = norm2(&w);
+            h[j + 1][j] = C64::new(hnext, 0.0);
+            if hnext > 0.0 {
+                let inv = C64::new(1.0 / hnext, 0.0);
+                for c in w.iter_mut() {
+                    *c *= inv;
+                }
+                v.push(w);
+            } else {
+                v.push(vec![zero; n]);
+            }
+            for i in 0..j {
+                let temp = C64::new(cs[i], 0.0) * h[i][j] + sn[i] * h[i + 1][j];
+                h[i + 1][j] = -sn[i].conj() * h[i][j] + C64::new(cs[i], 0.0) * h[i + 1][j];
+                h[i][j] = temp;
+            }
+            let (c, s) = givens(h[j][j], h[j + 1][j]);
+            cs[j] = c;
+            sn[j] = s;
+            h[j][j] = C64::new(c, 0.0) * h[j][j] + s * h[j + 1][j];
+            h[j + 1][j] = zero;
+            let gj = gbar[j];
+            gbar[j] = C64::new(c, 0.0) * gj;
+            gbar[j + 1] = -s.conj() * gj;
+            jused = j + 1;
+            if gbar[j + 1].norm() <= tol * bnorm {
+                break;
+            }
+        }
+        // Back-solve the (jused × jused) upper-triangular least-squares system.
+        let mut y = vec![zero; jused];
+        for i in (0..jused).rev() {
+            let mut acc = gbar[i];
+            for col in (i + 1)..jused {
+                acc -= h[i][col] * y[col];
+            }
+            y[i] = acc / h[i][i];
+        }
+        for i in 0..jused {
+            for t in 0..n {
+                x[t] += y[i] * z[i][t];
+            }
+        }
+    }
+    let sx = op(&x);
+    let rr: f64 = (0..n).map(|i| (b[i] - sx[i]).norm_sqr()).sum::<f64>().sqrt();
+    (x, total, rr / bnorm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,39 +475,52 @@ pub fn schur_solve(
         })
         .collect();
 
-    // Dense interface matrix S (n_iface × n_iface), seeded with K_ΓΓ.
-    let mut s_dense = vec![C64::new(0.0, 0.0); n_iface * n_iface];
-    for i in 0..kgg.rows.len() {
-        s_dense[kgg.rows[i] * n_iface + kgg.cols[i]] += kgg.vals[i];
-    }
+    // Interface-solve setup. Small interface → form the dense Schur matrix S
+    // and factorize it directly (exact, cheap). Large interface → matrix-free
+    // GMRES with the sparse K_ΓΓ as preconditioner: never store the dense S,
+    // and replace O(n_iface) back-solves with ~iters×k (issue #12).
+    // Interface-DOF threshold for switching to matrix-free GMRES; the const
+    // default can be overridden via RAPIDFEM_SCHUR_EXPLICIT_MAX (also lets a
+    // test force the GMRES path on a small system).
+    let explicit_max = std::env::var("RAPIDFEM_SCHUR_EXPLICIT_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(crate::constants::SCHUR_EXPLICIT_INTERFACE_MAX);
+    let use_gmres = n_iface > explicit_max;
+    let mut iface_solver: Option<Box<dyn super::SparseSolver>> = None; // dense-S path
+    let mut precond: Option<Box<dyn super::SparseSolver>> = None;      // K_ΓΓ for GMRES
 
-    // Subtract Σ_s K_ΓI^(s) (K_II^(s))^{-1} K_IΓ^(s), column by column.
-    for s in 0..k {
-        if n_int[s] == 0 {
-            continue;
+    if n_iface > 0 && use_gmres {
+        let mut m = pick(choice);
+        m.factorize(n_iface, &kgg.rows, &kgg.cols, &kgg.vals)
+            .map_err(|e| format!("interface preconditioner (K_GG) factorize failed: {e}"))?;
+        precond = Some(m);
+        eprintln!("  Schur: matrix-free interface GMRES (n_iface={n_iface}, K_GG-preconditioned)");
+    } else if n_iface > 0 {
+        // Dense S = K_ΓΓ − Σ_s K_ΓI^(s) (K_II^(s))^{-1} K_IΓ^(s), column by column.
+        let mut s_dense = vec![C64::new(0.0, 0.0); n_iface * n_iface];
+        for i in 0..kgg.rows.len() {
+            s_dense[kgg.rows[i] * n_iface + kgg.cols[i]] += kgg.vals[i];
         }
-        for j in 0..n_iface {
-            let col = &kig_cols[s][j];
-            if col.is_empty() {
+        for s in 0..k {
+            if n_int[s] == 0 {
                 continue;
             }
-            let mut b = vec![C64::new(0.0, 0.0); n_int[s]];
-            for &(ir, val) in col {
-                b[ir] += val;
-            }
-            let w = isolv[s].solve(&b)?; // w = K_II^{-1} K_IΓ[:, j]
-            // S[:, j] -= K_ΓI^(s) w   (K_ΓI triplets: iface_row, interior_col)
-            for t in 0..kgi[s].rows.len() {
-                let ir = kgi[s].rows[t];
-                let ic = kgi[s].cols[t];
-                s_dense[ir * n_iface + j] -= kgi[s].vals[t] * w[ic];
+            for j in 0..n_iface {
+                let col = &kig_cols[s][j];
+                if col.is_empty() {
+                    continue;
+                }
+                let mut b = vec![C64::new(0.0, 0.0); n_int[s]];
+                for &(ir, val) in col {
+                    b[ir] += val;
+                }
+                let w = isolv[s].solve(&b)?;
+                for t in 0..kgi[s].rows.len() {
+                    s_dense[kgi[s].rows[t] * n_iface + j] -= kgi[s].vals[t] * w[kgi[s].cols[t]];
+                }
             }
         }
-    }
-
-    // Build + factorize the interface system once (skip if no interface).
-    let mut iface_solver = pick(choice);
-    if n_iface > 0 {
         let mut sr = Vec::new();
         let mut sc = Vec::new();
         let mut sv = Vec::new();
@@ -390,9 +534,11 @@ pub fn schur_solve(
                 }
             }
         }
-        iface_solver
+        let mut solver = pick(choice);
+        solver
             .factorize(n_iface, &sr, &sc, &sv)
             .map_err(|e| format!("interface system factorize failed: {e}"))?;
+        iface_solver = Some(solver);
     }
 
     // Per-RHS condense → interface solve → back-substitute.
@@ -426,11 +572,45 @@ pub fn schur_solve(
             u.push(u_s);
         }
 
-        // Interface solve.
-        let x_g = if n_iface > 0 {
-            iface_solver.solve(&g)?
-        } else {
+        // Interface solve: matrix-free GMRES (large) or direct dense S (small).
+        let x_g = if n_iface == 0 {
             Vec::new()
+        } else if use_gmres {
+            // S·v = K_ΓΓ·v − Σ_s K_ΓI^(s) (K_II^(s))^{-1} (K_IΓ^(s)·v), matrix-free.
+            let mut op = |v: &[C64]| -> Vec<C64> {
+                let mut acc = vec![C64::new(0.0, 0.0); n_iface];
+                for i in 0..kgg.rows.len() {
+                    acc[kgg.rows[i]] += kgg.vals[i] * v[kgg.cols[i]];
+                }
+                for s in 0..k {
+                    if n_int[s] == 0 {
+                        continue;
+                    }
+                    let mut t = vec![C64::new(0.0, 0.0); n_int[s]];
+                    for e in 0..kig[s].rows.len() {
+                        t[kig[s].rows[e]] += kig[s].vals[e] * v[kig[s].cols[e]];
+                    }
+                    let w = isolv[s].solve(&t).expect("interior solve in Schur matvec");
+                    for e in 0..kgi[s].rows.len() {
+                        acc[kgi[s].rows[e]] -= kgi[s].vals[e] * w[kgi[s].cols[e]];
+                    }
+                }
+                acc
+            };
+            let pc = precond.as_mut().unwrap();
+            let mut prec = |v: &[C64]| -> Vec<C64> { pc.solve(v).expect("Schur precond solve") };
+            let (xg, iters, resid) = gmres_solve(
+                &mut op,
+                &mut prec,
+                &g,
+                crate::constants::SCHUR_GMRES_TOL,
+                crate::constants::SCHUR_GMRES_RESTART,
+                crate::constants::SCHUR_GMRES_MAX_OUTER,
+            );
+            eprintln!("  Schur interface GMRES: {iters} iters, rel.resid {resid:.2e}");
+            xg
+        } else {
+            iface_solver.as_mut().unwrap().solve(&g)?
         };
 
         // Back-substitute: x_I^(s) = u_s − K_II^(s)^{-1} (K_IΓ^(s) xΓ).

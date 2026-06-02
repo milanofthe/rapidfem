@@ -1628,6 +1628,283 @@ impl PyTdOperator {
         (c[0], c[1], c[2], c[3])
     }
 
+    /// Build a block-Krylov MIMO macromodel of the operator's modal
+    /// ports — the compact reduced state-space `(Â, B̂, Ĉ)` whose
+    /// `(A, B, C, D)` realisation exports to any external simulator.
+    ///
+    /// `r` is the requested block-Krylov dimension. `sprim = True` uses
+    /// the SPRIM structure-preserving E/H block-split build for better
+    /// passivity preservation; the default plain build is slightly
+    /// faster.
+    ///
+    /// `shift_omegas_op`, if given, switches to the shift-invert
+    /// rational-Krylov build (the multipole ROM): one shift gives the
+    /// single-shift rational Krylov, several shifts the broadband
+    /// multi-shift variant that distributes the basis across the band
+    /// (operator angular-frequency units, `c = 1`). `n_shift_steps`
+    /// controls how many `(σ_k I − A)⁻¹` applications run per port per
+    /// shift (typical 1–3; default 2). Use shift-invert when the design
+    /// band sits well below the mesh-induced spectral radius (the RFIC
+    /// regime), where plain impulse-Krylov cannot reach the in-band
+    /// physics. Mutually exclusive with `sprim`.
+    ///
+    /// Requires at least one port carrying a waveguide mode; pure
+    /// absorbing-only ports are silently skipped.
+    #[pyo3(signature = (r, sprim = false, shift_omegas_op = None, n_shift_steps = 2))]
+    fn macromodel(
+        &self,
+        r: usize,
+        sprim: bool,
+        shift_omegas_op: Option<Vec<f64>>,
+        n_shift_steps: usize,
+    ) -> PyResult<PyMacroModel> {
+        let inner = match (sprim, shift_omegas_op) {
+            (true, Some(_)) => {
+                return Err(PyRuntimeError::new_err(
+                    "macromodel: pass either sprim=True OR \
+                     shift_omegas_op, not both",
+                ));
+            }
+            (_, Some(omegas)) => {
+                if omegas.is_empty() {
+                    return Err(PyRuntimeError::new_err(
+                        "macromodel: shift_omegas_op must hold at least \
+                         one shift",
+                    ));
+                }
+                if omegas.len() == 1 {
+                    rapidfem_td::macromodel::MacroModel::build_shift_invert(
+                        &self.op, omegas[0], r,
+                    )
+                } else {
+                    rapidfem_td::macromodel::MacroModel::build_multi_shift(
+                        &self.op, &omegas, n_shift_steps,
+                    )
+                }
+            }
+            (true, None) => {
+                rapidfem_td::macromodel::MacroModel::build_sprim(&self.op, r)
+            }
+            (false, None) => {
+                rapidfem_td::macromodel::MacroModel::build(&self.op, r)
+            }
+        };
+        Ok(PyMacroModel { inner })
+    }
+}
+
+// --- Block-Krylov / multipole macromodel (MIMO state-space + S-matrix) ----
+
+/// A compact MIMO macromodel of a `TdOperator`: the reduced state-space
+/// `(Â, B̂, Ĉ)` from a block-Krylov (or multi-shift rational-Krylov)
+/// projection of the port-seeded subspace. Evaluates the S-matrix in
+/// microseconds per frequency, sweeps a band in milliseconds, exports
+/// the raw `(A, B, C, D)` realisation, and writes Touchstone.
+#[pyclass(name = "MacroModel", unsendable)]
+struct PyMacroModel {
+    inner: rapidfem_td::macromodel::MacroModel,
+}
+
+#[pymethods]
+impl PyMacroModel {
+    /// Realised reduced order `r` (block-Krylov dimension after any
+    /// deflation).
+    #[getter]
+    fn r(&self) -> usize {
+        self.inner.r()
+    }
+
+    /// Number of modal ports `N` (the size of the S-matrix).
+    #[getter]
+    fn n_ports(&self) -> usize {
+        self.inner.n_ports()
+    }
+
+    /// The reduced state-space realisation as raw real matrices, the
+    /// tuple `(A, B, C_e, C_h)`:
+    ///
+    /// * `A`   — `(r, r)` reduced state operator `Â = VᵀAV`,
+    /// * `B`   — `(r, N)` input map `B̂ = VᵀB` (column `j` drives port `j`),
+    /// * `C_e` — `(N, r)` transverse-`E` modal readout `Ĉ_E`,
+    /// * `C_h` — `(N, r)` transverse-`H` modal readout `Ĉ_H`.
+    ///
+    /// The state evolves `dx/dt = A·x + B·u` with `u` the per-port
+    /// incident amplitudes; the modal readouts are `z_E = C_e·x`,
+    /// `z_H = C_h·x`. The incident / scattered split per port `i` is
+    /// `a_i = ½(z_E,i + Z_i·z_H,i)`, `b_i = ½(z_E,i − Z_i·z_H,i)` with
+    /// the reference impedance from [`port_impedances`](Self::port_impedances) —
+    /// the same construction [`evaluate`](Self::evaluate) uses. All four
+    /// arrays are real (the multi-shift build re-realifies its basis).
+    fn state_space<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> (
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+        Bound<'py, PyArray2<f64>>,
+    ) {
+        let r = self.inner.r();
+        let n = self.inner.n_ports();
+        let a = numpy::ndarray::Array2::from_shape_vec(
+            (r, r),
+            self.inner.a_hat().to_vec(),
+        )
+        .expect("A is r x r");
+        let b = numpy::ndarray::Array2::from_shape_vec(
+            (r, n),
+            self.inner.b_hat().to_vec(),
+        )
+        .expect("B is r x N");
+        let c_e = numpy::ndarray::Array2::from_shape_vec(
+            (n, r),
+            self.inner.c_e_hat().to_vec(),
+        )
+        .expect("C_e is N x r");
+        let c_h = numpy::ndarray::Array2::from_shape_vec(
+            (n, r),
+            self.inner.c_h_hat().to_vec(),
+        )
+        .expect("C_h is N x r");
+        (
+            a.into_pyarray_bound(py),
+            b.into_pyarray_bound(py),
+            c_e.into_pyarray_bound(py),
+            c_h.into_pyarray_bound(py),
+        )
+    }
+
+    /// Per-port modal reference impedances `Z_i(omega)` at the given
+    /// operator angular frequency, length `N`. Frequency-independent for
+    /// TEM / Floquet ports; dispersive for `TE_mn`. Feeds the
+    /// incident / scattered split documented on
+    /// [`state_space`](Self::state_space).
+    fn port_impedances<'py>(
+        &self,
+        py: Python<'py>,
+        omega: f64,
+    ) -> Bound<'py, PyArray1<f64>> {
+        self.inner.port_impedances(omega).into_pyarray_bound(py)
+    }
+
+    /// Evaluate the `N x N` S-matrix at angular frequency `omega`.
+    /// Returns a numpy complex128 array of shape `(N, N)`.
+    fn evaluate<'py>(
+        &self,
+        py: Python<'py>,
+        omega: f64,
+    ) -> Bound<'py, PyArray2<NpC64>> {
+        let n = self.inner.n_ports();
+        let s = self.inner.evaluate(omega);
+        let np_s: Vec<NpC64> =
+            s.into_iter().map(|c| NpC64::new(c.re, c.im)).collect();
+        numpy::ndarray::Array2::from_shape_vec((n, n), np_s)
+            .expect("S is NxN")
+            .into_pyarray_bound(py)
+    }
+
+    /// Evaluate the S-matrix with the passivity-enforcement
+    /// perturbation: the singular values of `S` are clipped to at most
+    /// 1, giving the bounded-real property `sigma_max(S) <= 1` by
+    /// construction. Composes with either the plain or SPRIM build.
+    fn evaluate_passive<'py>(
+        &self,
+        py: Python<'py>,
+        omega: f64,
+    ) -> Bound<'py, PyArray2<NpC64>> {
+        let n = self.inner.n_ports();
+        let s = self.inner.evaluate_passive(omega);
+        let np_s: Vec<NpC64> =
+            s.into_iter().map(|c| NpC64::new(c.re, c.im)).collect();
+        numpy::ndarray::Array2::from_shape_vec((n, n), np_s)
+            .expect("S is NxN")
+            .into_pyarray_bound(py)
+    }
+
+    /// Evaluate the S-matrix on a sweep of angular frequencies.
+    /// Returns a numpy complex128 array of shape `(n_omega, N, N)`.
+    fn sweep<'py>(
+        &self,
+        py: Python<'py>,
+        omegas: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray3<NpC64>>> {
+        let omegas = omegas
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let n = self.inner.n_ports();
+        let rows = self.inner.sweep(omegas);
+        let mut flat: Vec<NpC64> = Vec::with_capacity(omegas.len() * n * n);
+        for row in rows {
+            for c in row {
+                flat.push(NpC64::new(c.re, c.im));
+            }
+        }
+        Ok(numpy::ndarray::Array3::from_shape_vec((omegas.len(), n, n), flat)
+            .expect("sweep result is n_omega x N x N")
+            .into_pyarray_bound(py))
+    }
+
+    /// Write the S-matrix sweep to a Touchstone `.s{N}p` file.
+    ///
+    /// `frequencies_for_header` is what appears in the file under
+    /// `frequency_unit` ("HZ" / "KHZ" / "MHZ" / "GHZ"). `omegas` is what
+    /// is fed to `evaluate` for each row, in the operator's
+    /// angular-frequency units. `format` is "MA", "RI" or "DB".
+    #[pyo3(signature = (path, frequencies_for_header, omegas, frequency_unit = "GHZ", z_ref = 50.0, format = "MA"))]
+    fn to_touchstone(
+        &self,
+        path: &str,
+        frequencies_for_header: PyReadonlyArray1<'_, f64>,
+        omegas: PyReadonlyArray1<'_, f64>,
+        frequency_unit: &str,
+        z_ref: f64,
+        format: &str,
+    ) -> PyResult<()> {
+        use rapidfem_td::macromodel::{
+            TouchstoneFormat, TouchstoneFrequencyUnit,
+        };
+        let unit = match frequency_unit.to_ascii_uppercase().as_str() {
+            "HZ" => TouchstoneFrequencyUnit::Hz,
+            "KHZ" => TouchstoneFrequencyUnit::Khz,
+            "MHZ" => TouchstoneFrequencyUnit::Mhz,
+            "GHZ" => TouchstoneFrequencyUnit::Ghz,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown frequency unit '{}', use HZ/KHZ/MHZ/GHZ",
+                    other,
+                )))
+            }
+        };
+        let fmt = match format.to_ascii_uppercase().as_str() {
+            "MA" => TouchstoneFormat::Ma,
+            "RI" => TouchstoneFormat::Ri,
+            "DB" => TouchstoneFormat::Db,
+            other => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "unknown format '{}', use MA/RI/DB",
+                    other,
+                )))
+            }
+        };
+        let freqs = frequencies_for_header
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let ws = omegas
+            .as_slice()
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        self.inner
+            .to_touchstone(
+                std::path::Path::new(path),
+                freqs,
+                ws,
+                unit,
+                z_ref,
+                fmt,
+            )
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("touchstone write: {}", e))
+            })
+    }
 }
 
 /// rapidfem — frequency- and time-domain EM FEM solver.
@@ -1643,5 +1920,6 @@ fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEigenmode>()?;
     m.add_class::<PyRadiationPattern>()?;
     m.add_class::<PyTdOperator>()?;
+    m.add_class::<PyMacroModel>()?;
     Ok(())
 }

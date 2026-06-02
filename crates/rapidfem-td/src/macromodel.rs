@@ -86,6 +86,49 @@ impl MacroModel {
         self.r
     }
 
+    /// Reduced state operator `Â = Vᵀ A V`, `r×r` row-major. Real,
+    /// because the DG operator `A` and the orthonormal basis `V` are
+    /// real (the complex multi-shift build re-realifies its basis). This
+    /// is the `A` of the exportable state-space `(A, B, C, D)`.
+    pub fn a_hat(&self) -> &[Field] {
+        &self.a_hat
+    }
+
+    /// Reduced input map `B̂ = Vᵀ B`, `r×N` row-major (column `j` drives
+    /// modal port `j` with a unit incident amplitude). The `B` of the
+    /// state-space `(A, B, C, D)`.
+    pub fn b_hat(&self) -> &[Field] {
+        &self.b_hat
+    }
+
+    /// `E`-field modal-projection readout `Ĉ_E = C_E V`, `N×r`
+    /// row-major. Row `i` reads the transverse-`E` modal amplitude of
+    /// port `i` from the reduced state. Pairs with [`Self::c_h_hat`].
+    pub fn c_e_hat(&self) -> &[Field] {
+        &self.c_e_hat
+    }
+
+    /// `H`-field modal-projection readout `Ĉ_H = C_H V`, `N×r`
+    /// row-major. Row `i` reads the transverse-`H` modal amplitude of
+    /// port `i`. Together with [`Self::c_e_hat`] and the per-port
+    /// reference impedance, the forward / backward (incident /
+    /// scattered) modal split is `a = ½(z_E + Z·z_H)`,
+    /// `b = ½(z_E − Z·z_H)` — the same split [`Self::evaluate`] uses.
+    pub fn c_h_hat(&self) -> &[Field] {
+        &self.c_h_hat
+    }
+
+    /// Per-port modal reference impedance `Z_i(omega)` at a given
+    /// operator angular frequency, in port order. For TEM / Floquet
+    /// (cutoff-free) ports this is frequency-independent; for a
+    /// dispersive `TE_mn` port it follows
+    /// `Z(omega) = Z_inf / sqrt(1 − (omega_c/omega)²)`. Needed to turn
+    /// the raw `(c_e_hat, c_h_hat)` readouts into incident / scattered
+    /// waves, i.e. to assemble a scattering state-space.
+    pub fn port_impedances(&self, omega: Field) -> Vec<Field> {
+        self.impedances.as_ref()(omega)
+    }
+
     /// Block-Krylov projection of `op` to a reduced order `r`. The basis
     /// spans `K_r(A, B) = span{B, A*B, A^2*B, ...}` where the columns of
     /// `B` are the port-injection vectors of the modal ports. The build

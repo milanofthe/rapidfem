@@ -674,6 +674,216 @@ def _write_pvd(path, entries):
         f.write("\n".join(lines) + "\n")
 
 
+class StateSpaceROM:
+    """A reduced-order linear state-space model ``(A, B, C, D)`` exported
+    from a :class:`TdMacroModel` for import into an external simulator.
+
+    The model is the LTI system
+
+    ::
+
+        dx/dt = A x + B u
+            z  = C x + D u
+
+    with ``x`` the ``r``-dimensional reduced state, ``u`` the ``N``
+    per-port incident-wave inputs and ``z`` the modal readouts. Because
+    the macromodel carries two modal readouts (transverse ``E`` and
+    ``H``), the output is split into ``C_e`` and ``C_h``; the
+    incident / scattered split per port ``i`` is
+    ``a_i = ½(z_E,i + Z_i z_H,i)``, ``b_i = ½(z_E,i − Z_i z_H,i)`` with
+    ``Z`` the port reference impedance (:attr:`port_impedances`). ``D`` is
+    zero — the impulse-Krylov model is strictly proper.
+
+    All matrices are real. Units follow ``physical``: if ``True`` (the
+    default of :meth:`TdMacroModel.state_space`), ``A``/``B`` are scaled
+    to physical SI time (``A`` eigenvalues are physical angular
+    resonances in rad/s); if ``False`` they are in the operator's
+    normalised units (``c = 1``).
+
+    Attributes
+    ----------
+    A : ndarray, shape (r, r)
+    B : ndarray, shape (r, N)
+    C_e, C_h : ndarray, shape (N, r)
+    D : ndarray, shape (N, N)
+        always zero, included so consumers get a complete (A, B, C, D).
+    c : float
+        speed of light used for the operator→physical unit mapping.
+    physical : bool
+        whether A/B are in physical SI time or normalised operator units.
+    """
+
+    def __init__(self, A, B, C_e, C_h, *, c, physical):
+        self.A = np.ascontiguousarray(A, dtype=float)
+        self.B = np.ascontiguousarray(B, dtype=float)
+        self.C_e = np.ascontiguousarray(C_e, dtype=float)
+        self.C_h = np.ascontiguousarray(C_h, dtype=float)
+        self.D = np.zeros((C_e.shape[0], B.shape[1]), dtype=float)
+        self.c = float(c)
+        self.physical = bool(physical)
+
+    @property
+    def r(self):
+        """Reduced state dimension."""
+        return self.A.shape[0]
+
+    @property
+    def n_ports(self):
+        """Number of ports ``N``."""
+        return self.B.shape[1]
+
+    def as_dict(self):
+        """The realisation as a plain dict of numpy arrays plus scalar
+        metadata — the form fed to :func:`scipy.io.savemat` or
+        :func:`numpy.savez`."""
+        return {
+            "A": self.A,
+            "B": self.B,
+            "C_e": self.C_e,
+            "C_h": self.C_h,
+            "D": self.D,
+            "c": np.array([[self.c]]),
+            "physical": np.array([[1 if self.physical else 0]]),
+        }
+
+    def to_npz(self, path):
+        """Write the realisation to a NumPy ``.npz`` archive (load with
+        :func:`numpy.load`)."""
+        np.savez(path, **{k: np.asarray(v) for k, v in self.as_dict().items()})
+        return path
+
+    def to_mat(self, path):
+        """Write the realisation to a MATLAB ``.mat`` file via
+        :func:`scipy.io.savemat` — loads directly into MATLAB / Simulink
+        (``ss(A, B, C, D)``) or :func:`scipy.io.loadmat`."""
+        from scipy.io import savemat
+
+        savemat(path, self.as_dict())
+        return path
+
+    def __repr__(self):
+        units = "physical-SI" if self.physical else "operator-normalised"
+        return (
+            f"StateSpaceROM(r={self.r}, n_ports={self.n_ports}, "
+            f"units={units})"
+        )
+
+
+class TdMacroModel:
+    """A compact MIMO macromodel of a :class:`ProblemTD`'s modal-port
+    network: a block-Krylov (or multi-shift rational-Krylov) projection
+    of the port-seeded Krylov subspace. Obtained from
+    :meth:`ProblemTD.macromodel`.
+
+    Evaluating the S-matrix at one frequency costs a small dense complex
+    LU solve (microseconds at ``r ~ a few hundred``); a thousand-point
+    sweep is milliseconds. :meth:`state_space` exports the raw
+    ``(A, B, C, D)`` realisation for an external simulator;
+    :meth:`to_touchstone` writes the S-matrix.
+
+    The TD operator runs in normalised units (``c = 1``); this wrapper
+    accepts and reports frequencies in physical Hertz
+    (``omega_op = 2*pi*f_Hz / c``).
+    """
+
+    def __init__(self, native, c):
+        self._m = native
+        self._c = float(c)
+
+    @property
+    def r(self):
+        """Realised reduced order (block-Krylov dimension after any
+        deflation)."""
+        return self._m.r
+
+    @property
+    def n_ports(self):
+        """Number of modal ports — size of the S-matrix."""
+        return self._m.n_ports
+
+    def state_space(self, *, physical=True):
+        """Export the reduced realisation as a :class:`StateSpaceROM`.
+
+        Parameters
+        ----------
+        physical : bool
+            If ``True`` (default) the ``A``/``B`` matrices are scaled to
+            physical SI time, so ``A``'s eigenvalues are physical angular
+            resonances (rad/s) and the model integrates against seconds.
+            If ``False`` they are left in the operator's normalised units
+            (``c = 1``). ``C`` is unit-independent either way.
+
+        Returns
+        -------
+        StateSpaceROM
+            Carries ``A, B, C_e, C_h, D`` and ``.to_mat`` / ``.to_npz``
+            writers.
+        """
+        A, B, C_e, C_h = self._m.state_space()
+        A = np.ascontiguousarray(A)
+        B = np.ascontiguousarray(B)
+        if physical:
+            # omega_op = omega_phys / c, so (j*omega_op I - A) =
+            # (1/c)(j*omega_phys I - c*A): the physical-time operator is
+            # c*A with the input map scaled by c, C unchanged, D = 0.
+            A = self._c * A
+            B = self._c * B
+        return StateSpaceROM(
+            A, B, C_e, C_h, c=self._c, physical=physical
+        )
+
+    def port_impedances(self, frequency_hz):
+        """Per-port modal reference impedances ``Z_i`` at a physical
+        frequency, length ``N``. Frequency-flat for TEM / Floquet ports,
+        dispersive for ``TE_mn``. Feeds the incident / scattered split on
+        :class:`StateSpaceROM`."""
+        omega_op = 2.0 * np.pi * float(frequency_hz) / self._c
+        return np.asarray(self._m.port_impedances(omega_op))
+
+    def evaluate(self, frequency_hz, *, passive=False):
+        """Evaluate the S-matrix at one physical frequency. Returns an
+        ``[n_ports, n_ports]`` complex numpy array.
+
+        ``passive=True`` applies the passivity-enforcement perturbation:
+        the SVD of ``S`` is clipped to ``sigma_max(S) <= 1``."""
+        omega_op = 2.0 * np.pi * float(frequency_hz) / self._c
+        if passive:
+            return np.asarray(self._m.evaluate_passive(omega_op))
+        return np.asarray(self._m.evaluate(omega_op))
+
+    def sweep(self, frequencies_hz):
+        """Evaluate the S-matrix on a sweep of physical frequencies.
+        Returns an ``[n_freq, n_ports, n_ports]`` complex numpy array."""
+        f = np.asarray(frequencies_hz, dtype=float).ravel()
+        omegas_op = 2.0 * np.pi * f / self._c
+        return np.asarray(self._m.sweep(omegas_op))
+
+    def to_touchstone(self, path, frequencies_hz, *, format="MA", z_ref=50.0):
+        """Write the S-matrix sweep to a Touchstone ``.s{N}p`` file.
+
+        Parameters
+        ----------
+        path : str
+            Output path (Touchstone 1.x: one file per N-port model).
+        frequencies_hz : array_like
+            Frequencies to sample, in Hertz.
+        format : {"MA", "RI", "DB"}
+            Per-entry format.
+        z_ref : float
+            Reference impedance (header ``R`` field).
+        """
+        f = np.asarray(frequencies_hz, dtype=float).ravel()
+        f_ghz = f / 1.0e9
+        omegas_op = 2.0 * np.pi * f / self._c
+        self._m.to_touchstone(
+            str(path), f_ghz, omegas_op, "GHZ", float(z_ref), str(format)
+        )
+        return path
+
+    def __repr__(self):
+        return f"TdMacroModel(r={self.r}, n_ports={self.n_ports})"
+
+
 class ProblemTD:
     """Time-domain DGTD Maxwell problem ready for analysis.
 
@@ -2068,6 +2278,93 @@ class ProblemTD:
                     f"[{h_min_log:.3g}, {h_max_log:.3g}] s"
                 )
         return TdTrajectory(traj, problem=self, dt=dt)
+
+    # -- model-order reduction --------------------------------------------
+    def macromodel(self, *, r=120, sprim=False, shift_freq_hz=None,
+                   shift_freqs_hz=None, n_shift_steps=2):
+        """Build a compact MIMO macromodel of the modal-port network.
+
+        Block-Krylov projection of the matrix-free operator seeded by all
+        port-injection vectors — the reduced state-space ``(Â, B̂, Ĉ)``
+        whose ``(A, B, C, D)`` realisation exports to any external
+        simulator (:meth:`TdMacroModel.state_space`). The result also
+        evaluates the S-matrix in microseconds per frequency and writes
+        Touchstone. See ``docs/td-macromodel-plan.md`` for the method.
+
+        Parameters
+        ----------
+        r : int
+            Requested block-Krylov dimension. Tens to a few hundred is
+            the impulse-Krylov regime; deflation may reduce the realised
+            order.
+        sprim : bool
+            Use the SPRIM structure-preserving E/H block-split build for
+            better passivity preservation. Mutually exclusive with the
+            shift options.
+        shift_freq_hz : float, optional
+            Single-shift rational-Krylov build with the shift at this
+            physical frequency — concentrates the basis around one
+            frequency.
+        shift_freqs_hz : sequence of float, optional
+            Multi-shift broadband rational-Krylov build (the multipole
+            ROM): shift centres in Hertz across the design band. The
+            union of per-shift bases spans in-band physics that
+            single-shift cannot reach on a non-resonant line. Mutually
+            exclusive with ``sprim`` and ``shift_freq_hz``.
+        n_shift_steps : int
+            Per-port ``(sigma_k I - A)^{-1}`` applications per shift
+            (default 2).
+
+        Returns
+        -------
+        TdMacroModel
+        """
+        if self._op.n_ports() == 0:
+            raise RuntimeError(
+                "ProblemTD has no ports — attach a port (RectWaveguidePort, "
+                "CoaxPort, WavePort, FloquetPort) to the geometry before "
+                "calling macromodel"
+            )
+        n_shift_modes = sum(
+            x is not None for x in (shift_freq_hz, shift_freqs_hz)
+        )
+        if sprim and n_shift_modes > 0:
+            raise ValueError(
+                "macromodel: sprim is mutually exclusive with "
+                "shift_freq_hz / shift_freqs_hz"
+            )
+        if n_shift_modes > 1:
+            raise ValueError(
+                "macromodel: pass either shift_freq_hz (single shift) "
+                "or shift_freqs_hz (multi-shift), not both"
+            )
+        omegas_op = None
+        if shift_freq_hz is not None:
+            omegas_op = [2.0 * np.pi * float(shift_freq_hz) / self.c]
+            mode = f"single-shift at {shift_freq_hz / 1e9:.3f} GHz"
+        elif shift_freqs_hz is not None:
+            fs = [float(f) for f in shift_freqs_hz]
+            omegas_op = [2.0 * np.pi * f / self.c for f in fs]
+            mode = (
+                f"multi-shift ({len(fs)} shifts at "
+                f"{fs[0] / 1e9:.2f}-{fs[-1] / 1e9:.2f} GHz, "
+                f"n_shift_steps={int(n_shift_steps)})"
+            )
+        else:
+            mode = "SPRIM" if sprim else "plain"
+        _log(
+            f"macromodel - {mode} block-Krylov r={int(r)} on "
+            f"{self.n_dof} DOFs"
+        )
+        native = self._op.macromodel(
+            int(r), bool(sprim), omegas_op, int(n_shift_steps),
+        )
+        m = TdMacroModel(native, self.c)
+        _log(
+            f"macromodel complete - reduced order r={m.r}, "
+            f"n_ports={m.n_ports}"
+        )
+        return m
 
     # -- field export ------------------------------------------------------
     def export_vtk(self, states, path, *, times=None):

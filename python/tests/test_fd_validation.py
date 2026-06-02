@@ -114,27 +114,29 @@ def test_wr90_te10_transmission(report):
     # Overlay EMerge reference, interpolated onto our sweep grid over the
     # 9-11 GHz overlap region (plot_sparams plots all series vs one axis).
     series = {"rapidfem": s}
-    try:
-        cmp = _load_compare()
-        f_ref, s_ref = cmp.load_csv(_EMERGE_WR90_CSV)
-        band = (freqs >= f_ref.min() - 1e6) & (freqs <= f_ref.max() + 1e6)
-        # Build an EMerge series on `freqs` (NaN outside support so the plot
-        # just doesn't draw there), interpolating each S entry.
-        s_emerge = np.full_like(s, np.nan, dtype=complex)
-        for i in range(2):
-            for j in range(2):
-                re_i = np.interp(freqs[band], f_ref, s_ref[:, i, j].real)
-                im_i = np.interp(freqs[band], f_ref, s_ref[:, i, j].imag)
-                s_emerge[band, i, j] = re_i + 1j * im_i
-        series["EMerge"] = s_emerge
-        s21_ref = np.abs(s_emerge[band, 1, 0])
-        dev = float(np.max(np.abs(s21[band] - s21_ref)))
-        print(f"  max |S21| dev vs EMerge (9-11 GHz): {dev:.4f}")
-        assert dev < 0.05, f"|S21| deviates {dev:.4f} from EMerge"
-        report.metric("max |S21| dev vs EMerge", dev, bound=0.05,
-                      detail="9-11 GHz overlap region")
-    except (FileNotFoundError, OSError):
-        report.note("EMerge reference CSV not found; skipped overlay.")
+    # Cross-validate against the EMerge reference. If the CSV is absent we
+    # skip explicitly — never let the deviation assert be silently bypassed
+    # (a silent pass would read as coverage the run did not provide).
+    if not os.path.exists(_EMERGE_WR90_CSV):
+        pytest.skip(f"EMerge reference CSV not found: {_EMERGE_WR90_CSV}")
+    cmp = _load_compare()
+    f_ref, s_ref = cmp.load_csv(_EMERGE_WR90_CSV)
+    band = (freqs >= f_ref.min() - 1e6) & (freqs <= f_ref.max() + 1e6)
+    # Build an EMerge series on `freqs` (NaN outside support so the plot
+    # just doesn't draw there), interpolating each S entry.
+    s_emerge = np.full_like(s, np.nan, dtype=complex)
+    for i in range(2):
+        for j in range(2):
+            re_i = np.interp(freqs[band], f_ref, s_ref[:, i, j].real)
+            im_i = np.interp(freqs[band], f_ref, s_ref[:, i, j].imag)
+            s_emerge[band, i, j] = re_i + 1j * im_i
+    series["EMerge"] = s_emerge
+    s21_ref = np.abs(s_emerge[band, 1, 0])
+    dev = float(np.max(np.abs(s21[band] - s21_ref)))
+    print(f"  max |S21| dev vs EMerge (9-11 GHz): {dev:.4f}")
+    assert dev < 0.05, f"|S21| deviates {dev:.4f} from EMerge"
+    report.metric("max |S21| dev vs EMerge", dev, bound=0.05,
+                  detail="9-11 GHz overlap region")
 
     report.plot_sparams(
         freqs, series,
@@ -284,9 +286,11 @@ def test_coax_tem_matched_50ohm(report):
     print(f"  |S11| max: {s11_max:.4f}   |S21| min: {s21_min:.4f}")
     print(f"  max(|S11|^2+|S21|^2): {pass_max:.4f}")
 
-    # Gates: matched lossless TEM line near 50 ohm.
-    assert z0_analytic == pytest.approx(50.0, abs=2.0), \
-        f"geometry Z0 {z0_analytic:.2f} ohm not near 50"
+    # Gates: matched lossless TEM line near 50 ohm. (The analytic Z0 below
+    # is geometry arithmetic, not a solver output, so it is reported as a
+    # metric rather than asserted — the matched-line |S11| gate is what
+    # actually exercises the solver's port-impedance computation: a wrong
+    # port Z0 would mismatch the line and lift |S11|.)
     assert s11_max < 0.05, f"|S11| up to {s11_max:.4f} (expected matched)"
     assert s21_min > 0.95, f"|S21| down to {s21_min:.4f} (expected ~1)"
     assert pass_max <= 1.05, f"passivity {pass_max:.4f} above 1.05"

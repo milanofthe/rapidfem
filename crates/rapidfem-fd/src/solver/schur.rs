@@ -307,6 +307,18 @@ pub fn schur_solve(
         }
     }
 
+    // Memory proxy: a single direct factorization's fill-in scales super-
+    // linearly with the matrix size, so the relevant bound is the LARGEST
+    // interior block we ever factorize, not the global n_free. Log it (and the
+    // interface size) so the win over the monolithic factor is visible.
+    let max_int = n_int.iter().copied().max().unwrap_or(0);
+    eprintln!(
+        "  Schur: {k} subdomains, largest interior block {max_int}/{n_free} \
+         ({:.0}% of global), interface {n_iface} ({:.0}%)",
+        100.0 * max_int as f64 / n_free as f64,
+        100.0 * n_iface as f64 / n_free as f64,
+    );
+
     // Factorize each interior block once (reused for all back-solves and RHS).
     let mut isolv: Vec<Box<dyn super::SparseSolver>> = Vec::with_capacity(k);
     for s in 0..k {

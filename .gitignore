@@ -60,3 +60,6 @@ python/python_src/rapidfem/ui/frontend-src/build/
 
 # Static demo bake artefacts (regenerated locally by scripts/bake_demo.py
 # and committed to git, so CI can deploy without re-running FEM solves)
+
+# generated test reports
+_report/

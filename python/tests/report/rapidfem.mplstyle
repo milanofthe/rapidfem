@@ -1,0 +1,57 @@
+# rapidfem matplotlib style — dark "lava-red" theme matching the UI.
+# Applied by tests/report/style.py. Colours mirror the frontend tokens
+# (src/lib/docs/docs.css): surface #1c1c21, text #e2ddd5, accent #d9513c.
+
+# --- figure / canvas ---
+figure.facecolor: 1c1c21
+figure.edgecolor: 1c1c21
+savefig.facecolor: 1c1c21
+savefig.edgecolor: 1c1c21
+savefig.transparent: False
+figure.dpi: 110
+figure.figsize: 7.2, 4.0
+
+# --- axes ---
+axes.facecolor: 1c1c21
+axes.edgecolor: 35353d
+axes.labelcolor: e2ddd5
+axes.titlecolor: e2ddd5
+axes.linewidth: 1.0
+axes.grid: True
+axes.titlesize: 12
+axes.titleweight: 600
+axes.labelsize: 10.5
+axes.prop_cycle: cycler('color', ['d9513c', '4a90d9', '6bbf8a', 'e8944a', 'a78bd9', 'e2ddd5'])
+
+# --- grid ---
+grid.color: 2a2a32
+grid.linewidth: 0.8
+grid.alpha: 1.0
+
+# --- ticks ---
+xtick.color: 9a96a0
+ytick.color: 9a96a0
+xtick.labelcolor: 9a96a0
+ytick.labelcolor: 9a96a0
+xtick.labelsize: 9.5
+ytick.labelsize: 9.5
+xtick.direction: out
+ytick.direction: out
+
+# --- lines / markers ---
+lines.linewidth: 1.8
+lines.markersize: 5
+lines.markeredgewidth: 0
+
+# --- legend ---
+legend.frameon: True
+legend.facecolor: 232329
+legend.edgecolor: 35353d
+legend.fontsize: 9.5
+legend.labelcolor: e2ddd5
+
+# --- fonts (DejaVu is always present; the HTML around the plot uses Inter) ---
+font.family: sans-serif
+font.sans-serif: DejaVu Sans, Inter, Arial
+font.size: 10.5
+mathtext.fontset: dejavusans

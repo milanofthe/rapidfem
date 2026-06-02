@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ report.title }}</title>
+<style>
+:root {
+  --surface: {{ t.surface }};
+  --surface-raised: {{ t.surface_raised }};
+  --surface-panel: {{ t.surface_panel }};
+  --surface-inset: {{ t.surface_inset }};
+  --text: {{ t.text }};
+  --text-muted: {{ t.text_muted }};
+  --text-disabled: {{ t.text_disabled }};
+  --border: {{ t.border }};
+  --border-subtle: {{ t.border_subtle }};
+  --accent: {{ t.accent }};
+  --accent-hover: {{ t.accent_hover }};
+  --accent-secondary: {{ t.accent_secondary }};
+  --success: {{ t.success }};
+  --warning: {{ t.warning }};
+  --error: {{ t.error }};
+  --font-body: {{ t.font_body }};
+  --font-mono: {{ t.font_mono }};
+}
+* { box-sizing: border-box; }
+html { scrollbar-width: thin; scrollbar-color: var(--border) var(--surface); }
+body {
+  margin: 0; background: var(--surface); color: var(--text);
+  font-family: var(--font-body); font-size: 13px; line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: underline; }
+code, pre, .mono { font-family: var(--font-mono); }
+::selection { background: rgba(217,81,60,0.2); color: var(--text); }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px 80px; }
+
+header.top {
+  border-bottom: 1px solid var(--border); margin-bottom: 24px;
+  padding: 28px 0 20px; display: flex; align-items: center; gap: 16px;
+}
+header.top .logo { width: 40px; height: 40px; flex: none; }
+header.top .logo svg { width: 100%; height: 100%; }
+header.top h1 {
+  margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -0.01em;
+}
+header.top .sub { color: var(--text-muted); font-size: 13px; margin-top: 2px; }
+header.top .gen { margin-left: auto; color: var(--text-disabled);
+  font-family: var(--font-mono); font-size: 11px; text-align: right; }
+
+.summary { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 8px; }
+.chip {
+  display: inline-flex; align-items: baseline; gap: 8px; padding: 8px 14px;
+  background: var(--surface-raised); border: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 12px;
+}
+.chip .n { font-size: 17px; font-weight: 600; }
+.chip.pass .n { color: var(--success); }
+.chip.fail .n { color: var(--error); }
+.chip.skip .n { color: var(--warning); }
+.chip .lbl { color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: 0.5px; font-size: 10px; }
+
+.meta { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 14px 0 26px;
+  color: var(--text-muted); font-family: var(--font-mono); font-size: 11px; }
+.meta b { color: var(--text); font-weight: 500; }
+
+h2.group {
+  margin: 34px 0 12px; font-size: 13px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.6px; color: var(--accent-secondary);
+  border-bottom: 1px solid var(--border-subtle); padding-bottom: 6px;
+}
+
+.card {
+  background: var(--surface-raised); border: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+.card.failed { border-left: 3px solid var(--error); }
+.card.error { border-left: 3px solid var(--error); }
+.card.skipped { border-left: 3px solid var(--warning); }
+.card.passed { border-left: 3px solid var(--success); }
+.card > .head {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  cursor: pointer; user-select: none;
+}
+.card > .head:hover { background: var(--surface-panel); }
+.card .name { font-family: var(--font-mono); font-size: 13px; font-weight: 500; }
+.card .origin { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-disabled); border: 1px solid var(--border); padding: 1px 5px; }
+.card .dur { margin-left: auto; color: var(--text-disabled);
+  font-family: var(--font-mono); font-size: 11px; }
+.badge {
+  display: inline-flex; align-items: center; padding: 2px 9px; font-size: 10px;
+  font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  border: 1px solid;
+}
+.badge.passed { color: var(--success); background: rgba(107,191,138,0.12);
+  border-color: var(--success); }
+.badge.failed, .badge.error { color: var(--error); background: rgba(217,81,60,0.12);
+  border-color: var(--error); }
+.badge.skipped { color: var(--warning); background: rgba(232,148,74,0.12);
+  border-color: var(--warning); }
+
+.card > .body { padding: 4px 16px 18px; border-top: 1px solid var(--border-subtle); }
+.doc { color: var(--text-muted); margin: 12px 0 4px; white-space: pre-wrap; }
+.msg {
+  font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap;
+  background: var(--surface-inset); border: 1px solid var(--error);
+  color: var(--error); padding: 10px 12px; margin: 12px 0; overflow-x: auto;
+}
+
+table.metrics, table.data { width: 100%; border-collapse: collapse; margin: 14px 0; }
+table.metrics th, table.metrics td, table.data th, table.data td {
+  padding: 7px 12px; border: 1px solid var(--border); text-align: left;
+  font-size: 12px;
+}
+table.metrics th, table.data th {
+  background: var(--surface-panel); color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; font-weight: 600;
+}
+table.metrics td.num, table.data td.num { font-family: var(--font-mono);
+  text-align: right; }
+td.verdict { font-family: var(--font-mono); font-weight: 600; }
+td.verdict.ok { color: var(--success); }
+td.verdict.bad { color: var(--error); }
+
+.plot { margin: 16px 0; }
+.plot .ptitle { font-size: 12px; color: var(--text-muted); margin-bottom: 6px;
+  text-transform: uppercase; letter-spacing: 0.5px; }
+.plot svg { max-width: 100%; height: auto; display: block;
+  border: 1px solid var(--border-subtle); background: var(--surface); }
+.plot .cap { color: var(--text-disabled); font-size: 11px; margin-top: 6px; }
+
+pre.log { background: var(--surface-inset); border: 1px solid var(--border);
+  padding: 10px 12px; overflow-x: auto; font-size: 11.5px; color: var(--text-muted);
+  line-height: 1.5; }
+
+footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid var(--border-subtle);
+  color: var(--text-disabled); font-size: 11px; font-family: var(--font-mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  {% if logo_svg %}<div class="logo">{{ logo_svg|safe }}</div>{% endif %}
+  <div>
+    <h1>{{ report.title }}</h1>
+    {% if report.subtitle %}<div class="sub">{{ report.subtitle }}</div>{% endif %}
+  </div>
+  <div class="gen">{{ report.generated }}</div>
+</header>
+
+<div class="summary">
+  {% set c = report.status_counts() %}
+  <div class="chip pass"><span class="n">{{ c.passed }}</span><span class="lbl">passed</span></div>
+  <div class="chip fail"><span class="n">{{ c.failed + c.error }}</span><span class="lbl">failed</span></div>
+  <div class="chip skip"><span class="n">{{ c.skipped }}</span><span class="lbl">skipped</span></div>
+  <div class="chip"><span class="n">{{ report.sections|length }}</span><span class="lbl">total</span></div>
+  <div class="chip"><span class="n">{{ '%.1f'|format(total_duration) }}s</span><span class="lbl">wall</span></div>
+</div>
+
+{% if report.meta %}
+<div class="meta">
+  {% for k, v in report.meta.items() %}<span>{{ k }}: <b>{{ v }}</b></span>{% endfor %}
+</div>
+{% endif %}
+
+{% for group, sections in grouped %}
+<h2 class="group">{{ group }}</h2>
+{% for sec in sections %}
+<div class="card {{ sec.status }}">
+  <div class="head" onclick="this.parentNode.classList.toggle('collapsed')">
+    <span class="badge {{ sec.status }}">{{ sec.status }}</span>
+    <span class="name">{{ sec.name }}</span>
+    <span class="origin">{{ sec.origin }}</span>
+    <span class="dur">{{ '%.2f'|format(sec.duration) }}s</span>
+  </div>
+  <div class="body">
+    {% if sec.doc %}<div class="doc">{{ sec.doc }}</div>{% endif %}
+    {% if sec.message %}<div class="msg">{{ sec.message }}</div>{% endif %}
+
+    {% set metrics = sec.items|selectattr('kind','equalto','metric')|list %}
+    {% if metrics %}
+    {% set cmpsym = {'approx': '≈', 'le': '≤', 'ge': '≥', 'info': ''} %}
+    <table class="metrics">
+      <tr><th>quantity</th><th>value</th><th>reference</th><th>tol</th><th>verdict</th></tr>
+      {% for m in metrics %}
+      <tr>
+        <td>{{ m.label }}{% if m.detail %} <span style="color:var(--text-disabled)">— {{ m.detail }}</span>{% endif %}</td>
+        <td class="num">{{ fmt(m.value) }}{% if m.unit %} {{ m.unit }}{% endif %}</td>
+        <td class="num">{% if m.ref is not none %}{{ cmpsym[m.cmp] }} {{ fmt(m.ref) }}{% if m.unit %} {{ m.unit }}{% endif %}{% else %}—{% endif %}</td>
+        <td class="num">{% if m.tol is not none %}{{ '%.2g'|format(m.tol*100) }}%{% else %}—{% endif %}</td>
+        {% if m.passed is none %}<td class="verdict">info</td>
+        {% elif m.passed %}<td class="verdict ok">PASS</td>
+        {% else %}<td class="verdict bad">FAIL</td>{% endif %}
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    {% for it in sec.items if it.kind != 'metric' %}
+      {% if it.kind == 'note' %}
+        <div class="doc">{{ it.text }}</div>
+      {% elif it.kind == 'plot' %}
+        <div class="plot">
+          {% if it.title %}<div class="ptitle">{{ it.title }}</div>{% endif %}
+          {{ it.svg|safe }}
+          {% if it.caption %}<div class="cap">{{ it.caption }}</div>{% endif %}
+        </div>
+      {% elif it.kind == 'table' %}
+        <div class="plot"><div class="ptitle">{{ it.title }}</div>
+        <table class="data">
+          <tr>{% for h in it.headers %}<th>{{ h }}</th>{% endfor %}</tr>
+          {% for row in it.rows %}<tr>{% for cell in row %}<td class="num">{{ fmt(cell) }}</td>{% endfor %}</tr>{% endfor %}
+        </table></div>
+      {% elif it.kind == 'log' %}
+        <div class="plot"><div class="ptitle">{{ it.title }}</div>
+        <pre class="log">{{ it.text }}</pre></div>
+      {% endif %}
+    {% endfor %}
+  </div>
+</div>
+{% endfor %}
+{% endfor %}
+
+<footer>
+  Generated by rapidfem's test-report harness ({{ producer }}). Click a test header to collapse it.
+</footer>
+
+</div>
+</body>
+</html>

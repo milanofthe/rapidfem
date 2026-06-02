@@ -20,6 +20,7 @@ use num_complex::Complex64 as C64;
 
 pub mod pardiso;
 pub mod faer_lu;
+pub mod schur;
 #[cfg(target_os = "macos")]
 pub mod accelerate;
 

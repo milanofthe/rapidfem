@@ -49,6 +49,24 @@ pub fn assemble_and_solve(
     assemble_and_solve_with_pml(mesh, basis, ports, port_tri_indices, pec_tri_indices, freq, materials, None)
 }
 
+/// The PEC-eliminated reduced system `K x = b`, free-DOF indexed.
+///
+/// This is the common product of FD assembly: the reduced COO triplets, the
+/// free-DOF map, and one free-indexed RHS per driven port. Both the monolithic
+/// solve and the Schur-DD solve consume it, so they are guaranteed to see the
+/// identical system (the basis of the bit-for-bit Schur validation gate).
+pub struct ReducedSystem {
+    pub n_free: usize,
+    pub n_field: usize,
+    pub rows: Vec<usize>,
+    pub cols: Vec<usize>,
+    pub vals: Vec<C64>,
+    /// Global DOF for each free index (`free_dofs[fi]` → global DOF).
+    pub free_dofs: Vec<usize>,
+    /// One free-indexed RHS per driven port.
+    pub rhs: Vec<Vec<C64>>,
+}
+
 pub fn assemble_and_solve_with_pml(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -59,6 +77,44 @@ pub fn assemble_and_solve_with_pml(
     materials: Option<&[crate::materials::Material]>,
     pml_regions: Option<&[crate::materials::PmlRegion]>,
 ) -> Result<SolveResult, String> {
+    let sys = assemble_reduced_with_pml(
+        mesh, basis, ports, port_tri_indices, pec_tri_indices, freq, materials, pml_regions,
+    )?;
+
+    let mut solver = crate::solver::pick(crate::solver::SolverChoice::from_env());
+    let t_solve = web_time::Instant::now();
+    solver.factorize(sys.n_free, &sys.rows, &sys.cols, &sys.vals)?;
+    eprintln!("  {}: factorized in {:.1}ms", solver.name(), t_solve.elapsed().as_secs_f64()*1e3);
+
+    let mut solutions = Vec::new();
+    for (pi, b_free) in sys.rhs.iter().enumerate() {
+        let x_free = solver.solve(b_free)?;
+        let mut x_full = vec![C64::new(0.0, 0.0); sys.n_field];
+        for (fi, &d) in sys.free_dofs.iter().enumerate() {
+            x_full[d] = x_free[fi];
+        }
+        let xnorm: f64 = x_full.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
+        eprintln!("  Port {} solved ({}) in {:.1}ms, ||x|| = {:.6e}",
+            pi, solver.name(), t_solve.elapsed().as_secs_f64()*1e3, xnorm);
+        solutions.push(x_full);
+    }
+
+    Ok(SolveResult { solutions, n_field: sys.n_field })
+}
+
+/// Build the PEC-eliminated reduced system without solving it.
+/// Factored out of `assemble_and_solve_with_pml` so the Schur-DD path and the
+/// monolithic path share one assembly.
+pub fn assemble_reduced_with_pml(
+    mesh: &Mesh,
+    basis: &Nedelec2Basis,
+    ports: &[&dyn Port],
+    port_tri_indices: &[&[usize]],
+    pec_tri_indices: &[usize],
+    freq: f64,
+    materials: Option<&[crate::materials::Material]>,
+    pml_regions: Option<&[crate::materials::PmlRegion]>,
+) -> Result<ReducedSystem, String> {
     let c0 = crate::constants::C0;
     let k0 = 2.0 * PI * freq / c0;
     let n_field = basis.n_field;
@@ -214,28 +270,22 @@ pub fn assemble_and_solve_with_pml(
     }
     eprintln!("  COO: {} entries, built in {:.1}ms", coo_rows.len(), t2.elapsed().as_secs_f64()*1e3);
 
-    // Backend-agnostic factor + solve via the SparseSolver trait. Selection
-    // honours RAPIDFEM_SOLVER (auto|pardiso|accelerate|faer).
-    let mut solver = crate::solver::pick(crate::solver::SolverChoice::from_env());
-    let t_solve = web_time::Instant::now();
-    solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
-    eprintln!("  {}: factorized in {:.1}ms", solver.name(), t_solve.elapsed().as_secs_f64()*1e3);
+    // Map each driven port's full-length excitation to free-DOF indexing.
+    let rhs: Vec<Vec<C64>> = port_vectors
+        .iter()
+        .map(|bvec| free_dofs.iter().map(|&d| bvec[d]).collect())
+        .collect();
+    let _ = &driven_port_indices; // kept for parity with the solve-side logging
 
-    let mut solutions = Vec::new();
-    for (pi, bvec) in port_vectors.iter().enumerate() {
-        let b_free: Vec<C64> = free_dofs.iter().map(|&d| bvec[d]).collect();
-        let x_free = solver.solve(&b_free)?;
-        let mut x_full = vec![C64::new(0.0, 0.0); n_field];
-        for (fi, &d) in free_dofs.iter().enumerate() {
-            x_full[d] = x_free[fi];
-        }
-        let xnorm: f64 = x_full.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
-        eprintln!("  Port {} solved ({}) in {:.1}ms, ||x|| = {:.6e}",
-            pi, solver.name(), t_solve.elapsed().as_secs_f64()*1e3, xnorm);
-        solutions.push(x_full);
-    }
-
-    Ok(SolveResult { solutions, n_field })
+    Ok(ReducedSystem {
+        n_free,
+        n_field,
+        rows: coo_rows,
+        cols: coo_cols,
+        vals: coo_vals,
+        free_dofs,
+        rhs,
+    })
 }
 
 /// Frequency sweep: solve at multiple frequencies.

@@ -65,6 +65,14 @@ _KV_RE = re.compile(
 
 _OUTCOME_STATUS = {"ok": "passed", "FAILED": "failed", "ignored": "skipped"}
 
+# A test that returns early because an optional backend (e.g. PARDISO/MKL)
+# is not available at runtime still reports `... ok` to libtest — there is
+# no native "skip" outcome in stable Rust. To avoid a silent green that
+# reads as real coverage, such a test prints a `SKIP:`/`SKIPPED` marker on
+# its own line; the bridge reclassifies an otherwise-passing test to
+# `skipped` when it sees that marker.
+_SKIP_RE = re.compile(r"^\s*SKIP(?:PED)?\b\s*[:\-]", re.MULTILINE)
+
 
 def _parse_metrics(block: str) -> list[Metric]:
     """Pull ``key = value`` numeric pairs out of a buffered output block."""
@@ -125,6 +133,12 @@ def parse_cargo_output(text: str, group: str = "rust") -> list[Section]:
                 for met in _parse_metrics(block):
                     sec.items.append(met)
                 sec.items.append(Log(title="cargo output", text=block))
+                # A passing test that printed a SKIP marker did not actually
+                # exercise its assertions (optional backend absent) — surface
+                # it as skipped, not as a green pass.
+                if sec.status == "passed" and _SKIP_RE.search(block):
+                    sec.status = "skipped"
+                    sec.message = "backend unavailable at runtime (see SKIP marker)"
             if status == "failed":
                 sec.message = block or "test FAILED (see cargo output)"
             sections.append(sec)

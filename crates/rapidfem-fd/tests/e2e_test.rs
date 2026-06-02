@@ -10,10 +10,21 @@ use rapidfem_fd::sparam::sparam_waveport;
 use rapidfem_fd::interp;
 use rapidfem_fd::constants::*;
 
+// WR-90 EMerge fixture at the repo-root `tests/meshes/` (cargo sets the test
+// binary cwd to the crate dir, so anchor on CARGO_MANIFEST_DIR).
+const WR90_MESH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"), "/../../tests/meshes/wr90_straight.msh");
+
+// Full assemble -> solve -> S-parameter-extraction gate on the EMerge WR-90
+// mesh. EMerge reference: |S11|=0.001496, |S21|=0.999824. On this identical
+// mesh rapidfem measures |S11|=0.000653, |S21|=0.999958 (matched straight
+// guide: |S11| sits in the numeric reflection floor, |S21|~1). The gates
+// below are set ~10-15x above the measured EMerge deviation so a real
+// regression (wrong port Z0, broken assembly/extraction) breaks them while
+// honest mesh/extraction differences pass.
 #[test]
-#[ignore = "needs tests/meshes/wr90_straight.msh fixture (not in repo)"]
 fn test_straight_waveguide_sparams() {
-    let mesh = load_mesh("tests/meshes/wr90_straight.msh").expect("Load mesh");
+    let mesh = load_mesh(WR90_MESH).expect("Load mesh");
     let basis = Nedelec2Basis::new(&mesh);
 
     let freq = 10.0e9;
@@ -119,4 +130,33 @@ fn test_straight_waveguide_sparams() {
     eprintln!("  |S21| = {:.6} ({:.1} dB)", s21.norm(), 20.0 * s21.norm().max(1e-10).log10());
     eprintln!("  |S11|²+|S21|² = {:.6}", s11.norm_sqr() + s21.norm_sqr());
     eprintln!("  EMerge ref: |S11|=0.001496, |S21|=0.999824");
+
+    // EMerge reference on the identical mesh.
+    const EMERGE_S11: f64 = 0.001496;
+    const EMERGE_S21: f64 = 0.999824;
+
+    let s11m = s11.norm();
+    let s21m = s21.norm();
+    let passivity = s11.norm_sqr() + s21.norm_sqr();
+
+    // Transmission must track the EMerge reference closely (measured dev
+    // ~1.3e-4; gate at 2e-3, ~15x margin).
+    assert!(
+        (s21m - EMERGE_S21).abs() < 2.0e-3,
+        "|S21| = {:.6} deviates {:.2e} from EMerge {:.6} (> 2e-3)",
+        s21m, (s21m - EMERGE_S21).abs(), EMERGE_S21,
+    );
+    // Matched line: reflection stays in the deep floor (ours 6.5e-4, EMerge
+    // 1.5e-3). A wrong port impedance or assembly bug lifts this well above.
+    assert!(
+        s11m < 5.0e-3,
+        "|S11| = {:.6} above the 5e-3 matched-line floor (EMerge ref {:.6})",
+        s11m, EMERGE_S11,
+    );
+    // Passive lossless 2-port: |S11|^2 + |S21|^2 <= 1 (mild numeric overshoot).
+    assert!(
+        passivity <= 1.01,
+        "passivity |S11|^2+|S21|^2 = {:.6} above 1.01", passivity,
+    );
+    eprintln!("  e2e WR-90 S-parameter gate: PASS");
 }

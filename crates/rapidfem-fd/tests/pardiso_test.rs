@@ -5,7 +5,10 @@ use rapidfem_fd::pardiso::{PardisoSolver, build_upper_csr};
 fn test_pardiso_2x2() {
     let mut solver = match PardisoSolver::try_new() {
         Some(s) => s,
-        None => { eprintln!("PARDISO not available, skipping"); return; }
+        // Stable libtest has no skip outcome, so a missing backend would
+        // otherwise report as a green pass. Print a SKIP marker the report
+        // bridge reclassifies to "skipped" when the MKL runtime is absent.
+        None => { eprintln!("SKIP: PARDISO runtime not available (MKL not loaded)"); return; }
     };
 
     // A = [[2+1j, 1], [1, 3+2j]] — same as Python test

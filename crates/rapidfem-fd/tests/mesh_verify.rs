@@ -2,10 +2,15 @@
 use rapidfem_fd::mesh_io::load_mesh;
 use rapidfem_fd::basis::Nedelec2Basis;
 
+// The WR-90 EMerge fixture lives at the repo-root `tests/meshes/`. cargo runs
+// a test binary with its cwd set to the crate dir, so a path relative to the
+// crate would miss it; anchor on CARGO_MANIFEST_DIR instead.
+const WR90_MESH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"), "/../../tests/meshes/wr90_straight.msh");
+
 #[test]
-#[ignore = "needs tests/meshes/wr90_straight.msh fixture (not in repo)"]
 fn test_mesh_counts_vs_emerge() {
-    let mesh = load_mesh("tests/meshes/wr90_straight.msh").expect("Load mesh");
+    let mesh = load_mesh(WR90_MESH).expect("Load mesh");
     let basis = Nedelec2Basis::new(&mesh);
 
     eprintln!("Our mesh: {} nodes, {} edges, {} tris, {} tets",

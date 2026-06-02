@@ -858,6 +858,30 @@ class TdMacroModel:
         omegas_op = 2.0 * np.pi * f / self._c
         return np.asarray(self._m.sweep(omegas_op))
 
+    def passivity(self, frequencies_hz):
+        """Largest singular value ``sigma_max(S)`` of the S-matrix at each
+        physical frequency.
+
+        A linear N-port is passive iff ``sigma_max(S) <= 1`` everywhere
+        (the scattering matrix is a contraction). A plain / multi-shift
+        build can overshoot slightly; use :meth:`evaluate` with
+        ``passive=True`` for the SVD-clip-enforced passive S-matrix. This
+        method is the numerical passivity check of the raw model.
+
+        Returns an ``[n_freq]`` real numpy array of ``sigma_max`` values
+        in the order of ``frequencies_hz``."""
+        s = self.sweep(frequencies_hz)
+        s = np.atleast_3d(s)
+        return np.array(
+            [np.linalg.svd(s_k, compute_uv=False).max() for s_k in s]
+        )
+
+    def is_passive(self, frequencies_hz, *, tol=1e-3):
+        """Whether the model is passive across ``frequencies_hz``: every
+        ``sigma_max(S) <= 1 + tol``. The small ``tol`` absorbs GMRES
+        residual drift and dense-solve round-off."""
+        return bool(np.all(self.passivity(frequencies_hz) <= 1.0 + tol))
+
     def to_touchstone(self, path, frequencies_hz, *, format="MA", z_ref=50.0):
         """Write the S-matrix sweep to a Touchstone ``.s{N}p`` file.
 

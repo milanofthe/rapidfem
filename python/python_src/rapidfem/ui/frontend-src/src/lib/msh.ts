@@ -12,4 +12,12 @@ export interface MeshData {
 	phys_names: Map<number, string>;
 	phys_dim: Map<number, number>;
 	bbox: { min: [number, number, number]; max: [number, number, number] };
+	/** Flat uint pairs [a0,b0, a1,b1, ...] of feature edges (geometric creases).
+	 *  Old payloads without this field render identically (treated as empty). */
+	edges?: Uint32Array;
+	/** Optional mesh quality statistics from the backend. */
+	stats?: {
+		n_edges?: number;
+		min_dihedral_deg?: number;
+	};
 }

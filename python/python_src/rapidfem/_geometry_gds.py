@@ -1,222 +1,195 @@
-"""GDSII import for :class:`rapidfem.geometry.Geometry`.
+"""GDSII import for rapidfem geometries.
 
-Split out of ``geometry.py`` as a mixin: the GDS-to-3D extrusion machinery is
-a self-contained subsystem (it only touches the scale helper, the wrap
-helpers, and gmsh), so it lives here to keep the core ``Geometry`` file
-navigable. ``Geometry`` inherits :class:`_GdsMixin`, so every method below is
-a normal ``Geometry`` method at runtime.
+The gmsh-backed ``Geometry.from_gds(path, ...)`` static method has been
+replaced by the module-level function ``from_gds(g, path, ...)``. The
+caller creates the Geometry first and passes it in; the loading machinery
+is decoupled from the geometry backend.
+
+New calling form::
+
+    import rapidfem as rf
+    import rapidfem.rfic as rfic
+
+    g = rf.Geometry(maxh=20e-6)
+    rfic.from_gds(g, "inductor.gds", stack=stack, top_cell="ind_3turn")
+
+The retired ``Geometry.from_gds(path, ...)`` static form is gone; create
+the Geometry first and pass it in.
 """
 from __future__ import annotations
 
-import gmsh
+import numpy as np
 
 
-class _GdsMixin:
-    """GDSII layout import, mixed into :class:`rapidfem.geometry.Geometry`."""
+# HELPERS ===============================================================================
 
-    @staticmethod
-    def from_gds(
-        path: str,
-        stack,                          # rapidfem.rfic.Stack
-        top_cell: str | None = None,
-        bbox: tuple[float, float, float, float] | None = None,
-        flatten: bool = True,
-        merge: bool = True,
-        thin_conductors: bool = False,
-    ) -> "Geometry":
-        """Load a GDSII layout and extrude all matching polygons into 3D primitives.
 
-        Each polygon on a (gds, datatype) tuple in `stack` becomes a 3D box
-        (rectangles) or extruded prism (general polygons) at the layer's z with
-        the layer's thickness. All polygons of one layer share the layer's
-        name on the resulting GeoObject so they can be batch-selected and
-        passed to `rf.PEC`/`rf.LumpedPort` together.
+def _clean_polygon(pts_m: np.ndarray) -> np.ndarray:
+    """Drop the closing duplicate vertex and near-coincident consecutive
+    vertices from a polygon given in metres.
 
-        Args:
-            path: Path to the .gds(.gz) file.
-            stack: A `rapidfem.rfic.Stack` mapping (gds, datatype) -> PdkLayer.
-            top_cell: Cell name to extrude. ``None`` auto-picks the unique
-                top-level cell.
-            bbox: Optional (xmin, ymin, xmax, ymax) crop box in meters; polygons
-                outside are skipped (faster iteration on large layouts).
-            flatten: Resolve cell references before extrusion (default True).
-                Set False only if your top cell has no references.
-            merge: Merge co-layer polygons via gmsh fragment so adjacent traces
-                produce a conformal mesh (default True).
-            thin_conductors: If True, metal layers become 2D PEC plates at the
-                layer's bottom z (thin-conductor approximation, t << w). The
-                resulting plate carries the layer's name as a SURFACE physical
-                group, which is what the simulator's `.pec(...)` BC expects.
-                Recommended for RFIC-style metal with thicknesses <= wavelength/100.
-        """
-        from .geometry import Geometry
+    Returns a float64 array of shape (N, 2). The deduplication tolerance
+    is 1 nm, tight enough to preserve nm-precision GDS geometry while
+    reliably eliminating Boolean-union slivers that appear at polygon joins.
+    """
+    if np.allclose(pts_m[0], pts_m[-1]):
+        pts_m = pts_m[:-1]
+    tol = 1e-9
+    keep = [pts_m[0]]
+    for p in pts_m[1:]:
+        if np.linalg.norm(p - keep[-1]) > tol:
+            keep.append(p)
+    if len(keep) > 1 and np.linalg.norm(keep[-1] - keep[0]) <= tol:
+        keep = keep[:-1]
+    return np.asarray(keep, dtype=np.float64)
 
-        try:
-            import gdstk
-        except ImportError as e:
-            raise ImportError("gdstk is required for from_gds(). pip install gdstk") from e
-        import numpy as np
 
-        lib = gdstk.read_gds(path)
-        cells_by_name = {c.name: c for c in lib.cells}
+def _material_for_layer(pdk_layer):
+    """Derive a rapidfem bulk material from a PdkLayer.
 
-        # Resolve top cell
-        if top_cell is None:
-            tops = lib.top_level()
-            if len(tops) != 1:
-                names = ", ".join(c.name for c in tops)
-                raise ValueError(
-                    f"GDS has {len(tops)} top-level cells ({names}); "
-                    f"specify top_cell=...")
-            cell = tops[0]
-        else:
-            if top_cell not in cells_by_name:
-                avail = ", ".join(cells_by_name.keys())
-                raise ValueError(f"top_cell {top_cell!r} not in GDS; available: {avail}")
-            cell = cells_by_name[top_cell]
+    PEC is typically applied to all conductor faces by the caller, so
+    the bulk material only needs to satisfy the geometry constraint that
+    every non-PML solid carries a material. The assignment mirrors the
+    layer's dominant physics:
 
-        # GDS unit (typically 1e-6 = micron, sometimes 1e-9 = nm). gdstk reports
-        # the working unit in lib.unit (meters per GDS unit).
-        unit = lib.unit  # meters per logical unit in the GDS
+    - metal/via with sigma > 0: Conductor(conductivity=sigma)
+    - poly/oxide/other with er > 1: Dielectric(er=er, tand=tand)
+    - everything else: Air() (lossless vacuum placeholder)
+    """
+    from rapidfem.materials import Conductor, Dielectric, Air
 
-        # Flatten the cell to expose all polygons including those in references.
-        flat_polys = cell.get_polygons() if not flatten else cell.flatten().polygons
+    if pdk_layer.type in ("metal", "via"):
+        if pdk_layer.sigma > 0:
+            return Conductor(conductivity=pdk_layer.sigma)
+    if pdk_layer.er > 1.0:
+        return Dielectric(er=pdk_layer.er, tand=pdk_layer.tand)
+    return Air()
 
-        # Optional bbox crop
+
+# PUBLIC API ============================================================================
+
+
+def from_gds(
+    g,
+    path: str,
+    stack,
+    top_cell: str | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
+    flatten: bool = True,
+    merge: bool = True,
+    thin_conductors: bool = False,
+) -> None:
+    """Load a GDSII layout and extrude all matching polygons into ``g``.
+
+    Each polygon whose (gds, datatype) tuple is present in ``stack`` is
+    either extruded as a 3-D prism at the layer's z/thickness (default),
+    or placed as a zero-thickness polygon sheet when
+    ``thin_conductors=True`` and the layer type is "metal". Solid
+    extrusions receive a bulk material derived from the PdkLayer (Conductor
+    for metals/vias, Dielectric for poly/oxide); callers apply PEC or other
+    surface BCs to the resulting faces.
+
+    Parameters
+    ----------
+    g : rapidfem.Geometry
+        Target geometry. Set a global maxh at construction time or pass
+        maxh to g.mesh() later.
+    path : str
+        Path to the .gds (.gz) file.
+    stack : rapidfem.rfic.Stack
+        Maps (gds, datatype) to PdkLayer; carries z, thickness, material
+        data.
+    top_cell : str, optional
+        Cell name to flatten and extrude. None auto-picks the unique
+        top-level cell.
+    bbox : tuple[float, float, float, float], optional
+        (xmin, ymin, xmax, ymax) crop box in metres; polygons wholly
+        outside are skipped.
+    flatten : bool
+        Flatten cell references before extrusion (default True).
+    merge : bool
+        Accepted for API compatibility; fragment() is a no-op in the
+        rapidmesh backend, so co-layer polygons are always arranged
+        conformally without explicit merging.
+    thin_conductors : bool
+        If True, metal layers become zero-thickness polygon sheets at the
+        layer bottom z (thin-conductor approximation, t << wavelength/100).
+        Vias and poly are still extruded as solids.
+    """
+    try:
+        import gdstk
+    except ImportError as exc:
+        raise ImportError(
+            "gdstk is required for from_gds(); pip install gdstk"
+        ) from exc
+
+    lib = gdstk.read_gds(path)
+    cells_by_name = {c.name: c for c in lib.cells}
+
+    if top_cell is None:
+        tops = lib.top_level()
+        if len(tops) != 1:
+            names = ", ".join(c.name for c in tops)
+            raise ValueError(
+                f"GDS has {len(tops)} top-level cells ({names}); "
+                f"specify top_cell=..."
+            )
+        cell = tops[0]
+    else:
+        if top_cell not in cells_by_name:
+            avail = ", ".join(cells_by_name.keys())
+            raise ValueError(
+                f"top_cell {top_cell!r} not in GDS; available: {avail}"
+            )
+        cell = cells_by_name[top_cell]
+
+    # lib.unit is metres per logical GDS unit (typically 1e-6 for µm files)
+    unit = lib.unit
+
+    flat_polys = cell.get_polygons() if not flatten else cell.flatten().polygons
+
+    per_layer: dict[str, list[np.ndarray]] = {}
+    for poly in flat_polys:
+        pdk_layer = stack.by_gds(poly.layer, poly.datatype)
+        if pdk_layer is None:
+            continue
+        pts_raw = np.asarray(poly.points, dtype=np.float64)
         if bbox is not None:
             xmin, ymin, xmax, ymax = bbox
-
-        g = Geometry(name=cell.name or "gds_import")
-        # Group polygons by their PdkLayer (so we name + extrude per-layer).
-        per_layer: dict[str, list[np.ndarray]] = {}
-        for poly in flat_polys:
-            pdk_layer = stack.by_gds(poly.layer, poly.datatype)
-            if pdk_layer is None:
+            if (pts_raw[:, 0].max() < xmin or pts_raw[:, 0].min() > xmax
+                    or pts_raw[:, 1].max() < ymin or pts_raw[:, 1].min() > ymax):
                 continue
-            pts_raw = np.asarray(poly.points, dtype=np.float64)
-            if bbox is not None:
-                if (pts_raw[:, 0].max() < xmin or pts_raw[:, 0].min() > xmax
-                        or pts_raw[:, 1].max() < ymin or pts_raw[:, 1].min() > ymax):
-                    continue
-            pts_m = pts_raw * unit  # convert GDS coords to meters
-            per_layer.setdefault(pdk_layer.name, []).append(pts_m)
+        per_layer.setdefault(pdk_layer.name, []).append(pts_raw * unit)
 
-        # Build each polygon at its layer's z. With thin_conductors=True (or
-        # for non-metal types) we keep it as a 2D plate so PEC BC can attach
-        # to a SURFACE group; otherwise we extrude to a 3D solid.
-        per_layer_objs: dict[str, list[GeoObject]] = {}
-        for layer_name, polys in per_layer.items():
-            pdk = stack.by_name(layer_name)
-            use_2d = thin_conductors and pdk.type == "metal"
-            objs: list[GeoObject] = []
-            for pts in polys:
-                if use_2d:
-                    obj = g._plate_polygon(pts, z=pdk.z)
-                else:
-                    obj = g._extrude_polygon(pts, z=pdk.z, thickness=pdk.thickness)
-                obj.name = layer_name
-                objs.append(obj)
+    per_layer_objs: dict[str, list] = {}
+    for layer_name, polys in per_layer.items():
+        pdk = stack.by_name(layer_name)
+        use_2d = thin_conductors and pdk.type == "metal"
+        objs = []
+        for pts in polys:
+            cleaned = _clean_polygon(pts)
+            if len(cleaned) < 3:
+                continue
+            pts_2d = [(float(p[0]), float(p[1])) for p in cleaned]
+            if use_2d:
+                obj = g.polygon_plate(pts_2d, position=(0.0, 0.0, pdk.z))
+            else:
+                mat = _material_for_layer(pdk)
+                obj = g.prism(
+                    pts_2d, pdk.thickness,
+                    position=(0.0, 0.0, pdk.z),
+                    material=mat,
+                )
+            obj.name = layer_name
+            objs.append(obj)
+        if objs:
             per_layer_objs[layer_name] = objs
 
-        # Optional: fragment co-layer polygons so adjacent traces share faces.
-        if merge:
-            for objs in per_layer_objs.values():
-                if len(objs) >= 2:
-                    g.fragment(objs[0], *objs[1:])
+    # fragment() is a no-op in the rapidmesh backend; the call is retained
+    # so call sites that set merge=True keep the same observable behaviour.
+    if merge:
+        for objs in per_layer_objs.values():
+            if len(objs) >= 2:
+                g.fragment(objs[0], *objs[1:])
 
-        return g
 
-    def _plate_polygon(self, pts: "np.ndarray", z: float) -> GeoObject:
-        """Create a 2D plane surface from a closed polygon at height z.
-
-        Used by `from_gds(thin_conductors=True)` so metals stay 2D and their
-        layer-name physical group lands on FACES (PEC-compatible).
-        """
-        import numpy as np
-        s = self._s
-        # Rectangle fast path
-        if pts.shape[0] in (4, 5):
-            p = pts[:4]
-            xs, ys = sorted(set(p[:, 0])), sorted(set(p[:, 1]))
-            if len(xs) == 2 and len(ys) == 2:
-                tag = gmsh.model.occ.addRectangle(
-                    s(xs[0]), s(ys[0]), s(z), s(xs[1] - xs[0]), s(ys[1] - ys[0])
-                )
-                return self._wrap_face(tag)
-        # General polygon
-        if np.allclose(pts[0], pts[-1]):
-            pts = pts[:-1]
-        tol = 1e-9
-        keep = [pts[0]]
-        for p in pts[1:]:
-            if np.linalg.norm(p - keep[-1]) > tol:
-                keep.append(p)
-        if len(keep) > 1 and np.linalg.norm(keep[-1] - keep[0]) <= tol:
-            keep = keep[:-1]
-        pts = np.asarray(keep)
-        if len(pts) < 3:
-            raise ValueError(f"Polygon collapsed to {len(pts)} unique vertices")
-        pt_tags = [gmsh.model.occ.addPoint(s(p[0]), s(p[1]), s(z)) for p in pts]
-        line_tags = [
-            gmsh.model.occ.addLine(pt_tags[i], pt_tags[(i + 1) % len(pt_tags)])
-            for i in range(len(pt_tags))
-        ]
-        loop = gmsh.model.occ.addCurveLoop(line_tags)
-        surf = gmsh.model.occ.addPlaneSurface([loop])
-        return self._wrap_face(surf)
-
-    def _extrude_polygon(
-        self,
-        pts: "np.ndarray",
-        z: float,
-        thickness: float,
-    ) -> GeoObject:
-        """Extrude a 2D polygon (Nx2 numpy array) vertically into a 3D solid.
-
-        Rectangular axis-aligned polygons become addBox (fast path).
-        Otherwise: build a wire, plane surface, then extrude.
-        """
-        import numpy as np
-
-        s = self._s
-        # Detect axis-aligned rectangle (4 points, 90 degree corners)
-        if pts.shape[0] in (4, 5):
-            p = pts[:4]
-            xs, ys = sorted(set(p[:, 0])), sorted(set(p[:, 1]))
-            if len(xs) == 2 and len(ys) == 2:
-                tag = gmsh.model.occ.addBox(
-                    s(xs[0]), s(ys[0]), s(z),
-                    s(xs[1] - xs[0]), s(ys[1] - ys[0]), s(thickness),
-                )
-                return self._wrap_volume(tag)
-
-        # General polygon: wire, plane, extrude
-        # Drop duplicated last point (gdstk includes it sometimes)
-        if np.allclose(pts[0], pts[-1]):
-            pts = pts[:-1]
-        # Drop adjacent coincident vertices, gdstk boolean unions can leave
-        # them at shared corners and they'd collapse OCC line endpoints into a
-        # broken loop. Keep one of every coincident-pair (within ~1nm).
-        tol = 1e-9
-        keep = [pts[0]]
-        for p in pts[1:]:
-            if np.linalg.norm(p - keep[-1]) > tol:
-                keep.append(p)
-        # Also check wraparound (last vs first)
-        if len(keep) > 1 and np.linalg.norm(keep[-1] - keep[0]) <= tol:
-            keep = keep[:-1]
-        pts = np.asarray(keep)
-        if len(pts) < 3:
-            raise ValueError(f"Polygon collapsed to {len(pts)} unique vertices")
-        pt_tags = [gmsh.model.occ.addPoint(s(p[0]), s(p[1]), s(z)) for p in pts]
-        line_tags = [
-            gmsh.model.occ.addLine(pt_tags[i], pt_tags[(i + 1) % len(pt_tags)])
-            for i in range(len(pt_tags))
-        ]
-        loop = gmsh.model.occ.addCurveLoop(line_tags)
-        surf = gmsh.model.occ.addPlaneSurface([loop])
-        # Extrude vertically by thickness; second elt of return is the top cap
-        out = gmsh.model.occ.extrude([(2, surf)], 0, 0, s(thickness))
-        # gmsh's extrude returns: [top_face, volume, side_faces...]
-        vol_tag = next(t for d, t in out if d == 3)
-        return self._wrap_volume(vol_tag)

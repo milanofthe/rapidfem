@@ -16,9 +16,8 @@ Typical workflow::
     import rapidfem.rfic as rfic
 
     stack = rfic.Stack.sky130()                       # PDK preset
-    g = rf.Geometry.from_gds(                         # GDS-driven extrusion
-        "inductor.gds", stack=stack, top_cell="ind_3turn",
-    )
+    g = rf.Geometry(maxh=20e-6)
+    rfic.from_gds(g, "inductor.gds", stack=stack, top_cell="ind_3turn")
     subs = stack.create_substrate(g, footprint=(400e-6, 400e-6))
     air = g.box(400e-6, 400e-6, 200e-6,               # ABC enclosure
                 position=(-200e-6, -200e-6, stack.top_z),
@@ -36,6 +35,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, asdict
 from typing import TYPE_CHECKING, Iterable, Literal
+
+from rapidfem._geometry_gds import from_gds  # noqa: F401 (re-exported)
 
 if TYPE_CHECKING:
     from rapidfem.geometry import Geometry, GeoObject
@@ -269,11 +270,10 @@ class Stack:
         derived from the stack constants, drop the returned objects straight
         into the Problem API, no extra material wiring needed.
 
-        Returns a dict of named GeoObjects (`substrate`, `oxide`). If
-        ``fragment_existing=True`` (the default) and the geometry already
-        contains 3D primitives (e.g. metal traces from `Geometry.from_gds`),
-        they are fragmented into the new oxide slab so the resulting mesh is
-        conformal at every interface.
+        Returns a dict of named GeoObjects (`substrate`, `oxide`).
+        ``fragment_existing`` is retained for API compatibility; in the
+        rapidmesh backend fragment() is a no-op (all primitives are arranged
+        exactly conformal by construction without explicit fragmentation).
         """
         # Local import, avoids a circular at module load (rapidfem.__init__
         # imports rapidfem.rfic).
@@ -283,9 +283,6 @@ class Stack:
         x0 = -wx / 2 if center else 0.0
         y0 = -wy / 2 if center else 0.0
         z_top = z_substrate_top if z_substrate_top is not None else self.bottom_z
-
-        # Snapshot existing 3D objects BEFORE adding substrate/oxide
-        existing_3d = [o for o in g._objects if o.dim == 3]
 
         silicon = Dielectric(er=self.substrate_er, conductivity=self.substrate_sigma)
         sio2 = Dielectric(er=self.oxide_er, tand=self.oxide_tand)
@@ -302,14 +299,10 @@ class Stack:
                        material=sio2)
             ox.name = "oxide"
 
-        # Fragment with all pre-existing 3D primitives so interfaces are conformal.
-        # Critical: do this in ONE call. Two sequential fragment ops carve the
-        # second target against the same tools but leave the first one in a
-        # half-resolved state, re-resolution by (cog, bbox) then misattributes
-        # the first volume's name to the wrong sub-piece (#64).
-        if fragment_existing and existing_3d:
-            others = existing_3d + ([ox] if ox is not None else [])
-            g.fragment(sub, *others)
+        # fragment() is a no-op in the rapidmesh backend; the call is
+        # retained so fragment_existing=False callers behave correctly.
+        if fragment_existing:
+            g.fragment(sub)
 
         return {"substrate": sub} | ({"oxide": ox} if ox is not None else {})
 
@@ -654,7 +647,7 @@ def from_fem_json(
     import json as _json
     from pathlib import Path as _Path
     from rapidfem.geometry import Geometry as _Geometry
-    from rapidfem.materials import Air as _Air, Dielectric as _Dielectric
+    from rapidfem.materials import Air as _Air, Dielectric as _Dielectric, Conductor as _Conductor
 
     if isinstance(source, (str, _Path)):
         with open(source) as f:
@@ -735,12 +728,7 @@ def from_fem_json(
 
     # Build the enclosure. Global maxh = ~10% of the smaller in-plane span,
     # finer-than-bulk meshing of conductors is set per-volume via maxh.
-    # scale=1e-6: gmsh OCC stores coords in µm internally (dilated back to
-    # metres before meshing) so the kernel's relative tolerances apply to
-    # µm-scale features. Without normalisation, tight RFIC structures
-    # (mom_cap fingers, fine spacings) trip OCC's "segment/facet intersect"
-    # error during mesh.generate.
-    g = _Geometry(maxh=min(foot_w, foot_h) / 10, scale=1e-6)
+    g = _Geometry(maxh=min(foot_w, foot_h) / 10)
 
     substrate = g.box(foot_w, foot_h, sub_thickness_um * 1e-6,
                       position=(cx_m - foot_w / 2, cy_m - foot_h / 2,
@@ -768,7 +756,7 @@ def from_fem_json(
         if thick <= 0:
             continue
 
-        # Pick the polygon set, merged bbox, or per-cell array for vias.
+        # Pick the polygon set: merged bbox (default) or per-cell for vias.
         polys = [c["polygon"]]
         if via_mode == "cells" and c.get("polygon_cells"):
             polys = c["polygon_cells"]
@@ -778,23 +766,38 @@ def from_fem_json(
         # individual solid pieces with no holes.
         holes_um = c.get("holes") if polys is not c.get("polygon_cells") else None
 
+        # Derive bulk material from layer data. PEC is applied to all
+        # conductor surfaces by the caller so the bulk assignment only
+        # needs to satisfy the "every non-PML solid needs a material" rule.
+        _ltype  = layer.get("type", "metal")
+        _sigma  = float(layer.get("sigma") or 0.0)
+        _er     = float(layer.get("er") or 1.0)
+        _tand   = float(layer.get("tand") or 0.0)
+        if _ltype in ("metal", "via") and _sigma > 0:
+            layer_mat = _Conductor(conductivity=_sigma)
+        elif _er > 1.0:
+            layer_mat = _Dielectric(er=_er, tand=_tand)
+        else:
+            layer_mat = _Air()
+
         for poly_um in polys:
             cleaned = _clean_polygon_um(poly_um)
             if len(cleaned) < 3:
                 continue
-            pts_3d = [(x * 1e-6, y * 1e-6, z_lo) for x, y in cleaned]
-            poly_kwargs = {}
+            pts_2d = [(x * 1e-6, y * 1e-6) for x, y in cleaned]
+            holes_2d = None
             if holes_um:
                 cleaned_holes = [_clean_polygon_um(h) for h in holes_um]
-                cleaned_holes = [
-                    [(x * 1e-6, y * 1e-6, z_lo) for x, y in h]
+                _h2d = [
+                    [(x * 1e-6, y * 1e-6) for x, y in h]
                     for h in cleaned_holes if len(h) >= 3
                 ]
-                if cleaned_holes:
-                    poly_kwargs["holes"] = cleaned_holes
-            face = g.polygon(pts_3d, **poly_kwargs)
-            vol = g.extrude(face, height=thick, material=oxide.material,
-                            maxh=cond_maxh)
+                if _h2d:
+                    holes_2d = _h2d
+            vol = g.prism(
+                pts_2d, height=thick, position=(0.0, 0.0, z_lo),
+                holes=holes_2d, material=layer_mat, maxh=cond_maxh,
+            )
             vol.name = layer_id
             conductor_objects.setdefault(layer_id, []).append(vol)
             all_conductors.append(vol)
@@ -1020,5 +1023,6 @@ __all__ = [
     "Stack", "PdkLayer", "LayerType",
     "microstrip", "via", "trace_port", "gsg_port", "differential_port",
     "TracePort", "GsgPort", "DifferentialPort",
+    "from_gds",
     "from_fem_json", "FemLayoutResult",
 ]

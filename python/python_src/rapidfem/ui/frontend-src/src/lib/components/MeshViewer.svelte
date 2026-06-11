@@ -9,10 +9,23 @@
 	import { buildTriSoupF64 } from '$lib/render/mesh_scene';
 	import type { MeshData } from '$lib/msh';
 	import type { TdTrajectoryPayload } from '$lib/api';
-	import { palette } from '$lib/theme';
+	import { palette, canvas as canvasTheme } from '$lib/theme';
 	import { viz_load_mesh, viz_sample, viz_sample_static, viz_eval_static } from '$lib/api';
 
 	const EMPTY_F32 = new Float32Array(0);
+
+	// ── Inspection layer tags (negative to avoid colliding with physics group ids) ──
+	const TAG_WIRE_SURF  = -11;  // surface wireframe overlay
+	const TAG_FEAT_EDGES = -12;  // feature edges from payload
+	const TAG_TET_WIRE   = -13;  // interior tet wireframe
+
+	// Axis descriptors for the crinkle-clip toolbar buttons.
+	const CLIP_AXES: { lbl: string; ax: 0 | 1 | 2 }[] = [
+		{ lbl: 'X', ax: 0 },
+		{ lbl: 'Y', ax: 1 },
+		{ lbl: 'Z', ax: 2 },
+	];
+
 	// Decade span of the time-domain field cloud's logarithmic colour scale.
 	const TD_LOG_DECADES = 3;
 	// Runtime sample-count ceiling for the time-domain field cloud — the
@@ -80,13 +93,39 @@
 	let hidden_tags = $state(new Set<number>());
 	let field_range = $state<{ min: number; max: number; decades: number } | null>(null);
 
+	// ── Inspection layer toggles (internal toolbar state) ───────────────
+	let layer_surface = $state(true);
+	let layer_wire    = $state(false);
+	let layer_edges   = $state(false);
+	let layer_tets    = $state(false);
+
+	// ── Crinkle clip (prefix-sort trick from rapidmesh MeshPanel) ───────
+	let clip_enable = $state(false);
+	let clip_axis   = $state<0 | 1 | 2>(0);
+	let clip_t      = $state(1.0);
+
+	// Each entry tracks one mesh/lineMesh in the GL state. Sorted by
+	// centroid along the active clip axis so the slider only needs a
+	// binary search to set the draw count. No re-uploads during drags.
+	interface PrefixMesh {
+		idx:        number;        // index into state.meshes or state.lineMeshes
+		line:       boolean;
+		vals:       Float64Array;  // centroid values sorted ascending along built_axis
+		vpu:        number;        // vertices per unit (3 for tri, 2 for edge)
+		full_count: number;        // total vertex count when clip is disabled
+	}
+	let prefix_meshes: PrefixMesh[] = [];
+	let built_axis  = -1;
+	// Non-null when the sorted geometry is already uploaded for a given mesh+axis.
+	let last_built_for: { mesh: MeshData; axis: number } | null = null;
 
 	function toggle_tag(tag: number) {
 		if (!gl_state) return;
 		const next = new Set(hidden_tags);
 		if (next.has(tag)) next.delete(tag); else next.add(tag);
 		hidden_tags = next;
-		setTagVisible(gl_state, tag, !next.has(tag));
+		// In inspection mode, layer_surface gates all surface fills.
+		setTagVisible(gl_state, tag, layer_surface && !next.has(tag));
 		schedule_render();
 	}
 	let is_dragging = false;
@@ -348,6 +387,13 @@
 		];
 	}
 
+	// Wire layer colors follow the rapidmesh convention: surface wire uses the
+	// crosshair token, interior tet wire uses the dimmer grid token, and
+	// feature edges use accentSecondary for visual distinction from wireframe.
+	const WIRE_SURF_COLOR:  [number, number, number] = hex(canvasTheme.crosshair);
+	const WIRE_INT_COLOR:   [number, number, number] = hex(canvasTheme.grid);
+	const FEAT_EDGE_COLOR:  [number, number, number] = hex(palette.accentSecondary);
+
 	/** The 12 edges of an axis-aligned box as a flat line-segment buffer
 	 *  (2 verts × 3 floats per edge) — the spatial-reference frame for the
 	 *  time-domain field cloud. */
@@ -480,32 +526,234 @@
 		return out;
 	}
 
+	// ── Crinkle clip helpers ────────────────────────────────────────────
+
+	/** Binary search: first index where vals[i] > d. */
+	function upper_bound(vals: Float64Array, d: number): number {
+		let lo = 0, hi = vals.length;
+		while (lo < hi) {
+			const mid = (lo + hi) >> 1;
+			if (vals[mid] <= d) lo = mid + 1;
+			else hi = mid;
+		}
+		return lo;
+	}
+
+	/** Adjust draw counts for all prefix meshes. Called on every slider drag
+	 *  without re-uploading buffers. */
+	function apply_clip_counts(state: GLState, enable: boolean, axis: 0 | 1 | 2, t: number) {
+		if (!mesh) return;
+		const d = enable
+			? mesh.bbox.min[axis] + t * (mesh.bbox.max[axis] - mesh.bbox.min[axis])
+			: Infinity;
+		for (const pm of prefix_meshes) {
+			const n = enable ? upper_bound(pm.vals, d) : pm.full_count / pm.vpu;
+			const target = pm.line ? state.lineMeshes[pm.idx] : state.meshes[pm.idx];
+			if (target) target.count = Math.round(n) * pm.vpu;
+		}
+	}
+
+	/** Apply layer visibility and hidden_tags to the current GL state.
+	 *  Prunes stale hidden_tags entries that no longer exist in the geometry. */
+	function apply_layer_visibility(state: GLState) {
+		const all_tags = new Set<number>();
+		for (const m of state.meshes) all_tags.add(m.tag);
+		const cur = untrack(() => hidden_tags);
+		const next = new Set<number>();
+		for (const t of cur) if (all_tags.has(t)) next.add(t);
+		if (next.size !== cur.size) hidden_tags = next;
+		const eff = next.size !== cur.size ? next : cur;
+		// Surface fills: visible when layer_surface is on and not explicitly hidden.
+		for (const entry of state.meshes) {
+			entry.visible = layer_surface && !eff.has(entry.tag);
+		}
+		setTagVisible(state, TAG_WIRE_SURF,  layer_wire);
+		setTagVisible(state, TAG_FEAT_EDGES, layer_edges);
+		setTagVisible(state, TAG_TET_WIRE,   layer_tets);
+	}
+
+	/** Upload sorted geometry for the given clip axis. Called once per axis change
+	 *  (or mesh change). All four layers (surface fills, surface wire, feature edges,
+	 *  interior tet wire) are built and sorted by centroid along `axis` so the
+	 *  crinkle-clip slider only needs to adjust draw counts. */
+	function build_for_axis(state: GLState, m: MeshData, axis: 0 | 1 | 2) {
+		clearMeshes(state);
+		prefix_meshes = [];
+
+		const np   = m.nodes;
+		const nf   = m.tri_phys.length;
+		const nt   = m.tet_phys.length;
+
+		// Centroid along axis for a surface tri and a tet.
+		const face_cv = (fi: number): number =>
+			(np[m.tris[fi*3]*3+axis] + np[m.tris[fi*3+1]*3+axis] + np[m.tris[fi*3+2]*3+axis]) / 3;
+		const tet_cv = (ti: number): number =>
+			(np[m.tets[ti*4]*3+axis] + np[m.tets[ti*4+1]*3+axis] +
+			 np[m.tets[ti*4+2]*3+axis] + np[m.tets[ti*4+3]*3+axis]) / 4;
+
+		// ---- Surface fills: explicit tri groups per physics tag ----
+		const by_surf = new Map<number, number[]>();
+		for (let f = 0; f < nf; f++) {
+			const tag = m.tri_phys[f];
+			if (!tag || (m.phys_dim.get(tag) ?? 2) !== 2) continue;
+			let arr = by_surf.get(tag);
+			if (!arr) { arr = []; by_surf.set(tag, arr); }
+			arr.push(f);
+		}
+		for (const [tag, fis] of by_surf) {
+			const name = m.phys_names.get(tag) ?? '';
+			const kind = classify(name);
+			if (!kind) continue;
+			fis.sort((a, b) => face_cv(a) - face_cv(b));
+			const flat_idx: number[] = new Array(fis.length * 3);
+			for (let i = 0; i < fis.length; i++) {
+				const fi = fis[i];
+				flat_idx[i*3]   = m.tris[fi*3];
+				flat_idx[i*3+1] = m.tris[fi*3+1];
+				flat_idx[i*3+2] = m.tris[fi*3+2];
+			}
+			const pm_idx = state.meshes.length;
+			const vals = Float64Array.from(fis, fi => face_cv(fi));
+			prefix_meshes.push({ idx: pm_idx, line: false, vals, vpu: 3, full_count: fis.length * 3 });
+			const { positions, normals } = buildTriSoupF64(np, flat_idx);
+			addMesh(state, positions, normals, color_for(kind, name), tag);
+		}
+
+		// ---- Volume hulls (implicit surfaces from tet connectivity) ----
+		const vol_b = build_volume_boundaries(m);
+		for (const [vtag, idx] of vol_b.entries()) {
+			const name = m.phys_names.get(vtag) ?? '';
+			if (!name) continue;
+			const kind = classify(name);
+			if (!kind) continue;
+			const ntri = idx.length / 3;
+			const order = Array.from({ length: ntri }, (_, i) => i);
+			order.sort((a, b) => {
+				const ca = (np[idx[a*3]*3+axis] + np[idx[a*3+1]*3+axis] + np[idx[a*3+2]*3+axis]) / 3;
+				const cb = (np[idx[b*3]*3+axis] + np[idx[b*3+1]*3+axis] + np[idx[b*3+2]*3+axis]) / 3;
+				return ca - cb;
+			});
+			const sorted_idx: number[] = new Array(ntri * 3);
+			const vals = new Float64Array(ntri);
+			for (let i = 0; i < ntri; i++) {
+				const t = order[i];
+				sorted_idx[i*3]   = idx[t*3];
+				sorted_idx[i*3+1] = idx[t*3+1];
+				sorted_idx[i*3+2] = idx[t*3+2];
+				vals[i] = (np[idx[t*3]*3+axis] + np[idx[t*3+1]*3+axis] + np[idx[t*3+2]*3+axis]) / 3;
+			}
+			const kind_offset: [number, number] | undefined = kind === 'dielectric' ? [2, 2] : undefined;
+			const pm_idx = state.meshes.length;
+			prefix_meshes.push({ idx: pm_idx, line: false, vals, vpu: 3, full_count: ntri * 3 });
+			const { positions, normals } = buildTriSoupF64(np, sorted_idx);
+			addMesh(state, positions, normals, color_for(kind, name), vtag, kind_offset);
+		}
+
+		// ---- Surface wireframe: edges from explicit surface tris, sorted by min face centroid ----
+		const surf_edge_val = new Map<bigint, { a: number; b: number; val: number }>();
+		for (let f = 0; f < nf; f++) {
+			if (!m.tri_phys[f]) continue;
+			const fv = face_cv(f);
+			const ea = m.tris[f*3], eb = m.tris[f*3+1], ec = m.tris[f*3+2];
+			const add_se = (u: number, w: number) => {
+				const lo = u < w ? u : w, hi = u < w ? w : u;
+				const k = (BigInt(lo) << 32n) | BigInt(hi);
+				const cur = surf_edge_val.get(k);
+				if (!cur) surf_edge_val.set(k, { a: u, b: w, val: fv });
+				else if (fv < cur.val) cur.val = fv;
+			};
+			add_se(ea, eb); add_se(eb, ec); add_se(ec, ea);
+		}
+		const surf_edges = [...surf_edge_val.values()].sort((x, y) => x.val - y.val);
+		{
+			const pos = new Float32Array(surf_edges.length * 6);
+			for (let i = 0; i < surf_edges.length; i++) {
+				const e = surf_edges[i];
+				pos[i*6]   = np[e.a*3];   pos[i*6+1] = np[e.a*3+1]; pos[i*6+2] = np[e.a*3+2];
+				pos[i*6+3] = np[e.b*3];   pos[i*6+4] = np[e.b*3+1]; pos[i*6+5] = np[e.b*3+2];
+			}
+			const pm_idx = state.lineMeshes.length;
+			const vals = Float64Array.from(surf_edges, e => e.val);
+			prefix_meshes.push({ idx: pm_idx, line: true, vals, vpu: 2, full_count: surf_edges.length * 2 });
+			addLineMesh(state, pos, WIRE_SURF_COLOR, TAG_WIRE_SURF);
+		}
+
+		// ---- Interior tet wireframe: tet edges NOT on surface, sorted by min tet centroid ----
+		const surf_edge_set = new Set<bigint>(surf_edge_val.keys());
+		const int_edge_val = new Map<bigint, { a: number; b: number; val: number }>();
+		for (let ti = 0; ti < nt; ti++) {
+			const tv = tet_cv(ti);
+			const v0 = m.tets[ti*4], v1 = m.tets[ti*4+1], v2 = m.tets[ti*4+2], v3 = m.tets[ti*4+3];
+			const tet_verts = [v0, v1, v2, v3];
+			for (let i = 0; i < 4; i++) {
+				for (let j = i + 1; j < 4; j++) {
+					const u = tet_verts[i], w = tet_verts[j];
+					const lo = u < w ? u : w, hi = u < w ? w : u;
+					const k = (BigInt(lo) << 32n) | BigInt(hi);
+					if (surf_edge_set.has(k)) continue;
+					const cur = int_edge_val.get(k);
+					if (!cur) int_edge_val.set(k, { a: u, b: w, val: tv });
+					else if (tv < cur.val) cur.val = tv;
+				}
+			}
+		}
+		const int_edges = [...int_edge_val.values()].sort((x, y) => x.val - y.val);
+		{
+			const pos = new Float32Array(int_edges.length * 6);
+			for (let i = 0; i < int_edges.length; i++) {
+				const e = int_edges[i];
+				pos[i*6]   = np[e.a*3];   pos[i*6+1] = np[e.a*3+1]; pos[i*6+2] = np[e.a*3+2];
+				pos[i*6+3] = np[e.b*3];   pos[i*6+4] = np[e.b*3+1]; pos[i*6+5] = np[e.b*3+2];
+			}
+			const pm_idx = state.lineMeshes.length;
+			const vals = Float64Array.from(int_edges, e => e.val);
+			prefix_meshes.push({ idx: pm_idx, line: true, vals, vpu: 2, full_count: int_edges.length * 2 });
+			addLineMesh(state, pos, WIRE_INT_COLOR, TAG_TET_WIRE);
+		}
+
+		// ---- Feature edges from payload (not clipped, always full draw) ----
+		if (m.edges && m.edges.length >= 2) {
+			const ne = (m.edges.length / 2) | 0;
+			const pos = new Float32Array(ne * 6);
+			for (let i = 0; i < ne; i++) {
+				const ea = m.edges[i*2], eb = m.edges[i*2+1];
+				pos[i*6]   = np[ea*3];    pos[i*6+1] = np[ea*3+1]; pos[i*6+2] = np[ea*3+2];
+				pos[i*6+3] = np[eb*3];    pos[i*6+4] = np[eb*3+1]; pos[i*6+5] = np[eb*3+2];
+			}
+			// Not in prefix_meshes: feature edges are not affected by the clip slider.
+			addLineMesh(state, pos, FEAT_EDGE_COLOR, TAG_FEAT_EDGES);
+		}
+
+		built_axis = axis;
+	}
+
 	function rebuild() {
 		if (!gl_state) return;
-		clearMeshes(gl_state);
-		// Time-domain field animation: a point cloud with a faint bounding-box
-		// wireframe for spatial reference. The cloud itself is uploaded
-		// per-frame by the dedicated $effect below; clearMeshes leaves the
-		// point cloud intact.
-		// Time-domain trajectory with no geometry of its own (ProblemTD.box):
-		// the bounding box is the only spatial frame; the cloud is uploaded
-		// per-frame by the dedicated $effect below.
+
+		const useField    = show_field && field != null && !td_trajectory;
+		// Inspection mode: mesh present, no FD field, no TD trajectory.
+		// Uses prefix-sorted geometry so the crinkle-clip slider is O(log n).
+		const inInspection = mesh != null && !useField && td_trajectory == null;
+
+		// For non-inspection cases (or when geo rebuild is needed) clear now.
+		// In inspection mode, clearMeshes is deferred to build_for_axis so
+		// layer/clip changes that DON'T need a re-upload skip the clear.
+		if (!inInspection || last_built_for?.mesh !== mesh || last_built_for?.axis !== clip_axis) {
+			clearMeshes(gl_state);
+		}
+
+		// ---- TD-only (bounding-box frame, no geometry) ----
 		if (td_trajectory && !mesh) {
 			const bb = td_trajectory.bbox;
 			setBBox(gl_state, bb.min, bb.max);
 			field_norm = null;
 			in_field_mode = false;
-			addLineMesh(
-				gl_state,
-				Float32Array.from(bbox_edges(bb.min, bb.max)),
-				hex('#3a3a44'), -1,
-			);
+			addLineMesh(gl_state, Float32Array.from(bbox_edges(bb.min, bb.max)), hex('#3a3a44'), -1);
 			needs_rebuild = false;
 			return;
 		}
-		// A trajectory WITH geometry falls through to the mesh path below —
-		// the Geometry / Mesh toggles compose freely under the cloud.
-		// Wireframe-only view (geometry shown before any g.mesh() call).
+
+		// ---- Wireframe-only (geometry shown before any mesh() call) ----
 		if (!mesh && wireframe && wireframe.entities.length > 0) {
 			setBBox(gl_state, wireframe.bbox.min, wireframe.bbox.max);
 			field_norm = null;
@@ -515,31 +763,43 @@
 				const c = e.color as [number, number, number];
 				addLineMesh(gl_state, Float32Array.from(e.lines), c, e.tag);
 			}
-			// preserve hidden_tags semantics
-			const all_tags = new Set<number>();
-			for (const m of gl_state.lineMeshes) all_tags.add(m.tag);
 			const cur = untrack(() => hidden_tags);
-			for (const m of gl_state.lineMeshes) setTagVisible(gl_state, m.tag, !cur.has(m.tag));
+			for (const wm of gl_state.lineMeshes) setTagVisible(gl_state, wm.tag, !cur.has(wm.tag));
 			needs_rebuild = false;
 			return;
 		}
 		if (!mesh) return;
 
-		// Three independent toggles — geometry, wireframe, field — composed
-		// freely. The field cloud only renders when both `show_field` and
-		// actual field data are present.
-		// A TD trajectory owns the point cloud; the FD field path stays off.
-		const useField = show_field && field != null && !td_trajectory;
-		const showFaces = show_geometry;
-		const showWire = show_wireframe;
-
 		setBBox(gl_state, mesh.bbox.min, mesh.bbox.max);
+
+		// ---- Inspection mode: sorted geometry + crinkle clip ----
+		if (inInspection) {
+			field_norm = null;
+			in_field_mode = false;
+			const needsGeoRebuild = last_built_for?.mesh !== mesh || last_built_for?.axis !== clip_axis;
+			if (needsGeoRebuild) {
+				// clearMeshes was already called at the top of this branch.
+				build_for_axis(gl_state, mesh, clip_axis);
+				last_built_for = { mesh, axis: clip_axis };
+			}
+			apply_clip_counts(gl_state, clip_enable, clip_axis, clip_t);
+			apply_layer_visibility(gl_state);
+			setPointCloud(gl_state, EMPTY_F32, EMPTY_F32);
+			field_range = null;
+			needs_rebuild = false;
+			return;
+		}
+
+		// ---- Field / TD+mesh mode (original path, unmodified) ----
+		last_built_for = null;
 		field_norm = null;
 		in_field_mode = useField;
 
+		const showFaces = show_geometry;
+		const showWire  = show_wireframe;
+
 		if (showFaces) {
-			// 1) Named surface tris (conductors/ports/gnd). In field mode we
-			//    keep these as faint silhouettes for spatial reference.
+			// Named surface tris (conductors/ports/gnd).
 			const by_surf = new Map<number, number[]>();
 			for (let i = 0; i < mesh.tri_phys.length; i++) {
 				const tag = mesh.tri_phys[i];
@@ -554,13 +814,13 @@
 				if (!kind) continue;
 				push_group(idx, kind, name, tag);
 			}
-			// 2) Implicit volume hulls (substrate/oxide/air, PML, …)
+			// Implicit volume hulls (substrate/oxide/air, PML, ...).
 			const vol_b = build_volume_boundaries(mesh);
 			for (const [vtag, idx] of vol_b.entries()) {
 				const name = mesh.phys_names.get(vtag) ?? '';
 				if (!name) continue;
 				const kind = classify(name);
-				if (!kind) continue;     // e.g. ABC → transparent
+				if (!kind) continue;
 				push_group(idx, kind, name, vtag);
 			}
 		}
@@ -584,29 +844,16 @@
 				const a = mesh.tris[i * 3], b = mesh.tris[i * 3 + 1], c = mesh.tris[i * 3 + 2];
 				add_edge(a, b); add_edge(b, c); add_edge(c, a);
 			}
-			// Mesh wireframe: a dimmer grey than the new text-dim palette
-			// value so it reads as structure on the dark canvas, not as text.
 			addLineMesh(gl_state, Float32Array.from(edges), hex('#3a3a44'), -1);
 		}
 
-		// Field splat cloud is sampled asynchronously (see the dedicated
-		// `$effect` below). rebuild() just clears any stale cloud here; the
-		// sampler repopulates it.
-		// A TD trajectory keeps its own point cloud (owned by the per-frame
-		// $effect) and gets a faint bounding-box frame; only a stale FD
-		// cloud is cleared here.
 		if (td_trajectory && show_field) {
-			// Only frame the field cloud in field mode (same as FD); in the
-			// geometry / mesh modes the faces and wireframe are the reference.
 			addLineMesh(
 				gl_state,
 				Float32Array.from(bbox_edges(td_trajectory.bbox.min, td_trajectory.bbox.max)),
 				hex('#3a3a44'), -1,
 			);
 		} else if (useField) {
-			// FD field mode: the geometry faces are dropped to a faint
-			// silhouette or off entirely, so render the domain bounding box
-			// as a stable spatial frame for the field cloud (same as TD).
 			addLineMesh(
 				gl_state,
 				Float32Array.from(bbox_edges(mesh.bbox.min, mesh.bbox.max)),
@@ -618,16 +865,12 @@
 		}
 
 		// Re-apply the user's explicit hides to the freshly-built meshes.
-		// untrack() so reading hidden_tags here doesn't make the parent
-		// rebuild $effect depend on it (which would loop when we write below).
 		const all_tags = new Set<number>();
 		for (const m of gl_state.meshes) all_tags.add(m.tag);
 		for (const m of gl_state.lineMeshes) all_tags.add(m.tag);
 		const cur = untrack(() => hidden_tags);
 		const next = new Set<number>();
 		for (const t of cur) if (all_tags.has(t)) next.add(t);
-		// Only assign when something actually dropped out so we don't
-		// thrash state with structurally-equal new Sets.
 		if (next.size !== cur.size) hidden_tags = next;
 		const eff = next.size !== cur.size ? next : cur;
 		for (const m of gl_state.meshes) setTagVisible(gl_state, m.tag, !eff.has(m.tag));
@@ -795,12 +1038,30 @@
 		};
 	});
 
-	// React to mesh / toggles / field / density changes
+	// React to mesh / toggles / field / density / layer / clip-axis changes.
+	// clip_t is deliberately excluded — the fast clip_t effect below handles
+	// slider drags without a full rebuild.
 	$effect(() => {
 		mesh; wireframe; show_geometry; show_wireframe; show_field; field; point_density;
 		td_trajectory;
+		layer_surface; layer_wire; layer_edges; layer_tets;
+		clip_enable; clip_axis;
 		if (!mounted || !gl_state) return;
 		needs_rebuild = true;
+		schedule_render();
+	});
+
+	// Fast clip-t path: only adjusts draw counts on the already-sorted buffers.
+	// No re-uploads. Only runs when clip_t changes (clip_enable and clip_axis
+	// are read with untrack so they don't trigger this effect on their own).
+	$effect(() => {
+		const ct = clip_t;
+		if (!gl_state || !mesh || !mounted) return;
+		if (prefix_meshes.length === 0 || built_axis < 0) return;
+		const ce = untrack(() => clip_enable);
+		const ca = untrack(() => clip_axis);
+		if (ca !== built_axis) return; // axis change in flight, rebuild will fix it
+		apply_clip_counts(gl_state, ce, ca, ct);
 		schedule_render();
 	});
 
@@ -1258,6 +1519,42 @@
 				{scale_mode}
 			</button>
 		{/if}
+		{#if mesh && !show_field && !td_trajectory}
+			<span class="tb-sep" aria-hidden="true"></span>
+			<button class="tb tb-label" class:active={layer_surface}
+				onclick={() => { layer_surface = !layer_surface; }}>
+				<span class="tip">Toggle filled surface</span>Surf
+			</button>
+			<button class="tb tb-label" class:active={layer_wire}
+				onclick={() => { layer_wire = !layer_wire; }}>
+				<span class="tip">Toggle surface wireframe</span>Wire
+			</button>
+			<button class="tb tb-label" class:active={layer_edges}
+				onclick={() => { layer_edges = !layer_edges; }}>
+				<span class="tip">Toggle feature edges</span>Edge
+			</button>
+			<button class="tb tb-label" class:active={layer_tets}
+				onclick={() => { layer_tets = !layer_tets; }}>
+				<span class="tip">Toggle interior tet wireframe</span>Tets
+			</button>
+			<span class="tb-sep" aria-hidden="true"></span>
+			<button class="tb tb-label" class:active={clip_enable}
+				onclick={() => { clip_enable = !clip_enable; }}>
+				<span class="tip">Crinkle clip (whole-tet by centroid)</span>Clip
+			</button>
+			{#if clip_enable}
+				{#each CLIP_AXES as { lbl, ax }}
+					<button class="tb tb-label" class:active={clip_axis === ax}
+						onclick={() => { clip_axis = ax; }}>
+						<span class="tip">Clip along {lbl} axis</span>{lbl}
+					</button>
+				{/each}
+				<div class="clip-row">
+					<input type="range" class="clip-slider" min="0" max="1" step="0.001"
+						bind:value={clip_t} />
+				</div>
+			{/if}
+		{/if}
 	</div>
 
 	<div class="hud">
@@ -1265,6 +1562,12 @@
 		<span class="coord">y {(cursor_world.y * 1e6).toFixed(1)} µm</span>
 		{#if mesh}
 			<span class="coord stats">{(mesh.nodes.length / 3) | 0}n · {(mesh.tris.length / 3) | 0}t · {(mesh.tets.length / 4) | 0}T</span>
+		{/if}
+		{#if mesh?.stats?.n_edges != null}
+			<span class="coord stats">{mesh.stats.n_edges}e</span>
+		{/if}
+		{#if mesh?.stats?.min_dihedral_deg != null}
+			<span class="coord stats">min&#8736; {mesh.stats.min_dihedral_deg.toFixed(1)}&#176;</span>
 		{/if}
 	</div>
 
@@ -1481,6 +1784,22 @@
 		line-height: 1;
 		color: var(--text-muted);
 		white-space: nowrap;
+	}
+
+	/* Crinkle clip slider row: full-width so it wraps to its own line in the
+	   flex-wrap toolbar. The range input fills the available width. */
+	.clip-row {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		padding: 2px 0 0;
+	}
+	.clip-slider {
+		width: 100%;
+		height: 4px;
+		accent-color: var(--accent);
+		cursor: pointer;
+		appearance: auto;
 	}
 
 </style>

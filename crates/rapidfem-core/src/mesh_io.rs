@@ -169,3 +169,75 @@ pub fn parse_mesh_bytes(bytes: &[u8]) -> Result<Mesh, String> {
 
     Ok(mesh)
 }
+
+/// Builds a [`Mesh`] from raw arrays produced by an external mesher (e.g.
+/// rapidmesh): 0-indexed, positively oriented tets with a material tag each,
+/// plus tagged boundary/interface triangles (ports, PEC, ABC). Every tagged
+/// triangle must be a face of the tet complex (conformity is checked); the
+/// tag values are what the TOML config references, exactly like gmsh
+/// physical-group tags.
+pub fn mesh_from_arrays(
+    nodes: Vec<[f64; 3]>,
+    tets: Vec<[usize; 4]>,
+    tet_tags: &[i32],
+    tris: &[[usize; 3]],
+    tri_tags: &[i32],
+) -> Result<Mesh, String> {
+    if tets.len() != tet_tags.len() {
+        return Err(format!(
+            "tet_tags length {} != tets length {}",
+            tet_tags.len(),
+            tets.len()
+        ));
+    }
+    if tris.len() != tri_tags.len() {
+        return Err(format!(
+            "tri_tags length {} != tris length {}",
+            tri_tags.len(),
+            tris.len()
+        ));
+    }
+    let n_nodes = nodes.len();
+    for t in &tets {
+        if t.iter().any(|&v| v >= n_nodes) {
+            return Err("tet node index out of range".to_string());
+        }
+    }
+    if tets.is_empty() {
+        return Err("no tetrahedra".to_string());
+    }
+    // Normalize tet orientation to the gmsh convention the solver assumes:
+    // det(p1-p0, p2-p0, p3-p0) > 0. External meshers differ (Shewchuk
+    // orient3d positivity is the mirror image), and a flipped tet silently
+    // inverts the port mode overlap (the |S11| = 2 symptom).
+    let mut tets = tets;
+    for t in &mut tets {
+        let p: [[f64; 3]; 4] = std::array::from_fn(|k| nodes[t[k]]);
+        let r: [[f64; 3]; 3] =
+            std::array::from_fn(|i| std::array::from_fn(|k| p[i + 1][k] - p[0][k]));
+        let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+        if det == 0.0 {
+            return Err("degenerate (zero-volume) tet".to_string());
+        }
+        if det < 0.0 {
+            t.swap(0, 1);
+        }
+    }
+    let mut mesh = Mesh::from_tets(nodes, tets);
+    for (ti, &tag) in tet_tags.iter().enumerate() {
+        mesh.vtag_to_tet.entry(tag).or_default().push(ti);
+    }
+    for (t, &tag) in tris.iter().zip(tri_tags) {
+        let mut key = *t;
+        key.sort_unstable();
+        let Some(&idx) = mesh.inv_tris.get(&(key[0], key[1], key[2])) else {
+            return Err(format!(
+                "tagged triangle {key:?} is not a face of the tet complex"
+            ));
+        };
+        mesh.ftag_to_tri.entry(tag).or_default().push(idx);
+    }
+    Ok(mesh)
+}

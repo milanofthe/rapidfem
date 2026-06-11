@@ -69,6 +69,59 @@ impl PySimulation {
         Ok(PySimulation { inner })
     }
 
+    /// Construct from raw mesh arrays (an external mesher such as
+    /// rapidmesh, or any conforming tet mesh):
+    ///
+    /// - `nodes`: (n, 3) float64 coordinates
+    /// - `tets`: (m, 4) int64 node indices, positively oriented
+    /// - `tet_tags`: (m,) int32 material tag per tet (the TOML
+    ///   `materials.volume_tag` values)
+    /// - `tris`: (k, 3) int64 tagged boundary/interface triangles; every
+    ///   one must be a face of the tet complex
+    /// - `tri_tags`: (k,) int32 tag per triangle (the TOML port/PEC/ABC
+    ///   `tag` values)
+    #[staticmethod]
+    fn from_arrays(
+        nodes: numpy::PyReadonlyArray2<f64>,
+        tets: numpy::PyReadonlyArray2<i64>,
+        tet_tags: numpy::PyReadonlyArray1<i32>,
+        tris: numpy::PyReadonlyArray2<i64>,
+        tri_tags: numpy::PyReadonlyArray1<i32>,
+        config_toml: &str,
+    ) -> PyResult<Self> {
+        let nodes = nodes.as_array();
+        let tets = tets.as_array();
+        let tris = tris.as_array();
+        if nodes.shape()[1] != 3 || tets.shape()[1] != 4 || tris.shape()[1] != 3 {
+            return Err(PyRuntimeError::new_err(
+                "expected nodes (n,3), tets (m,4), tris (k,3)",
+            ));
+        }
+        let nodes_v: Vec<[f64; 3]> = nodes
+            .outer_iter()
+            .map(|r| [r[0], r[1], r[2]])
+            .collect();
+        let tets_v: Vec<[usize; 4]> = tets
+            .outer_iter()
+            .map(|r| [r[0] as usize, r[1] as usize, r[2] as usize, r[3] as usize])
+            .collect();
+        let tris_v: Vec<[usize; 3]> = tris
+            .outer_iter()
+            .map(|r| [r[0] as usize, r[1] as usize, r[2] as usize])
+            .collect();
+        let mesh = rapidfem_fd::mesh_io::mesh_from_arrays(
+            nodes_v,
+            tets_v,
+            tet_tags.as_slice()?,
+            &tris_v,
+            tri_tags.as_slice()?,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("mesh: {}", e)))?;
+        let config = rapidfem_fd::config::parse_config(config_toml)
+            .map_err(|e| PyRuntimeError::new_err(format!("config: {}", e)))?;
+        Ok(PySimulation { inner: Simulation::new(mesh, config) })
+    }
+
     /// Run the configured frequency sweep. Returns a SweepResult with frequencies
     /// (float64 array, shape `[n_freq]`) and S-parameters (complex128 array,
     /// shape `[n_freq, n_driven, n_driven]`).

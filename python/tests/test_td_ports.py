@@ -42,15 +42,16 @@ def test_coax_line_transmits_tem():
     g = rf.Geometry(maxh=3.0 * MM)
     air = g.cylinder(radius=r_outer, height=length, position=(0, 0, 0),
                      material=rf.Air())
-    inner = g.cylinder(radius=r_inner, height=length, position=(0, 0, 0),
-                       material=rf.Air())
-    g.fragment(air, inner)
-    # End caps carry the two coax ports.
+    # The inner conductor is a VOID: its volume is carved out and its wall
+    # becomes selectable boundary (nothing of interest inside a conductor).
+    inner = g.cylinder(radius=r_inner, height=length, position=(0, 0, 0))
+    g.cut(air, inner)
+    # End-cap rings carry the two coax ports.
     rf.CoaxPort(air.faces.min(axis="z"), ri=r_inner, ro=r_outer,
                 origin=(0, 0, 0))
     rf.CoaxPort(air.faces.max(axis="z"), ri=r_inner, ro=r_outer,
                 origin=(0, 0, length))
-    # Everything else (inner-conductor surface + outer shield) is PEC.
+    # Everything else (inner-conductor wall + outer shield) is PEC.
     rf.PEC(*air.faces.unassigned)
     g.mesh()
 

@@ -367,6 +367,37 @@ class Geometry:
             bbox=(allp.min(axis=0), allp.max(axis=0)),
         )
 
+    def sweep(self, path, radius: float, *, segments: int = 16,
+              material=None, maxh: float | None = None) -> GeoObject:
+        """circular wire swept along a 3D polyline (watertight tube)"""
+        pts = [tuple(float(c) for c in p) for p in path]
+        if len(pts) < 2:
+            raise ValueError("sweep path needs at least 2 points")
+        allp = np.asarray(pts, dtype=float)
+        return self._add_solid(
+            "sweep", {"path": pts, "radius": float(radius), "segments": segments},
+            material=material, maxh=maxh,
+            bbox=(allp.min(axis=0) - radius, allp.max(axis=0) + radius),
+        )
+
+    def helix(self, radius: float, pitch: float, turns: float,
+              wire_radius: float, position=(0, 0, 0), *,
+              points_per_turn: int = 24, segments: int = 12,
+              material=None, maxh: float | None = None) -> GeoObject:
+        """helical wire around the z axis through ``position``"""
+        c = np.asarray(position, dtype=float)
+        r = radius + wire_radius
+        height = pitch * turns
+        lo = c + np.array([-r, -r, -wire_radius])
+        hi = c + np.array([r, r, height + wire_radius])
+        return self._add_solid(
+            "helix", {"radius": float(radius), "pitch": float(pitch),
+                      "turns": float(turns), "wire_radius": float(wire_radius),
+                      "position": tuple(c), "points_per_turn": points_per_turn,
+                      "segments": segments},
+            material=material, maxh=maxh, bbox=(lo, hi),
+        )
+
     def extrude(self, profile, height: float, axis=(0, 0, 1), *,
                 material=None, maxh: float | None = None) -> GeoObject:
         """extrude a planar 3D point profile along ``axis``"""
@@ -839,6 +870,14 @@ def _build_rapidmesh(gm, entry: dict):
                         tube_segments=a["tube_segments"], maxh=maxh, void=void)
     if k == "loft":
         return gm.loft(a["profile_a"], a["profile_b"], maxh=maxh, void=void)
+    if k == "sweep":
+        return gm.sweep(a["path"], a["radius"], segments=a["segments"],
+                        maxh=maxh, void=void)
+    if k == "helix":
+        return gm.helix(a["radius"], a["pitch"], a["turns"], a["wire_radius"],
+                        position=a["position"],
+                        points_per_turn=a["points_per_turn"],
+                        segments=a["segments"], maxh=maxh, void=void)
     if k == "plate":
         return gm.plate(a["p0"], a["du"], a["dv"],
                         tag=entry["sheet_tag"], maxh=maxh)

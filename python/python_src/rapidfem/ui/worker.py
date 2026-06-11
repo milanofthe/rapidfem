@@ -106,7 +106,7 @@ _field_store: dict[str, Any] = {"sim": None, "result": None}
 
 
 def _reset_namespace() -> None:
-    """Wipe the worker's Python namespace and any gmsh model state."""
+    """Wipe the worker's Python namespace."""
     global _namespace
     import rapidfem
     _namespace = {
@@ -116,12 +116,6 @@ def _reset_namespace() -> None:
     }
     _field_store["sim"] = None
     _field_store["result"] = None
-    try:
-        import gmsh
-        if gmsh.isInitialized():
-            gmsh.clear()
-    except Exception:
-        pass
 
 
 def initialize() -> None:
@@ -148,20 +142,8 @@ def initialize() -> None:
 
     _reset_namespace()
 
-    # gmsh installs a SIGINT handler that only works on the main thread;
-    # eager init here keeps later Geometry() calls quick.
-    try:
-        import gmsh
-        if not gmsh.isInitialized():
-            gmsh.initialize()
-            gmsh.option.setNumber("General.Terminal", 0)
-    except Exception:
-        pass
-
-    # Restore Python's default SIGINT handler, gmsh.initialize() installs
-    # one that suppresses the signal, but we want SIGINT to raise
-    # KeyboardInterrupt inside the current cell so the parent can interrupt
-    # a long-running solve.
+    # Make sure SIGINT raises KeyboardInterrupt inside the current cell so
+    # the parent can interrupt a long-running solve.
     try:
         signal.signal(signal.SIGINT, signal.default_int_handler)
     except (ValueError, OSError):

@@ -168,6 +168,15 @@ class GeoObject:
         self._geometry._solids[self._index]["material"] = value
 
     @property
+    def name(self):
+        """display label (viewer/legend only; physics binds via objects)"""
+        return self._geometry._solids[self._index].get("name")
+
+    @name.setter
+    def name(self, value: str) -> None:
+        self._geometry._solids[self._index]["name"] = value
+
+    @property
     def maxh(self):
         return self._geometry._solids[self._index].get("maxh")
 
@@ -445,6 +454,69 @@ class Geometry:
              "holes": [[(float(x), float(y)) for x, y in h] for h in holes or []]},
             maxh=maxh, bbox=(lo, hi),
         )
+
+    # ------------------------------------------------------------ rigid ops
+
+    def translate(self, obj: GeoObject, dx: float = 0.0, dy: float = 0.0,
+                  dz: float = 0.0) -> GeoObject:
+        """shift a recorded object in place (description level)"""
+        entry = self._geometry_entry(obj)
+        d = np.array([dx, dy, dz], dtype=float)
+        _shift_args(entry["args"], d)
+        lo, hi = entry["bbox"]
+        entry["bbox"] = (np.asarray(lo) + d, np.asarray(hi) + d)
+        return obj
+
+    def mirror(self, obj: GeoObject, normal=(1, 0, 0)) -> GeoObject:
+        """reflect a recorded object across the axis plane through the
+        origin with the given axis-aligned ``normal``"""
+        entry = self._geometry_entry(obj)
+        k = _axis_index(normal, "mirror")
+        _mirror_args(entry["kind"], entry["args"], k)
+        lo, hi = (np.asarray(b, dtype=float).copy() for b in entry["bbox"])
+        lo[k], hi[k] = -hi[k], -lo[k]
+        entry["bbox"] = (lo, hi)
+        return obj
+
+    def copy(self, obj: GeoObject) -> GeoObject:
+        """independent duplicate: shares the material INSTANCE, drops the
+        name, and further ops on either object leave the other untouched"""
+        import copy as _copy
+
+        entry = self._geometry_entry(obj)
+        mat = entry["material"]
+        new = _copy.deepcopy({k: v for k, v in entry.items() if k != "material"})
+        new["material"] = mat
+        new.pop("name", None)
+        if entry["sheet_tag"] != 0:
+            new["sheet_tag"] = self._next_sheet_tag
+            self._next_sheet_tag += 1
+        else:
+            new["solid3"] = self._n_solid3
+            self._n_solid3 += 1
+        self._solids.append(new)
+        return GeoObject(self, obj.dim, len(self._solids) - 1)
+
+    def array(self, obj: GeoObject, n: int, *, spacing=None,
+              rotation: float | None = None) -> list:
+        """replicate ``obj`` ``n`` times: linearly (``spacing`` vector) or
+        polar around the z axis (``rotation`` step in radians). Returns the
+        cells with ``obj`` itself as the first entry."""
+        if (spacing is None) == (rotation is None):
+            raise ValueError("array needs exactly one of spacing= or rotation=")
+        if n < 1:
+            raise ValueError("array needs n >= 1")
+        cells = [obj]
+        for k in range(1, n):
+            c = self.copy(obj)
+            if spacing is not None:
+                d = np.asarray(spacing, dtype=float) * k
+                self.translate(c, *d)
+            else:
+                entry = self._geometry_entry(c)
+                _rotate_z_entry(entry, rotation * k)
+            cells.append(c)
+        return cells
 
     # ------------------------------------------------------------ booleans
 
@@ -778,6 +850,111 @@ def _build_rapidmesh(gm, entry: dict):
                                 holes=a["holes"] or None,
                                 tag=entry["sheet_tag"], maxh=maxh)
     raise ValueError(f"unknown primitive kind {k!r}")
+
+
+def _axis_index(normal, what: str) -> int:
+    n = np.asarray(normal, dtype=float)
+    nz = np.nonzero(np.abs(n) > 1e-12)[0]
+    if len(nz) != 1:
+        raise ValueError(f"{what}: only axis-aligned planes through the "
+                         f"origin are supported (normal {normal!r})")
+    return int(nz[0])
+
+
+def _shift_args(a: dict, d: np.ndarray) -> None:
+    for key in ("position", "p0", "center"):
+        if key in a:
+            a[key] = tuple(np.asarray(a[key], dtype=float) + d)
+    for key in ("profile_a", "profile_b"):
+        if key in a:
+            a[key] = [tuple(np.asarray(p, dtype=float) + d) for p in a[key]]
+
+
+def _mirror_args(kind: str, a: dict, k: int) -> None:
+    def flip(v):
+        v = np.asarray(v, dtype=float).copy()
+        v[k] = -v[k]
+        return tuple(v)
+
+    if kind == "box":
+        x = np.asarray(a["position"], dtype=float)
+        x[k] = -(x[k] + a["size"][k])
+        a["position"] = tuple(x)
+    elif kind in ("cylinder", "cone"):
+        a["position"] = flip(a["position"])
+        a["axis"] = flip(a["axis"])
+    elif kind == "sphere":
+        a["center"] = flip(a["center"])
+    elif kind == "torus":
+        a["center"] = flip(a["center"])
+        a["axis"] = flip(a["axis"])
+    elif kind == "loft":
+        a["profile_a"] = [flip(p) for p in a["profile_a"]]
+        a["profile_b"] = [flip(p) for p in a["profile_b"]]
+    elif kind == "plate":
+        a["p0"] = flip(a["p0"])
+        a["du"] = flip(a["du"])
+        a["dv"] = flip(a["dv"])
+    elif kind == "disc":
+        a["position"] = flip(a["position"])
+        a["axis"] = flip(a["axis"])
+    elif kind == "polygon_plate":
+        if k == 2:
+            a["position"] = flip(a["position"])
+        else:
+            a["position"] = flip(a["position"])
+            a["points"] = [
+                ((-x, y) if k == 0 else (x, -y)) for x, y in a["points"]
+            ]
+            a["holes"] = [
+                [((-x, y) if k == 0 else (x, -y)) for x, y in h]
+                for h in a["holes"]
+            ]
+    else:
+        raise ValueError(f"mirror is not supported for {kind!r} yet")
+
+
+def _rotate_z_entry(entry: dict, theta: float) -> None:
+    """rotate one recorded primitive around the z axis through the origin;
+    a box leaves the axis-aligned world and is rewritten as the loft of its
+    rotated corner rectangles (exact, the surfaces are still planar)."""
+    c, s = np.cos(theta), np.sin(theta)
+    rot = lambda p: (c * p[0] - s * p[1], c * p[1] + s * p[0], p[2])
+    a = entry["args"]
+    kind = entry["kind"]
+    if kind == "box":
+        x, y, z = a["position"]
+        w, d, h = a["size"]
+        lo = [(x, y, z), (x + w, y, z), (x + w, y + d, z), (x, y + d, z)]
+        entry["kind"] = "loft"
+        entry["args"] = {
+            "profile_a": [rot(p) for p in lo],
+            "profile_b": [rot((p[0], p[1], z + h)) for p in lo],
+        }
+    elif kind in ("cylinder", "cone", "disc"):
+        a["position"] = rot(a["position"])
+        a["axis"] = rot(a["axis"])
+    elif kind == "sphere":
+        a["center"] = rot(a["center"])
+    elif kind == "torus":
+        a["center"] = rot(a["center"])
+        a["axis"] = rot(a["axis"])
+    elif kind == "loft":
+        a["profile_a"] = [rot(p) for p in a["profile_a"]]
+        a["profile_b"] = [rot(p) for p in a["profile_b"]]
+    elif kind == "plate":
+        a["p0"] = rot(a["p0"])
+        a["du"] = rot(a["du"])
+        a["dv"] = rot(a["dv"])
+    else:
+        raise ValueError(f"polar array is not supported for {kind!r} yet")
+    # conservative bbox: rotate the old corners
+    lo, hi = entry["bbox"]
+    corners = np.array([rot((x, y, z))
+                        for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1])
+                        for z in (lo[2], hi[2])])
+    entry["bbox"] = (corners.min(axis=0), corners.max(axis=0))
 
 
 def _on_box(bbox, ref, tol) -> bool:

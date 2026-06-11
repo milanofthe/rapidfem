@@ -682,252 +682,77 @@ impl PyTdOperator {
         pec_faces: Option<Vec<i32>>,
         wave_ports: Option<Vec<(i32, bool, usize, f64)>>,
     ) -> PyResult<Self> {
-        use rapidfem_td::dispersive::DebyeMaterial;
-        use rapidfem_td::rhs::{
-            ElemMaterial, MaxwellOperator, PecSpec, PeriodicSpec, PortSpec,
-        };
-        use rapidfem_td::waveguide::FloquetPolarisation;
         let mesh = rapidfem_core::mesh_io::parse_mesh_bytes(mesh_bytes)
             .map_err(PyRuntimeError::new_err)?;
-        let mut materials = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-        if let Some(tm) = tag_materials {
-            for (tag, eps, mu, sigma) in tm {
-                if let Some(tets) = mesh.vtag_to_tet.get(&tag) {
-                    for &t in tets {
-                        materials[t] = ElemMaterial {
-                            eps: [eps.0, eps.1, eps.2],
-                            mu: [mu.0, mu.1, mu.2],
-                            sigma,
-                            sigma_m: 0.0,
-                        };
-                    }
-                }
-            }
-        }
-        // Graded matched absorbers — per tet, depth into the layer sets a
-        // quadratically ramped loss rate `nu`, mirroring `absorber.rs`. The
-        // tet keeps its eps/mu; the matched pair `sigma = nu*eps`,
-        // `sigma_m = nu*mu` keeps `sigma*/mu = sigma/eps = nu`, so the layer
-        // is reflectionless at the interface.
-        if let Some(abs_specs) = absorbers {
-            for (tag, axis, inner_face, thickness, nu_max, is_low) in abs_specs
-            {
-                let tets = match mesh.vtag_to_tet.get(&tag) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                for &t in tets {
-                    let centroid: f64 = mesh.tets[t]
-                        .iter()
-                        .map(|&n| mesh.nodes[n][axis])
-                        .sum::<f64>()
-                        / 4.0;
-                    let depth = if is_low {
-                        inner_face - centroid
-                    } else {
-                        centroid - inner_face
-                    };
-                    if depth <= 0.0 {
-                        continue;
-                    }
-                    let frac = (depth / thickness).clamp(0.0, 1.0);
-                    let nu = nu_max * frac * frac;
-                    let m = &mut materials[t];
-                    m.sigma = nu * m.eps[0];
-                    m.sigma_m = nu * m.mu[0];
-                }
-            }
-        }
-        // Debye dispersive volumes — applied after tag_materials / absorbers.
-        // Each tagged tet's permittivity is forced to eps_inf (the static
-        // curl term) and the tet is added to the ADE list; the appended
-        // polarisation block then carries the dispersion. An empty list
-        // leaves the operator byte-identical to the non-dispersive build.
-        let mut disp_elems: Vec<(usize, DebyeMaterial)> = Vec::new();
-        if let Some(dsp) = dispersive {
-            for (tag, eps_inf, eps_static, tau) in dsp {
-                let tets = match mesh.vtag_to_tet.get(&tag) {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let mat =
-                    DebyeMaterial { eps_inf, eps_static, tau };
-                for &t in tets {
-                    materials[t].eps = [eps_inf; 3];
-                    disp_elems.push((t, mat));
-                }
-            }
-        }
-        let mut port_specs: Vec<PortSpec> = Vec::new();
-        if let Some(ps) = ports {
-            for (tag, m, n, dir, z0_op) in ps {
-                let dir = dir.map(|(x, y, z)| [x, y, z]);
-                let spec = PortSpec::from_mesh_tag_with_z0(
-                    &mesh, tag, (m, n), dir, z0_op,
-                )
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err(format!(
-                        "port face tag {tag} has no triangles, or its \
-                         direction is zero / parallel to the face"
-                    ))
-                })?;
-                port_specs.push(spec);
-            }
-        }
-        // Coaxial TEM ports — appended after the rectangular ports.
-        if let Some(cps) = coax_ports {
-            for (tag, center) in cps {
-                let center = center.map(|(x, y, z)| [x, y, z]);
-                let spec = PortSpec::coax_from_mesh_tag(&mesh, tag, center)
-                    .ok_or_else(|| {
-                        PyRuntimeError::new_err(format!(
-                            "coax port face tag {tag} has no triangles"
-                        ))
-                    })?;
-                port_specs.push(spec);
-            }
-        }
-        // Floquet plane-wave ports — appended after the rectangular and
-        // coax ports. `polarisation_mode` encodes the TE / TM choice as in
-        // the FD backend's `mode_nr`: 1 -> TE, 2 -> TM.
-        if let Some(fps) = floquet_ports {
-            for (tag, pol_nr, scan_theta, scan_phi) in fps {
-                let polarisation = match pol_nr {
-                    1 => FloquetPolarisation::Te,
-                    2 => FloquetPolarisation::Tm,
-                    _ => {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "floquet port face tag {tag}: \
-                             polarisation_mode must be 1 (TE) or 2 (TM), \
-                             got {pol_nr}"
-                        )));
-                    }
-                };
-                let spec = PortSpec::floquet_from_mesh_tag(
-                    &mesh,
-                    tag,
-                    polarisation,
-                    scan_theta,
-                    scan_phi,
-                    None,
-                )
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err(format!(
-                        "floquet port face tag {tag} has no triangles"
-                    ))
-                })?;
-                port_specs.push(spec);
-            }
-        }
-        // Numerically-solved wave ports — appended after the rectangular,
-        // coax and Floquet modal ports (and before the absorbing faces),
-        // so the modal-port subset stays contiguous. Each entry is
-        // `(face_tag, te, mode_index, k0)`: a 2D cross-section eigensolve
-        // runs at build time and the sampled profile becomes the port
-        // mode. `k0 > 0` selects the inhomogeneous vector solve at that
-        // operating wavenumber (microstrip-class); `k0 <= 0` the scalar
-        // TE/TM solve (homogeneous hollow guide). Per-tet `ε_r` is read
-        // off the already-resolved `materials`.
-        if let Some(wps) = wave_ports {
-            let eps_per_tet: Vec<f64> =
-                materials.iter().map(|m| m.eps[0]).collect();
-            // Per-node internal-PEC mask: any node on a PEC face tag is a
-            // conductor node (the microstrip trace + ground). The vector
-            // wave-port solve pins tangential E = 0 there, resolving the
-            // quasi-TEM mode of an inhomogeneous line with an embedded
-            // trace. Borrowed from `pec_faces` before it is consumed below.
-            let pec_nodes: Option<Vec<bool>> = pec_faces.as_ref().map(|tags| {
-                let mut mask = vec![false; mesh.n_nodes()];
-                for &tag in tags {
-                    if let Some(tris) = mesh.ftag_to_tri.get(&tag) {
-                        for &t in tris {
-                            for &nd in &mesh.tris[t] {
-                                mask[nd] = true;
-                            }
-                        }
-                    }
-                }
-                mask
-            });
-            for (tag, te, mode_index, k0) in wps {
-                let spec = PortSpec::wave_from_mesh_tag(
-                    &mesh,
-                    tag,
-                    te,
-                    mode_index,
-                    Some(&eps_per_tet),
-                    k0,
-                    pec_nodes.as_deref(),
-                )
-                .ok_or_else(|| {
-                    PyRuntimeError::new_err(format!(
-                        "wave port face tag {tag}: no triangles, or the \
-                         cross-section eigensolve found fewer than \
-                         {} mode(s)",
-                        mode_index + 1,
-                    ))
-                })?;
-                port_specs.push(spec);
-            }
-        }
-        // Absorbing-only (ABC) boundary faces - characteristic
-        // non-reflecting flux, no waveguide mode. Appended after the
-        // modal ports, so absorbing faces do NOT shift the modal-port
-        // indices used by `sparams`.
-        if let Some(faces) = abc_faces {
-            for tag in faces {
-                let spec = PortSpec::absorbing_from_mesh_tag(&mesh, tag)
-                    .ok_or_else(|| {
-                        PyRuntimeError::new_err(format!(
-                            "ABC face tag {tag} has no triangles"
-                        ))
-                    })?;
-                port_specs.push(spec);
-            }
-        }
-        // Periodic boundary pairs, collect each `(face_a, face_b)` into a
-        // PeriodicSpec. The matcher inside the operator handles the
-        // transverse alignment and the face-node permutation.
-        let mut periodic_specs: Vec<PeriodicSpec> = Vec::new();
-        if let Some(pairs) = periodic_pairs {
-            for (face_a, face_b) in pairs {
-                let spec = PeriodicSpec::from_mesh_tags(&mesh, face_a, face_b)
-                    .ok_or_else(|| {
-                        PyRuntimeError::new_err(format!(
-                            "periodic pair ({face_a}, {face_b}): one of the \
-                             face tags has no triangles"
-                        ))
-                    })?;
-                periodic_specs.push(spec);
-            }
-        }
-        // Internal-PEC plates: collect from face tags.
-        let mut pec_specs: Vec<PecSpec> = Vec::new();
-        if let Some(tags) = pec_faces {
-            for tag in tags {
-                let spec = PecSpec::from_mesh_tag(&mesh, tag)
-                    .ok_or_else(|| {
-                        PyRuntimeError::new_err(format!(
-                            "PEC face tag {tag} has no triangles"
-                        ))
-                    })?;
-                pec_specs.push(spec);
-            }
-        }
-        let op = MaxwellOperator::new_full(
-            &mesh, order, flux_alpha, &materials, &port_specs, &disp_elems,
-            &periodic_specs, &pec_specs,
-        );
-        Ok(PyTdOperator {
-            op,
-            krylov: rapidfem_td::propagator::KrylovWorkspace::new(),
-            driven_b: Vec::new(),
-            lserk: rapidfem_td::explicit::LserkWorkspace::new(),
-            kcl: rapidfem_td::explicit_adaptive::KclWorkspace::new(),
-            gpu: None,
-        })
+        Self::build(
+            mesh, order, flux_alpha, tag_materials, ports, absorbers,
+            dispersive, coax_ports, periodic_pairs, floquet_ports, abc_faces,
+            pec_faces, wave_ports,
+        )
     }
 
+    /// Array-mesh variant of `from_mesh_bytes`: identical physics arguments,
+    /// the mesh comes as numpy arrays (the rapidmesh path). Tet orientation
+    /// is normalized and every tagged triangle is conformity-checked, same
+    /// as `Simulation.from_arrays`.
+    #[staticmethod]
+    #[pyo3(signature = (nodes, tets, tet_tags, tris, tri_tags, order, flux_alpha = 1.0, tag_materials = None, ports = None, absorbers = None, dispersive = None, coax_ports = None, periodic_pairs = None, floquet_ports = None, abc_faces = None, pec_faces = None, wave_ports = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn from_arrays(
+        nodes: numpy::PyReadonlyArray2<f64>,
+        tets: numpy::PyReadonlyArray2<i64>,
+        tet_tags: numpy::PyReadonlyArray1<i32>,
+        tris: numpy::PyReadonlyArray2<i64>,
+        tri_tags: numpy::PyReadonlyArray1<i32>,
+        order: usize,
+        flux_alpha: f64,
+        tag_materials: Option<
+            Vec<(i32, (f64, f64, f64), (f64, f64, f64), f64)>,
+        >,
+        ports: Option<Vec<(i32, usize, usize, Option<(f64, f64, f64)>, f64)>>,
+        absorbers: Option<Vec<(i32, usize, f64, f64, f64, bool)>>,
+        dispersive: Option<Vec<(i32, f64, f64, f64)>>,
+        coax_ports: Option<Vec<(i32, Option<(f64, f64, f64)>)>>,
+        periodic_pairs: Option<Vec<(i32, i32)>>,
+        floquet_ports: Option<Vec<(i32, u32, f64, f64)>>,
+        abc_faces: Option<Vec<i32>>,
+        pec_faces: Option<Vec<i32>>,
+        wave_ports: Option<Vec<(i32, bool, usize, f64)>>,
+    ) -> PyResult<Self> {
+        let nodes = nodes.as_array();
+        let tets = tets.as_array();
+        let tris = tris.as_array();
+        if nodes.shape()[1] != 3 || tets.shape()[1] != 4 || tris.shape()[1] != 3 {
+            return Err(PyRuntimeError::new_err(
+                "expected nodes (n,3), tets (m,4), tris (k,3)",
+            ));
+        }
+        let nodes_v: Vec<[f64; 3]> = nodes
+            .outer_iter()
+            .map(|r| [r[0], r[1], r[2]])
+            .collect();
+        let tets_v: Vec<[usize; 4]> = tets
+            .outer_iter()
+            .map(|r| [r[0] as usize, r[1] as usize, r[2] as usize, r[3] as usize])
+            .collect();
+        let tris_v: Vec<[usize; 3]> = tris
+            .outer_iter()
+            .map(|r| [r[0] as usize, r[1] as usize, r[2] as usize])
+            .collect();
+        let mesh = rapidfem_fd::mesh_io::mesh_from_arrays(
+            nodes_v,
+            tets_v,
+            tet_tags.as_slice()?,
+            &tris_v,
+            tri_tags.as_slice()?,
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("mesh: {}", e)))?;
+        Self::build(
+            mesh, order, flux_alpha, tag_materials, ports, absorbers,
+            dispersive, coax_ports, periodic_pairs, floquet_ports, abc_faces,
+            pec_faces, wave_ports,
+        )
+    }
     /// Degrees of freedom — `6·Np·n_elem` for the `[E,H]` block, plus
     /// `3·Np` per Debye dispersive element for the appended
     /// auxiliary-polarisation block. Exactly `6·Np·n_elem` with no
@@ -1779,6 +1604,273 @@ impl PyTdOperator {
 }
 
 /// rapidfem — frequency- and time-domain EM FEM solver.
+impl PyTdOperator {
+    /// Shared TD-operator build on a parsed mesh: materials, graded
+    /// absorbers, Debye dispersion, every port family, periodic pairs and
+    /// internal PEC, then the DG Maxwell operator.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        mesh: rapidfem_core::mesh::Mesh,
+        order: usize,
+        flux_alpha: f64,
+        tag_materials: Option<
+            Vec<(i32, (f64, f64, f64), (f64, f64, f64), f64)>,
+        >,
+        ports: Option<Vec<(i32, usize, usize, Option<(f64, f64, f64)>, f64)>>,
+        absorbers: Option<Vec<(i32, usize, f64, f64, f64, bool)>>,
+        dispersive: Option<Vec<(i32, f64, f64, f64)>>,
+        coax_ports: Option<Vec<(i32, Option<(f64, f64, f64)>)>>,
+        periodic_pairs: Option<Vec<(i32, i32)>>,
+        floquet_ports: Option<Vec<(i32, u32, f64, f64)>>,
+        abc_faces: Option<Vec<i32>>,
+        pec_faces: Option<Vec<i32>>,
+        wave_ports: Option<Vec<(i32, bool, usize, f64)>>,
+    ) -> PyResult<Self> {
+        use rapidfem_td::dispersive::DebyeMaterial;
+        use rapidfem_td::rhs::{
+            ElemMaterial, MaxwellOperator, PecSpec, PeriodicSpec, PortSpec,
+        };
+        use rapidfem_td::waveguide::FloquetPolarisation;
+        let mut materials = vec![ElemMaterial::VACUUM; mesh.n_tets()];
+        if let Some(tm) = tag_materials {
+            for (tag, eps, mu, sigma) in tm {
+                if let Some(tets) = mesh.vtag_to_tet.get(&tag) {
+                    for &t in tets {
+                        materials[t] = ElemMaterial {
+                            eps: [eps.0, eps.1, eps.2],
+                            mu: [mu.0, mu.1, mu.2],
+                            sigma,
+                            sigma_m: 0.0,
+                        };
+                    }
+                }
+            }
+        }
+        // Graded matched absorbers — per tet, depth into the layer sets a
+        // quadratically ramped loss rate `nu`, mirroring `absorber.rs`. The
+        // tet keeps its eps/mu; the matched pair `sigma = nu*eps`,
+        // `sigma_m = nu*mu` keeps `sigma*/mu = sigma/eps = nu`, so the layer
+        // is reflectionless at the interface.
+        if let Some(abs_specs) = absorbers {
+            for (tag, axis, inner_face, thickness, nu_max, is_low) in abs_specs
+            {
+                let tets = match mesh.vtag_to_tet.get(&tag) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                for &t in tets {
+                    let centroid: f64 = mesh.tets[t]
+                        .iter()
+                        .map(|&n| mesh.nodes[n][axis])
+                        .sum::<f64>()
+                        / 4.0;
+                    let depth = if is_low {
+                        inner_face - centroid
+                    } else {
+                        centroid - inner_face
+                    };
+                    if depth <= 0.0 {
+                        continue;
+                    }
+                    let frac = (depth / thickness).clamp(0.0, 1.0);
+                    let nu = nu_max * frac * frac;
+                    let m = &mut materials[t];
+                    m.sigma = nu * m.eps[0];
+                    m.sigma_m = nu * m.mu[0];
+                }
+            }
+        }
+        // Debye dispersive volumes — applied after tag_materials / absorbers.
+        // Each tagged tet's permittivity is forced to eps_inf (the static
+        // curl term) and the tet is added to the ADE list; the appended
+        // polarisation block then carries the dispersion. An empty list
+        // leaves the operator byte-identical to the non-dispersive build.
+        let mut disp_elems: Vec<(usize, DebyeMaterial)> = Vec::new();
+        if let Some(dsp) = dispersive {
+            for (tag, eps_inf, eps_static, tau) in dsp {
+                let tets = match mesh.vtag_to_tet.get(&tag) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let mat =
+                    DebyeMaterial { eps_inf, eps_static, tau };
+                for &t in tets {
+                    materials[t].eps = [eps_inf; 3];
+                    disp_elems.push((t, mat));
+                }
+            }
+        }
+        let mut port_specs: Vec<PortSpec> = Vec::new();
+        if let Some(ps) = ports {
+            for (tag, m, n, dir, z0_op) in ps {
+                let dir = dir.map(|(x, y, z)| [x, y, z]);
+                let spec = PortSpec::from_mesh_tag_with_z0(
+                    &mesh, tag, (m, n), dir, z0_op,
+                )
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "port face tag {tag} has no triangles, or its \
+                         direction is zero / parallel to the face"
+                    ))
+                })?;
+                port_specs.push(spec);
+            }
+        }
+        // Coaxial TEM ports — appended after the rectangular ports.
+        if let Some(cps) = coax_ports {
+            for (tag, center) in cps {
+                let center = center.map(|(x, y, z)| [x, y, z]);
+                let spec = PortSpec::coax_from_mesh_tag(&mesh, tag, center)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "coax port face tag {tag} has no triangles"
+                        ))
+                    })?;
+                port_specs.push(spec);
+            }
+        }
+        // Floquet plane-wave ports — appended after the rectangular and
+        // coax ports. `polarisation_mode` encodes the TE / TM choice as in
+        // the FD backend's `mode_nr`: 1 -> TE, 2 -> TM.
+        if let Some(fps) = floquet_ports {
+            for (tag, pol_nr, scan_theta, scan_phi) in fps {
+                let polarisation = match pol_nr {
+                    1 => FloquetPolarisation::Te,
+                    2 => FloquetPolarisation::Tm,
+                    _ => {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "floquet port face tag {tag}: \
+                             polarisation_mode must be 1 (TE) or 2 (TM), \
+                             got {pol_nr}"
+                        )));
+                    }
+                };
+                let spec = PortSpec::floquet_from_mesh_tag(
+                    &mesh,
+                    tag,
+                    polarisation,
+                    scan_theta,
+                    scan_phi,
+                    None,
+                )
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "floquet port face tag {tag} has no triangles"
+                    ))
+                })?;
+                port_specs.push(spec);
+            }
+        }
+        // Numerically-solved wave ports — appended after the rectangular,
+        // coax and Floquet modal ports (and before the absorbing faces),
+        // so the modal-port subset stays contiguous. Each entry is
+        // `(face_tag, te, mode_index, k0)`: a 2D cross-section eigensolve
+        // runs at build time and the sampled profile becomes the port
+        // mode. `k0 > 0` selects the inhomogeneous vector solve at that
+        // operating wavenumber (microstrip-class); `k0 <= 0` the scalar
+        // TE/TM solve (homogeneous hollow guide). Per-tet `ε_r` is read
+        // off the already-resolved `materials`.
+        if let Some(wps) = wave_ports {
+            let eps_per_tet: Vec<f64> =
+                materials.iter().map(|m| m.eps[0]).collect();
+            // Per-node internal-PEC mask: any node on a PEC face tag is a
+            // conductor node (the microstrip trace + ground). The vector
+            // wave-port solve pins tangential E = 0 there, resolving the
+            // quasi-TEM mode of an inhomogeneous line with an embedded
+            // trace. Borrowed from `pec_faces` before it is consumed below.
+            let pec_nodes: Option<Vec<bool>> = pec_faces.as_ref().map(|tags| {
+                let mut mask = vec![false; mesh.n_nodes()];
+                for &tag in tags {
+                    if let Some(tris) = mesh.ftag_to_tri.get(&tag) {
+                        for &t in tris {
+                            for &nd in &mesh.tris[t] {
+                                mask[nd] = true;
+                            }
+                        }
+                    }
+                }
+                mask
+            });
+            for (tag, te, mode_index, k0) in wps {
+                let spec = PortSpec::wave_from_mesh_tag(
+                    &mesh,
+                    tag,
+                    te,
+                    mode_index,
+                    Some(&eps_per_tet),
+                    k0,
+                    pec_nodes.as_deref(),
+                )
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "wave port face tag {tag}: no triangles, or the \
+                         cross-section eigensolve found fewer than \
+                         {} mode(s)",
+                        mode_index + 1,
+                    ))
+                })?;
+                port_specs.push(spec);
+            }
+        }
+        // Absorbing-only (ABC) boundary faces - characteristic
+        // non-reflecting flux, no waveguide mode. Appended after the
+        // modal ports, so absorbing faces do NOT shift the modal-port
+        // indices used by `sparams`.
+        if let Some(faces) = abc_faces {
+            for tag in faces {
+                let spec = PortSpec::absorbing_from_mesh_tag(&mesh, tag)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "ABC face tag {tag} has no triangles"
+                        ))
+                    })?;
+                port_specs.push(spec);
+            }
+        }
+        // Periodic boundary pairs, collect each `(face_a, face_b)` into a
+        // PeriodicSpec. The matcher inside the operator handles the
+        // transverse alignment and the face-node permutation.
+        let mut periodic_specs: Vec<PeriodicSpec> = Vec::new();
+        if let Some(pairs) = periodic_pairs {
+            for (face_a, face_b) in pairs {
+                let spec = PeriodicSpec::from_mesh_tags(&mesh, face_a, face_b)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "periodic pair ({face_a}, {face_b}): one of the \
+                             face tags has no triangles"
+                        ))
+                    })?;
+                periodic_specs.push(spec);
+            }
+        }
+        // Internal-PEC plates: collect from face tags.
+        let mut pec_specs: Vec<PecSpec> = Vec::new();
+        if let Some(tags) = pec_faces {
+            for tag in tags {
+                let spec = PecSpec::from_mesh_tag(&mesh, tag)
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "PEC face tag {tag} has no triangles"
+                        ))
+                    })?;
+                pec_specs.push(spec);
+            }
+        }
+        let op = MaxwellOperator::new_full(
+            &mesh, order, flux_alpha, &materials, &port_specs, &disp_elems,
+            &periodic_specs, &pec_specs,
+        );
+        Ok(PyTdOperator {
+            op,
+            krylov: rapidfem_td::propagator::KrylovWorkspace::new(),
+            driven_b: Vec::new(),
+            lserk: rapidfem_td::explicit::LserkWorkspace::new(),
+            kcl: rapidfem_td::explicit_adaptive::KclWorkspace::new(),
+            gpu: None,
+        })
+    }
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -114,52 +114,65 @@ pub fn solve_eigenmode(
         y
     };
 
-    // Shift-invert Lanczos: find eigenvalues of (E-σB)⁻¹ B near σ
+    // Shift-invert Lanczos on Op = (E-σB)⁻¹ B. Op is symmetric ONLY in the
+    // B-weighted (complex-symmetric) inner product <x,y> = xᵀBy, so every
+    // dot below carries a B: the plain-l2 variant tridiagonalizes a
+    // non-normal map, whose Ritz values can converge to NON-eigenvalues
+    // (wandering ghost modes, first seen on rapidmesh cavity meshes).
     let t2 = web_time::Instant::now();
     let n_lanczos = (3 * n_modes + 20).min(n_free).min(100);
 
-    // Random start vector
+    let b_dot = |x: &[C64], by: &[C64]| -> C64 {
+        x.iter().zip(by.iter()).map(|(a, b)| a * b).sum()
+    };
+
+    // Start vector, normalized in the B-norm.
     let mut v: Vec<C64> = (0..n_free).map(|i| C64::from(((i * 7 + 13) % 97) as f64 / 97.0)).collect();
-    let norm: f64 = v.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
-    for x in &mut v { *x /= C64::from(norm); }
+    let bv0 = b_matvec(&v);
+    let nb = b_dot(&v, &bv0).sqrt();
+    for x in &mut v { *x /= nb; }
 
     let mut vecs: Vec<Vec<C64>> = Vec::new();
+    let mut bvecs: Vec<Vec<C64>> = Vec::new();
     let mut alphas: Vec<C64> = Vec::new();
-    let mut betas: Vec<f64> = Vec::new();
+    let mut betas: Vec<C64> = Vec::new();
     let mut v_prev = vec![C64::new(0.0, 0.0); n_free];
-    let mut beta_prev = 0.0f64;
+    let mut beta_prev = C64::new(0.0, 0.0);
 
     for _j in 0..n_lanczos {
+        let bv = b_matvec(&v);
         vecs.push(v.clone());
+        bvecs.push(bv.clone());
 
         // w = (E - σB)⁻¹ * B * v
-        let bv = b_matvec(&v);
         let mut w = solver.solve(&bv)?;
 
-        // α = v^T * w (complex-symmetric inner product, NOT Hermitian)
-        let alpha: C64 = v.iter().zip(w.iter()).map(|(vi, wi)| vi * wi).sum();
+        // α = <v, w>_B = (Bv)ᵀ w (complex-symmetric, NOT Hermitian)
+        let alpha: C64 = b_dot(&w, &bv);
         alphas.push(alpha);
 
         // w = w - α*v - β*v_prev
         for i in 0..n_free {
-            w[i] -= alpha * v[i] + C64::from(beta_prev) * v_prev[i];
+            w[i] -= alpha * v[i] + beta_prev * v_prev[i];
         }
 
-        // Re-orthogonalize against all previous vectors (full reorthogonalization)
-        for prev in &vecs {
-            let dot: C64 = prev.iter().zip(w.iter()).map(|(pi, wi)| pi * wi).sum();
+        // Full reorthogonalization in the B inner product.
+        for (prev, bprev) in vecs.iter().zip(&bvecs) {
+            let dot: C64 = b_dot(&w, bprev);
             for i in 0..n_free { w[i] -= dot * prev[i]; }
         }
 
-        // β = ||w||
-        let w_norm: f64 = w.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
-        betas.push(w_norm);
+        // β = sqrt(<w, w>_B) (complex principal branch; real and positive
+        // for the lossless SPD-B case)
+        let bw = b_matvec(&w);
+        let beta = b_dot(&w, &bw).sqrt();
+        betas.push(beta);
 
-        if w_norm < LANCZOS_BREAKDOWN { break; }
+        if beta.norm() < LANCZOS_BREAKDOWN { break; }
 
         v_prev = v;
-        beta_prev = w_norm;
-        v = w.iter().map(|x| x / C64::from(w_norm)).collect();
+        beta_prev = beta;
+        v = w.iter().map(|x| x / beta).collect();
     }
 
     let m = alphas.len();
@@ -170,9 +183,9 @@ pub fn solve_eigenmode(
         if i == j {
             faer::c64 { re: alphas[i].re, im: alphas[i].im }
         } else if j == i + 1 && i < betas.len() {
-            faer::c64 { re: betas[i], im: 0.0 }
+            faer::c64 { re: betas[i].re, im: betas[i].im }
         } else if i == j + 1 && j < betas.len() {
-            faer::c64 { re: betas[j], im: 0.0 }
+            faer::c64 { re: betas[j].re, im: betas[j].im }
         } else {
             faer::c64 { re: 0.0, im: 0.0 }
         }
@@ -186,11 +199,33 @@ pub fn solve_eigenmode(
     // Convert: μ → λ = σ + 1/μ, then f = c√λ / 2π
     let mut modes: Vec<(C64, Vec<C64>)> = Vec::new();
 
+    // Residual bound of a Lanczos Ritz pair: ||Op·z - μ·z|| = β_m · |y_m(k)|
+    // (last subdiagonal times the tridiagonal eigenvector's last component).
+    // Unconverged Ritz values are NOT eigenvalues; without this gate they
+    // surface as ghost modes that track the shift.
+    let beta_last = betas.last().map(|b| b.norm()).unwrap_or(0.0);
+    let mut n_ghost = 0usize;
+
     for k in 0..m {
         let mu = C64::new(eigenvalues[k].re, eigenvalues[k].im);
         if mu.norm() < SINGULAR_EPS { continue; }
+        let y_last = C64::new(eigenvectors[(m - 1, k)].re, eigenvectors[(m - 1, k)].im);
+        if beta_last * y_last.norm() > LANCZOS_RITZ_TOL * mu.norm() {
+            n_ghost += 1;
+            continue;
+        }
         let lambda = sigma + C64::new(1.0, 0.0) / mu;
         if lambda.re <= 0.0 { continue; }
+        // Gradient-nullspace basin: E has a huge exact nullspace (discrete
+        // gradients, λ = 0). Under shift-invert they pile up degenerate at
+        // μ = -1/σ, and finite-precision Lanczos smears Ritz values out of
+        // that cluster to SHIFT-PROPORTIONAL pseudo-frequencies (~0.6·f₀).
+        // A λ closer to 0 than to the shift sits in that basin, not in the
+        // solver's trust region: re-target instead of trusting it.
+        if (lambda - sigma).norm() > lambda.norm() {
+            n_ghost += 1;
+            continue;
+        }
 
         // Ritz vector: x = V * y
         let mut x_free = vec![C64::new(0.0, 0.0); n_free];
@@ -208,6 +243,10 @@ pub fn solve_eigenmode(
         }
 
         modes.push((lambda, x_full));
+    }
+
+    if n_ghost > 0 {
+        eprintln!("  Eigenmode: dropped {n_ghost} unconverged Ritz pair(s)");
     }
 
     // Sort by distance to target

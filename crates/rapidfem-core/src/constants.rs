@@ -32,6 +32,14 @@ pub const POINT_IN_TET_EPS: f64 = 1e-8;
 /// subspace stops growing once the next vector's norm drops below this.
 pub const LANCZOS_BREAKDOWN: f64 = 1e-12;
 
+/// Relative Ritz-pair convergence tolerance for the eigenmode solver: a
+/// Ritz value mu is accepted only when its residual bound
+/// `beta_m * |y_last|` is below this fraction of `|mu|`. Unconverged Ritz
+/// values otherwise surface as shift-tracking ghost modes (first seen on
+/// rapidmesh cavity meshes, whose spectrum converges less uniformly than
+/// gmsh's).
+pub const LANCZOS_RITZ_TOL: f64 = 1e-6;
+
 /// dB value reported for a far-field power at or below `SINGULAR_EPS`.
 pub const FARFIELD_DB_FLOOR: f64 = -100.0;
 

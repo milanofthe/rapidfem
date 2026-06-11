@@ -120,24 +120,16 @@ def _arr(y):
 
 
 def _volume_materials(geometry):
-    """Yield ``(material, tag)`` for each unique volume :class:`Material`
-    carrying a physical-group tag. The single walk + ``id``-dedup that
+    """Yield ``(material, tag)`` per VOLUME from the geometry's material
+    registry (one entry per region tag; the declarative geometry guarantees
+    every non-PML volume carries a material). The single walk that
     :func:`_collect_materials` and :func:`_collect_dispersive` share.
     """
     from ..materials import Material
 
-    seen = set()
-    for ent in getattr(geometry, "_entities", []):
-        mat = getattr(ent, "material", None)
-        if not isinstance(mat, Material) or getattr(ent, "dim", None) != 3:
-            continue
-        if id(mat) in seen:
-            continue
-        seen.add(id(mat))
-        tag = geometry._material_tags.get(id(mat))
-        if tag is None:
-            continue
-        yield mat, int(tag)
+    for tag, mat in getattr(geometry, "_volume_materials", []):
+        if isinstance(mat, Material):
+            yield mat, int(tag)
 
 
 def _collect_materials(geometry):
@@ -763,13 +755,12 @@ class ProblemTD:
         """
         if flux not in _FLUX:
             raise ValueError(f"flux must be one of {sorted(_FLUX)}")
-        if getattr(geometry, "_last_mesh", None) is None:
+        if getattr(geometry, "_mesh_arrays", None) is None:
             raise RuntimeError(
                 "geometry not meshed yet, call g.mesh() before "
                 "constructing a ProblemTD"
             )
         self.c = float(c)
-        mesh_bytes = geometry._last_mesh[0]
         tag_materials = _collect_materials(geometry)
         tag_ports, coax_ports, floquet_ports, wave_ports = \
             _collect_ports(geometry)
@@ -798,8 +789,9 @@ class ProblemTD:
             (tag, er_inf, er_static, self.c * tau_s)
             for (tag, er_inf, er_static, tau_s) in _collect_dispersive(geometry)
         ]
-        self._op = TdOperator.from_mesh_bytes(
-            bytes(mesh_bytes), order, _FLUX[flux],
+        nodes, tets, tet_tags, tris, tri_tags = geometry._mesh_arrays
+        self._op = TdOperator.from_arrays(
+            nodes, tets, tet_tags, tris, tri_tags, order, _FLUX[flux],
             tag_materials or None, tag_ports or None,
             tag_absorbers or None, tag_dispersive or None,
             coax_ports or None,

@@ -21,16 +21,16 @@ def test_coax_geometry_only():
     assert len(cx.port_b) >= 1
     assert cx.ports == []  # no physics attached unless asked
     # Geometry-only result must still mesh.
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_coax_add_ports_meshes():
     g = rf.Geometry(maxh=3 * MM)
     cx = st.coax(g, ri=1.5 * MM, ro=3.45 * MM, length=20 * MM, add_ports=True)
     assert len(cx.ports) == 2
-    mesh_bytes, name_to_tag = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_coax_dielectric_fill():
@@ -45,8 +45,8 @@ def test_coax_axis_x_meshes():
     cx = st.coax(g, ri=1.5 * MM, ro=3.45 * MM, length=15 * MM,
                  axis="x", add_ports=True)
     assert len(cx.ports) == 2
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_coax_rejects_bad_radii():
@@ -73,8 +73,8 @@ def test_microstrip_geometry_only():
     assert len(ms.ground) >= 1
     assert len(ms.port_a) == 2 and len(ms.port_b) == 2
     assert ms.ports == [] and ms.pec is None
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_microstrip_add_ports_meshes():
@@ -82,8 +82,8 @@ def test_microstrip_add_ports_meshes():
     ms = st.microstrip(g, add_ports=True, f0=3.0e9, **_ms_kwargs())
     assert len(ms.ports) == 2
     assert ms.pec is not None
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_microstrip_add_ports_requires_f0():
@@ -110,16 +110,16 @@ def test_cpw_geometry_only():
     assert cw.signal is not None
     assert cw.ground_left is not None and cw.ground_right is not None
     assert cw.ports == []
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_cpw_add_ports_meshes():
     g = rf.Geometry(maxh=4 * MM)
     cw = st.cpw(g, add_ports=True, f0=10e9, backside_ground=True, **_cpw_kwargs())
     assert len(cw.ports) == 2
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_cpw_rejects_oversized_gap():
@@ -140,16 +140,16 @@ def test_stripline_geometry_only():
     assert sl.lower is not None and sl.upper is not None and sl.trace is not None
     assert len(sl.port_a) == 2 and len(sl.port_b) == 2
     assert sl.ports == []
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_stripline_add_ports_meshes():
     g = rf.Geometry(maxh=4 * MM)
     sl = st.stripline(g, add_ports=True, f0=5e9, **_sl_kwargs())
     assert len(sl.ports) == 2 and sl.pec is not None
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_stripline_requires_f0():
@@ -163,8 +163,8 @@ def test_rect_waveguide_add_ports_meshes():
     wg = st.rect_waveguide(g, a=22.86 * MM, b=10.16 * MM, length=30 * MM,
                            add_ports=True)
     assert len(wg.ports) == 2
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_rect_waveguide_axis_y():
@@ -172,8 +172,8 @@ def test_rect_waveguide_axis_y():
     wg = st.rect_waveguide(g, a=22.86 * MM, b=10.16 * MM, length=30 * MM,
                            axis="y", add_ports=True)
     assert len(wg.ports) == 2
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_circ_waveguide_add_ports_meshes():
@@ -181,8 +181,8 @@ def test_circ_waveguide_add_ports_meshes():
     wg = st.circ_waveguide(g, radius=10 * MM, length=30 * MM,
                            add_ports=True, f0=12e9)
     assert len(wg.ports) == 2
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_circ_waveguide_requires_f0():
@@ -194,26 +194,25 @@ def test_circ_waveguide_requires_f0():
 def test_sweep_along_path_arc_meshes():
     g = rf.Geometry(maxh=0.5 * MM)
     pts = [(0, 0, 0), (0.5 * MM, 0, 0.4 * MM), (1 * MM, 0, 0)]
-    prof = g.disc(50e-6, position=pts[0], axis=(0, 0, 1))
-    wire = st.sweep_along_path(g, prof, pts, material=rf.Air())
+    wire = st.sweep_along_path(g, 50e-6, pts, material=rf.Air())
     assert wire.dim == 3
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_sweep_along_path_rejects_short_path():
     g = rf.Geometry(maxh=MM)
-    prof = g.disc(50e-6, position=(0, 0, 0))
     with pytest.raises(ValueError):
-        st.sweep_along_path(g, prof, [(0, 0, 0)])
+        st.sweep_along_path(g, 50e-6, [(0, 0, 0)])
 
 
 def test_helix_meshes():
     g = rf.Geometry(maxh=0.6 * MM)
-    coil = st.helix(g, radius=2 * MM, pitch=1 * MM, turns=3, wire_radius=0.15 * MM)
+    coil = st.helix(g, radius=2 * MM, pitch=1 * MM, turns=3,
+                    wire_radius=0.15 * MM, material=rf.Air())
     assert coil.dim == 3
-    mesh_bytes, _ = g.mesh()
-    assert len(mesh_bytes) > 0
+    g.mesh()
+    assert g.n_tets > 0
 
 
 def test_helix_rejects_bad_turns():

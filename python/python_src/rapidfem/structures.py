@@ -19,11 +19,8 @@ solvable; otherwise use the returned port faces to wire your own physics.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-
-import gmsh
 
 from .materials import Air, Dielectric
 from .physics import ABC, CoaxPort, PEC, RectWaveguidePort, WavePort
@@ -156,12 +153,12 @@ def coax(g: "Geometry", *,
     fill = material if material is not None else (
         Air() if er == 1.0 else Dielectric(er=er))
 
-    # Outer fill cylinder with the inner-conductor cylinder fragmented out, so
-    # the inner-conductor surface exists as a face we can mark PEC. The core's
-    # material is irrelevant (it is walled off by PEC), so it shares the fill.
+    # Outer fill cylinder with the inner-conductor cylinder cut out so the
+    # inner-conductor surface exists as a face we can mark PEC. The inner
+    # cylinder becomes a void; its walls remain selectable via outer.faces.
     outer = g.cylinder(ro, length, position=origin, axis=av, material=fill)
-    inner = g.cylinder(ri, length, position=origin, axis=av, material=fill)
-    g.fragment(outer, inner)
+    inner = g.cylinder(ri, length, position=origin, axis=av)
+    g.cut(outer, inner)
 
     port_a = outer.faces.min(axis=axis)
     port_b = outer.faces.max(axis=axis)
@@ -851,18 +848,22 @@ def circ_waveguide(g: "Geometry", *,
     return wg
 
 
-def sweep_along_path(g: "Geometry", profile: "GeoObject",
+def sweep_along_path(g: "Geometry", radius: float,
                      points: "list[tuple[float, float, float]]",
                      *,
                      material=None,
                      maxh: float | None = None) -> "GeoObject":
-    """sweep a 2-D ``profile`` face along the spline through ``points`` into
-    a 3-D solid.
+    """sweep a circular cross-section of ``radius`` along the polygonal
+    path through ``points`` into a 3-D solid.
 
     The workhorse behind curved conductors: bond wires, bent traces, coax
-    bends, helices. The ``profile`` face (e.g. from :meth:`Geometry.disc`)
-    must be positioned at ``points[0]`` with its normal along the initial
-    path tangent, so the swept tube starts flush with the profile.
+    bends. The sweep is piecewise linear (polygonal) between the given
+    waypoints; use more waypoints per segment for a smoother curve.
+
+    Note: the old API accepted a ``profile`` :class:`GeoObject` (disc face)
+    as the second argument. That form is retired because :meth:`Geometry.disc`
+    now creates a zero-thickness sheet, not a sweep profile. Pass the circular
+    cross-section ``radius`` directly.
 
 
     Example
@@ -873,19 +874,18 @@ def sweep_along_path(g: "Geometry", profile: "GeoObject",
 
         from rapidfem import structures as st
         pts = [(0, 0, 0), (0.5e-3, 0, 0.4e-3), (1e-3, 0, 0)]
-        prof = g.disc(50e-6, position=pts[0], axis=(0, 0, 1))
-        wire = st.sweep_along_path(g, prof, pts)
+        wire = st.sweep_along_path(g, 50e-6, pts, material=rf.Air())
 
 
     Parameters
     ----------
     g : Geometry
         geometry to build into
-    profile : GeoObject
-        the 2-D cross-section face to sweep (dim must be 2)
+    radius : float
+        radius of the circular cross-section in metres
     points : list[tuple[float, float, float]]
-        path control points in metres; a spline is fitted through them (a
-        straight segment for two points)
+        path waypoints in metres; the sweep is polygonal (piecewise linear)
+        between them
     material : rapidfem.Material, optional
         material for the swept solid
     maxh : float, optional
@@ -899,22 +899,11 @@ def sweep_along_path(g: "Geometry", profile: "GeoObject",
     Raises
     ------
     ValueError
-        if ``profile`` is not a face or fewer than two points are given
+        if fewer than two points are given
     """
-    if profile.dim != 2:
-        raise ValueError(f"sweep_along_path expects a 2D profile, got dim={profile.dim}")
     if len(points) < 2:
         raise ValueError("sweep_along_path needs at least two path points")
-    s = g._s
-    pt_tags = [gmsh.model.occ.addPoint(s(p[0]), s(p[1]), s(p[2])) for p in points]
-    spline = gmsh.model.occ.addSpline(pt_tags)
-    wire = gmsh.model.occ.addWire([spline])
-    out = gmsh.model.occ.addPipe([(profile.dim, profile._entity.tag)], wire)
-    gmsh.model.occ.synchronize()
-    vol_tag = next((t for d, t in out if d == 3), None)
-    if vol_tag is None:
-        raise RuntimeError("sweep_along_path produced no volume")
-    return g._wrap_volume(vol_tag, material=material, maxh=maxh)
+    return g.sweep(points, radius, material=material, maxh=maxh)
 
 
 def helix(g: "Geometry", *,
@@ -929,10 +918,10 @@ def helix(g: "Geometry", *,
     the given coil ``radius``, axial ``pitch`` (rise per full turn) and
     number of ``turns``. The helix climbs along +z starting at
     ``position + (radius, 0, 0)``. For another orientation, build it here
-    and reorient with :meth:`Geometry.rotate` / :meth:`Geometry.translate`.
+    and reorient with :meth:`Geometry.translate` / :meth:`Geometry.array`.
 
-    Useful for inductors and helical antennas. Built on
-    :func:`sweep_along_path`.
+    Useful for inductors and helical antennas. Delegates to
+    :meth:`Geometry.helix` which uses the rapidmesh kernel pipe primitive.
 
 
     Example
@@ -942,7 +931,8 @@ def helix(g: "Geometry", *,
     .. code-block:: python
 
         from rapidfem import structures as st
-        coil = st.helix(g, radius=2e-3, pitch=1e-3, turns=5, wire_radius=0.1e-3)
+        coil = st.helix(g, radius=2e-3, pitch=1e-3, turns=5,
+                        wire_radius=0.1e-3, material=rf.Air())
 
 
     Parameters
@@ -969,7 +959,7 @@ def helix(g: "Geometry", *,
     Returns
     -------
     GeoObject
-        the swept helical wire
+        the helical wire volume
 
     Raises
     ------
@@ -980,19 +970,5 @@ def helix(g: "Geometry", *,
         raise ValueError(f"helix: turns must be > 0, got {turns}")
     if points_per_turn < 2:
         raise ValueError(f"helix: points_per_turn must be >= 2, got {points_per_turn}")
-    cx, cy, cz = position
-    n = max(2, int(round(turns * points_per_turn)))
-    t_end = turns * 2.0 * math.pi
-    points = []
-    for i in range(n + 1):
-        t = t_end * i / n
-        points.append((
-            cx + radius * math.cos(t),
-            cy + radius * math.sin(t),
-            cz + pitch * t / (2.0 * math.pi),
-        ))
-    # Profile disc at the start, normal along the initial path tangent
-    # d/dt(r cos t, r sin t, pitch t / 2pi) at t=0 = (0, r, pitch/2pi).
-    tangent = (0.0, radius, pitch / (2.0 * math.pi))
-    prof = g.disc(wire_radius, position=points[0], axis=tangent)
-    return sweep_along_path(g, prof, points, material=material, maxh=maxh)
+    return g.helix(radius, pitch, turns, wire_radius, position=position,
+                   points_per_turn=points_per_turn, material=material, maxh=maxh)

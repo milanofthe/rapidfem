@@ -64,8 +64,9 @@ from rapidfem.physics import (
 from rapidfem.problem import Problem, ProblemFD, ProblemTD, Adaptive, ErrorIndicator
 from rapidfem.excitation import GaussianPulse
 from rapidfem import io  # registers .to_network/.to_touchstone/.to_hdf5 on SweepResult
-# rfic and structures still build on the retired gmsh backend; they are being
-# migrated to the rapidmesh geometry and are unavailable until then.
+from rapidfem import structures  # general RF structure builders (coax, microstrip, ...)
+# rfic still builds on the retired gmsh backend (GDS extrusion); it is being
+# migrated to the rapidmesh geometry and is unavailable until then.
 from rapidfem import _show_capture
 
 

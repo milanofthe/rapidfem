@@ -1,196 +1,70 @@
-#########################################################################################
-##
-##                              GEOMETRY + MESHING
-##                                 (geometry.py)
-##
-#########################################################################################
+"""Declarative geometry layer on the rapidmesh kernel.
 
-"""Geometry + meshing builder for rapidfem, NGSolve-style.
+The public surface mirrors the original gmsh-backed module (``Geometry``
+primitives, ``obj.faces`` selection, physics objects binding to faces or
+volumes), but the implementation is fully declarative: primitive calls only
+record descriptions, face selections are lazy queries, and :meth:`Geometry.mesh`
+builds the rapidmesh scene, meshes it, resolves every selection against the
+final mesh faces and assigns the solver tags.
 
-Wraps gmsh's OpenCASCADE kernel with tracked entities that survive
-boolean ops, plus a per-entity registry that carries materials, mesh
-sizes, and physics targets through to the FEM solver. The user-facing
-flow is
+Key semantic differences from the gmsh backend (intentional):
 
-.. code-block:: python
+- ``fragment()`` is a no-op: rapidmesh arranges every operand exactly and
+  conformally by construction, there is nothing left to make conforming.
+- ``cut(target, *tools)`` marks the tool solids as voids (their volume is
+  carved out of everything added before them, walls stay selectable).
+- Face selection (``.min/.max/.where/.outer/.hull/.unassigned``) evaluates at
+  ``mesh()`` time against facet groups of the final mesh. A facet group is the
+  set of mesh faces sharing (sheet tag, analytic surface, region pair), which
+  reproduces the granularity gmsh's ``fragment`` produced. ``where`` predicates
+  receive the same ``(cog, bbox)`` tuples as before.
+- Every non-PML volume must carry a material; the solver zero-fills tensors of
+  unlisted volumes once any material section exists, which panics deep in
+  assembly. Failing early here is the holistic fix.
 
-    g = rf.Geometry(maxh=rf.lambda_maxh(f_max=12e9))
-    sub = g.box(60e-3, 60e-3, 1.6e-3, position=(-30e-3, -30e-3, 0),
-                material=rf.Dielectric(er=4.4))
-    patch = g.xy_plate(38e-3, 29e-3, position=(-19e-3, -14.5e-3, 1.6e-3))
-
-    g.fragment(sub, patch)         # bool op, names + materials survive
-    g.mesh()                       # generate tet mesh
-
-
-Note
-----
-Tracking strategy: each named entity stores (cog, bbox, dim) at
-registration time. After every boolean op, the geometry walks its
-registry and re-resolves each entity by matching (cog, bbox) against
-current gmsh entities. COG-only is ambiguous for coplanar overlapping
-faces (e.g. annulus + sub-region after embedding a plate); bbox
-disambiguates. ``fuse`` is supported but warned about, face merging
-shifts COGs, so names cannot survive.
+All coordinates are metres.
 """
-
-# IMPORTS ===============================================================================
 
 from __future__ import annotations
 
-import math
-import os
-import sys
-import tempfile
-import warnings
-from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable
 
-import gmsh
 import numpy as np
 
-from ._geometry_gds import _GdsMixin
-from ._geometry_primitives import _PrimitivesMixin
+import rapidmesh as _rm
 
 
-# TOLERANCES ============================================================================
-
-# After a gmsh boolean op entity tags get renumbered, so entities are
-# re-identified by geometry. 1e-9 m (1 nm) is the slack for those matches:
-# well below any realistic mesh feature (microns and up) yet far above the
-# float64 round-off gmsh introduces in O(1 m)..O(1 mm) coordinates, so it
-# never merges distinct features nor splits one that the kernel nudged.
-_COG_TOL = 1e-9   # distance tol for matching center-of-mass (m)
-_BBOX_TOL = 1e-9  # tol for matching bounding-box corners (m)
-# Tolerance for matching a face against a bounding-box extremum. Coarser than
-# _BBOX_TOL on purpose: gmsh's getBoundingBox inflates the box by ~1e-7 m on
-# each side, so "zero-extent" face coordinates come back as ±1e-7. Comparing
-# against an extremum (not two getBoundingBox results, where the fluff cancels)
-# must absorb that inflation, hence 1e-6 m.
-_HULL_TOL = 1e-6
-# gmsh.getBoundingBox(-1, -1) returns ±1e106 when the model holds a degenerate
-# or unbounded entity; treat anything past this as "no usable bbox".
-_UNBOUNDED = 1e10
+# SELECTION =============================================================================
 
 
-# INTERNAL ENTITY TRACKING ==============================================================
-
-
-
-
-@dataclass
 class _Entity:
-    """A tracked gmsh entity with stable identity through boolean ops.
+    """One lazy selection node: a base face/volume set plus a filter chain.
 
-    `tag` is the *current* gmsh tag, may be updated by Geometry._reresolve()
-    after fragment/cut. The (cog, bbox, dim) triple is the stable identity used
-    for re-resolution.
-
-    ``material`` can be either a :class:`rapidfem.Material` instance (object-API
-    path, set via ``g.box(..., material=...)``) or a string (legacy, set via
-    ``obj.material = "fr4"``, used by rfic.Stack et al.).
+    ``base`` is ``("solid", index)``, ``("sheet", internal_tag)`` or
+    ``("volume", index)``; ``ops`` is a tuple of filter steps applied to the
+    base set at resolve time. Physics objects store these and the geometry
+    resolves them against the mesh facet groups in :meth:`Geometry.mesh`.
     """
-    dim: int
-    tag: int
-    cog: tuple[float, float, float]
-    bbox: tuple[float, float, float, float, float, float]
-    name: str | None = None
-    material: object = None    # rapidfem.Material | str | None
-    maxh: float | None = None
-    _geometry: object = None   # back-ref to Geometry, set by registration
 
-    @staticmethod
-    def from_dimtag(dim: int, tag: int) -> "_Entity":
-        cog = tuple(gmsh.model.occ.getCenterOfMass(dim, tag))
-        bbox = tuple(gmsh.model.getBoundingBox(dim, tag))
-        return _Entity(dim=dim, tag=tag, cog=cog, bbox=bbox)
+    __slots__ = ("_geometry", "dim", "base", "ops")
 
+    def __init__(self, geometry: "Geometry", dim: int, base, ops: tuple = ()):
+        self._geometry = geometry
+        self.dim = dim
+        self.base = base
+        self.ops = ops
 
-def _bbox_match(a: tuple, b: tuple, tol: float) -> bool:
-    return all(abs(a[i] - b[i]) < tol for i in range(6))
+    def _with(self, op) -> "_Entity":
+        return _Entity(self._geometry, self.dim, self.base, self.ops + (op,))
 
-
-def _resolve_entity(target: _Entity) -> int | None:
-    """Find a gmsh entity in `target.dim` matching the stored (bbox, cog).
-
-    Strategy: bbox is the primary identity (stable through fragment, even when
-    sub-volumes are carved out, the outer bbox doesn't change). COG is a
-    secondary discriminator with a tolerance that scales with the bbox extent.
-    This handles two real failure modes:
-      1. COG drift after carving a sub-volume out of a larger one (e.g. air
-         box minus substrate), bbox stays put, COG shifts by mass redistribution.
-      2. Coplanar overlapping faces (annulus + sub-region after fragment),
-         both have the same COG, but different bboxes.
-    """
-    # bbox extent diagonal, sets an "internal scale" for COG drift tolerance.
-    extent = math.sqrt(sum((target.bbox[3 + i] - target.bbox[i]) ** 2 for i in range(3)))
-    cog_tol = max(_COG_TOL, 0.01 * extent)  # 1% of diagonal, or absolute floor
-
-    candidates = []
-    for d, t in gmsh.model.getEntities(target.dim):
-        if d != target.dim:
-            continue
-        bbox = tuple(gmsh.model.getBoundingBox(d, t))
-        if not _bbox_match(bbox, target.bbox, _BBOX_TOL):
-            continue
-        cog = tuple(gmsh.model.occ.getCenterOfMass(d, t))
-        if math.dist(cog, target.cog) < cog_tol:
-            candidates.append(t)
-    if len(candidates) == 1:
-        return candidates[0]
-    if len(candidates) > 1:
-        # Tie-break by smallest COG distance.
-        candidates.sort(key=lambda t: math.dist(
-            tuple(gmsh.model.occ.getCenterOfMass(target.dim, t)), target.cog))
-        return candidates[0]
-    return None
-
-
-# ENTITY COLLECTION =====================================================================
 
 class EntityCollection:
-    """A collection of sub-entities (faces or edges) with selectors and
-    bulk attribute writes.
+    """A chainable, lazily evaluated set of faces.
 
-    Returned by ``obj.faces`` and ``obj.edges`` on a :class:`GeoObject`,
-    and by selector methods (:meth:`min`, :meth:`max`, :meth:`where`,
-    :attr:`unassigned`, :attr:`outer`) on existing collections. Every
-    selector returns a *new* collection so chains compose:
-
-    .. code-block:: python
-
-        port_face   = air.faces.min(axis="z")
-        top_corner  = air.faces.where(lambda c, b: c[2] > 0.5).max(axis="x")
-        loose_ends  = air.faces.outer.unassigned
-
-
-    Note
-    ----
-    Bulk attribute writes (``coll.name = "..."`` / ``coll.maxh = ...``)
-    apply to every member. The old-API pattern of assigning names this
-    way still works (used by ``rfic.Stack`` and the ``from_gds``
-    importer); the object-API path goes through physics constructors
-    (``rf.PEC(coll)`` / ``rf.RectWaveguidePort(coll)``) and does not
-    require names.
-
-
-    Example
-    -------
-    .. code-block:: python
-
-        # Pick the bottom face of an air box and drive it as a port
-        rf.RectWaveguidePort(air.faces.min(axis="z"))
-
-        # All un-targeted outer faces become PEC
-        rf.PEC(*air.faces.outer.unassigned)
-
-
-    Parameters
-    ----------
-    geometry : Geometry
-        owning geometry (for back-references to the physics registry)
-    entities : list[_Entity]
-        the underlying tracked entity records
+    Filters return new collections; nothing touches the mesh until
+    :meth:`Geometry.mesh` resolves the chain. Iteration yields the underlying
+    selection nodes so the variadic physics constructors keep working
+    (``rf.PEC(*obj.faces.where(...))``).
     """
 
     def __init__(self, geometry: "Geometry", entities: list[_Entity]):
@@ -200,2046 +74,691 @@ class EntityCollection:
     def __iter__(self):
         return iter(self._entities)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._entities)
 
-    # Selectors
+    def _map(self, op) -> "EntityCollection":
+        return EntityCollection(
+            self._geometry, [e._with(op) for e in self._entities]
+        )
+
     def min(self, axis: str = "z") -> "EntityCollection":
-        """keep only entities whose centroid is at the minimum along ``axis``
-
-        For a convex primitive (box, cylinder) this usually returns a
-        single-face collection, exactly what you want for picking
-        ports or specific walls.
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            port_face = air.faces.min(axis="z")
-            rf.RectWaveguidePort(port_face)
-
-
-        Parameters
-        ----------
-        axis : {'x', 'y', 'z'}
-            axis to compare centroids on
-
-        Returns
-        -------
-        EntityCollection
-            subset of this collection at the min coordinate
-        """
-        ax = {"x": 0, "y": 1, "z": 2}[axis.lower()]
-        if not self._entities:
-            return EntityCollection(self._geometry, [])
-        m = min(e.cog[ax] for e in self._entities)
-        kept = [e for e in self._entities if abs(e.cog[ax] - m) < _COG_TOL]
-        return EntityCollection(self._geometry, kept)
+        """faces whose centroid sits at the set's minimum along ``axis``
+        (within mesh tolerance; a planar end face resolves as one group)"""
+        return self._map(("extreme", axis, -1))
 
     def max(self, axis: str = "z") -> "EntityCollection":
-        """keep only entities whose centroid is at the maximum along ``axis``
+        """faces whose centroid sits at the set's maximum along ``axis``"""
+        return self._map(("extreme", axis, +1))
 
-        Mirror of :meth:`min`; see that method for the worked example.
-
-
-        Parameters
-        ----------
-        axis : {'x', 'y', 'z'}
-            axis to compare centroids on
-
-        Returns
-        -------
-        EntityCollection
-            subset of this collection at the max coordinate
-        """
-        ax = {"x": 0, "y": 1, "z": 2}[axis.lower()]
-        if not self._entities:
-            return EntityCollection(self._geometry, [])
-        m = max(e.cog[ax] for e in self._entities)
-        kept = [e for e in self._entities if abs(e.cog[ax] - m) < _COG_TOL]
-        return EntityCollection(self._geometry, kept)
-
-    def where(self, predicate: Callable[[tuple, tuple], bool]) -> "EntityCollection":
-        """filter entities by a user-supplied predicate on centroid + bbox
-
-        The most flexible selector, escape hatch for selecting faces
-        by region or orientation that don't reduce to a simple ``min``
-        / ``max`` along an axis.
-
-
-        Example
-        -------
-        Horn antenna's trapezoidal side flares (faces strictly inside
-        the horn region in x):
-
-        .. code-block:: python
-
-            rf.PEC(*horn.faces.where(lambda c, b: 1e-6 < c[0] < Lhorn - 1e-6))
-
-
-        Parameters
-        ----------
-        predicate : Callable[[tuple, tuple], bool]
-            function ``(centroid, bbox) -> bool``; ``centroid`` is a
-            3-tuple and ``bbox`` is ``(xmin, ymin, zmin, xmax, ymax, zmax)``
-
-        Returns
-        -------
-        EntityCollection
-            entities for which the predicate returned True
-        """
-        kept = [e for e in self._entities if predicate(e.cog, e.bbox)]
-        return EntityCollection(self._geometry, kept)
-
-    # Bulk attribute setters (NGSolve idiom: `coll.name = "..."` writes to all)
-    @property
-    def name(self) -> str | None:
-        names = {e.name for e in self._entities if e.name is not None}
-        if len(names) == 1:
-            return names.pop()
-        return None
-
-    @name.setter
-    def name(self, value: str) -> None:
-        for e in self._entities:
-            e.name = value
-
-    @property
-    def maxh(self) -> float | None:
-        vals = {e.maxh for e in self._entities if e.maxh is not None}
-        if len(vals) == 1:
-            return vals.pop()
-        return None
-
-    @maxh.setter
-    def maxh(self, value: float) -> None:
-        for e in self._entities:
-            e.maxh = value
-
-    @property
-    def unassigned(self) -> "EntityCollection":
-        """subset of entities with no physics object pointing at them yet
-
-        Filters this collection against the geometry's physics registry
-        and drops any entity already targeted by a port or BC. The
-        canonical use is a catch-all PEC declaration after the explicit
-        port faces have been declared.
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            rf.RectWaveguidePort(air.faces.min(axis="z"))
-            rf.RectWaveguidePort(air.faces.max(axis="z"))
-            rf.PEC(*air.faces.unassigned)   # everything else
-
-
-        Returns
-        -------
-        EntityCollection
-            entities not yet referenced by any physics object
-        """
-        targeted: set[int] = set()
-        for phys in self._geometry._physics:
-            for ent in getattr(phys, "_entities", ()):
-                targeted.add(id(ent))
-        kept = [e for e in self._entities if id(e) not in targeted]
-        return EntityCollection(self._geometry, kept)
+    def where(self, predicate: Callable) -> "EntityCollection":
+        """faces passing ``predicate(cog, bbox)`` with ``cog = (x, y, z)``
+        and ``bbox = (xmin, ymin, zmin, xmax, ymax, zmax)`` of the group"""
+        return self._map(("where", predicate))
 
     @property
     def outer(self) -> "EntityCollection":
-        """axis-aligned faces lying on the outer hull of the gmsh model
-
-        A face is "outer" iff one of its axes is degenerate (zero
-        extent, i.e. the face is planar and perpendicular to that
-        axis) AND the face's coordinate along that axis matches the
-        model bounding-box extremum within tolerance.
-
-        Interior fragmented interfaces, which share the model's x/y
-        bbox extents but sit at some inner z, are correctly excluded.
-        Useful for tagging the external walls of a PML enclosure where
-        the inner air↔PML interface must stay free.
-
-
-        Note
-        ----
-        Uses a 1e-6 m tolerance to absorb gmsh's ``getBoundingBox``
-        inflation (gmsh adds ~1e-7 m of fluff on each side, which is
-        much larger than the 1e-9 m tolerance used elsewhere for
-        cog/bbox identity matching).
-
-
-        Example
-        -------
-        ABC on every external face of the air box:
-
-        .. code-block:: python
-
-            rf.ABC(*air.faces.outer)
-
-
-        Returns
-        -------
-        EntityCollection
-            entities on the model bounding box
-        """
-        try:
-            bb = gmsh.model.getBoundingBox(-1, -1)
-        except Exception:
-            return EntityCollection(self._geometry, list(self._entities))
-        xmin, ymin, zmin, xmax, ymax, zmax = bb
-        # gmsh's getBoundingBox(-1, -1) returns ±1e+106 on any axis whenever
-        # the model contains a degenerate or unbounded entity (we hit this
-        # with the mom-cap 200-via cluster, fragment leaves slivers that
-        # gmsh's bbox accumulator treats as infinite). When that happens the
-        # naive extremum-match below filters every face out and the caller
-        # gets an empty collection, which torpedoes any `rf.ABC(*air.faces
-        # .outer, ...)` wiring downstream. Fall back to the union of every
-        # tracked entity's bbox, those are real getBoundingBox results for
-        # specific entities so they don't carry the infinity.
-        def _is_finite_bbox(b):
-            return all(abs(v) < _UNBOUNDED for v in b)
-        if not _is_finite_bbox((xmin, ymin, zmin, xmax, ymax, zmax)):
-            # gmsh.getBoundingBox(-1, -1) returns ±1e100 when the model has
-            # degenerate entities (e.g. mom-cap's 200-via cluster leaves
-            # fragment slivers gmsh treats as infinite). Substituting a
-            # global union over all tracked entities doesn't help either,
-            # those same slivers carry the infinite bbox, AND non-sliver
-            # volumes like substrate/oxide/air sometimes end up with
-            # different post-fragment footprints from each other.
-            # Best fallback: pick extremes from THIS collection's faces
-            # only. For `air.faces.outer`, that means we compare air's
-            # outer faces against the bbox of air alone, exactly what the
-            # caller intuitively expects.
-            xs0, ys0, zs0, xs1, ys1, zs1 = (
-                math.inf, math.inf, math.inf, -math.inf, -math.inf, -math.inf)
-            for e in self._entities:
-                if not _is_finite_bbox(e.bbox):
-                    continue
-                ex0, ey0, ez0, ex1, ey1, ez1 = e.bbox
-                if ex0 < xs0: xs0 = ex0
-                if ey0 < ys0: ys0 = ey0
-                if ez0 < zs0: zs0 = ez0
-                if ex1 > xs1: xs1 = ex1
-                if ey1 > ys1: ys1 = ey1
-                if ez1 > zs1: zs1 = ez1
-            if math.isfinite(xs0):
-                xmin, ymin, zmin = xs0, ys0, zs0
-                xmax, ymax, zmax = xs1, ys1, zs1
-        return self._faces_on_box(xmin, ymin, zmin, xmax, ymax, zmax)
+        """faces that lie flat on the global model bounding box"""
+        return self._map(("outer",))
 
     @property
     def hull(self) -> "EntityCollection":
-        """axis-aligned faces lying on *this collection's own* bounding box
+        """faces that lie flat on this selection's own bounding box"""
+        return self._map(("hull",))
 
-        Like :attr:`outer`, but the reference box is the bounding box of
-        the entities in *this* collection, not the whole gmsh model. A
-        face is kept iff one of its axes is degenerate and its coordinate
-        along that axis matches this collection's extremum.
-
-        This is what you want for a closed surface around an object that
-        is itself wrapped by something else. ``air.faces.outer`` returns
-        nothing once ``air`` is surrounded by PML on every side (none of
-        air's faces touch the *model* bbox any more, they are all interior
-        air↔PML interfaces); ``air.faces.hull`` returns those six interface
-        faces, the natural near-field-to-far-field (Huygens) surface.
+    @property
+    def unassigned(self) -> "EntityCollection":
+        """faces not claimed by any physics object registered earlier
+        (resolution follows physics registration order)"""
+        return self._map(("unassigned",))
 
 
-        Example
-        -------
-        Far-field surface on the air / PML interface:
-
-        .. code-block:: python
-
-            rf.FarFieldSurface(*air.faces.hull)
-
-
-        Returns
-        -------
-        EntityCollection
-            entities on this collection's bounding box
-        """
-        if not self._entities:
-            return EntityCollection(self._geometry, [])
-        xmin = ymin = zmin = math.inf
-        xmax = ymax = zmax = -math.inf
-        for e in self._entities:
-            ex0, ey0, ez0, ex1, ey1, ez1 = e.bbox
-            xmin, ymin, zmin = min(xmin, ex0), min(ymin, ey0), min(zmin, ez0)
-            xmax, ymax, zmax = max(xmax, ex1), max(ymax, ey1), max(zmax, ez1)
-        return self._faces_on_box(xmin, ymin, zmin, xmax, ymax, zmax)
-
-    def _faces_on_box(self, xmin, ymin, zmin, xmax, ymax, zmax) -> "EntityCollection":
-        """faces in this collection lying on the given axis-aligned box
-
-        Shared core of :attr:`outer` (box = model bbox) and :attr:`hull`
-        (box = this collection's own bbox). A face is kept iff one of its
-        axes is degenerate (zero extent) and its coordinate along that
-        axis matches that box's min or max within :data:`_HULL_TOL`.
-        """
-        kept = []
-        for e in self._entities:
-            ex0, ey0, ez0, ex1, ey1, ez1 = e.bbox
-            on_box = (
-                (abs(ex1 - ex0) < _HULL_TOL
-                 and (abs(ex0 - xmin) < _HULL_TOL or abs(ex0 - xmax) < _HULL_TOL))
-                or (abs(ey1 - ey0) < _HULL_TOL
-                    and (abs(ey0 - ymin) < _HULL_TOL or abs(ey0 - ymax) < _HULL_TOL))
-                or (abs(ez1 - ez0) < _HULL_TOL
-                    and (abs(ez0 - zmin) < _HULL_TOL or abs(ez0 - zmax) < _HULL_TOL))
-            )
-            if on_box:
-                kept.append(e)
-        return EntityCollection(self._geometry, kept)
-
-
-# Back-compat aliases (and clearer naming for users)
 FaceCollection = EntityCollection
 EdgeCollection = EntityCollection
 
 
-# GEOMETRIC OBJECT ======================================================================
+# GEO OBJECTS ===========================================================================
+
 
 class GeoObject:
-    """A primitive (volume or 2-D plate) in the geometry.
+    """Handle to one solid, void or sheet added to a :class:`Geometry`."""
 
-    The return type of every :class:`Geometry` factory method
-    (:meth:`Geometry.box`, :meth:`Geometry.cylinder`, ...). Carries a
-    reference to its owning geometry plus the tracked
-    :class:`_Entity` record that survives boolean ops.
-
-
-    Note
-    ----
-    The recommended path to attach materials and per-entity mesh
-    sizes is the constructor kwarg form
-    (``g.box(..., material=rf.Air(), maxh=2e-3)``). The
-    ``obj.material = ...`` / ``obj.maxh = ...`` setters still work and
-    are used by legacy paths like ``from_gds`` and ``rfic.Stack``, but
-    new code should prefer the kwarg form.
-
-
-    Example
-    -------
-    .. code-block:: python
-
-        substrate = g.box(60e-3, 60e-3, 1.6e-3,
-                          material=rf.Dielectric(er=4.4),
-                          maxh=0.5e-3)
-        ground_face = substrate.faces.min(axis="z")
-
-
-    Attributes
-    ----------
-    name : str or None
-        physical-group name applied at mesh time (legacy / GDS path);
-        the object-API path attaches physics directly and does not
-        require names
-    material : rapidfem.Material or str or None
-        volume material, a :class:`Material` instance under the new
-        object API, or a string under the legacy ``rfic.Stack`` path
-    maxh : float or None
-        per-entity mesh size override in metres
-    dim : int
-        topological dimension (3 for volumes, 2 for plates)
-    faces : EntityCollection
-        bounding faces of a volume (or self, for a plate)
-    edges : EntityCollection
-        bounding edges of the entity
-    """
-
-    def __init__(self, geometry: "Geometry", entity: _Entity):
+    def __init__(self, geometry: "Geometry", dim: int, index: int):
         self._geometry = geometry
-        self._entity = entity
-        # Note: `.faces` and `.edges` are computed on-demand (properties) so
-        # they always reflect the CURRENT gmsh topology. After a boolean op
-        # splits a face into pieces, accessing `obj.faces` re-discovers them
-        # all. Names set previously persist via the geometry's entity registry
-        # (matched by cog+bbox).
+        self.dim = dim
+        self._index = index
 
-    def _discover_subentities(self, target_dim: int) -> list[_Entity]:
-        """Re-query gmsh for the current sub-entities of dimension `target_dim`.
-        Existing entries in `self._geometry._entities` matching by (cog, bbox)
-        keep their name/material/maxh; new entries get fresh blank metadata."""
-        if self._entity.dim == 3 and target_dim == 2:
-            children = [(d, t) for d, t in
-                        gmsh.model.getBoundary([(3, self._entity.tag)], oriented=False)
-                        if d == 2]
-        elif self._entity.dim == 3 and target_dim == 1:
-            children = []
-            seen: set[int] = set()
-            for d, t in gmsh.model.getBoundary([(3, self._entity.tag)], oriented=False):
-                if d != 2:
-                    continue
-                for d_e, t_e in gmsh.model.getBoundary([(2, t)], oriented=False):
-                    if d_e == 1 and t_e not in seen:
-                        seen.add(t_e)
-                        children.append((d_e, t_e))
-        elif self._entity.dim == 2 and target_dim == 1:
-            children = [(d, t) for d, t in
-                        gmsh.model.getBoundary([(2, self._entity.tag)], oriented=False)
-                        if d == 1]
-        else:
-            children = []
-
-        # Build entries, reusing existing _Entity records if cog+bbox matches
-        out: list[_Entity] = []
-        for d, t in children:
-            cog = tuple(gmsh.model.occ.getCenterOfMass(d, t))
-            bbox = tuple(gmsh.model.getBoundingBox(d, t))
-            existing = self._find_or_register_entity(d, t, cog, bbox)
-            out.append(existing)
-        return out
-
-    def _find_or_register_entity(self, dim, tag, cog, bbox) -> _Entity:
-        """Look up an existing _Entity in the geometry registry by (cog, bbox);
-        register a new one if not found. Updates the tag to current."""
-        for ent in self._geometry._entities:
-            if ent.dim != dim:
-                continue
-            if math.dist(ent.cog, cog) < _COG_TOL and _bbox_match(ent.bbox, bbox, _BBOX_TOL):
-                ent.tag = tag       # refresh tag (may have changed after fragment)
-                return ent
-        new_ent = _Entity(dim=dim, tag=tag, cog=cog, bbox=bbox)
-        new_ent._geometry = self._geometry
-        self._geometry._entities.append(new_ent)
-        return new_ent
+    @property
+    def _entity(self) -> _Entity:
+        """selection node for variadic physics targets: a sheet object selects
+        its faces, a material solid selects its volume"""
+        entry = self._geometry._solids[self._index]
+        if self.dim == 2:
+            return _Entity(self._geometry, 2, ("sheet", entry["sheet_tag"]))
+        if entry["void"]:
+            raise ValueError(
+                "a void cannot be a volume physics target (select its walls "
+                "via .faces instead)")
+        return _Entity(self._geometry, 3, ("volume", self._index))
 
     @property
     def faces(self) -> EntityCollection:
-        return EntityCollection(self._geometry, self._discover_subentities(2))
+        """lazy selection over this object's mesh faces"""
+        entry = self._geometry._solids[self._index]
+        if self.dim == 2:
+            base = ("sheet", entry["sheet_tag"])
+        else:
+            base = ("solid", self._index)
+        return EntityCollection(
+            self._geometry, [_Entity(self._geometry, 2, base)]
+        )
 
     @property
-    def edges(self) -> EntityCollection:
-        return EntityCollection(self._geometry, self._discover_subentities(1))
+    def material(self):
+        return self._geometry._solids[self._index].get("material")
 
     @property
-    def name(self) -> str | None:
-        return self._entity.name
+    def bbox(self) -> tuple:
+        lo, hi = self._geometry._solids[self._index]["bbox"]
+        return (*lo, *hi)
 
-    @name.setter
-    def name(self, value: str) -> None:
-        self._entity.name = value
 
-    @property
-    def material(self) -> str | None:
-        return self._entity.material
+class _FaceGroup:
+    """A resolved facet group of the final mesh (selection granularity)."""
 
-    @material.setter
-    def material(self, value: str) -> None:
-        self._entity.material = value
+    __slots__ = ("tri_idx", "cog", "bbox", "sheet_tag", "owner", "regions", "claimed")
 
-    @property
-    def maxh(self) -> float | None:
-        return self._entity.maxh
+    def __init__(self, tri_idx, cog, bbox, sheet_tag, owner, regions):
+        self.tri_idx = tri_idx          # np.ndarray of face indices
+        self.cog = cog                  # (x, y, z) area-weighted centroid
+        self.bbox = bbox                # (xmin, ymin, zmin, xmax, ymax, zmax)
+        self.sheet_tag = sheet_tag      # internal sheet tag, 0 = none
+        self.owner = owner              # owning solid index (insertion order)
+        self.regions = regions          # (lo, hi) region pair
+        self.claimed = False            # set when a physics object takes it
 
-    @maxh.setter
-    def maxh(self, value: float) -> None:
-        self._entity.maxh = value
 
-    @property
-    def dim(self) -> int:
-        return self._entity.dim
+_TOL_REL = 1e-9
 
 
 # GEOMETRY ==============================================================================
 
-class Geometry(_GdsMixin, _PrimitivesMixin):
-    """Top-level geometry builder. Owns a gmsh OCC model for its lifetime.
 
-    Build with primitive factory methods (:meth:`box`, :meth:`cylinder`,
-    :meth:`xy_plate`, ...) each of which returns a :class:`GeoObject`.
-    Attach physics via the object-API constructors
-    (:class:`rapidfem.RectWaveguidePort`, :class:`rapidfem.PEC`, ...)
-    pointing at faces or volumes. When the description is complete,
-    call :meth:`mesh` and feed the geometry to a
-    :class:`rapidfem.Problem` for analysis.
+class Geometry:
+    """Declarative geometry builder on the rapidmesh kernel.
 
-
-    Note
-    ----
-    The Geometry holds the global gmsh OCC model exclusive while it
-    lives. Constructing two ``Geometry`` instances back-to-back is
-    fine (the second wipes the first's model state), but they cannot
-    coexist.
-
-
-    Example
-    -------
-    .. code-block:: python
-
-        g = rf.Geometry(maxh=rf.lambda_maxh(f_max=12e9))
-        air = g.box(22.86e-3, 10.16e-3, 30e-3,
-                    position=(-11.43e-3, -5.08e-3, 0),
-                    material=rf.Air())
-
-        rf.RectWaveguidePort(air.faces.min(axis="z"))
-        rf.RectWaveguidePort(air.faces.max(axis="z"))
-        rf.PEC(*air.faces.unassigned)
-
-        g.mesh()
-
+    Primitive calls record descriptions; :meth:`mesh` assembles the exact CSG
+    scene, meshes it, resolves the registered physics selections and stores
+    the solver-ready arrays. ``rapidfem.Problem`` consumes those directly,
+    no mesh files and no gmsh.
 
     Parameters
     ----------
-    maxh : float, optional
-        global maximum tet edge length in metres; used by
-        :meth:`mesh` when no explicit override is passed
-    name : str, optional
-        gmsh model name (for diagnostic / log output)
-
-
-    Attributes
-    ----------
-    _objects : list[GeoObject]
-        every primitive ever added via this builder
-    _entities : list[_Entity]
-        tracked sub-entity registry (volumes + faces + edges)
-    _physics : list
-        object-API physics registry (ports + BCs + PML)
-    _material_tags : dict[int, int]
-        ``id(Material) → physical-group tag`` map populated by
-        :meth:`mesh`
-    _physics_tags : dict[int, int]
-        ``id(physics_obj) → physical-group tag`` map populated by
-        :meth:`mesh`
-    _last_mesh : tuple[bytes, dict] or None
-        ``(mesh_bytes, name_to_tag)`` cache populated by :meth:`mesh`
+    maxh : float
+        global target tet edge length in metres
+    grading : float
+        Lipschitz size-grading constant (0.5 grows neighbors ~1.5x)
     """
 
-    def __init__(self, *, maxh: float | None = None, scale: float = 1.0,
-                 grading: bool = True,
+    def __init__(self, *, maxh: float, scale: float = 1.0, grading: float = 0.5,
                  name: str = "rapidfem"):
-        if not gmsh.isInitialized():
-            gmsh.initialize()
-        gmsh.option.setNumber("General.Terminal", 0)
-        # Working scale: gmsh internally works in (user_meters / scale) units.
-        # Default scale=1.0 means gmsh sees meters directly. Set scale=1e-6
-        # for µm-scale RFIC geometries so a 1 µm feature becomes 1.0 in gmsh
-        # units, way above gmsh's default 1e-7 tolerance, so booleans and
-        # meshing on dense layouts (interleaved combs, via clusters, …) stay
-        # robust. Just before meshing every entity is dilated back to user
-        # units so the resulting mesh nodes land at the original meter
-        # coordinates the FEM solver expects.
-        self._scale = float(scale)
-        # Default tolerance is 1e-7 m, comparable to a µm feature, which
-        # makes boolean ops/mesh struggle at RFIC scale. Drop two orders so
-        # the tolerance lives well below any feature the FEM cares about.
-        gmsh.option.setNumber("Geometry.Tolerance", 1e-9)
-        gmsh.option.setNumber("Geometry.ToleranceBoolean", 1e-9)
-        # Single-threaded OCC boolean operators. The multi-threaded path
-        # intermittently deadlocks on geometrically dense models (the RFIC
-        # layouts with many fragmented conductors), a known OpenCASCADE
-        # flakiness; the booleans are not the meshing bottleneck anyway.
-        gmsh.option.setNumber("Geometry.OCCParallel", 0)
-        gmsh.model.add(name)
-        self._objects: list[GeoObject] = []
-        self._entities: list[_Entity] = []  # all named-or-trackable entities
-        self._owns_gmsh = True  # we'll finalize on close
-        self._maxh = maxh                   # global mesh size cap (USER units)
-        # Soft size grading from boundary into the bulk. When True (default),
-        # `Mesh.MeshSizeExtendFromBoundary` is enabled in `mesh()` so the fine
-        # boundary sizes (e.g. a 0.5 mm substrate next to a 10 mm air cap)
-        # ramp gradually into the interior instead of HXT placing the full
-        # 10 mm tet right against the 0.5 mm interface. Costs a moderate tet
-        # count increase (~15-30%) in the transition zone but kills the
-        # "giant air tets visible in the field viz" artefact and produces a
-        # better-conditioned solve. Pass `grading=False` to recover the old
-        # behaviour for benchmarks or specific mesh-count budgets.
-        self._grading = bool(grading)
-        # Object-API state: physics registry + post-mesh tag maps.
-        self._physics: list = []            # rapidfem.physics.* instances
-        self._material_tags: dict[int, int] = {}  # id(Material) -> phys group tag
-        self._physics_tags: dict[int, int] = {}   # id(physics_obj) -> phys group tag
-        self._last_mesh = None              # (mesh_bytes, name_to_tag) after .mesh()
-        # Refinement requests added via refine_near_points(). Each entry
-        # is {points: (N, 3) np.ndarray, h: float, distance: float}.
-        # Consumed in mesh() as extra Distance + Threshold background
-        # fields, merged into the per-entity Min combiner.
-        self._refinements: list[dict] = []
+        if scale != 1.0:
+            raise ValueError("scale is retired: model in metres directly")
+        self.maxh = float(maxh)
+        self._grading = float(grading)
+        self._name = name
+        # solid AND sheet descriptions, in insertion order
+        self._solids: list[dict] = []
+        self._n_solid3 = 0          # rapidmesh solid counter (voids included)
+        self._next_sheet_tag = 1
+        self._size_points: list[tuple[tuple[float, float, float], float]] = []
+        self._physics: list = []
+        # filled by mesh():
+        self._mesh = None
+        self._groups: list[_FaceGroup] | None = None
+        self._mesh_arrays = None    # (nodes, tets, tet_tags, tris, tri_tags)
+        self._volume_materials: list[tuple[int, object]] = []
+        self._physics_tags: dict[int, int] = {}
+        self._region_of_solid: dict[int, int] = {}
 
-    # ── Scale helpers ──────────────────────────────────────────────────────
-    # Every coord that goes INTO gmsh is divided by self._scale; every coord
-    # read BACK from gmsh stays in the scaled space (entity bbox/cog are
-    # stored scaled). mesh() dilates everything back to user units before
-    # tessellation so the .msh nodes are in real meters.
-    def _s(self, v: float) -> float:
-        return v / self._scale
+    # ------------------------------------------------------------ recording helpers
 
-    # ── GDS-driven extrusion ────────────────────────────────────────────────
-    # from_gds / _plate_polygon / _extrude_polygon live in
-    # _geometry_gds._GdsMixin (inherited) to keep this file navigable.
+    def _add_solid(self, kind: str, args: dict, *, material, maxh, bbox) -> GeoObject:
+        if material is not None and getattr(material, "maxh", None) is not None:
+            maxh = material.maxh if maxh is None else min(maxh, material.maxh)
+        self._solids.append({
+            "kind": kind, "args": args, "void": False, "material": material,
+            "maxh": maxh, "surface_maxh": None, "sheet_tag": 0, "bbox": bbox,
+            "solid3": self._n_solid3,
+        })
+        self._n_solid3 += 1
+        return GeoObject(self, 3, len(self._solids) - 1)
+
+    def _add_sheet(self, kind: str, args: dict, *, maxh, bbox) -> GeoObject:
+        tag = self._next_sheet_tag
+        self._next_sheet_tag += 1
+        self._solids.append({
+            "kind": kind, "args": args, "void": False, "material": None,
+            "maxh": maxh, "surface_maxh": None, "sheet_tag": tag, "bbox": bbox,
+            "solid3": None,
+        })
+        return GeoObject(self, 2, len(self._solids) - 1)
+
+    # ------------------------------------------------------------ solid primitives
+
+    def box(self, width: float, depth: float, height: float,
+            position=(0, 0, 0), *, material=None, maxh: float | None = None) -> GeoObject:
+        """axis-aligned box; ``position`` is the lower corner"""
+        x, y, z = position
+        return self._add_solid(
+            "box", {"size": (width, depth, height), "position": (x, y, z)},
+            material=material, maxh=maxh,
+            bbox=(np.array([x, y, z]), np.array([x + width, y + depth, z + height])),
+        )
+
+    def cylinder(self, radius: float, height: float, position=(0, 0, 0),
+                 axis=(0, 0, 1), *, segments: int = 24,
+                 material=None, maxh: float | None = None) -> GeoObject:
+        """cylinder from ``position`` along ``axis`` (length = ``height``)"""
+        p = np.asarray(position, dtype=float)
+        a = np.asarray(axis, dtype=float)
+        a = a / np.linalg.norm(a)
+        ends = np.stack([p, p + height * a])
+        pad = radius * np.sqrt(np.maximum(0.0, 1.0 - a * a))
+        return self._add_solid(
+            "cylinder",
+            {"radius": radius, "height": height, "position": tuple(p),
+             "axis": tuple(a), "segments": segments},
+            material=material, maxh=maxh,
+            bbox=(ends.min(axis=0) - pad, ends.max(axis=0) + pad),
+        )
+
+    def sphere(self, radius: float, position=(0, 0, 0), *, segments: int = 24,
+               rings: int = 12, material=None, maxh: float | None = None,
+               center=None) -> GeoObject:
+        """sphere centred at ``position`` (alias ``center``)"""
+        c = np.asarray(center if center is not None else position, dtype=float)
+        return self._add_solid(
+            "sphere", {"radius": radius, "center": tuple(c),
+                       "segments": segments, "rings": rings},
+            material=material, maxh=maxh, bbox=(c - radius, c + radius),
+        )
+
+    def cone(self, r1: float, r2: float, height: float, position=(0, 0, 0),
+             axis=(0, 0, 1), *, segments: int = 24,
+             material=None, maxh: float | None = None) -> GeoObject:
+        """truncated cone: radius ``r1`` at ``position``, ``r2`` at the top"""
+        p = np.asarray(position, dtype=float)
+        a = np.asarray(axis, dtype=float)
+        a = a / np.linalg.norm(a)
+        ends = np.stack([p, p + height * a])
+        pad = max(r1, r2) * np.sqrt(np.maximum(0.0, 1.0 - a * a))
+        return self._add_solid(
+            "cone", {"r1": r1, "r2": r2, "height": height,
+                     "position": tuple(p), "axis": tuple(a), "segments": segments},
+            material=material, maxh=maxh,
+            bbox=(ends.min(axis=0) - pad, ends.max(axis=0) + pad),
+        )
+
+    def wedge(self, dx: float, dy: float, dz: float, top_x: float = 0.0,
+              position=(0, 0, 0), *, material=None,
+              maxh: float | None = None) -> GeoObject:
+        """right-angular wedge: box footprint ``dx, dy``, height ``dz``,
+        top edge pulled to ``top_x``"""
+        x, y, z = position
+        return self._add_solid(
+            "wedge", {"dx": dx, "dy": dy, "dz": dz, "top_x": top_x,
+                      "position": (x, y, z)},
+            material=material, maxh=maxh,
+            bbox=(np.array([x, y, z]),
+                  np.array([x + max(dx, top_x), y + dy, z + dz])),
+        )
+
+    def torus(self, major_radius: float, minor_radius: float, position=(0, 0, 0),
+              axis=(0, 0, 1), *, segments: int = 32, tube_segments: int = 16,
+              material=None, maxh: float | None = None, center=None) -> GeoObject:
+        """torus around ``axis`` through ``position`` (alias ``center``)"""
+        c = np.asarray(center if center is not None else position, dtype=float)
+        r = major_radius + minor_radius
+        return self._add_solid(
+            "torus", {"major_radius": major_radius, "minor_radius": minor_radius,
+                      "center": tuple(c), "axis": tuple(axis),
+                      "segments": segments, "tube_segments": tube_segments},
+            material=material, maxh=maxh, bbox=(c - r, c + r),
+        )
+
+    def loft(self, profile_a, profile_b, *, material=None,
+             maxh: float | None = None) -> GeoObject:
+        """ruled loft between two equal-count 3D point profiles
+        (``polygon()`` results or raw point lists)"""
+        pa = _profile_points(profile_a)
+        pb = _profile_points(profile_b)
+        allp = np.asarray(pa + pb, dtype=float)
+        return self._add_solid(
+            "loft", {"profile_a": pa, "profile_b": pb},
+            material=material, maxh=maxh,
+            bbox=(allp.min(axis=0), allp.max(axis=0)),
+        )
+
+    def extrude(self, profile, height: float, axis=(0, 0, 1), *,
+                material=None, maxh: float | None = None) -> GeoObject:
+        """extrude a planar 3D point profile along ``axis``"""
+        pa = _profile_points(profile)
+        a = np.asarray(axis, dtype=float)
+        a = a / np.linalg.norm(a)
+        pb = [tuple(np.asarray(p) + height * a) for p in pa]
+        return self.loft(pa, pb, material=material, maxh=maxh)
+
+    def polygon(self, points, position=(0, 0, 0), *, holes=None,
+                maxh: float | None = None) -> list:
+        """planar polygon PROFILE for :meth:`loft` / :meth:`extrude`
+        (for a meshed zero-thickness sheet use :meth:`polygon_plate`)"""
+        del maxh
+        if holes:
+            raise ValueError(
+                "polygon profiles cannot carry holes; use polygon_plate for "
+                "sheets with holes")
+        off = np.asarray(position, dtype=float)
+        return [tuple(np.asarray(p, dtype=float) + off) for p in points]
+
+    # ------------------------------------------------------------ sheet primitives
+
+    def xy_plate(self, width: float, height: float, position=(0, 0, 0), *,
+                 maxh: float | None = None) -> GeoObject:
+        """zero-thickness rectangle in an xy-plane (PEC traces, ports)"""
+        x, y, z = position
+        return self._add_sheet(
+            "plate", {"p0": (x, y, z), "du": (width, 0, 0), "dv": (0, height, 0)},
+            maxh=maxh,
+            bbox=(np.array([x, y, z]), np.array([x + width, y + height, z])),
+        )
+
+    def xz_plate(self, width: float, height: float, position=(0, 0, 0), *,
+                 maxh: float | None = None) -> GeoObject:
+        x, y, z = position
+        return self._add_sheet(
+            "plate", {"p0": (x, y, z), "du": (width, 0, 0), "dv": (0, 0, height)},
+            maxh=maxh,
+            bbox=(np.array([x, y, z]), np.array([x + width, y, z + height])),
+        )
+
+    def yz_plate(self, width: float, height: float, position=(0, 0, 0), *,
+                 maxh: float | None = None) -> GeoObject:
+        x, y, z = position
+        return self._add_sheet(
+            "plate", {"p0": (x, y, z), "du": (0, width, 0), "dv": (0, 0, height)},
+            maxh=maxh,
+            bbox=(np.array([x, y, z]), np.array([x, y + width, z + height])),
+        )
+
+    def plate(self, p0, width, height, *, maxh: float | None = None) -> GeoObject:
+        """arbitrary-orientation rectangle spanned by edge vectors ``width``
+        and ``height`` from corner ``p0``"""
+        p = np.asarray(p0, dtype=float)
+        du = np.asarray(width, dtype=float)
+        dv = np.asarray(height, dtype=float)
+        corners = np.stack([p, p + du, p + dv, p + du + dv])
+        return self._add_sheet(
+            "plate", {"p0": tuple(p), "du": tuple(du), "dv": tuple(dv)},
+            maxh=maxh, bbox=(corners.min(axis=0), corners.max(axis=0)),
+        )
+
+    def disc(self, radius: float, position=(0, 0, 0), *, axis=(0, 0, 1),
+             segments: int = 24, maxh: float | None = None) -> GeoObject:
+        """zero-thickness disc sheet"""
+        c = np.asarray(position, dtype=float)
+        return self._add_sheet(
+            "disc", {"radius": radius, "position": tuple(c),
+                     "axis": tuple(axis), "segments": segments},
+            maxh=maxh, bbox=(c - radius, c + radius),
+        )
+
+    def polygon_plate(self, points, position=(0, 0, 0), *, holes=None,
+                      maxh: float | None = None) -> GeoObject:
+        """zero-thickness polygon sheet in an xy-plane (2D points + holes)"""
+        off = np.asarray(position, dtype=float)
+        p2 = [(float(p[0]), float(p[1])) for p in points]
+        allp = np.asarray(p2, dtype=float)
+        lo = np.array([allp[:, 0].min(), allp[:, 1].min(), 0.0]) + off
+        hi = np.array([allp[:, 0].max(), allp[:, 1].max(), 0.0]) + off
+        return self._add_sheet(
+            "polygon_plate",
+            {"points": p2, "position": tuple(off),
+             "holes": [[(float(x), float(y)) for x, y in h] for h in holes or []]},
+            maxh=maxh, bbox=(lo, hi),
+        )
+
+    # ------------------------------------------------------------ booleans
+
+    def fragment(self, *objects) -> None:
+        """no-op: rapidmesh arranges all operands exactly and conformally by
+        construction; shared faces and embedded sheets always conform"""
+
+    def cut(self, target, *tools) -> None:
+        """carve the tool solids out of ``target`` (and everything added
+        before them): the tools become voids, their walls stay selectable"""
+        del target  # priority is positional: a void carves everything earlier
+        for t in tools:
+            if not isinstance(t, GeoObject) or t.dim != 3:
+                raise ValueError("cut tools must be solids")
+            entry = self._geometry_entry(t)
+            entry["void"] = True
+            entry["material"] = None
+
+    def _geometry_entry(self, obj: GeoObject) -> dict:
+        if obj._geometry is not self:
+            raise ValueError("object belongs to another Geometry")
+        return self._solids[obj._index]
+
+    # ------------------------------------------------------------ sizing
+
+    def auto_refine_features(self, base_maxh: float | None = None,
+                             resolution: float = 1.5,
+                             min_maxh: float | None = None) -> None:
+        """thin-volume sizing: every solid whose smallest bbox extent is below
+        ``base_maxh`` gets ``region maxh = extent / resolution`` (clamped to
+        ``min_maxh``). The validated microstrip recipe is thickness / 1.5 on
+        the dielectric plus per-plate ``maxh`` on the conductor sheets."""
+        base = self.maxh if base_maxh is None else float(base_maxh)
+        for entry in self._solids:
+            if entry["sheet_tag"] != 0 or entry["void"]:
+                continue
+            lo, hi = entry["bbox"]
+            thickness = float(np.min(np.asarray(hi) - np.asarray(lo)))
+            if thickness <= 0.0 or thickness >= base:
+                continue
+            h = thickness / resolution
+            if min_maxh is not None:
+                h = max(h, float(min_maxh))
+            entry["maxh"] = h if entry["maxh"] is None else min(entry["maxh"], h)
+
+    def refine_near_points(self, points, h: float, distance=None) -> None:
+        """point size sources: the target shrinks to ``h`` at each point and
+        recovers along the Lipschitz grading (adaptive-refinement hook)"""
+        del distance  # the Lipschitz field needs no explicit radius
+        for pt in points:
+            self._size_points.append((tuple(float(c) for c in pt), float(h)))
+
+    def refine_surface(self, obj: GeoObject, h: float) -> None:
+        """per-solid surface sizing (reaches void walls, e.g. coax inner
+        conductors): boundary patches mesh at ``h`` and grade outward"""
+        self._geometry_entry(obj)["surface_maxh"] = float(h)
+
+    # ------------------------------------------------------------ meshing
+
+    def mesh(self, maxh: float | None = None, *, radius_edge: float = 2.0,
+             max_points: int = 2_000_000, grading: float | None = None,
+             algorithm: str = "rapidmesh", optimize: bool = True):
+        """assemble the scene, mesh it, resolve physics selections, and store
+        the solver arrays; returns ``self``"""
+        del algorithm, optimize  # retired gmsh knobs
+        gm = _rm.Geometry(
+            maxh=float(maxh) if maxh is not None else self.maxh,
+            grading=self._grading if grading is None else float(grading),
+        )
+        rm_solids: list = []
+        for entry in self._solids:
+            rm_obj = _build_rapidmesh(gm, entry)
+            if entry["sheet_tag"] == 0:
+                rm_solids.append(rm_obj)
+                if entry["surface_maxh"] is not None:
+                    gm.refine_surface(rm_obj, entry["surface_maxh"])
+        for pt, h in self._size_points:
+            gm.refine_near_points([pt], h)
+
+        m = gm.mesh(radius_edge=radius_edge, max_points=max_points)
+        if m.stats.get("abandoned_patches", 0):
+            raise RuntimeError(
+                f"mesh is not fully conforming "
+                f"({m.stats['abandoned_patches']} abandoned patches); "
+                f"the geometry needs review")
+        self._mesh = m
+
+        self._region_of_solid = {}
+        for entry in self._solids:
+            if entry["sheet_tag"] == 0 and not entry["void"]:
+                s3 = entry["solid3"]
+                self._region_of_solid[s3] = rm_solids[s3].region
+
+        self._build_groups()
+        self._resolve_physics()
+        self._collect_materials()
+        return self
+
+    # -- facet groups -------------------------------------------------------------
+
+    def _build_groups(self) -> None:
+        m = self._mesh
+        faces = m.faces.astype(np.int64)
+        pts = m.points
+        tri_pts = pts[faces]
+        cents = tri_pts.mean(axis=1)
+        areas = 0.5 * np.linalg.norm(
+            np.cross(tri_pts[:, 1] - tri_pts[:, 0], tri_pts[:, 2] - tri_pts[:, 0]),
+            axis=1,
+        )
+        r = m.face_regions.astype(np.int64)
+        rlo = np.minimum(r[:, 0], r[:, 1])
+        rhi = np.maximum(r[:, 0], r[:, 1])
+        owners = m.surface_owners.astype(np.int64)[m.face_surfaces.astype(np.int64)]
+        keys = np.stack(
+            [m.face_tags.astype(np.int64), m.face_surfaces.astype(np.int64),
+             rlo, rhi],
+            axis=1,
+        )
+        _, first, inverse = np.unique(
+            keys, axis=0, return_index=True, return_inverse=True)
+        groups: list[_FaceGroup] = []
+        for gi in range(len(first)):
+            idx = np.nonzero(inverse == gi)[0]
+            a = areas[idx]
+            w = a.sum()
+            cog = ((cents[idx] * a[:, None]).sum(axis=0) / w
+                   if w > 0 else cents[idx].mean(axis=0))
+            gp = tri_pts[idx].reshape(-1, 3)
+            k = keys[first[gi]]
+            groups.append(_FaceGroup(
+                tri_idx=idx, cog=tuple(cog),
+                bbox=(*gp.min(axis=0), *gp.max(axis=0)),
+                sheet_tag=int(k[0]), owner=int(owners[idx[0]]),
+                regions=(int(k[2]), int(k[3])),
+            ))
+        self._groups = groups
+        self._model_bbox = (*pts.min(axis=0), *pts.max(axis=0))
+        self._tol = _TOL_REL * max(
+            self._model_bbox[3] - self._model_bbox[0],
+            self._model_bbox[4] - self._model_bbox[1],
+            self._model_bbox[5] - self._model_bbox[2],
+        )
+
+    def _base_groups(self, base) -> list[_FaceGroup]:
+        kind, key = base
+        out = []
+        for g in self._groups:
+            if kind == "sheet":
+                if g.sheet_tag == key:
+                    out.append(g)
+            elif kind == "solid":
+                entry = self._solids[key]
+                s3 = entry["solid3"]
+                region = 0 if entry["void"] else self._region_of_solid[s3]
+                if g.sheet_tag != 0:
+                    continue  # tagged sheets belong to their plate objects
+                if g.owner == s3 or (region != 0 and region in g.regions):
+                    out.append(g)
+        return out
+
+    def _resolve_entity(self, ent: _Entity) -> list[_FaceGroup]:
+        groups = self._base_groups(ent.base)
+        tol = self._tol
+        ax = {"x": 0, "y": 1, "z": 2}
+        for op in ent.ops:
+            if op[0] == "extreme":
+                k, sign = ax[op[1]], op[2]
+                if not groups:
+                    break
+                vals = [g.cog[k] for g in groups]
+                m = max(vals) if sign > 0 else min(vals)
+                groups = [g for g in groups if abs(g.cog[k] - m) <= tol]
+            elif op[0] == "where":
+                groups = [g for g in groups if op[1](g.cog, g.bbox)]
+            elif op[0] == "outer":
+                groups = [g for g in groups
+                          if _on_box(g.bbox, self._model_bbox, tol)]
+            elif op[0] == "hull":
+                if groups:
+                    lo = np.min([g.bbox[:3] for g in groups], axis=0)
+                    hi = np.max([g.bbox[3:] for g in groups], axis=0)
+                    hb = (*lo, *hi)
+                    groups = [g for g in groups if _on_box(g.bbox, hb, tol)]
+            elif op[0] == "unassigned":
+                groups = [g for g in groups if not g.claimed]
+        return groups
+
+    # -- physics resolution -------------------------------------------------------
+
+    def _resolve_physics(self) -> None:
+        from rapidfem.physics import PML
+
+        tris: list[np.ndarray] = []
+        tri_tags: list[np.ndarray] = []
+        self._physics_tags = {}
+        next_tag = 1
+        m = self._mesh
+        faces = m.faces.astype(np.int64)
+        for phys in self._physics:
+            if isinstance(phys, PML):
+                regions = []
+                for ent in phys._entities:
+                    if ent.base[0] != "volume":
+                        raise ValueError("PML targets must be material solids")
+                    regions.append(self._region_of_solid[
+                        self._solids[ent.base[1]]["solid3"]])
+                if len(set(regions)) != 1:
+                    raise ValueError("one PML object per volume")
+                self._physics_tags[id(phys)] = regions[0]
+                continue
+            picked: list[np.ndarray] = []
+            for ent in phys._entities:
+                for g in self._resolve_entity(ent):
+                    g.claimed = True
+                    picked.append(g.tri_idx)
+            if not picked:
+                raise ValueError(
+                    f"{type(phys).__name__}: face selection matched nothing "
+                    f"(predicates evaluate on mesh facet groups)")
+            idx = np.unique(np.concatenate(picked))
+            tag = next_tag
+            next_tag += 1
+            self._physics_tags[id(phys)] = tag
+            tris.append(faces[idx])
+            tri_tags.append(np.full(len(idx), tag, dtype=np.int32))
+
+        nodes = m.points
+        tets = m.tets.astype(np.int64)
+        tet_tags = m.tet_regions.astype(np.int32)
+        all_tris = (np.concatenate(tris) if tris
+                    else np.zeros((0, 3), dtype=np.int64))
+        all_tags = (np.concatenate(tri_tags) if tri_tags
+                    else np.zeros(0, dtype=np.int32))
+        self._mesh_arrays = (nodes, tets, tet_tags, all_tris, all_tags)
+
+    def _collect_materials(self) -> None:
+        from rapidfem.physics import PML
+
+        pml_regions: set[int] = set()
+        for phys in self._physics:
+            if isinstance(phys, PML):
+                pml_regions.add(self._physics_tags[id(phys)])
+        self._volume_materials = []
+        for entry in self._solids:
+            if entry["sheet_tag"] != 0 or entry["void"]:
+                continue
+            region = self._region_of_solid[entry["solid3"]]
+            if region in pml_regions:
+                continue  # the PML stretch profile carries its own tensors
+            if entry["material"] is None:
+                raise ValueError(
+                    f"solid #{entry['solid3']} ({entry['kind']}) has no "
+                    f"material; every non-PML volume needs one (the solver "
+                    f"zero-fills unlisted volumes and fails in assembly)")
+            self._volume_materials.append((region, entry["material"]))
+
+    # ------------------------------------------------------------ misc
+
+    @property
+    def n_tets(self) -> int:
+        return 0 if self._mesh is None else int(self._mesh.stats["n_tets"])
+
+    def close(self) -> None:
+        """retired gmsh-session hook, kept for API compatibility"""
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
-
-    def close(self):
-        if self._owns_gmsh and gmsh.isInitialized():
-            gmsh.finalize()
-            self._owns_gmsh = False
-
-    # PRIMITIVES ───────────────────────────────────────────────────────────
-
-    def _wrap_volume(self, tag: int, *,
-                     material=None,
-                     maxh: float | None = None) -> GeoObject:
-        gmsh.model.occ.synchronize()
-        ent = _Entity.from_dimtag(3, tag)
-        ent._geometry = self
-        ent.material = material
-        ent.maxh = maxh
-        obj = GeoObject(self, ent)
-        self._objects.append(obj)
-        self._entities.append(ent)
-        return obj
-
-    def _wrap_face(self, tag: int, *,
-                   maxh: float | None = None) -> GeoObject:
-        gmsh.model.occ.synchronize()
-        ent = _Entity.from_dimtag(2, tag)
-        ent._geometry = self
-        ent.maxh = maxh
-        obj = GeoObject(self, ent)
-        self._objects.append(obj)
-        self._entities.append(ent)
-        return obj
-
-
-    # ── Extrude / revolve ───────────────────────────────────────────────────
-
-    def extrude(self, face: GeoObject, height: float,
-                axis: tuple[float, float, float] = (0, 0, 1),
-                *,
-                material=None,
-                maxh: float | None = None) -> GeoObject:
-        """extrude a 2-D face along ``axis * height`` into a 3-D volume
-
-        The source ``face`` becomes the bottom cap of the new volume
-        and remains tracked in the entity registry (so names and per-
-        entity mesh sizes set on it survive).
-
-
-        Example
-        -------
-        A 35 µm copper trace from a polygon footprint:
-
-        .. code-block:: python
-
-            poly = g.polygon([(0, 0), (1e-3, 0), (1e-3, 0.5e-3), (0, 0.5e-3)])
-            trace = g.extrude(poly, height=35e-6)
-
-
-        Parameters
-        ----------
-        face : GeoObject
-            2-D face from :meth:`polygon`, :meth:`disc`, :meth:`plate`,
-            etc.
-        height : float
-            sweep distance along ``axis``
-        axis : tuple[float, float, float]
-            sweep direction, will be scaled by ``height`` (defaults
-            to +z)
-        material : rapidfem.Material, optional
-            volume material
-        maxh : float, optional
-            per-volume mesh size override
-
-        Returns
-        -------
-        GeoObject
-            new volume
-        """
-        if face.dim != 2:
-            raise ValueError(f"extrude expects a 2D face, got dim={face.dim}")
-        dx, dy, dz = axis[0] * height, axis[1] * height, axis[2] * height
-        s = self._s
-        out = gmsh.model.occ.extrude([(face.dim, face._entity.tag)], s(dx), s(dy), s(dz))
-        gmsh.model.occ.synchronize()
-        vol_tag = next((t for d, t in out if d == 3), None)
-        if vol_tag is None:
-            raise RuntimeError("extrude produced no volume")
-        return self._wrap_volume(vol_tag, material=material, maxh=maxh)
-
-    def loft(self, face_a: GeoObject, face_b: GeoObject,
-             ruled: bool = True,
-             *,
-             material=None,
-             maxh: float | None = None) -> GeoObject:
-        """loft a volume between two coplanar / parallel 2-D faces
-
-        Linearly interpolates the perimeter of ``face_a`` onto the
-        perimeter of ``face_b``. Both faces must have the same number
-        of edges in their outer boundary (a 4-edge rectangle lofts to
-        a 4-edge rectangle, producing a frustum with 4 trapezoidal
-        sides).
-
-
-        Note
-        ----
-        The input faces are absorbed into the new volume's boundary
-        and remain tracked as cap faces.
-
-
-        Example
-        -------
-        Pyramidal horn between a WR-90 throat and a flared aperture:
-
-        .. code-block:: python
-
-            throat = g.polygon([(0, -wga/2, -wgb/2), (0,  wga/2, -wgb/2),
-                                (0,  wga/2,  wgb/2), (0, -wga/2,  wgb/2)])
-            aper   = g.polygon([(L, -WH/2, -HH/2),   (L,  WH/2, -HH/2),
-                                (L,  WH/2,  HH/2),   (L, -WH/2,  HH/2)])
-            horn = g.loft(throat, aper)
-
-
-        Parameters
-        ----------
-        face_a, face_b : GeoObject
-            two 2-D faces to bridge
-        ruled : bool
-            ``True`` (default) gives flat side surfaces, the right
-            choice for pyramidal / frustum-style horns; ``False`` fits
-            a spline through the section profiles
-        material : rapidfem.Material, optional
-            volume material
-        maxh : float, optional
-            per-volume mesh size override
-
-        Returns
-        -------
-        GeoObject
-            new volume
-        """
-        if face_a.dim != 2 or face_b.dim != 2:
-            raise ValueError("loft expects two 2D faces")
-        wire_a = self._face_outer_wire(face_a)
-        wire_b = self._face_outer_wire(face_b)
-        out = gmsh.model.occ.addThruSections(
-            [wire_a, wire_b], makeSolid=True, makeRuled=ruled
-        )
-        gmsh.model.occ.synchronize()
-        vol_tag = next((t for d, t in out if d == 3), None)
-        if vol_tag is None:
-            raise RuntimeError("loft produced no volume")
-        return self._wrap_volume(vol_tag, material=material, maxh=maxh)
-
-    def _face_outer_wire(self, face: GeoObject) -> int:
-        """Return a wire tag for the outer boundary of ``face``.
-
-        gmsh ``addThruSections`` expects wire tags; we build a fresh wire
-        from the face's boundary edges so the call is self-contained.
-        """
-        bd = gmsh.model.getBoundary(
-            [(face.dim, face._entity.tag)], oriented=False, recursive=False
-        )
-        edge_tags = [t for d, t in bd if d == 1]
-        return gmsh.model.occ.addWire(edge_tags, checkClosed=True)
-
-    def revolve(self, face: GeoObject,
-                axis_point: tuple[float, float, float] = (0, 0, 0),
-                axis_dir: tuple[float, float, float] = (0, 0, 1),
-                angle: float = 2 * math.pi,
-                *,
-                material=None,
-                maxh: float | None = None) -> GeoObject:
-        """revolve a 2-D face around an axis to create a 3-D volume
-
-        For a full :math:`2\\pi` sweep the profile typically touches
-        the axis to close the body; partial sweeps produce a wedge-shaped
-        volume.
-
-
-        Example
-        -------
-        Conical horn from a 4-point profile revolved around the x-axis:
-
-        .. code-block:: python
-
-            profile = g.polygon([(L, 0), (L+a, 0), (L+a, R), (L, r)])
-            horn = g.revolve(profile, axis_point=(0, 0, 0), axis_dir=(1, 0, 0))
-
-
-        Parameters
-        ----------
-        face : GeoObject
-            2-D face to revolve
-        axis_point : tuple[float, float, float]
-            a point on the rotation axis (defaults to origin)
-        axis_dir : tuple[float, float, float]
-            axis direction (defaults to +z)
-        angle : float
-            sweep angle in radians (defaults to :math:`2\\pi`)
-        material : rapidfem.Material, optional
-            volume material
-        maxh : float, optional
-            per-volume mesh size override
-
-        Returns
-        -------
-        GeoObject
-            new volume
-        """
-        if face.dim != 2:
-            raise ValueError(f"revolve expects a 2D face, got dim={face.dim}")
-        cx, cy, cz = axis_point
-        ax, ay, az = axis_dir
-        s = self._s
-        out = gmsh.model.occ.revolve(
-            [(face.dim, face._entity.tag)], s(cx), s(cy), s(cz), ax, ay, az, angle
-        )
-        gmsh.model.occ.synchronize()
-        vol_tag = next((t for d, t in out if d == 3), None)
-        if vol_tag is None:
-            raise RuntimeError("revolve produced no volume")
-        return self._wrap_volume(vol_tag, material=material, maxh=maxh)
-
-    # BOOLEAN OPS ──────────────────────────────────────────────────────────
-
-    def fragment(self, target: GeoObject, *tools: GeoObject) -> None:
-        """make every overlap between ``target`` and ``tools`` conformal
-
-        Splits each overlap into a shared face or volume that both
-        operands keep. Meshing then produces a single conformal tet
-        mesh across every interface, exactly what the FEM solver
-        needs. Names and per-entity mesh sizes assigned on the
-        operands survive.
-
-
-        Note
-        ----
-        Uses gmsh's ``occ.fragment`` ``out_map`` to update each input's
-        tag directly, robust against COG drift that can break naive
-        name-tracking after boolean ops. Child faces and edges are
-        re-resolved by ``(centroid, bbox)`` matching against the
-        registry.
-
-
-        Example
-        -------
-        Substrate + air + thin patch + lumped-port plate, all
-        conformally fragmented in one call:
-
-        .. code-block:: python
-
-            g.fragment(air, sub, patch, feed)
-
-
-        Parameters
-        ----------
-        target : GeoObject
-            first operand
-        *tools : GeoObject
-            additional operands to fragment with ``target``
-        """
-        target_dt = [(target.dim, target._entity.tag)]
-        tools_dt = [(t.dim, t._entity.tag) for t in tools]
-        _, out_map = gmsh.model.occ.fragment(target_dt, tools_dt)
-        gmsh.model.occ.synchronize()
-        inputs = [target] + list(tools)
-        self._apply_out_map(inputs, out_map)
-        self._reresolve_children(top_level=set(id(o._entity) for o in inputs))
-
-    def cut(self, target: GeoObject, *tools: GeoObject) -> None:
-        """boolean subtract ``tools`` from ``target``
-
-        Carves the volumes / faces of ``tools`` out of ``target``. The
-        target survives (possibly as several pieces); tools are
-        consumed by the operation.
-
-
-        Note
-        ----
-        Tools are **consumed** by ``cut``, do not reference them after
-        the call. Use :meth:`fragment` instead if you need both
-        operands to survive (e.g. for a substrate-in-air model).
-
-
-        Parameters
-        ----------
-        target : GeoObject
-            object to subtract from
-        *tools : GeoObject
-            objects to subtract (consumed)
-        """
-        target_dt = [(target.dim, target._entity.tag)]
-        tools_dt = [(t.dim, t._entity.tag) for t in tools]
-        _, out_map = gmsh.model.occ.cut(target_dt, tools_dt)
-        gmsh.model.occ.synchronize()
-        # Tools are consumed by `cut`; only the target survives (with possibly
-        # multiple pieces). out_map[0] = target's new pieces.
-        self._apply_out_map([target], out_map[:1] if out_map else [[]])
-        self._reresolve_children(top_level={id(target._entity)})
-
-    def _apply_out_map(self, inputs: list[GeoObject], out_map: list) -> None:
-        """For each input GeoObject, update its tag/cog/bbox from gmsh's out_map.
-        If an input was split into multiple pieces, the first piece keeps the
-        original GeoObject; the others are registered as additional `_Entity`s
-        carrying the same name/material/maxh.
-
-        When tools sit fully inside the target (e.g. iris-strips inside an air
-        box), gmsh's out_map[0] for the target enumerates EVERY piece of the
-        partition that covers it, including the pieces each tool claims as
-        its own primary. Without de-duplication, those tool pieces would also
-        appear as "extras" under the target with the wrong material, producing
-        overlapping physical groups in gmsh and ambiguous material tagging in
-        the Rust solver. We collect the primary tags first and skip them when
-        creating extras.
-        """
-        primary_tags: set[tuple[int, int]] = set()
-        for input_obj, new_dimtags in zip(inputs, out_map):
-            if new_dimtags:
-                d0, t0 = new_dimtags[0]
-                primary_tags.add((int(d0), int(t0)))
-        for input_obj, new_dimtags in zip(inputs, out_map):
-            if not new_dimtags:
-                warnings.warn(
-                    f"GeoObject (dim={input_obj.dim}, name={input_obj._entity.name!r}) "
-                    f"vanished during boolean op",
-                    stacklevel=3,
-                )
-                continue
-            d0, t0 = new_dimtags[0]
-            input_obj._entity.tag = t0
-            input_obj._entity.cog = tuple(gmsh.model.occ.getCenterOfMass(d0, t0))
-            input_obj._entity.bbox = tuple(gmsh.model.getBoundingBox(d0, t0))
-            for d, t in new_dimtags[1:]:
-                if (int(d), int(t)) in primary_tags:
-                    continue
-                extra = _Entity.from_dimtag(d, t)
-                extra.name = input_obj._entity.name
-                extra.material = input_obj._entity.material
-                extra.maxh = input_obj._entity.maxh
-                self._entities.append(extra)
-
-    def _reresolve_children(self, top_level: set[int]) -> None:
-        """Re-resolve child entities (faces, edges) by COG+bbox. Top-level
-        entities (already updated via out_map) are skipped via `top_level` set
-        of `_Entity` ids."""
-        survived = []
-        for ent in self._entities:
-            if id(ent) in top_level:
-                survived.append(ent)
-                continue
-            new_tag = _resolve_entity(ent)
-            if new_tag is not None:
-                ent.tag = new_tag
-                survived.append(ent)
-            elif ent.name or ent.material or ent.maxh:
-                warnings.warn(
-                    f"Tracked entity (dim={ent.dim}, name={ent.name!r}, "
-                    f"cog={ent.cog}) lost during boolean op; attributes dropped.",
-                    stacklevel=3,
-                )
-        self._entities = survived
-
-    # TRANSFORMS ───────────────────────────────────────────────────────────
-
-    def rotate(self, obj: GeoObject, angle: float,
-               axis: tuple[float, float, float] = (0, 0, 1),
-               center: tuple[float, float, float] = (0, 0, 0)) -> None:
-        """rotate ``obj`` (and all its child faces / edges) in place
-
-        gmsh dimtags survive the transform unchanged; only the
-        geometric attributes (COG, bbox) of every tracked entity
-        descending from ``obj`` are refreshed. Named selectors keep
-        working, the resolver sees the new positions.
-
-
-        Example
-        -------
-        Rotate a horn 30° around y:
-
-        .. code-block:: python
-
-            g.rotate(horn, math.pi / 6, axis=(0, 1, 0))
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to rotate
-        angle : float
-            rotation angle in radians (right-hand rule about ``axis``)
-        axis : tuple[float, float, float]
-            axis direction (defaults to +z)
-        center : tuple[float, float, float]
-            a point on the rotation axis (defaults to origin)
-        """
-        cx, cy, cz = center
-        ax, ay, az = axis
-        s = self._s
-        gmsh.model.occ.rotate([(obj.dim, obj._entity.tag)],
-                              s(cx), s(cy), s(cz), ax, ay, az, angle)
-        gmsh.model.occ.synchronize()
-        self._refresh_descendants(obj)
-
-    def stretch(self, obj: GeoObject,
-                fx: float = 1.0, fy: float = 1.0, fz: float = 1.0,
-                center: tuple[float, float, float] = (0, 0, 0)) -> None:
-        """anisotropic scale ``obj`` about ``center`` by ``(fx, fy, fz)``
-
-        Per-axis dilation. The scaling centre stays fixed; everything
-        else moves by :math:`(f_x x, f_y y, f_z z)` relative to it.
-
-
-        Example
-        -------
-        Squash a circular waveguide by 0.1 % to split degenerate modes:
-
-        .. code-block:: python
-
-            g.stretch(feed, fy=1.001)
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to scale
-        fx, fy, fz : float
-            scale factors along each axis (default 1 = no change)
-        center : tuple[float, float, float]
-            scaling centre (defaults to origin)
-        """
-        cx, cy, cz = center
-        s = self._s
-        gmsh.model.occ.dilate([(obj.dim, obj._entity.tag)],
-                              s(cx), s(cy), s(cz), fx, fy, fz)
-        gmsh.model.occ.synchronize()
-        self._refresh_descendants(obj)
-
-    def translate(self, obj: GeoObject,
-                  dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> None:
-        """move ``obj`` (and all its child faces / edges) in place by ``(dx, dy, dz)``
-
-        Like :meth:`rotate`, gmsh dimtags survive the transform, only
-        the geometric attributes (COG, bbox) of every tracked entity
-        descending from ``obj`` are refreshed, so named selectors keep
-        resolving to the moved entities.
-
-
-        Example
-        -------
-        Lift a feed line 0.5 mm in z:
-
-        .. code-block:: python
-
-            g.translate(feed, dz=0.5e-3)
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to move
-        dx, dy, dz : float
-            translation along each axis in metres (default 0 = no move)
-        """
-        s = self._s
-        gmsh.model.occ.translate([(obj.dim, obj._entity.tag)], s(dx), s(dy), s(dz))
-        gmsh.model.occ.synchronize()
-        self._refresh_descendants(obj)
-
-    def mirror(self, obj: GeoObject,
-               normal: tuple[float, float, float] = (1, 0, 0),
-               point: tuple[float, float, float] = (0, 0, 0)) -> None:
-        """reflect ``obj`` in place across the plane through ``point`` with ``normal``
-
-        Useful for building symmetric structures (one half plus its
-        mirror image) without re-deriving coordinates. The reflection is
-        in place: dimtags survive, COG/bbox of every descendant are
-        refreshed, so named selectors keep working.
-
-
-        Note
-        ----
-        A reflection flips orientation. For a closed solid this is
-        harmless (the volume is still valid), but if you mirror and then
-        :meth:`fuse` the two halves, set face names AFTER the fuse (see
-        :meth:`fuse`).
-
-
-        Example
-        -------
-        Mirror a horn arm across the x = 0 plane (yz-plane):
-
-        .. code-block:: python
-
-            g.mirror(arm, normal=(1, 0, 0))
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to reflect
-        normal : tuple[float, float, float]
-            plane normal (need not be unit length); defaults to +x,
-            i.e. the yz-plane
-        point : tuple[float, float, float]
-            a point the plane passes through (defaults to origin)
-        """
-        nx, ny, nz = normal
-        px, py, pz = point
-        s = self._s
-        # Plane a*x + b*y + c*z + d = 0 through `point` with the given normal.
-        # a,b,c are dimensionless; d carries length units, so build it from the
-        # scaled point coordinates (everything inside gmsh lives in scaled space).
-        d = -(nx * s(px) + ny * s(py) + nz * s(pz))
-        gmsh.model.occ.mirror([(obj.dim, obj._entity.tag)], nx, ny, nz, d)
-        gmsh.model.occ.synchronize()
-        self._refresh_descendants(obj)
-
-    def copy(self, obj: GeoObject, *,
-             material=None,
-             maxh: float | None = None) -> GeoObject:
-        """duplicate ``obj`` into a new, independent :class:`GeoObject`
-
-        The copy is a fresh body at the same location; move it with
-        :meth:`translate` / :meth:`rotate` afterwards (or use
-        :meth:`array`, which does this for you). Material and per-entity
-        ``maxh`` are inherited from the source unless overridden.
-
-
-        Note
-        ----
-        The copy's ``name`` is intentionally **not** inherited: two
-        entities sharing a name would make named-face resolution
-        ambiguous. Name the copy yourself (or attach physics directly)
-        after placing it.
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            via2 = g.copy(via1)
-            g.translate(via2, dx=1e-3)
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to duplicate
-        material : rapidfem.Material, optional
-            material for the copy (defaults to the source's material;
-            volumes only)
-        maxh : float, optional
-            per-entity mesh size for the copy (defaults to the source's)
-
-        Returns
-        -------
-        GeoObject
-            the new, independent duplicate
-        """
-        out = gmsh.model.occ.copy([(obj.dim, obj._entity.tag)])
-        gmsh.model.occ.synchronize()
-        new_dim, new_tag = out[0]
-        eff_maxh = maxh if maxh is not None else obj.maxh
-        if new_dim == 3:
-            eff_material = material if material is not None else obj.material
-            return self._wrap_volume(new_tag, material=eff_material, maxh=eff_maxh)
-        return self._wrap_face(new_tag, maxh=eff_maxh)
-
-    def array(self, obj: GeoObject, count: int, *,
-              spacing: tuple[float, float, float] | None = None,
-              rotation: float | None = None,
-              axis: tuple[float, float, float] = (0, 0, 1),
-              center: tuple[float, float, float] = (0, 0, 0)) -> list[GeoObject]:
-        """replicate ``obj`` into a linear or polar array of ``count`` instances
-
-        Pass exactly one of ``spacing`` (linear array) or ``rotation``
-        (polar array). The returned list has length ``count`` with the
-        original ``obj`` as element ``0`` and the fresh copies after it,
-        so a 4-element array yields 3 new bodies plus the original.
-
-        Pairs naturally with :class:`rapidfem.FloquetPort` /
-        :class:`rapidfem.PeriodicBoundary` for antenna arrays, frequency
-        selective surfaces, and metamaterial unit-cell tilings.
-
-
-        Example
-        -------
-        A 1x8 linear patch array on a 12 mm pitch, and a 6-fold polar ring:
-
-        .. code-block:: python
-
-            patches = g.array(patch, 8, spacing=(12e-3, 0, 0))
-            petals  = g.array(petal, 6, rotation=2 * math.pi / 6)
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume or face to replicate
-        count : int
-            total number of instances including the original (>= 1)
-        spacing : tuple[float, float, float], optional
-            per-step translation in metres for a linear array
-        rotation : float, optional
-            per-step rotation angle in radians for a polar array
-        axis : tuple[float, float, float]
-            rotation axis for the polar case (defaults to +z)
-        center : tuple[float, float, float]
-            a point on the rotation axis for the polar case (defaults
-            to origin)
-
-        Returns
-        -------
-        list[GeoObject]
-            ``count`` instances, ``[0]`` being the original ``obj``
-
-        Raises
-        ------
-        ValueError
-            if ``count < 1`` or not exactly one of ``spacing`` / ``rotation``
-        """
-        if count < 1:
-            raise ValueError(f"array: count must be >= 1, got {count}")
-        if (spacing is None) == (rotation is None):
-            raise ValueError(
-                "array: pass exactly one of spacing= (linear) or rotation= (polar)")
-        instances = [obj]
-        for i in range(1, count):
-            inst = self.copy(obj)
-            if spacing is not None:
-                # Place each copy at i steps from the original (no cumulative
-                # drift: always derived from the un-moved source).
-                inst_shift = (spacing[0] * i, spacing[1] * i, spacing[2] * i)
-                self.translate(inst, *inst_shift)
-            else:
-                self.rotate(inst, rotation * i, axis=axis, center=center)
-            instances.append(inst)
-        return instances
-
-    def _refresh_descendants(self, obj: GeoObject) -> None:
-        """Refresh COG/bbox for every tracked entity in ``obj``'s boundary
-        tree (plus ``obj`` itself). In-place transforms keep dimtags but
-        move centroids, without this, named-face resolvers would miss.
-
-        gmsh's ``getBoundary(recursive=True)`` descends straight to the
-        vertices, so we walk one dimension at a time to collect faces and
-        edges as well.
-        """
-        descendants = {(obj.dim, obj._entity.tag)}
-        current = [(obj.dim, obj._entity.tag)]
-        while current and current[0][0] > 0:
-            next_level = gmsh.model.getBoundary(current, oriented=False, recursive=False)
-            descendants.update(next_level)
-            current = list(next_level)
-        for ent in self._entities:
-            if (ent.dim, ent.tag) in descendants:
-                ent.cog = tuple(gmsh.model.occ.getCenterOfMass(ent.dim, ent.tag))
-                ent.bbox = tuple(gmsh.model.getBoundingBox(ent.dim, ent.tag))
-
-    def intersect(self, target: GeoObject, *tools: GeoObject) -> None:
-        """boolean intersect ``target ∩ tools``
-
-        Carves the intersection of ``target`` with every member of
-        ``tools`` and assigns it back to ``target``. The tools are
-        consumed by the operation.
-
-
-        Note
-        ----
-        Tools are **consumed** by ``intersect``, do not reference
-        them after the call.
-
-
-        Example
-        -------
-        Clip a horn to the upper half-space:
-
-        .. code-block:: python
-
-            g.intersect(horn, halfspace)
-
-
-        Parameters
-        ----------
-        target : GeoObject
-            object to intersect (survives as the intersection region)
-        *tools : GeoObject
-            objects to intersect with (consumed)
-        """
-        target_dt = [(target.dim, target._entity.tag)]
-        tools_dt = [(t.dim, t._entity.tag) for t in tools]
-        _, out_map = gmsh.model.occ.intersect(target_dt, tools_dt)
-        gmsh.model.occ.synchronize()
-        # Tools are consumed; only target survives (possibly as several pieces).
-        self._apply_out_map([target], out_map[:1] if out_map else [[]])
-        self._reresolve_children(top_level={id(target._entity)})
-
-    def fuse(self, target: GeoObject, *tools: GeoObject) -> None:
-        """boolean union ``target ∪ tools``
-
-        Merges the operands into a single connected body assigned back
-        to ``target``.
-
-
-        Note
-        ----
-        Face names on the operands are **not** preserved (faces merge
-        and centroids shift). Top-level volume names survive via the
-        gmsh ``out_map``, but set face names AFTER ``fuse``, or use
-        :meth:`fragment` if you need the interfaces themselves to
-        survive as named entities.
-
-
-        Parameters
-        ----------
-        target : GeoObject
-            first operand (survives as the merged object)
-        *tools : GeoObject
-            operands to merge in
-        """
-        warnings.warn(
-            "fuse() merges faces and shifts their COGs; named faces on the "
-            "operands will not be reliably re-resolvable. Set face names AFTER "
-            "fuse, or use fragment() if you need them preserved.",
-            stacklevel=2,
-        )
-        target_dt = [(target.dim, target._entity.tag)]
-        tools_dt = [(t.dim, t._entity.tag) for t in tools]
-        _, out_map = gmsh.model.occ.fuse(target_dt, tools_dt)
-        gmsh.model.occ.synchronize()
-        inputs = [target] + list(tools)
-        self._apply_out_map(inputs, out_map)
-        self._reresolve_children(top_level=set(id(o._entity) for o in inputs))
-
-    def fillet(self, obj: GeoObject, radius: float,
-               edges: "EntityCollection | None" = None) -> GeoObject:
-        """round the edges of a volume with a constant-radius fillet
-
-        Rounds either every edge of ``obj`` (``edges=None``) or just the
-        ones in a selected :class:`EntityCollection`, replacing the
-        volume with the filleted result. Realistic conductor edges and
-        rounded housings need this; sharp edges also concentrate the
-        field and stress the mesh.
-
-
-        Note
-        ----
-        Filleting reshapes the boundary: the original flat faces and
-        sharp edges are replaced by new rounded surfaces, so names /
-        materials / ``maxh`` set on the *child faces or edges* of ``obj``
-        may not survive (the top-level volume identity does). Select
-        faces for physics **after** filleting, or fillet before naming.
-
-
-        Example
-        -------
-        Round all 12 edges of a box by 0.2 mm; or just its vertical edges:
-
-        .. code-block:: python
-
-            g.fillet(housing, 0.2e-3)
-            g.fillet(post, 50e-6, edges=post.edges.where(
-                lambda c, b: b[5] - b[2] > 1e-6))  # tall (z-extent) edges
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume to fillet (dim must be 3)
-        radius : float
-            fillet radius in metres
-        edges : EntityCollection, optional
-            edges to round (defaults to every edge of ``obj``)
-
-        Returns
-        -------
-        GeoObject
-            the same ``obj``, now pointing at the filleted volume
-
-        Raises
-        ------
-        ValueError
-            if ``obj`` is not a volume or has no edges to round
-        """
-        if obj.dim != 3:
-            raise ValueError(f"fillet expects a volume (dim=3), got dim={obj.dim}")
-        edge_tags = [e.tag for e in (edges if edges is not None else obj.edges)]
-        if not edge_tags:
-            raise ValueError("fillet: no edges to round")
-        s = self._s
-        # A single radius is broadcast by gmsh across every supplied curve.
-        out = gmsh.model.occ.fillet([obj._entity.tag], edge_tags, [s(radius)],
-                                    removeVolume=True)
-        gmsh.model.occ.synchronize()
-        self._apply_out_map([obj], [out])
-        self._reresolve_children(top_level={id(obj._entity)})
-        return obj
-
-    def chamfer(self, obj: GeoObject, distance: float,
-                edges: "EntityCollection | None" = None) -> GeoObject:
-        """bevel the edges of a volume with a constant chamfer
-
-        The flat-bevel counterpart to :meth:`fillet`: each selected edge
-        is replaced by a planar facet set back ``distance`` from the
-        edge. Same boundary-reshaping caveat as :meth:`fillet` (child
-        face / edge names may not survive).
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            g.chamfer(connector_body, 0.1e-3)
-
-
-        Parameters
-        ----------
-        obj : GeoObject
-            volume to chamfer (dim must be 3)
-        distance : float
-            chamfer setback in metres
-        edges : EntityCollection, optional
-            edges to bevel (defaults to every edge of ``obj``)
-
-        Returns
-        -------
-        GeoObject
-            the same ``obj``, now pointing at the chamfered volume
-
-        Raises
-        ------
-        ValueError
-            if ``obj`` is not a volume or has no edges to bevel
-        """
-        if obj.dim != 3:
-            raise ValueError(f"chamfer expects a volume (dim=3), got dim={obj.dim}")
-        edge_tags = [e.tag for e in (edges if edges is not None else obj.edges)]
-        if not edge_tags:
-            raise ValueError("chamfer: no edges to bevel")
-        # gmsh's chamfer measures the setback from a reference surface per
-        # curve, so pair each edge with one of its adjacent faces.
-        surf_tags: list[int] = []
-        for et in edge_tags:
-            up, _down = gmsh.model.getAdjacencies(1, et)
-            if len(up) == 0:
-                raise RuntimeError(f"chamfer: edge {et} has no adjacent surface")
-            surf_tags.append(int(up[0]))
-        s = self._s
-        out = gmsh.model.occ.chamfer([obj._entity.tag], edge_tags, surf_tags,
-                                     [s(distance)], removeVolume=True)
-        gmsh.model.occ.synchronize()
-        self._apply_out_map([obj], [out])
-        self._reresolve_children(top_level={id(obj._entity)})
-        return obj
-
-    # MESH EMIT ────────────────────────────────────────────────────────────
-
-    def auto_refine_features(
-        self,
-        base_maxh: float,
-        resolution: int = 3,
-        min_maxh: float | None = None,
-    ) -> dict[str, float]:
-        """auto-assign per-volume ``maxh`` for any volume thinner than
-        ``base_maxh``
-
-        Walks every 3-D volume in the geometry. For each, computes the
-        smallest bbox dimension (the "feature size"). If that dimension
-        is smaller than ``base_maxh`` *and* the user hasn't already
-        set ``vol.maxh`` explicitly, sets
-
-        .. math::
-
-            \\mathrm{vol.maxh} = \\max\\!\\left(
-                \\frac{d_{\\min}}{\\mathrm{resolution}},
-                \\mathrm{min\\_maxh}
-            \\right)
-
-        so the volume is resolved with at least ``resolution`` tets
-        across its thinnest axis.
-
-
-        Note
-        ----
-        Idempotent, only writes ``maxh`` when it's currently ``None``,
-        so explicit per-volume sizes (set via ``g.box(..., maxh=...)``
-        or ``obj.maxh = ...``) always win.
-
-
-        Example
-        -------
-        Resolve a 0.5 mm thin substrate against a 12 mm global cap:
-
-        .. code-block:: python
-
-            g.auto_refine_features(base_maxh=12e-3, resolution=3)
-
-
-        Parameters
-        ----------
-        base_maxh : float
-            reference size, volumes wider than this in all directions
-            are left untouched
-        resolution : int
-            target number of tets across the thinnest dimension (3 is
-            enough for ND-2 to capture per-element gradients; bump to
-            4-5 for very high accuracy near a specific feature)
-        min_maxh : float, optional
-            floor on the auto-assigned size, to avoid catastrophic
-            refinement on micron-scale features
-
-        Returns
-        -------
-        dict[str, float]
-            map ``{volume_descriptor: assigned_maxh}`` for the volumes
-            touched (descriptor is the volume's ``name`` if set, else
-            ``"vol@(cx,cy,cz)"``)
-        """
-        assigned: dict[str, float] = {}
-        for obj in self._objects:
-            if obj.dim != 3 or obj.maxh is not None:
-                continue
-            bbox = obj._entity.bbox
-            dims = (bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2])
-            min_dim = min(d for d in dims if d > 0)
-            if min_dim >= base_maxh:
-                continue
-            h = min_dim / resolution
-            if min_maxh is not None:
-                h = max(h, min_maxh)
-            obj.maxh = h
-            cog = obj._entity.cog
-            desc = obj.name or f"vol@({cog[0]*1e3:.1f},{cog[1]*1e3:.1f},{cog[2]*1e3:.1f})mm"
-            assigned[desc] = h
-        return assigned
-
-    def refine_near_points(self, points, h: float,
-                           distance: float | None = None) -> None:
-        """register a local mesh-size refinement around a point cloud
-
-        On the next :meth:`mesh` call, gmsh's ``Distance`` + ``Threshold``
-        background fields will enforce element size ``h`` within
-        ``distance`` of any point in ``points``, smoothly relaxing back
-        to the global cap further out. Multiple calls are additive,
-        each request becomes its own field and merges with the others
-        via ``Min``.
-
-        Designed to consume the output of
-        :meth:`rapidfem.ProblemFD.element_errors`: the user marks high-η
-        tets, picks a target size relative to their current ``h_k``,
-        and re-meshes. The loop is explicit (user drives it); no
-        automatic AMR.
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            errs = prob.element_errors(result, freq_idx=res_idx,
-                                       theta=0.3)
-            hot = errs.tet_centroids[errs.marked]
-            h_target = errs.h_k[errs.marked].mean() * 0.5
-            g.refine_near_points(hot, h=h_target)
-            g.mesh()                # picks up the new field
-            prob2 = rf.Problem(g)   # fresh problem on the refined mesh
-
-
-        Parameters
-        ----------
-        points : array_like
-            ``(N, 3)`` coordinates of refinement centres in metres
-        h : float
-            target tet size at the points (m)
-        distance : float, optional
-            transition radius; defaults to ``5 * h`` (smooth ramp back
-            to the global cap)
-        """
-        pts = np.asarray(points, dtype=float)
-        if pts.ndim != 2 or pts.shape[1] != 3:
-            raise ValueError(
-                f"refine_near_points expects (N, 3) array, got shape {pts.shape}"
-            )
-        if h <= 0:
-            raise ValueError(f"h must be positive, got {h}")
-        self._refinements.append({
-            "points": pts,
-            "h": float(h),
-            "distance": (float(distance) if distance is not None else 5.0 * float(h)),
-        })
-
-    def mesh(
-        self,
-        maxh: float | None = None,
-        transition_distance: float | None = None,
-        algorithm: str = "hxt",
-        optimize: bool | str = True,
-    ) -> tuple[bytes, dict[str, int]]:
-        """generate the 3-D tet mesh of the current geometry
-
-        Calls gmsh's OCC mesher with the configured per-entity sizes
-        and global cap. Per-entity ``obj.maxh = h`` is honoured via
-        gmsh ``Distance + Threshold`` background fields so refinement
-        transitions are smooth, not abrupt.
-
-        The 3-D mesher and a post-pass sliver fixer are configured by the
-        ``algorithm`` and ``optimize`` kwargs (defaults give the highest-
-        quality mesh; the per-call overrides are escape hatches).
-
-
-        Note
-        ----
-        Three sources of physical groups are created at mesh time:
-
-        - Every :class:`rapidfem.Material` instance attached via
-          ``g.box(..., material=...)`` gets its own physical group
-          on dim 3; the resulting tag is stored in
-          ``self._material_tags[id(material)]``.
-        - Every physics object in ``self._physics`` (created by
-          ``rf.PEC(...)``, ``rf.LumpedPort(...)``, ...) gets its own
-          physical group containing all its target entities; the tag is
-          stored in ``self._physics_tags[id(physics_obj)]``.
-        - Legacy string materials/names (``obj.material = "fr4"``,
-          ``obj.name = "ground"``) continue to work for the GDS
-          import / ``rfic.Stack`` flow, they produce name-keyed groups
-          in the returned ``name_to_tag`` dict.
-
-
-        Example
-        -------
-        .. code-block:: python
-
-            g = rf.Geometry(maxh=rf.lambda_maxh(f_max=12e9))
-            # ... primitives + physics ...
-            g.mesh()                      # uses the geometry's maxh
-            g.mesh(maxh=1e-3)             # one-off override
-
-
-        Parameters
-        ----------
-        maxh : float, optional
-            global mesh size cap override in metres; falls back to the
-            ``maxh=`` passed to :class:`Geometry` when ``None`` (raises
-            if neither is set)
-        transition_distance : float, optional
-            distance over which a refined region's element size grows
-            from its local ``h`` to the global cap (defaults to
-            :math:`5h` per-entity)
-
-        Returns
-        -------
-        mesh_bytes : bytes
-            gmsh ``.msh`` v4 file as bytes, also cached on
-            ``self._last_mesh`` for :class:`rapidfem.Problem`
-        name_to_tag : dict[str, int]
-            legacy name → tag map (empty under the object-API path)
-        """
-        if maxh is None:
-            maxh = self._maxh
-        if maxh is None:
-            raise ValueError(
-                "no maxh set, pass it to Geometry(maxh=...) or g.mesh(maxh=...)"
-            )
-        gmsh.model.occ.synchronize()
-        # Dilate every OCC entity from the internal scaled coords back to
-        # user units BEFORE any mesh setup. Threshold fields, mesh size
-        # hints and the mesher itself then all see real-meter geometry; the
-        # resulting .msh ends up in user units without needing a post-mesh
-        # transform. Idempotent, flag guards re-runs of mesh().
-        if self._scale != 1.0 and not getattr(self, "_dilated", False):
-            s = self._scale
-            all_dt = gmsh.model.getEntities()
-            if all_dt:
-                gmsh.model.occ.dilate(all_dt, 0, 0, 0, s, s, s)
-                gmsh.model.occ.synchronize()
-            self._dilated = True
-
-        # Wipe any prior mesh state AND physical groups. Without the latter,
-        # re-running this cell hits "Physical surface 1 already exists".
-        # Without the former, gmsh reuses stale 1D/2D meshes and partially
-        # ignores the new maxh.
-        try:
-            gmsh.model.mesh.clear()
-        except Exception:
-            pass
-        try:
-            for dim, ptag in gmsh.model.getPhysicalGroups():
-                gmsh.model.removePhysicalGroups([(dim, ptag)])
-        except Exception:
-            pass
-
-        # ── Per-entity mesh size: gmsh Distance + Threshold background fields ──
-        # Effective per-entity maxh = explicit `ent.maxh` first, then the
-        # entity's Material.maxh as a per-material refinement floor (lets
-        # users tag every conductor or thin dielectric without touching the
-        # primitives that carry that material).
-        threshold_field_ids: list[int] = []
-        for ent in self._entities:
-            eff_maxh = ent.maxh
-            if eff_maxh is None:
-                eff_maxh = getattr(ent.material, "maxh", None)
-            if eff_maxh is None:
-                continue
-            dist_id = gmsh.model.mesh.field.add("Distance")
-            if ent.dim == 0:
-                gmsh.model.mesh.field.setNumbers(dist_id, "PointsList", [ent.tag])
-            elif ent.dim == 1:
-                gmsh.model.mesh.field.setNumbers(dist_id, "CurvesList", [ent.tag])
-            elif ent.dim == 2:
-                gmsh.model.mesh.field.setNumbers(dist_id, "SurfacesList", [ent.tag])
-            elif ent.dim == 3:
-                # Volumes: refine across their boundary surfaces
-                boundary = gmsh.model.getBoundary([(3, ent.tag)], oriented=False)
-                surf_tags = [t for d, t in boundary if d == 2]
-                if not surf_tags:
-                    continue
-                gmsh.model.mesh.field.setNumbers(dist_id, "SurfacesList", surf_tags)
-            else:
-                continue
-
-            thr_id = gmsh.model.mesh.field.add("Threshold")
-            gmsh.model.mesh.field.setNumber(thr_id, "InField", dist_id)
-            # Post-dilate, gmsh is in user units → set thresholds in user
-            # units too.
-            gmsh.model.mesh.field.setNumber(thr_id, "SizeMin", eff_maxh)
-            gmsh.model.mesh.field.setNumber(thr_id, "SizeMax", maxh)
-            gmsh.model.mesh.field.setNumber(thr_id, "DistMin", 0.0)
-            gmsh.model.mesh.field.setNumber(
-                thr_id, "DistMax",
-                transition_distance if transition_distance is not None else 5 * eff_maxh,
-            )
-            threshold_field_ids.append(thr_id)
-
-        # ── refine_near_points() requests ─────────────────────────────────────
-        # Each registered refinement becomes an OCC point cloud + a
-        # Distance + Threshold field. The OCC points must exist on the
-        # synced model before the Distance field can reference them.
-        # Each refinement request becomes a cloud of OCC points with a
-        # ``meshSize`` attribute, embedded into the volumes that
-        # contain them, plus a Distance + Threshold field that smooths
-        # the transition out to ``distance``. Three pieces together,
-        # ``meshSize`` + ``embed`` + ``MeshSizeFromPoints=1``, are
-        # required to get HXT to actually honour the local size; the
-        # field alone is too soft (HXT-Delaunay treats it as a hint,
-        # not a constraint). Empirically: bare-field gives ~0%
-        # refinement; full recipe gives +200% local tets.
-        refinement_field_ids: list[int] = []
-        refinement_has_embed = False
-        # Cache the volume list once, typically a handful, and
-        # ``isInside`` is cheap. After-fragment we have the final
-        # volume set.
-        post_frag_vols = [t for d, t in gmsh.model.getEntities(dim=3)]
-        _refdbg = os.environ.get("RAPIDFEM_REFINE_DEBUG")
-        if _refdbg:
-            print(f"[refine] {len(self._refinements)} requests in queue",
-                  file=sys.stderr)
-        for req in self._refinements:
-            pts = req["points"]
-            h = req["h"]
-            dist_radius = req["distance"]
-            tags: list[int] = []
-            for p in pts:
-                # ``meshSize`` on the OCC point ties the local size to
-                # the point, picked up when MeshSizeFromPoints=1.
-                tag = gmsh.model.occ.addPoint(
-                    self._s(float(p[0])), self._s(float(p[1])),
-                    self._s(float(p[2])),
-                    meshSize=self._s(h),
-                )
-                tags.append(tag)
-            if not tags:
-                continue
-            gmsh.model.occ.synchronize()
-            # Dilate the newly-added points if the geometry was dilated
-            # earlier (scale != 1), keep them in user units.
-            if self._scale != 1.0 and getattr(self, "_dilated", False):
-                s = self._scale
-                gmsh.model.occ.dilate(
-                    [(0, t) for t in tags], 0, 0, 0, s, s, s,
-                )
-                gmsh.model.occ.synchronize()
-
-            # Embed each point into the volume that contains it (the
-            # mesher only treats embedded points as size constraints;
-            # free OCC points get ignored).
-            for tag, p in zip(tags, pts):
-                coords = [self._s(float(p[0])), self._s(float(p[1])),
-                          self._s(float(p[2]))]
-                if self._scale != 1.0 and getattr(self, "_dilated", False):
-                    # Post-dilate, coords are user-meters; gmsh's
-                    # isInside expects model coords (= user-meters
-                    # too, post-dilate).
-                    coords = [float(p[0]), float(p[1]), float(p[2])]
-                for vol_tag in post_frag_vols:
-                    try:
-                        if gmsh.model.isInside(3, vol_tag, coords) > 0:
-                            gmsh.model.mesh.embed(0, [tag], 3, vol_tag)
-                            refinement_has_embed = True
-                            break
-                    except Exception:
-                        continue
-
-            dist_id = gmsh.model.mesh.field.add("Distance")
-            gmsh.model.mesh.field.setNumbers(dist_id, "PointsList", tags)
-            thr_id = gmsh.model.mesh.field.add("Threshold")
-            gmsh.model.mesh.field.setNumber(thr_id, "InField", dist_id)
-            gmsh.model.mesh.field.setNumber(thr_id, "SizeMin", h)
-            gmsh.model.mesh.field.setNumber(thr_id, "SizeMax", maxh)
-            gmsh.model.mesh.field.setNumber(thr_id, "DistMin", 0.0)
-            gmsh.model.mesh.field.setNumber(thr_id, "DistMax", dist_radius)
-            refinement_field_ids.append(thr_id)
-            if _refdbg:
-                print(f"[refine] added Distance #{dist_id} + Threshold #{thr_id} "
-                      f"(N_pts={len(tags)}, h={h:.3e}, dist={dist_radius:.3e})",
-                      file=sys.stderr)
-
-        all_field_ids = threshold_field_ids + refinement_field_ids
-        if _refdbg:
-            print(f"[refine] all_field_ids={all_field_ids}, "
-                  f"fields_list={list(gmsh.model.mesh.field.list())}",
-                  file=sys.stderr)
-        if all_field_ids:
-            min_id = gmsh.model.mesh.field.add("Min")
-            gmsh.model.mesh.field.setNumbers(min_id, "FieldsList", all_field_ids)
-            gmsh.model.mesh.field.setAsBackgroundMesh(min_id)
-            if _refdbg:
-                print(f"[refine] Min combiner = field #{min_id}",
-                      file=sys.stderr)
-            # When threshold fields are active the user explicitly cares
-            # about local size. Keep ``ExtendFromBoundary`` off so the
-            # global Max applies away from refined regions, but leave
-            # Curvature on (combined via Min) so curved features get
-            # resolved cleanly even if the user only set per-volume
-            # sizes. ``MeshSizeFromPoints`` stays ON when there are
-            # refinement points so their ``meshSize`` attribute kicks
-            # in (HXT-Delaunay needs both the field AND the per-point
-            # size to actually refine, field alone is too soft).
-            gmsh.option.setNumber(
-                "Mesh.MeshSizeFromPoints",
-                1 if refinement_has_embed else 0,
-            )
-            # Without ExtendFromBoundary, HXT-Delaunay treats the
-            # background field as a soft hint and barely refines the
-            # interior, and lets neighbouring tets across an interface
-            # jump by an order of magnitude (e.g. 0.5 mm substrate next
-            # to 10 mm air). With grading ON the boundary sizes propagate
-            # smoothly inward, killing those extreme-size transitions at
-            # the cost of ~15-30% more tets in the air. Point-driven
-            # refinement always needs this propagation (the embedded
-            # points are how the field reaches the bulk in the first
-            # place), so it overrides the user's grading toggle.
-            gmsh.option.setNumber(
-                "Mesh.MeshSizeExtendFromBoundary",
-                1 if (self._grading or refinement_has_embed) else 0,
-            )
-
-        # Curvature-based sizing: gmsh disables this by default. Turning it
-        # on gives curved primitives (cylinder, sphere, cone, torus) a
-        # geometry-accurate facet count without the user having to refine
-        # those surfaces by hand. Value = target elements per 2π radians.
-        # 12 is a reasonable balance between fidelity and DoF count for
-        # second-kind Nédélec-2 (high-order absorbs some discretisation
-        # error already). User can override before calling .mesh().
-        gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 12)
-
-        # Assign physical groups. Three sources, in order:
-        #   1. Object-API Material instances (one group per instance)
-        #   2. Object-API physics objects (one group per rf.PEC/Port/... call)
-        #   3. Legacy string materials/names (rfic.Stack and old code paths)
-        # Each source produces independent physical-group tags, so the
-        # registries stay self-contained and Problem can read them by id.
-        self._material_tags = {}
-        self._physics_tags = {}
-        name_to_tag: dict[str, int] = {}
-        # Start physical-group tags well above every entity tag, the Rust
-        # mesh loader (`src/mesh_io.rs::tris_for_tag`) keys tris by either
-        # the entity's physical-group tag OR (fallback) the entity tag
-        # itself when no group is assigned. Sharing the integer namespace
-        # means a physical-group tag like 9 collides with face entity 9
-        # and Port "9" picks up the unrelated entity's triangles.
-        next_tag = 100_000
-
-        # Collect volume entities targeted by PML, they go into the PML
-        # physical group (step 2) and must NOT also land in a material group,
-        # otherwise the Rust solver sees them tagged twice and the PML's
-        # coordinate stretch is overridden by the bulk material assignment.
-        pml_volume_ids: set[int] = set()
-        for phys in self._physics:
-            if type(phys).__name__ == "PML":
-                for ent in getattr(phys, "_entities", ()):
-                    pml_volume_ids.add(id(ent))
-
-        # Per-class counters keep physical-group names unique without leaking
-        # python id()s into the viewer legend. Class lower-case + 1-based index.
-        # Example: two Dielectric() instances → "dielectric_1", "dielectric_2".
-        # Driven ports collapse onto a shared "port_<N>" namespace so the legend
-        # reads Port 1 / Port 2 regardless of waveguide/lumped/coax mix.
-        mat_class_count: dict[str, int] = {}
-        phys_class_count: dict[str, int] = {}
-        port_classes = {
-            "RectWaveguidePort", "LumpedPort", "CoaxPort", "WavePort",
-            "UserDefinedPort", "FloquetPort",
-        }
-
-        def _mat_group_name(mat) -> str:
-            cls = type(mat).__name__.lower()
-            mat_class_count[cls] = mat_class_count.get(cls, 0) + 1
-            return f"{cls}_{mat_class_count[cls]}"
-
-        def _phys_group_name(phys) -> str:
-            cls_name = type(phys).__name__
-            key = "port" if cls_name in port_classes else cls_name.lower()
-            phys_class_count[key] = phys_class_count.get(key, 0) + 1
-            return f"{key}_{phys_class_count[key]}"
-
-        # 1) Material instances → volume groups (skipping PML-targeted volumes).
-        mat_to_volumes: dict[int, tuple[object, list[int]]] = {}
-        for ent in self._entities:
-            mat = ent.material
-            # Skip strings (handled in step 3) and None.
-            if mat is None or isinstance(mat, str):
-                continue
-            if ent.dim != 3:
-                continue
-            if id(ent) in pml_volume_ids:
-                continue
-            key = id(mat)
-            if key not in mat_to_volumes:
-                mat_to_volumes[key] = (mat, [])
-            mat_to_volumes[key][1].append(ent.tag)
-        for mat_id, (mat, tags) in mat_to_volumes.items():
-            phys_tag = next_tag
-            next_tag += 1
-            gmsh.model.addPhysicalGroup(3, tags, tag=phys_tag, name=_mat_group_name(mat))
-            self._material_tags[mat_id] = phys_tag
-
-        # 2) Physics objects → faces or volume groups.
-        for phys in self._physics:
-            # A PeriodicBoundary is a two-sided physics object: each side
-            # must carry its own physical-group tag so the time-domain
-            # backend can match the pair. The geometry stores the pair as
-            # `(tag_a, tag_b)` under `_physics_tags`; downstream walkers
-            # ignore it unless they are the periodic collector.
-            if type(phys).__name__ == "PeriodicBoundary":
-                ents_a = getattr(phys, "_entities_a", None)
-                ents_b = getattr(phys, "_entities_b", None)
-                if not ents_a or not ents_b:
-                    continue
-                name = _phys_group_name(phys)
-                tag_a = next_tag
-                next_tag += 1
-                gmsh.model.addPhysicalGroup(
-                    2, [e.tag for e in ents_a], tag=tag_a, name=f"{name}_a")
-                tag_b = next_tag
-                next_tag += 1
-                gmsh.model.addPhysicalGroup(
-                    2, [e.tag for e in ents_b], tag=tag_b, name=f"{name}_b")
-                self._physics_tags[id(phys)] = (tag_a, tag_b)
-                continue
-
-            ents = getattr(phys, "_entities", None)
-            if not ents:
-                continue
-            # All entities in one physics object share dim by construction.
-            dim = ents[0].dim
-            tags = [e.tag for e in ents]
-            phys_tag = next_tag
-            next_tag += 1
-            phys_id = id(phys)
-            gmsh.model.addPhysicalGroup(dim, tags, tag=phys_tag, name=_phys_group_name(phys))
-            self._physics_tags[phys_id] = phys_tag
-
-        # 3) Legacy: name/material strings (rfic.Stack + builder workflow).
-        by_dim_name: dict[tuple[int, str], list[int]] = {}
-        for ent in self._entities:
-            if ent.name:
-                by_dim_name.setdefault((ent.dim, ent.name), []).append(ent.tag)
-        for ent in self._entities:
-            if isinstance(ent.material, str) and ent.dim == 3:
-                key = (3, f"_mat_{ent.material}")
-                by_dim_name.setdefault(key, []).append(ent.tag)
-        for (dim, name), tags in by_dim_name.items():
-            phys_tag = next_tag
-            next_tag += 1
-            gmsh.model.addPhysicalGroup(dim, tags, tag=phys_tag, name=name)
-            display_name = name[len("_mat_"):] if name.startswith("_mat_") else name
-            name_to_tag[display_name] = phys_tag
-
-        # Generate. SaveAll=1 ensures volumes without explicit material/name still
-        # land in the .msh (otherwise gmsh writes only physical-group elements).
-        # Post-dilate, gmsh is in user units → no further scaling needed.
-        gmsh.option.setNumber("Mesh.MeshSizeMax", maxh)
-        gmsh.option.setNumber("Mesh.SaveAll", 1)
-
-        # 3-D mesher choice. HXT (algorithm 10) is gmsh's parallel Delaunay:
-        # it scales across cores, and on curved bodies its tet population
-        # carries fewer near-degenerate slivers than the serial Delaunay
-        # (1) or Frontal (4). The original Delaunay default predates HXT
-        # in gmsh and is kept only as an escape hatch, pick the relevant
-        # algorithm explicitly so the mesh is reproducible across users.
-        algo_codes = {
-            "hxt":      10,    # parallel Delaunay (recommended default)
-            "delaunay": 1,     # serial Delaunay (gmsh's historical default)
-            "frontal":  4,     # frontal-Delaunay (occasionally cleaner on thin shells)
-            "mmg3d":    7,     # MMG3D (anisotropic remesher; rarely needed)
-        }
-        algo_lc = algorithm.lower()
-        if algo_lc not in algo_codes:
-            raise ValueError(
-                f"algorithm must be one of {sorted(algo_codes)}, got "
-                f"{algorithm!r}"
-            )
-        gmsh.option.setNumber("Mesh.Algorithm3D", algo_codes[algo_lc])
-
-        gmsh.model.mesh.generate(3)
-
-        # Sliver-killing post-pass, run BEFORE writing the .msh so every
-        # downstream consumer sees the optimised mesh.
-        #
-        # Default (``optimize=True``) uses gmsh's BUILT-IN optimiser (edge-swap
-        # + node-smoothing): cheap and, crucially, crash-safe on degenerate
-        # geometry. Netgen's optimiser removes slivers more aggressively but
-        # HARD-CRASHES the process (a native segfault, NOT a catchable Python
-        # exception) on geometry with embedded thin sheets or boolean slivers,
-        # e.g. the Vivaldi feed/stub/port sheets plus the tapered-slot cut.
-        # Opt into it with ``optimize="netgen"`` only when the geometry is
-        # known to be well-behaved; ``optimize=False`` skips the pass.
-        #
-        # The try/except + re-mesh recovery below catches a *Python-level*
-        # optimiser failure (the mesh state is then poisoned: boundary-face
-        # physical groups silently drop elements, seen on the patch antenna's
-        # PML+substrate+plate stack), but cannot catch a Netgen segfault, hence
-        # the safe default.
-        if optimize:
-            optimizer = "Netgen" if str(optimize).lower() == "netgen" else ""
-            try:
-                gmsh.model.mesh.optimize(optimizer)
-            except Exception as e:
-                print(
-                    f"warning: gmsh.optimize({optimizer!r}) failed "
-                    f"({type(e).__name__}); regenerating the mesh without "
-                    f"optimisation to keep port / PEC physical groups intact",
-                    file=sys.stderr,
-                )
-                # Wipe + re-mesh. The size fields and Algorithm3D are still set
-                # from above, so the second pass is parameter-identical, just
-                # without the failed post-pass.
-                gmsh.model.mesh.clear()
-                gmsh.model.mesh.generate(3)
-
-        # Write to a temp file, read bytes back
-        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-            tmp_path = f.name
-        try:
-            gmsh.write(tmp_path)
-            with open(tmp_path, "rb") as f:
-                mesh_bytes = f.read()
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-        self._last_mesh = (mesh_bytes, name_to_tag)
-        return mesh_bytes, name_to_tag
-
-
-__all__ = ["Geometry", "GeoObject", "FaceCollection"]
+        return False
+
+
+# BUILD HELPERS =========================================================================
+
+
+def _profile_points(profile) -> list:
+    pts = [tuple(float(c) for c in p) for p in profile]
+    if len(pts) < 3:
+        raise ValueError("profiles need at least 3 points")
+    return pts
+
+
+def _build_rapidmesh(gm, entry: dict):
+    """replay one recorded primitive into the rapidmesh builder"""
+    k, a = entry["kind"], entry["args"]
+    maxh = entry["maxh"]
+    void = entry["void"]
+    if k == "box":
+        w, d, h = a["size"]
+        return gm.box(w, d, h, position=a["position"], maxh=maxh, void=void)
+    if k == "cylinder":
+        return gm.cylinder(a["radius"], a["height"], position=a["position"],
+                           axis=a["axis"], segments=a["segments"],
+                           maxh=maxh, void=void)
+    if k == "sphere":
+        return gm.sphere(a["radius"], position=a["center"],
+                         segments=a["segments"], rings=a["rings"],
+                         maxh=maxh, void=void)
+    if k == "cone":
+        return gm.cone(a["r1"], a["r2"], a["height"], position=a["position"],
+                       axis=a["axis"], segments=a["segments"],
+                       maxh=maxh, void=void)
+    if k == "wedge":
+        return gm.wedge(a["dx"], a["dy"], a["dz"], position=a["position"],
+                        top_x=a["top_x"], maxh=maxh, void=void)
+    if k == "torus":
+        return gm.torus(a["major_radius"], a["minor_radius"],
+                        position=a["center"], axis=a["axis"],
+                        segments=a["segments"],
+                        tube_segments=a["tube_segments"], maxh=maxh, void=void)
+    if k == "loft":
+        return gm.loft(a["profile_a"], a["profile_b"], maxh=maxh, void=void)
+    if k == "plate":
+        return gm.plate(a["p0"], a["du"], a["dv"],
+                        tag=entry["sheet_tag"], maxh=maxh)
+    if k == "disc":
+        return gm.disc(a["radius"], position=a["position"], axis=a["axis"],
+                       segments=a["segments"], tag=entry["sheet_tag"], maxh=maxh)
+    if k == "polygon_plate":
+        return gm.polygon_plate(a["points"], position=a["position"],
+                                holes=a["holes"] or None,
+                                tag=entry["sheet_tag"], maxh=maxh)
+    raise ValueError(f"unknown primitive kind {k!r}")
+
+
+def _on_box(bbox, ref, tol) -> bool:
+    """True when the face bbox is degenerate in one axis AND that plane lies
+    on the reference box (the gmsh-era 'outer' test)."""
+    for k in range(3):
+        if abs(bbox[3 + k] - bbox[k]) <= tol:
+            if abs(bbox[k] - ref[k]) <= tol or abs(bbox[k] - ref[3 + k]) <= tol:
+                return True
+    return False

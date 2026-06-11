@@ -185,12 +185,16 @@ class ProblemFD:
     """
 
     def __init__(self, geometry: Geometry):
-        if geometry._last_mesh is None:
+        if geometry._mesh_arrays is None:
             raise ValueError(
                 "geometry not meshed yet, call g.mesh() before constructing a ProblemFD")
         self._geometry = geometry
-        self._mesh_bytes, _ = geometry._last_mesh
         self._native: _NativeSimulation | None = None  # cached after first analysis
+
+    def _make_native(self, toml: str) -> "_NativeSimulation":
+        nodes, tets, tet_tags, tris, tri_tags = self._geometry._mesh_arrays
+        return _NativeSimulation.from_arrays(
+            nodes, tets, tet_tags, tris, tri_tags, toml)
 
     # ── Analyses ──────────────────────────────────────────────────────────
 
@@ -239,7 +243,7 @@ class ProblemFD:
         if not freqs:
             raise ValueError("sweep needs at least one frequency")
         toml = self._assemble_toml(frequencies=freqs, z0=z0, adaptive=adaptive)
-        self._native = _NativeSimulation.from_bytes(self._mesh_bytes, toml)
+        self._native = self._make_native(toml)
         # The native callback is (freq_idx, freq, s_matrix). Compose an optional
         # user `on_frequency` with the UI's per-frequency streaming callback.
         from rapidfem import _show_capture
@@ -299,7 +303,7 @@ class ProblemFD:
             z0=z0,
             eigenmode=(float(target_frequency), int(n_modes)),
         )
-        self._native = _NativeSimulation.from_bytes(self._mesh_bytes, toml)
+        self._native = self._make_native(toml)
         return self._native.run_eigenmode()
 
     def farfield(self, result, *,
@@ -619,35 +623,13 @@ class ProblemFD:
         freqs_str = ", ".join(_f64(f) for f in frequencies)
         parts.append(f"[frequency]\nvalues = [{freqs_str}]\n")
 
-        # Collect volume entities targeted by PML, they get a [[pml]] block
-        # and must NOT also generate a [[materials]] entry (the PML carries
-        # its own er_base/ur_base, and double-tagging volumes confuses the
-        # Rust solver). Mirrors the old builder workflow where a PML volume
-        # had no .material at all.
-        pml_volume_ids: set[int] = set()
-        for phys in g._physics:
-            if isinstance(phys, PML):
-                for ent in phys._entities:
-                    pml_volume_ids.add(id(ent))
-
-        # Materials, group volumes by Material instance; tag came from mesh().
-        # Skip Material instances whose every-volume is a PML target.
-        seen_materials: set[int] = set()
-        for ent in g._entities:
-            mat = ent.material
-            if mat is None or isinstance(mat, str) or ent.dim != 3:
-                continue
-            if id(ent) in pml_volume_ids:
-                continue
-            mat_id = id(mat)
-            if mat_id in seen_materials:
-                continue
-            seen_materials.add(mat_id)
-            tag = g._material_tags.get(mat_id)
-            if tag is None:
-                raise RuntimeError(
-                    f"material {mat!r} has no tag, re-run g.mesh() after attaching it")
-            parts.append(mat._to_toml(tag))
+        # Materials: one [[materials]] block per VOLUME (region tag), never
+        # per material instance. The solver zero-fills the tensors of any
+        # volume missing from the material list once one exists, which
+        # panics deep in assembly; the geometry guarantees completeness
+        # (every non-PML volume carries a material) and we emit them all.
+        for volume_tag, mat in g._volume_materials:
+            parts.append(mat._to_toml(volume_tag))
 
         # Physics, ports, BCs, PML. PEC tags get aggregated separately;
         # a FarFieldSurface tag is consumed by the [output] block.

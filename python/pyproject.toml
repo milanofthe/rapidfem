@@ -30,7 +30,9 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.26",
-    "gmsh>=4.11",
+    # rapidmesh is the meshing kernel (private package, installed from the
+    # sibling repo via `maturin develop`); not resolvable from PyPI.
+    "rapidmesh",
 ]
 
 [project.optional-dependencies]

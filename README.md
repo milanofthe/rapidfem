@@ -18,8 +18,9 @@ pip install rapidfem[ui]        # solver + local UI
 Wheels for Windows, Linux, and macOS are built via CI. The Rust core is
 compiled ahead of time — no Rust toolchain required on the user's machine.
 
-Gmsh (Python wheel `gmsh`) is pulled in automatically as a dependency and
-provides the OpenCASCADE-based geometry + mesher used by `rapidfem.Geometry`.
+Meshing is provided by [rapidmesh](https://github.com/milanofthe/rapidmesh),
+a pure-Rust exact-CSG tetrahedral mesher developed alongside rapidfem and
+used by `rapidfem.Geometry` (no gmsh, no OpenCASCADE).
 
 ## Quick start (Python API)
 
@@ -64,7 +65,7 @@ Opens a browser window with:
 - a 3D geometry / mesh / field viewer on the right (raw WebGL2, viridis
   colormap for scalar fields),
 - S-parameter plots in a separate tab,
-- a `Generate Mesh` button (gmsh) and a `Run Simulation` button (FEM sweep).
+- a `Generate Mesh` button (rapidmesh) and a `Run Simulation` button (FEM sweep).
 
 The geometry view updates automatically every time you save the file
 (`Ctrl+S`). Mesh and solver runs are explicit.
@@ -101,7 +102,7 @@ the viewer.
   dependent K per point, reuses the symbolic LU pattern
 - **Eigenmode solver** — shift-invert Lanczos on the complex-symmetric system
 - **Adaptive refinement** — residual error estimator (volume residual + face
-  jumps) with Dörfler marking, exports a size field for gmsh re-meshing
+  jumps) with Dörfler marking, exports a size field for rapidmesh re-meshing
 - **Output** — Touchstone (.s1p/.s2p/.snp), VTK field export, far-field NFFT
   (Huygens surface auto-detected from an ABC boundary, or marked with
   `rf.FarFieldSurface` for a PML-truncated open region)

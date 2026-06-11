@@ -367,6 +367,23 @@ class Geometry:
             bbox=(allp.min(axis=0), allp.max(axis=0)),
         )
 
+    def prism(self, points, height: float, position=(0, 0, 0), *,
+              holes=None, material=None, maxh: float | None = None) -> GeoObject:
+        """solid extrusion of a 2D polygon (with optional holes) along +z
+        from ``position`` (the GDS/RFIC conductor workhorse)"""
+        p2 = [(float(p[0]), float(p[1])) for p in points]
+        off = np.asarray(position, dtype=float)
+        allp = np.asarray(p2, dtype=float)
+        lo = np.array([allp[:, 0].min(), allp[:, 1].min(), 0.0]) + off
+        hi = np.array([allp[:, 0].max(), allp[:, 1].max(), height]) + off
+        return self._add_solid(
+            "prism",
+            {"points": p2, "height": float(height), "position": tuple(off),
+             "holes": [[(float(x), float(y)) for x, y in h]
+                       for h in holes or []]},
+            material=material, maxh=maxh, bbox=(lo, hi),
+        )
+
     def sweep(self, path, radius: float, *, segments: int = 16,
               material=None, maxh: float | None = None) -> GeoObject:
         """circular wire swept along a 3D polyline (watertight tube)"""
@@ -870,6 +887,9 @@ def _build_rapidmesh(gm, entry: dict):
                         tube_segments=a["tube_segments"], maxh=maxh, void=void)
     if k == "loft":
         return gm.loft(a["profile_a"], a["profile_b"], maxh=maxh, void=void)
+    if k == "prism":
+        return gm.prism(a["points"], a["height"], position=a["position"],
+                        holes=a["holes"] or None, maxh=maxh, void=void)
     if k == "sweep":
         return gm.sweep(a["path"], a["radius"], segments=a["segments"],
                         maxh=maxh, void=void)

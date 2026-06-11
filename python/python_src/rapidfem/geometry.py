@@ -157,6 +157,24 @@ class GeoObject:
     def material(self):
         return self._geometry._solids[self._index].get("material")
 
+    @material.setter
+    def material(self, value) -> None:
+        if isinstance(value, str):
+            raise ValueError(
+                f"string materials are retired: assign a material instance "
+                f"(rf.Air(), rf.Dielectric(er=...)) instead of {value!r}")
+        if self.dim != 3:
+            raise ValueError("only solids carry a material")
+        self._geometry._solids[self._index]["material"] = value
+
+    @property
+    def maxh(self):
+        return self._geometry._solids[self._index].get("maxh")
+
+    @maxh.setter
+    def maxh(self, value: float) -> None:
+        self._geometry._solids[self._index]["maxh"] = float(value)
+
     @property
     def bbox(self) -> tuple:
         lo, hi = self._geometry._solids[self._index]["bbox"]
@@ -200,11 +218,11 @@ class Geometry:
         Lipschitz size-grading constant (0.5 grows neighbors ~1.5x)
     """
 
-    def __init__(self, *, maxh: float, scale: float = 1.0, grading: float = 0.5,
-                 name: str = "rapidfem"):
+    def __init__(self, *, maxh: float | None = None, scale: float = 1.0,
+                 grading: float = 0.5, name: str = "rapidfem"):
         if scale != 1.0:
             raise ValueError("scale is retired: model in metres directly")
-        self.maxh = float(maxh)
+        self.maxh = None if maxh is None else float(maxh)
         self._grading = float(grading)
         self._name = name
         # solid AND sheet descriptions, in insertion order
@@ -460,6 +478,10 @@ class Geometry:
         ``min_maxh``). The validated microstrip recipe is thickness / 1.5 on
         the dielectric plus per-plate ``maxh`` on the conductor sheets."""
         base = self.maxh if base_maxh is None else float(base_maxh)
+        if base is None:
+            raise ValueError(
+                "auto_refine_features needs a base size: pass base_maxh or "
+                "construct Geometry(maxh=...)")
         for entry in self._solids:
             if entry["sheet_tag"] != 0 or entry["void"]:
                 continue
@@ -492,8 +514,12 @@ class Geometry:
         """assemble the scene, mesh it, resolve physics selections, and store
         the solver arrays; returns ``self``"""
         del algorithm, optimize  # retired gmsh knobs
+        eff_maxh = float(maxh) if maxh is not None else self.maxh
+        if eff_maxh is None:
+            raise ValueError(
+                "no mesh size: pass maxh to Geometry(...) or g.mesh(maxh=...)")
         gm = _rm.Geometry(
-            maxh=float(maxh) if maxh is not None else self.maxh,
+            maxh=eff_maxh,
             grading=self._grading if grading is None else float(grading),
         )
         rm_solids: list = []

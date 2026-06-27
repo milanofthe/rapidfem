@@ -111,6 +111,32 @@ def test_brep_imports(fixtures):
     assert isinstance(part, rf.GeoObject) and part.dim == 3
 
 
+def test_step_placement_position(fixtures):
+    g = rf.Geometry(maxh=2.0)
+    part = g.load(fixtures["step"], position=(0.1, 0.0, 0.0))
+    assert part._entity.bbox[0] == pytest.approx(0.1, abs=1e-6)       # xmin
+    assert part._entity.bbox[3] == pytest.approx(0.1 + 10 * MM, abs=1e-6)
+
+
+def test_step_placement_rotation(fixtures):
+    import math
+    g = rf.Geometry(maxh=2.0)
+    part = g.load(fixtures["step"], rotation=(math.pi / 2, (0, 0, 1)))
+    # 90 deg about z swaps the x (10mm) and y (5mm) extents
+    dx = part._entity.bbox[3] - part._entity.bbox[0]
+    dy = part._entity.bbox[4] - part._entity.bbox[1]
+    assert dx == pytest.approx(5 * MM, rel=1e-3)
+    assert dy == pytest.approx(10 * MM, rel=1e-3)
+
+
+def test_step_posthoc_transforms_work(fixtures):
+    g = rf.Geometry(maxh=2.0)
+    part = g.load(fixtures["step"])
+    x0 = part._entity.cog[0]
+    g.translate(part, dx=0.05)
+    assert part._entity.cog[0] - x0 == pytest.approx(0.05, abs=1e-6)
+
+
 # ── STL: healed solid ───────────────────────────────────────────────────────
 
 def test_stl_heals_into_meshable_solid(fixtures):
@@ -121,6 +147,36 @@ def test_stl_heals_into_meshable_solid(fixtures):
     assert (r[3] - r[0]) == pytest.approx(2.0, rel=0.05)  # diameter ~2
     mb, _ = g.mesh()
     assert len(mb) > 0
+
+
+def test_stl_placement_shifts_and_meshes(fixtures):
+    g = rf.Geometry(maxh=0.3)
+    solid = g.load(fixtures["stl"], material=rf.Air(), position=(5.0, 0.0, 0.0))
+    assert solid._entity.cog[0] == pytest.approx(5.0, abs=0.05)
+    mb, _ = g.mesh()
+    assert len(mb) > 0
+
+
+def test_stl_rejects_posthoc_transforms(fixtures):
+    g = rf.Geometry(maxh=0.3)
+    solid = g.load(fixtures["stl"])
+    with pytest.raises(RuntimeError, match="discrete mesh"):
+        g.translate(solid, dx=1.0)
+    with pytest.raises(RuntimeError, match="discrete mesh"):
+        g.rotate(solid, angle=0.3)
+
+
+def test_stl_cannot_mix_with_primitives(fixtures):
+    # primitive after STL
+    g = rf.Geometry(maxh=0.3)
+    g.load(fixtures["stl"])
+    with pytest.raises(RuntimeError, match="discrete"):
+        g.box(1.0, 1.0, 1.0)
+    # STL after primitive
+    g2 = rf.Geometry(maxh=0.3)
+    g2.box(1.0, 1.0, 1.0)
+    with pytest.raises(RuntimeError, match="discrete"):
+        g2.load(fixtures["stl"])
 
 
 # ── MSH: mesh mode ──────────────────────────────────────────────────────────
@@ -181,3 +237,9 @@ def test_missing_file():
     g = rf.Geometry(maxh=1.0)
     with pytest.raises(FileNotFoundError):
         g.load("does_not_exist.step")
+
+
+def test_msh_placement_rejected(fixtures):
+    g = rf.Geometry()
+    with pytest.raises(ValueError, match="position/rotation"):
+        g.load(fixtures["msh"], position=(1.0, 0.0, 0.0))

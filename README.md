@@ -70,14 +70,21 @@ g = rf.Geometry(maxh=rf.lambda_maxh(f_max=20e9))
 part = g.load("horn.step", material=rf.Air())   # mm STEP -> metres by default
 post = g.cylinder(radius=0.5e-3, height=5e-3)
 g.cut(part, post)                                # compose CAD with primitives
+g.rotate(part, math.pi / 2, axis=(0, 1, 0))      # full transform API applies
 rf.RectWaveguidePort(part.faces.max(axis="z"))
 rf.PEC(*part.faces.unassigned)
 g.mesh()
 
-# STL is a surface triangulation; it is healed into a meshable solid (boolean
-# ops against it are best-effort, it is not a clean BREP). STL is unit-less,
-# pass scale= (metres per file unit) for a model authored in mm.
-blob = g.load("antenna.stl", material=rf.Air(), scale=1e-3)
+# Place/orient any import at load time, like a primitive's position= kwarg:
+part = g.load("horn.step", position=(0, 0, 5e-3), rotation=(math.pi, (0, 0, 1)))
+
+# STL is a surface triangulation, healed into a meshable solid. It is a
+# discrete body (its geometry IS the mesh), so it stays standalone: it takes a
+# material, physics, placement and meshing, but it cannot be combined with OCC
+# primitives or boolean ops (use a STEP/IGES/BREP export for that). STL is
+# unit-less, pass scale= (metres per file unit) for a model authored in mm.
+g = rf.Geometry(maxh=0.5e-3)
+blob = g.load("antenna.stl", material=rf.Air(), scale=1e-3, position=(0, 0, 1e-3))
 
 # A pre-built .msh volume mesh is already tessellated, so loading one switches
 # the geometry into mesh mode: its named physical groups become selectable

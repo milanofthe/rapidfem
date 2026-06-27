@@ -41,6 +41,85 @@ _STL_EXTS = {".stl"}
 _MESH_EXTS = {".msh"}
 
 
+class _Placement:
+    """A rigid placement (rotation about a centre, then translation).
+
+    Parsed once from ``load``'s ``position`` / ``rotation`` kwargs and applied
+    in whichever kernel the import lands in: OCC dimtags for CAD (via
+    ``occ.rotate`` + ``occ.translate``) or raw mesh nodes for a healed STL
+    (a numpy affine, since a discrete body has no OCC transform). All distances
+    are user metres; callers pass the scale helper so the maths happens in the
+    geometry's working space.
+    """
+
+    def __init__(self, position, angle, axis, centre):
+        self.position = position
+        self.angle = angle
+        self.axis = axis
+        self.centre = centre
+
+    @staticmethod
+    def parse(position, rotation) -> "_Placement":
+        pos = tuple(float(v) for v in position)
+        if len(pos) != 3:
+            raise ValueError(f"position must be (x, y, z), got {position!r}")
+        if rotation is None:
+            return _Placement(pos, 0.0, (0.0, 0.0, 1.0), (0.0, 0.0, 0.0))
+        if len(rotation) == 2:
+            angle, axis = rotation
+            centre = (0.0, 0.0, 0.0)
+        elif len(rotation) == 3:
+            angle, axis, centre = rotation
+        else:
+            raise ValueError(
+                "rotation must be (angle, axis) or (angle, axis, centre), "
+                f"got {rotation!r}")
+        axis = tuple(float(v) for v in axis)
+        centre = tuple(float(v) for v in centre)
+        if axis == (0.0, 0.0, 0.0):
+            raise ValueError("rotation axis must be non-zero")
+        return _Placement(pos, float(angle), axis, centre)
+
+    @property
+    def is_identity(self) -> bool:
+        return self.angle == 0.0 and self.position == (0.0, 0.0, 0.0)
+
+    def apply_occ(self, dimtags, s) -> None:
+        """Apply to OCC dimtags in place (rotate about centre, then translate)."""
+        if self.is_identity:
+            return
+        if self.angle != 0.0:
+            cx, cy, cz = self.centre
+            gmsh.model.occ.rotate(dimtags, s(cx), s(cy), s(cz),
+                                  self.axis[0], self.axis[1], self.axis[2],
+                                  self.angle)
+        if self.position != (0.0, 0.0, 0.0):
+            dx, dy, dz = self.position
+            gmsh.model.occ.translate(dimtags, s(dx), s(dy), s(dz))
+        gmsh.model.occ.synchronize()
+
+    def node_affine(self, s):
+        """Return ``(R, t)`` mapping a node ``x`` to ``R @ x + t`` in working space.
+
+        ``s`` is the scale helper, so the rotation centre and translation are
+        expressed in the same (scaled) units as the mesh nodes.
+        """
+        import numpy as np
+
+        ax = np.asarray(self.axis, dtype=float)
+        ax = ax / np.linalg.norm(ax)
+        a = self.angle
+        # Rodrigues' rotation matrix.
+        K = np.array([[0, -ax[2], ax[1]],
+                      [ax[2], 0, -ax[0]],
+                      [-ax[1], ax[0], 0]], dtype=float)
+        R = np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * (K @ K)
+        centre = np.array([s(c) for c in self.centre], dtype=float)
+        pos = np.array([s(p) for p in self.position], dtype=float)
+        t = pos + centre - R @ centre
+        return R, t
+
+
 class MeshScene:
     """Handle for a pre-built ``.msh`` loaded via :meth:`Geometry.load`.
 
@@ -101,6 +180,8 @@ class _ImportMixin:
              maxh: float | None = None,
              unit: str = "M",
              scale: float = 1.0,
+             position: tuple[float, float, float] = (0.0, 0.0, 0.0),
+             rotation: "tuple | None" = None,
              heal_angle: float = 40.0):
         """Load external CAD or a pre-built mesh into this geometry.
 
@@ -145,6 +226,15 @@ class _ImportMixin:
             extra multiplicative factor applied after import, in metres per
             file unit. Use for unit-less STL (e.g. ``scale=1e-3`` for a model
             authored in millimetres) or to correct a mis-declared STEP unit.
+        position : tuple[float, float, float]
+            place the imported part at this offset in metres (CAD/STL). The
+            primitive-style placement kwarg: equivalent to importing at the
+            origin and calling :meth:`translate`, but it also works for STL,
+            which cannot be transformed after healing.
+        rotation : tuple, optional
+            orient the imported part (CAD/STL), as ``(angle_rad, axis)`` or
+            ``(angle_rad, axis, centre)``; ``axis``/``centre`` are xyz tuples
+            and ``centre`` defaults to the origin. Applied before ``position``.
         heal_angle : float
             STL only, the dihedral angle in degrees below which adjacent facets
             are merged into one smooth surface patch during healing
@@ -158,13 +248,18 @@ class _ImportMixin:
         ext = os.path.splitext(str(path))[1].lower()
         if not os.path.exists(path):
             raise FileNotFoundError(f"load(): no such file: {path}")
+        place = _Placement.parse(position, rotation)
         if ext in _CAD_EXTS:
             return self._load_cad(path, material=material, maxh=maxh,
-                                  unit=unit, scale=scale)
+                                  unit=unit, scale=scale, place=place)
         if ext in _STL_EXTS:
             return self._load_stl(path, material=material, maxh=maxh,
-                                  scale=scale, heal_angle=heal_angle)
+                                  scale=scale, heal_angle=heal_angle, place=place)
         if ext in _MESH_EXTS:
+            if position != (0.0, 0.0, 0.0) or rotation is not None:
+                raise ValueError(
+                    "load(.msh): position/rotation are not supported for a "
+                    "pre-built mesh; it is consumed in its own coordinates.")
             return self._load_mesh(path)
         supported = ", ".join(sorted(_CAD_EXTS | _STL_EXTS | _MESH_EXTS))
         raise ValueError(
@@ -172,7 +267,7 @@ class _ImportMixin:
             f"supported: {supported}")
 
     # ── CAD: STEP / IGES / BREP ─────────────────────────────────────────────
-    def _load_cad(self, path, *, material, maxh, unit, scale):
+    def _load_cad(self, path, *, material, maxh, unit, scale, place=None):
         self._require_occ_mode("import CAD")
         # OCC converts the file's declared unit into `unit` on import. With the
         # default unit="M" a millimetre STEP comes in at metre coordinates,
@@ -198,6 +293,11 @@ class _ImportMixin:
             gmsh.model.occ.dilate(new_dt, 0, 0, 0, factor, factor, factor)
             gmsh.model.occ.synchronize()
 
+        # Placement (rotate + translate) before wrapping, so the GeoObjects'
+        # cog/bbox are read at the final position.
+        if place is not None:
+            place.apply_occ(new_dt, self._s)
+
         vols = [t for d, t in new_dt if d == 3]
         if not vols:
             # Surface-only CAD (rare): wrap free faces so the user can still
@@ -210,21 +310,30 @@ class _ImportMixin:
         return objs[0] if len(objs) == 1 else objs
 
     # ── STL: discrete surface healed into a meshable solid ──────────────────
-    def _load_stl(self, path, *, material, maxh, scale, heal_angle):
+    def _load_stl(self, path, *, material, maxh, scale, heal_angle, place=None):
         import math
 
         self._require_occ_mode("import STL")
+        if self._objects:
+            raise RuntimeError(
+                "load(.stl): a healed STL is a discrete body and cannot share "
+                "the OCC kernel with other geometry. Load it into a fresh "
+                "Geometry(); for a part that composes with primitives/booleans, "
+                "use a STEP/IGES/BREP export instead.")
         before = {tuple(dt) for dt in gmsh.model.getEntities()}
         # `merge` loads the STL triangles as a discrete surface in the model.
         gmsh.merge(str(path))
 
-        # STL carries no unit. Scale the raw nodes about the origin into the
-        # geometry's working space *before* healing (the geo kernel has no
-        # dilate, so we transform the discrete nodes directly). mesh() dilates
-        # everything back to user metres before tessellation.
+        # A healed STL is discrete: its geometry *is* its mesh nodes, so unit
+        # scaling and placement are done by transforming those nodes directly
+        # (OCC/geo transforms don't move a discrete body) *before* healing.
+        # mesh() dilates everything back to user metres before tessellation.
         factor = (1.0 / self._scale) * float(scale)
         if factor != 1.0:
             self._scale_discrete_nodes(factor)
+        if place is not None and not place.is_identity:
+            R, t = place.node_affine(self._s)
+            self._apply_node_affine(R, t)
 
         # Reconstruct surface patches + a parametrisation from the raw triangle
         # soup so the volume mesher has something to mesh against. The dihedral
@@ -242,7 +351,15 @@ class _ImportMixin:
         vol = gmsh.model.geo.addVolume([loop])
         gmsh.model.geo.synchronize()
 
-        return self._wrap_volume(vol, material=material, maxh=maxh)
+        obj = self._wrap_volume(vol, material=material, maxh=maxh)
+        # Tag the entity discrete: it has no OCC body, so boolean ops and
+        # post-import transforms are rejected with a clear message (see
+        # Geometry._reject_discrete). Place/orient it via load(position=...,
+        # rotation=...) instead. The geometry-level flag blocks adding OCC
+        # primitives/CAD after this point (kernels can't mix).
+        obj._entity._discrete = True
+        self._has_discrete = True
+        return obj
 
     @staticmethod
     def _scale_discrete_nodes(factor: float) -> None:
@@ -253,6 +370,19 @@ class _ImportMixin:
         if len(tags) == 0:
             return
         xyz = np.asarray(coords, dtype=float).reshape(-1, 3) * factor
+        for tag, p in zip(tags, xyz):
+            gmsh.model.mesh.setNode(int(tag), p.tolist(), [])
+
+    @staticmethod
+    def _apply_node_affine(R, t) -> None:
+        """Map every mesh node ``x`` to ``R @ x + t`` in place (STL placement)."""
+        import numpy as np
+
+        tags, coords, _ = gmsh.model.mesh.getNodes()
+        if len(tags) == 0:
+            return
+        xyz = np.asarray(coords, dtype=float).reshape(-1, 3)
+        xyz = xyz @ np.asarray(R, dtype=float).T + np.asarray(t, dtype=float)
         for tag, p in zip(tags, xyz):
             gmsh.model.mesh.setNode(int(tag), p.tolist(), [])
 
@@ -292,6 +422,37 @@ class _ImportMixin:
         scene = MeshScene(self, groups, dims, file_tags)
         self._mesh_scene = scene
         return scene
+
+    # ── Guards ──────────────────────────────────────────────────────────────
+    def _reject_discrete(self, obj, op: str) -> None:
+        """Reject OCC ops on a healed-STL (discrete) object with a clear message.
+
+        A discrete body has no OCC representation, so boolean ops and post-import
+        transforms silently no-op or raise a cryptic kernel error. Fail loudly
+        and point the user at the supported path instead.
+        """
+        ent = getattr(obj, "_entity", None)
+        if ent is not None and getattr(ent, "_discrete", False):
+            raise RuntimeError(
+                f"{op}: not supported on an imported STL solid (it is a discrete "
+                f"mesh, not an OCC body). Place/orient it at import time with "
+                f"load(path, position=..., rotation=...), and use a clean BREP "
+                f"(STEP/IGES/BREP) import if you need boolean ops or transforms.")
+
+    def _reject_after_discrete(self, what: str) -> None:
+        """Reject new OCC geometry once a healed STL is present in the model.
+
+        A discrete STL body lives outside the OCC kernel; adding OCC primitives
+        or CAD afterwards makes ``occ.synchronize`` choke on the discrete
+        surfaces. Keep an STL import standalone (it still takes materials,
+        physics, placement, and meshing).
+        """
+        if getattr(self, "_has_discrete", False):
+            raise RuntimeError(
+                f"cannot {what}: this Geometry contains an imported STL solid, "
+                f"which is a discrete mesh and cannot share the OCC kernel with "
+                f"primitives or CAD. Build the surrounding geometry in a clean "
+                f"BREP (STEP/IGES/BREP) instead, or keep the STL standalone.")
 
     # ── Mode guard ──────────────────────────────────────────────────────────
     def _require_occ_mode(self, what: str) -> None:

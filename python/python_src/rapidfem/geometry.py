@@ -99,6 +99,9 @@ class _Entity:
     material: object = None    # rapidfem.Material | str | None
     maxh: float | None = None
     _geometry: object = None   # back-ref to Geometry, set by registration
+    _discrete: bool = False    # True for healed-STL volumes (geo/discrete kernel,
+                               # not OCC): they live as mesh nodes, so OCC boolean
+                               # ops and post-import transforms don't apply
 
     @staticmethod
     def from_dimtag(dim: int, tag: int) -> "_Entity":
@@ -803,6 +806,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         # _ImportMixin._load_mesh().
         self._mode = "occ"
         self._mesh_scene = None             # MeshScene when in mesh mode
+        # True once a healed STL (discrete/geo body) is present: it cannot share
+        # the OCC kernel with primitives, so further OCC geometry is rejected.
+        self._has_discrete = False
 
     # ── Scale helpers ──────────────────────────────────────────────────────
     # Every coord that goes INTO gmsh is divided by self._scale; every coord
@@ -834,6 +840,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                      maxh: float | None = None) -> GeoObject:
         if self._mode == "mesh":
             self._require_occ_mode("build OCC geometry")
+        self._reject_after_discrete("add a volume")
         gmsh.model.occ.synchronize()
         ent = _Entity.from_dimtag(3, tag)
         ent._geometry = self
@@ -848,6 +855,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                    maxh: float | None = None) -> GeoObject:
         if self._mode == "mesh":
             self._require_occ_mode("build OCC geometry")
+        self._reject_after_discrete("add a face")
         gmsh.model.occ.synchronize()
         ent = _Entity.from_dimtag(2, tag)
         ent._geometry = self
@@ -1085,6 +1093,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             additional operands to fragment with ``target``
         """
+        for _op in (target, *tools):
+            self._reject_discrete(_op, "boolean op")
         target_dt = [(target.dim, target._entity.tag)]
         tools_dt = [(t.dim, t._entity.tag) for t in tools]
         _, out_map = gmsh.model.occ.fragment(target_dt, tools_dt)
@@ -1115,6 +1125,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to subtract (consumed)
         """
+        for _op in (target, *tools):
+            self._reject_discrete(_op, "boolean op")
         target_dt = [(target.dim, target._entity.tag)]
         tools_dt = [(t.dim, t._entity.tag) for t in tools]
         _, out_map = gmsh.model.occ.cut(target_dt, tools_dt)
@@ -1219,6 +1231,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             a point on the rotation axis (defaults to origin)
         """
+        self._reject_discrete(obj, "rotate")
         cx, cy, cz = center
         ax, ay, az = axis
         s = self._s
@@ -1254,6 +1267,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             scaling centre (defaults to origin)
         """
+        self._reject_discrete(obj, "stretch")
         cx, cy, cz = center
         s = self._s
         gmsh.model.occ.dilate([(obj.dim, obj._entity.tag)],
@@ -1287,6 +1301,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         dx, dy, dz : float
             translation along each axis in metres (default 0 = no move)
         """
+        self._reject_discrete(obj, "translate")
         s = self._s
         gmsh.model.occ.translate([(obj.dim, obj._entity.tag)], s(dx), s(dy), s(dz))
         gmsh.model.occ.synchronize()
@@ -1330,6 +1345,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         point : tuple[float, float, float]
             a point the plane passes through (defaults to origin)
         """
+        self._reject_discrete(obj, "mirror")
         nx, ny, nz = normal
         px, py, pz = point
         s = self._s
@@ -1383,6 +1399,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             the new, independent duplicate
         """
+        self._reject_discrete(obj, "copy")
         out = gmsh.model.occ.copy([(obj.dim, obj._entity.tag)])
         gmsh.model.occ.synchronize()
         new_dim, new_tag = out[0]
@@ -1513,6 +1530,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to intersect with (consumed)
         """
+        for _op in (target, *tools):
+            self._reject_discrete(_op, "boolean op")
         target_dt = [(target.dim, target._entity.tag)]
         tools_dt = [(t.dim, t._entity.tag) for t in tools]
         _, out_map = gmsh.model.occ.intersect(target_dt, tools_dt)
@@ -1550,6 +1569,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             "fuse, or use fragment() if you need them preserved.",
             stacklevel=2,
         )
+        for _op in (target, *tools):
+            self._reject_discrete(_op, "boolean op")
         target_dt = [(target.dim, target._entity.tag)]
         tools_dt = [(t.dim, t._entity.tag) for t in tools]
         _, out_map = gmsh.model.occ.fuse(target_dt, tools_dt)
@@ -1608,6 +1629,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ValueError
             if ``obj`` is not a volume or has no edges to round
         """
+        self._reject_discrete(obj, "fillet")
         if obj.dim != 3:
             raise ValueError(f"fillet expects a volume (dim=3), got dim={obj.dim}")
         edge_tags = [e.tag for e in (edges if edges is not None else obj.edges)]
@@ -1658,6 +1680,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ValueError
             if ``obj`` is not a volume or has no edges to bevel
         """
+        self._reject_discrete(obj, "chamfer")
         if obj.dim != 3:
             raise ValueError(f"chamfer expects a volume (dim=3), got dim={obj.dim}")
         edge_tags = [e.tag for e in (edges if edges is not None else obj.edges)]

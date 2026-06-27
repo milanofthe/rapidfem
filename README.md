@@ -56,6 +56,48 @@ See `python_src/rapidfem/examples/` for end-to-end runs of microstrip lines,
 patch and Vivaldi antennas (PML enclosure + far-field), pyramidal horns, iris
 filters, dielectric resonators, and more.
 
+## Importing external CAD and meshes
+
+`g.load(path)` brings external geometry into the scene; the action is chosen
+from the file extension:
+
+```python
+g = rf.Geometry(maxh=rf.lambda_maxh(f_max=20e9))
+
+# STEP / IGES / BREP land in the same OpenCASCADE kernel as the primitives,
+# so the result is a normal GeoObject: boolean it, transform it, select its
+# faces, attach materials and physics, all exactly like a g.box(...).
+part = g.load("horn.step", material=rf.Air())   # mm STEP -> metres by default
+post = g.cylinder(radius=0.5e-3, height=5e-3)
+g.cut(part, post)                                # compose CAD with primitives
+rf.RectWaveguidePort(part.faces.max(axis="z"))
+rf.PEC(*part.faces.unassigned)
+g.mesh()
+
+# STL is a surface triangulation; it is healed into a meshable solid (boolean
+# ops against it are best-effort, it is not a clean BREP). STL is unit-less,
+# pass scale= (metres per file unit) for a model authored in mm.
+blob = g.load("antenna.stl", material=rf.Air(), scale=1e-3)
+
+# A pre-built .msh volume mesh is already tessellated, so loading one switches
+# the geometry into mesh mode: its named physical groups become selectable
+# handles you attach materials and physics to. g.mesh() then bakes the
+# bindings (no remeshing) and the usual Problem/sweep pipeline runs unchanged.
+g = rf.Geometry()
+scene = g.load("waveguide.msh")
+scene.group("air").material = rf.Air()
+rf.RectWaveguidePort(scene.group("port_in"))
+rf.RectWaveguidePort(scene.group("port_out"))
+rf.PEC(scene.group("walls"))
+g.mesh()
+result = rf.Problem(g).sweep(np.linspace(8e9, 12e9, 21))
+```
+
+`unit=` sets the target unit OpenCASCADE converts a STEP/IGES file into
+(default `"M"`, so a millimetre file comes in at metre coordinates); `scale=`
+is an extra metres-per-file-unit factor for unit-less STL or a mis-declared
+CAD unit. See `examples/fd_step_import.py` for a full STEP-driven sweep.
+
 ## Local UI
 
 ```bash
@@ -89,6 +131,10 @@ the viewer.
   array) and fillet/chamfer; ready-made RF structures in `rf.structures`
   (coax, microstrip, CPW, stripline, rectangular / circular waveguide, helix)
   build geometry and optional ports in one call
+- **External CAD / mesh import** — `g.load(path)` pulls in STEP / IGES / BREP
+  solids as fully composable primitives, heals STL surfaces into meshable
+  solids, or loads a pre-built `.msh` and exposes its named physical groups
+  for material / physics binding (GDSII layouts via `g.from_gds`)
 - **Nedelec-2 elements** — 20 DOFs per tetrahedron, vector edge basis for the
   curl–curl form of Maxwell's equations
 - **Excitations** — rectangular waveguide ports (arbitrary TE modes), lumped

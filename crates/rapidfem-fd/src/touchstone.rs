@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Exact port of touchstone.py: Touchstone S-parameter file export.
+//! Touchstone S-parameter file export.
+//!
+//! Implements the public Touchstone File Format (IBIS Open Forum, "Touchstone
+//! File Format Specification" rev 1.1/2.0): a `# GHZ S RI R <z0>` option line
+//! followed by one record per frequency. The .s2p two-port record is written
+//! in the format's column-major order (S11 S21 S12 S22); for N>2 ports the
+//! row-major SNP layout with 4 complex values per line is used.
 
 use num_complex::Complex64 as C64;
 use std::io::Write;
 
 /// Write S-parameters to a Touchstone file.
-/// Port of touchstone.py:generate_touchstone().
 ///
 /// `frequencies`: frequency points in Hz
 /// `s_params`: s_params[freq_idx][row][col], complex S-matrix per frequency

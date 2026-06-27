@@ -193,66 +193,94 @@
 			(m) => typeof MediaRecorder !== 'undefined'
 				&& MediaRecorder.isTypeSupported(m),
 		) ?? '';
-		if (typeof MediaRecorder === 'undefined' || !mime) {
+		if (typeof MediaRecorder === 'undefined' || !mime
+			|| typeof canvas.captureStream !== 'function') {
 			alert('Video recording is not supported in this browser.');
 			return;
 		}
 
 		const fps = 30;
+		const frameMs = 1000 / fps;
 		const wasPlaying = td_playing;
 		td_playing = false;
 		td_frame = 0;
 		td_recording = { done: 0, total: n };
 
-		const stream = canvas.captureStream(fps);
-		const chunks: Blob[] = [];
-		const recorder = new MediaRecorder(stream, {
-			mimeType: mime,
-			videoBitsPerSecond: 6_000_000,
-		});
-		recorder.ondataavailable = (ev) => {
-			if (ev.data && ev.data.size > 0) chunks.push(ev.data);
-		};
-		const done = new Promise<Blob>((resolve) => {
-			recorder.onstop = () => resolve(new Blob(chunks, { type: mime }));
-		});
-		recorder.start();
-
+		let recorder: MediaRecorder | null = null;
 		try {
-			const frameMs = 1000 / fps;
+			// Prefer manual-frame capture: `captureStream(0)` only emits a
+			// frame when we call `requestFrame()`, so the recording is
+			// frame-accurate and immune to our WebGL2 context clearing its
+			// drawing buffer (we deliberately skip `preserveDrawingBuffer`).
+			// Safari lacks `requestFrame`, so fall back to realtime sampling.
+			const ctor = (globalThis as any).CanvasCaptureMediaStreamTrack;
+			const manual = ctor != null && 'requestFrame' in ctor.prototype;
+			const stream = canvas.captureStream(manual ? 0 : fps);
+			const vtrack = stream.getVideoTracks()[0] as CanvasCaptureMediaStreamTrack;
+
+			const chunks: Blob[] = [];
+			recorder = new MediaRecorder(stream, {
+				mimeType: mime,
+				videoBitsPerSecond: 6_000_000,
+			});
+			recorder.ondataavailable = (ev) => {
+				if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+			};
+			// Resolve on stop, reject on error, and a watchdog so a recorder
+			// that never fires `stop` (a MediaRecorder/encoder hiccup seen on
+			// both Safari and Chrome) can't hang the export forever — that
+			// silent hang is exactly the "frozen export button" bug.
+			const rec = recorder;
+			const done = new Promise<Blob>((resolve, reject) => {
+				rec.onstop = () => resolve(new Blob(chunks, { type: mime }));
+				rec.onerror = (ev) =>
+					reject((ev as any)?.error ?? new Error('MediaRecorder failed'));
+			});
+			recorder.start();
+
 			for (let i = 0; i < n; i++) {
 				td_frame = i;
-				// Drain Svelte's reactive frame update, then force a render
-				// so the new field lands on the canvas before the recorder
-				// samples it on the next interval — without the explicit
-				// render the rAF-batched draw can be merged with the next
-				// frame's update and the recorder skips a beat.
+				// Drain Svelte's reactive frame update, then force a render so
+				// the new field lands on the canvas before we capture it.
 				await tick();
 				render_frame();
+				if (manual) vtrack.requestFrame();
 				await new Promise((r) => setTimeout(r, frameMs));
 				td_recording = { done: i + 1, total: n };
 			}
-			// One padding interval so the recorder picks up the last frame.
+			// One padding interval so the recorder flushes the last frame.
 			await new Promise((r) => setTimeout(r, frameMs));
+			if (recorder.state !== 'inactive') recorder.stop();
+
+			const watchdog = new Promise<never>((_, rej) =>
+				setTimeout(() => rej(new Error('recording timed out')), 15000));
+			const blob = await Promise.race([done, watchdog]);
+
+			const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+			const ts = new Date()
+				.toISOString()
+				.replace(/[:.]/g, '-')
+				.slice(0, 19);
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = `rapidfem-td-${ts}.${ext}`;
+			a.click();
+			URL.revokeObjectURL(url);
+		} catch (err) {
+			console.error('TD video export failed:', err);
+			alert('Video export failed: '
+				+ (err instanceof Error ? err.message : String(err)));
 		} finally {
-			recorder.stop();
+			// Always release the recorder and reset UI state — without this an
+			// exception leaves `td_recording` set and the export button stays
+			// disabled, which reads as the viewer being frozen.
+			try {
+				if (recorder && recorder.state !== 'inactive') recorder.stop();
+			} catch { /* already inactive */ }
+			td_recording = null;
+			td_playing = wasPlaying;
 		}
-
-		const blob = await done;
-		const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-		const ts = new Date()
-			.toISOString()
-			.replace(/[:.]/g, '-')
-			.slice(0, 19);
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = `rapidfem-td-${ts}.${ext}`;
-		a.click();
-		URL.revokeObjectURL(url);
-
-		td_recording = null;
-		td_playing = wasPlaying;
 	}
 
 	// ── Mesh classification & coloring ──────────────────────────────────

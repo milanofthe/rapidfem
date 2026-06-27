@@ -1,0 +1,243 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+"""Emit the Rust golden test for interp.rs field/curl reconstruction.
+
+Math anchor
+-----------
+The R2 element exactly represents any vector field in its span. Setting the
+DOF vector to a single canonical basis function (one DOF = 1, the rest 0) on a
+tet makes the reconstructed field equal that basis function exactly:
+
+    E(x)      = RECON_SIGN * phi_i(x)
+    curl E(x) = RECON_SIGN * (curl phi_i)(x)
+
+both known in closed form from the symbolic element (element.py). We pin the
+Rust `eval_field_in_tet` / `eval_curl_in_tet` to these exact values at several
+interior sample points, entrywise.
+
+Critical ordering note
+-----------------------
+`interp.rs` derives its per-tet `edge_map`/`tri_map` from the mesh, which stores
+edge/face node tuples SORTED. For a single tet [0,1,2,3] this differs from
+element.py's LOCAL_EDGE_MAP / LOCAL_TRI_MAP at the two intentionally-reversed
+entries (edge 4: [1,3] not (3,1); face 2: [0,1,3] not (0,3,1)). We rebuild the
+basis here with the mesh ordering so the symbolic phi_i matches the Rust DOF i
+exactly. `tet_to_field[0]` is the identity for a single-tet mesh.
+
+RECON_SIGN = -1.0 in interp.rs (a physically-immaterial global basis sign,
+pinned to the sparam/excitation convention); we bake it into the expected
+values so the test pins the actual Rust output including that sign.
+"""
+from __future__ import annotations
+
+import os
+
+import sympy as sp
+
+import element
+
+# interp.rs ordering: mesh stores edge/face node tuples sorted (min..max).
+# These are TET_EDGE_LOCAL / TET_FACE_LOCAL from rapidfem-core/src/mesh.rs with
+# the two reversed entries sorted, exactly what local_mapping yields for a tet
+# whose global node ids equal its local order [0,1,2,3].
+EDGE_MAP = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+TRI_MAP = [(0, 1, 2), (0, 2, 3), (0, 1, 3), (1, 2, 3)]
+
+RECON_SIGN = -1  # interp.rs RECON_SIGN
+
+x, y, z = sp.symbols("x y z")
+
+
+def build_basis_mesh(verts):
+    """20 basis functions in DOF order [edge.m1][face.m1][edge.m2][face.m2],
+    built with the interp.rs (mesh-sorted) edge/tri maps. Mirrors the Rust
+    `tet_assembly_r2::build_basis` term-for-term."""
+    _sixV, grads = element.barycentric_gradients(verts)
+    edge_m1, edge_m2, face_m1, face_m2 = [], [], [], []
+    for (a, b) in EDGE_MAP:
+        le = element.dist(verts, a, b)
+        edge_m1.append(element.weighted_whitney(grads, a, a, b, le))  # le*L_a*W_ab
+        edge_m2.append(element.weighted_whitney(grads, b, a, b, le))  # le*L_b*W_ab
+    for (n0, n1, n2) in TRI_MAP:
+        l_f1 = element.dist(verts, n0, n2)
+        l_f2 = element.dist(verts, n0, n1)
+        face_m1.append(element.weighted_whitney(grads, n1, n2, n0, l_f1))
+        face_m2.append(element.weighted_whitney(grads, n2, n0, n1, l_f2))
+    basis = edge_m1 + face_m1 + edge_m2 + face_m2
+    assert len(basis) == 20
+    return basis, grads
+
+
+def lambda_exprs(verts):
+    M = sp.Matrix([[sp.Integer(1), v[0], v[1], v[2]] for v in verts]).inv()
+    return [M[0, j] + M[1, j] * x + M[2, j] * y + M[3, j] * z for j in range(4)]
+
+
+def field_eval(field, Lexpr, pt):
+    """Evaluate a barycentric vector field sum(coeff * prod L^exps * vec) at a
+    numeric physical point pt, exactly (rational arithmetic)."""
+    Lval = [le.subs({x: pt[0], y: pt[1], z: pt[2]}) for le in Lexpr]
+    out = [sp.Integer(0), sp.Integer(0), sp.Integer(0)]
+    for coeff, exps, vec in field:
+        s = coeff
+        for k in range(4):
+            s *= Lval[k] ** exps[k]
+        for c in range(3):
+            out[c] += s * vec[c]
+    return [sp.nsimplify(v) for v in out]
+
+
+def f64(v):
+    return f"{float(sp.N(v, 25)):.17e}"
+
+
+def emit_vec_arr(name, vecs):
+    rows = ",\n".join("    [" + ", ".join(f64(c) for c in vec) + "]" for vec in vecs)
+    return f"const {name}: [[f64; 3]; {len(vecs)}] = [\n{rows}\n];\n"
+
+
+# --- Non-trivial physical tet (skewed, exercises the geometry mapping). ---
+R = sp.Rational
+VERTS = [
+    (R(1, 10), R(1, 5), R(3, 10)),
+    (R(13, 10), R(1, 10), R(1, 5)),
+    (R(1, 5), R(11, 10), R(2, 5)),
+    (R(3, 10), R(1, 4), R(6, 5)),
+]
+
+# Interior sample points as barycentric weights (positive, sum to 1).
+BARY = [
+    (R(1, 4), R(1, 4), R(1, 4), R(1, 4)),   # centroid
+    (R(2, 5), R(3, 10), R(1, 5), R(1, 10)),
+    (R(1, 10), R(1, 5), R(3, 10), R(2, 5)),
+]
+
+# DOFs to pin: an edge mode and a face mode, including the two reordered
+# (edge 4, face 2) entries so the mesh-sorting subtlety is exercised.
+#   local 0  -> edge.m1, edge 0
+#   local 14 -> edge.m2, edge 4 (the reversed edge)
+#   local 8  -> face.m1, face 2 (the reversed face)
+#   local 19 -> face.m2, face 3
+DOFS = [
+    (0, "edge_m1_e0"),
+    (14, "edge_m2_e4_reversed"),
+    (8, "face_m1_f2_reversed"),
+    (19, "face_m2_f3"),
+]
+
+HEADER = """\
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+//
+// GENERATED by derivations/nedelec2/emit_interp_golden.py — do not edit.
+// Golden field/curl reconstruction values from the independent symbolic R2
+// element (element.py). Each case sets ONE canonical DOF to 1 (rest 0), so the
+// reconstructed field equals RECON_SIGN*phi_i and its curl equals
+// RECON_SIGN*(curl phi_i) exactly. Pins `interp::eval_field_in_tet` and
+// `eval_curl_in_tet` to the derivation, entrywise, at interior sample points.
+
+use num_complex::Complex64 as C64;
+use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::interp::{eval_curl_in_tet, eval_field_in_tet};
+use rapidfem_fd::mesh::Mesh;
+
+const NODES: [[f64; 3]; 4] = [
+__NODES__
+];
+
+fn build_mesh() -> Mesh {
+    let nodes = vec![NODES[0], NODES[1], NODES[2], NODES[3]];
+    let tets = vec![[0usize, 1, 2, 3]];
+    Mesh::from_tets(nodes, tets)
+}
+
+/// Set local DOF `local_dof` to 1 (rest 0) and pin the reconstructed field and
+/// curl at every sample point against the symbolic golden values.
+fn check_dof(local_dof: usize, pts: &[[f64; 3]], e_exp: &[[f64; 3]], curl_exp: &[[f64; 3]]) {
+    let mesh = build_mesh();
+    let basis = Nedelec2Basis::new(&mesh);
+    assert_eq!(basis.n_field, 20);
+    // Single-tet mesh: tet_to_field[0] is the identity, but route through it
+    // anyway so the test stays correct under any DOF-numbering change.
+    let mut sol = vec![C64::new(0.0, 0.0); basis.n_field];
+    sol[basis.tet_to_field[0][local_dof]] = C64::new(1.0, 0.0);
+
+    for (pi, p) in pts.iter().enumerate() {
+        let (ex, ey, ez) = eval_field_in_tet(&mesh, &basis, &sol, 0, p[0], p[1], p[2]);
+        let got = [ex, ey, ez];
+        let scale = e_exp[pi].iter().fold(1e-12_f64, |m, &v| m.max(v.abs()));
+        for k in 0..3 {
+            let diff = (got[k].re - e_exp[pi][k]).abs();
+            assert!(
+                diff / scale < 1e-9,
+                "E dof {local_dof} pt {pi} comp {k}: got {} exp {} rel {:.2e}",
+                got[k].re, e_exp[pi][k], diff / scale
+            );
+            assert!(got[k].im.abs() < 1e-12, "E imag dof {local_dof} pt {pi} comp {k}: {}", got[k].im);
+        }
+        let curl = eval_curl_in_tet(&mesh, &basis, &sol, 0, p[0], p[1], p[2]);
+        let cscale = curl_exp[pi].iter().fold(1e-12_f64, |m, &v| m.max(v.abs()));
+        for k in 0..3 {
+            let diff = (curl[k].re - curl_exp[pi][k]).abs();
+            assert!(
+                diff / cscale < 1e-9,
+                "curl dof {local_dof} pt {pi} comp {k}: got {} exp {} rel {:.2e}",
+                curl[k].re, curl_exp[pi][k], diff / cscale
+            );
+            assert!(curl[k].im.abs() < 1e-12, "curl imag dof {local_dof} pt {pi} comp {k}: {}", curl[k].im);
+        }
+    }
+}
+"""
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.abspath(os.path.join(here, "..", ".."))
+    out_path = os.path.join(repo, "crates", "rapidfem-fd", "tests", "interp_golden_test.rs")
+
+    basis, grads = build_basis_mesh(VERTS)
+    Lexpr = lambda_exprs(VERTS)
+
+    # Physical sample points from barycentric weights.
+    pts_phys = []
+    for w in BARY:
+        p = [sum(w[i] * VERTS[i][c] for i in range(4)) for c in range(3)]
+        pts_phys.append(p)
+
+    nodes_lines = ",\n".join(
+        "    [" + ", ".join(f64(c) for c in v) + "]" for v in VERTS
+    )
+    body = HEADER.replace("__NODES__", nodes_lines)
+    body += emit_vec_arr("PTS", pts_phys)
+
+    max_consistency = 0.0
+    for local_dof, label in DOFS:
+        field = basis[local_dof]
+        curl = element.curl_field(field, grads)
+        e_vals, curl_vals = [], []
+        for p in pts_phys:
+            ev = field_eval(field, Lexpr, p)
+            cv = field_eval(curl, Lexpr, p)
+            e_vals.append([RECON_SIGN * c for c in ev])
+            curl_vals.append([RECON_SIGN * c for c in cv])
+        body += f"\n// ===== DOF {local_dof} ({label}) =====\n"
+        body += emit_vec_arr(f"E_D{local_dof}", e_vals)
+        body += emit_vec_arr(f"CURL_D{local_dof}", curl_vals)
+        body += f"""
+#[test]
+fn interp_recon_dof_{local_dof}_{label}() {{
+    check_dof({local_dof}, &PTS, &E_D{local_dof}, &CURL_D{local_dof});
+}}
+"""
+        print(f"emitted DOF {local_dof} ({label})")
+
+    with open(out_path, "w") as fh:
+        fh.write(body)
+    print(f"wrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()

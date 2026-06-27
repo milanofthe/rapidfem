@@ -1,14 +1,20 @@
-"""pytest configuration for the rapidfem Python test suite.
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+"""pytest configuration for the rapidfem test suite.
 
-Marker convention:
-- `slow`: runs a full transient or sweep. Default opt-out via
-  `pytest -m "not slow"`; explicit opt-in via `pytest -m slow`.
+Layout:
+  tests/harness/      build→solve helpers + analytical references
+  tests/geometries/   one module per physics phenomenon (the breadth suite)
+  tests/kernel/       sympy/analytical kernel checks driven from Python (if any)
+
+Markers (also declared in pyproject [tool.pytest.ini_options]):
+  slow         full FD sweep or TD transient; opt out with -m "not slow"
+  phenomenon   a physics-phenomenon geometry test
+
+`tests/` is on sys.path so test modules can `from harness import case`.
 """
-import pytest
+import os
+import sys
 
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        "markers",
-        "slow: tests that run a full TD transient or FD sweep (minutes)",
-    )
+sys.path.insert(0, os.path.dirname(__file__))

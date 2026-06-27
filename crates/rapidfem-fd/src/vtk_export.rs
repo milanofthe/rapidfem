@@ -54,9 +54,11 @@ pub fn write_vtk(
 
         let p = mesh.nodes[ni];
         let (ex, ey, ez) = interp::eval_field_in_tet(mesh, basis, solution, tet_idx, p[0], p[1], p[2]);
-        e_real[ni] = [ex.re, ey.re, ez.re];
-        e_imag[ni] = [ex.im, ey.im, ez.im];
-        e_mag[ni] = (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt();
+        // Field on the L₀-normalized mesh is L₀·E_phys → divide for physical V/m.
+        let il = 1.0 / mesh.l0;
+        e_real[ni] = [ex.re * il, ey.re * il, ez.re * il];
+        e_imag[ni] = [ex.im * il, ey.im * il, ez.im * il];
+        e_mag[ni] = (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt() * il;
     }
 
     // Write legacy VTK format
@@ -69,7 +71,8 @@ pub fn write_vtk(
     writeln!(file, "POINTS {} double", n_nodes)?;
     for ni in 0..n_nodes {
         let p = mesh.nodes[ni];
-        writeln!(file, "{:.10e} {:.10e} {:.10e}", p[0], p[1], p[2])?;
+        let l = mesh.l0; // physical coordinates (the mesh is stored in L₀ units)
+        writeln!(file, "{:.10e} {:.10e} {:.10e}", p[0]*l, p[1]*l, p[2]*l)?;
     }
 
     // Cells (tetrahedra: 4 nodes each, preceded by count 4)
@@ -129,7 +132,8 @@ pub fn write_vtk_error(
     writeln!(file, "POINTS {} double", n_nodes)?;
     for ni in 0..n_nodes {
         let p = mesh.nodes[ni];
-        writeln!(file, "{:.10e} {:.10e} {:.10e}", p[0], p[1], p[2])?;
+        let l = mesh.l0; // physical coordinates (the mesh is stored in L₀ units)
+        writeln!(file, "{:.10e} {:.10e} {:.10e}", p[0]*l, p[1]*l, p[2]*l)?;
     }
 
     writeln!(file, "CELLS {} {}", n_tets, n_tets * 5)?;

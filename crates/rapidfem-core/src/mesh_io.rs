@@ -167,5 +167,8 @@ pub fn parse_mesh_bytes(bytes: &[u8]) -> Result<Mesh, String> {
     eprintln!("Mesh: {} nodes, {} edges, {} tris, {} tets",
         mesh.n_nodes(), mesh.n_edges(), mesh.n_tris(), mesh.n_tets());
 
+    // Conditioning gate: flag sliver tets before they reach the solver.
+    crate::quality::assess(&mesh).warn_if_poor();
+
     Ok(mesh)
 }

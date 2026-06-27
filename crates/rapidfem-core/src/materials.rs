@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Exact port of EMerge material handling from assembler.py lines 280-305.
+//! Per-tet material tensors for the frequency-domain assembly.
 //!
-//! Builds per-tet εr and μr tensors with loss tangent and conductivity:
-//!   er_complex = er * (1 - j*tand) - j*cond / (ω*ε₀)
+//! The effective complex relative permittivity combines a loss tangent and a
+//! bulk conductivity into the standard lossy-dielectric form (e.g. Pozar,
+//! *Microwave Engineering*, §1.3; Jackson, *Classical Electrodynamics*):
+//!
+//!   εr*(ω) = εr·(1 − j·tanδ) − j·σ/(ω·ε₀)
+//!
+//! with optional diagonal anisotropy, Debye/Drude dispersion and uniaxial
+//! PML coordinate stretching layered on top.
 
 use num_complex::Complex64 as C64;
 use crate::constants::EPS0;
@@ -52,8 +54,7 @@ impl Dispersion {
     }
 }
 
-/// Material definition for a region of the mesh.
-/// Mirrors EMerge's Material class interface. Supports diagonal anisotropy:
+/// Material definition for a region of the mesh. Supports diagonal anisotropy:
 /// `er_diag` and `ur_diag` override the scalar values when present.
 pub struct Material {
     /// Relative permittivity (scalar, isotropic baseline)
@@ -75,7 +76,8 @@ pub struct Material {
 }
 
 /// Build per-tet εr and μr tensors from material definitions.
-/// Exact port of assembler.py lines 280-303.
+/// Accumulates each region's diagonal εr/μr/tanδ/σ onto its tets, then applies
+/// the complex-permittivity relation εr* = εr(1 − j·tanδ) − j·σ/(ω·ε₀).
 ///
 /// Returns (er_tensors, ur_tensors) where each is Vec of 3x3 complex tensors.
 pub fn build_material_tensors(
@@ -85,14 +87,13 @@ pub fn build_material_tensors(
 ) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
     let w0 = 2.0 * std::f64::consts::PI * frequency;
 
-    // Initialize as zeros (matches EMerge: np.zeros((3,3,n_tets)))
     let zero3x3 = [[C64::new(0.0, 0.0); 3]; 3];
     let mut er = vec![zero3x3; n_tets];
     let mut ur = vec![zero3x3; n_tets];
     let mut tand = vec![zero3x3; n_tets];
     let mut cond = vec![zero3x3; n_tets];
 
-    // Accumulate material properties per tet (matches EMerge's mat.er(frequency, er) pattern).
+    // Accumulate each region's diagonal properties onto its tets.
     // For dispersive materials, εr is replaced by Dispersion::evaluate(εr_base, frequency).
     for mat in materials {
         let er_diag = mat.er_diag.unwrap_or([mat.er; 3]);
@@ -114,8 +115,7 @@ pub fn build_material_tensors(
         }
     }
 
-    // Apply loss formula: er = er*(1 - 1j*tand) - 1j*cond/(W0*EPS0)
-    // Exact port of assembler.py line 303
+    // Complex permittivity: εr* = εr·(1 − j·tanδ) − j·σ/(ω·ε₀)
     for ti in 0..n_tets {
         for i in 0..3 {
             for j in 0..3 {

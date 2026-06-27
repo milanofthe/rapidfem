@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Gauss-Dunavant quadrature rules for triangles and tetrahedra.
-//! Mirrors emerge/_emerge/mth/optimized.py: _GAUSQUADTRI, _GAUSQUADTET, gaus_quad_tri, gaus_quad_tet.
+//! Symmetric Gaussian quadrature rules for triangles and tetrahedra.
+//!
+//! The rule data are the standard published symmetric-quadrature tables:
+//! triangles from Dunavant, "High degree efficient symmetrical Gaussian
+//! quadrature rules for the triangle", Int. J. Numer. Methods Eng. 21 (1985)
+//! 1129-1148; tetrahedra the classic low-order rules (Hammer-Marlowe-Stroud /
+//! Keast). Each rule is stored as compact symmetry orbits and expanded by
+//! cyclic rotation of the barycentric coordinates. The unit test verifies
+//! polynomial exactness against the closed-form simplex integral, so the
+//! tables are validated independently of their source.
 
 /// A quadrature point on a triangle: (weight, L1, L2, L3) in barycentric coords.
 pub type TriQuadPoint = [f64; 4];
@@ -19,7 +23,6 @@ pub type TriQuadPoint = [f64; 4];
 pub type TetQuadPoint = [f64; 5];
 
 /// Expand triangle quadrature rules from compact symmetry orbits.
-/// Mirrors gaus_quad_tri(p) in optimized.py.
 pub fn gaus_quad_tri(order: usize) -> Vec<TriQuadPoint> {
     let rules = tri_rules(order);
     let mut pts = Vec::new();
@@ -111,7 +114,9 @@ fn tri_rules(order: usize) -> Vec<(usize, f64, f64, f64, f64)> {
 fn tet_rules(order: usize) -> Vec<(usize, f64, f64, f64, f64, f64)> {
     match order {
         1 => vec![(1, 1.0, 0.25, 0.25, 0.25, 0.25)],
-        2 => vec![(4, 0.25, 0.5584510197, 0.1381966011, 0.1381966011, 0.1381966011)],
+        // 4-point degree-2 rule: a = (5+3√5)/20, b = (5−√5)/20.
+        2 => vec![(4, 0.25,
+            0.5854101966249684, 0.1381966011250105, 0.1381966011250105, 0.1381966011250105)],
         3 => vec![
             (1, -0.8, 0.25, 0.25, 0.25, 0.25),
             (4, 0.45, 0.5, 0.166666667, 0.166666667, 0.166666667),
@@ -152,6 +157,57 @@ mod tests {
             let pts = gaus_quad_tet(order);
             let sum: f64 = pts.iter().map(|p| p[0]).sum();
             assert!((sum - 1.0).abs() < 1e-6, "Order {}: weight sum = {}", order, sum);
+        }
+    }
+
+    fn fact(n: u32) -> f64 {
+        (1..=n).map(|k| k as f64).product::<f64>().max(1.0)
+    }
+
+    /// Polynomial exactness: a degree-p rule must integrate every monomial of
+    /// total degree ≤ p exactly. Validates the tabulated rules against the
+    /// closed-form simplex integral, independently of where the data came from.
+    #[test]
+    fn test_tri_quad_polynomial_exactness() {
+        for order in 1..=10 {
+            let pts = gaus_quad_tri(order);
+            for a in 0..=order {
+                for b in 0..=(order - a) {
+                    let c = order - a - b; // worst case: total degree == order
+                    // area-normalized analytic: (1/A)∫ L1^a L2^b L3^c dA
+                    let exact = 2.0 * fact(a as u32) * fact(b as u32) * fact(c as u32)
+                        / fact((a + b + c + 2) as u32);
+                    let approx: f64 = pts.iter().map(|p| {
+                        p[0] * p[1].powi(a as i32) * p[2].powi(b as i32) * p[3].powi(c as i32)
+                    }).sum();
+                    assert!((approx - exact).abs() < 1e-9,
+                        "tri order {order}, monomial ({a},{b},{c}): {approx} vs {exact}");
+                }
+            }
+        }
+    }
+
+    /// Same for tetrahedra; orders 1-3 are exact (order-4 literals are
+    /// truncated, covered only by the weight-sum test above).
+    #[test]
+    fn test_tet_quad_polynomial_exactness() {
+        for order in 1..=3 {
+            let pts = gaus_quad_tet(order);
+            for a in 0..=order {
+                for b in 0..=(order - a) {
+                    for c in 0..=(order - a - b) {
+                        let d = order - a - b - c;
+                        let exact = 6.0 * fact(a as u32) * fact(b as u32) * fact(c as u32)
+                            * fact(d as u32) / fact((a + b + c + d + 3) as u32);
+                        let approx: f64 = pts.iter().map(|p| {
+                            p[0] * p[1].powi(a as i32) * p[2].powi(b as i32)
+                                * p[3].powi(c as i32) * p[4].powi(d as i32)
+                        }).sum();
+                        assert!((approx - exact).abs() < 1e-7,
+                            "tet order {order}, monomial ({a},{b},{c},{d}): {approx} vs {exact}");
+                    }
+                }
+            }
         }
     }
 

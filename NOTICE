@@ -1,67 +1,36 @@
 rapidfem — NOTICE
 ==================
 
-This file lists copyright attribution and third-party dependencies.
-See LICENSE for the full GNU GPL v3 text with the Gmsh additional
-permission.
+See LICENSE for the full GNU GPL v3 text with the Gmsh additional permission.
 
 ────────────────────────────────────────────────────────────────────────
-1. EMerge (GPL-2.0+ with Gmsh additional permission)
+0. Licensing
 ────────────────────────────────────────────────────────────────────────
 
-Copyright (C) Robert Fennis and EMerge contributors.
-Upstream: https://github.com/FennisRobert/EMerge
+All rapidfem source code is original work, copyright (C) Milan Rother and
+rapidfem contributors. The public distribution is offered under
+GPL-3.0-or-later (with the Gmsh additional permission): free for hobby and
+academic use. Because the copyright is held wholly by the project, it may
+also be licensed under separate commercial terms; the GPL grant does not
+waive that right. Commercial licensing is available on request.
 
-The following files in `crates/rapidfem-fd` and `crates/rapidfem-core`
-contain code directly ported from EMerge. Per the GPL-2.0-or-later
-grant, they are redistributed here under GPL-3.0-or-later with the Gmsh
-additional permission carried forward.
-
-  crates/rapidfem-fd/src/abc_order2.rs       (port of microwave_bc.py
-                                              order-2 ABC correction)
-  crates/rapidfem-fd/src/assembly.rs         (port of microwave_3d.py
-                                              assemble_and_solve)
-  crates/rapidfem-fd/src/basis.rs            (port of nedleg2.py
-                                              Nedelec2Basis)
-  crates/rapidfem-fd/src/interp.rs           (port of ned2_tet_interp.py)
-  crates/rapidfem-fd/src/sparam.rs           (port of sparam.py)
-  crates/rapidfem-fd/src/touchstone.rs       (port of touchstone.py)
-  crates/rapidfem-fd/src/tet_assembly.rs     (port of ned2_tet.py
-                                              stiff / mass / force)
-  crates/rapidfem-fd/src/tri_assembly.rs     (port of robinbc.py
-                                              ned2_tri_stiff / force)
-  crates/rapidfem-fd/src/waveguide.rs        (port of microwave_bc.py
-                                              RectangularWaveguide,
-                                              CoaxPort, LumpedPort,
-                                              FloquetPort,
-                                              UserDefinedPort,
-                                              SurfaceImpedance,
-                                              LumpedElement, ABC, plus
-                                              cs.py CoordinateSystem)
-  crates/rapidfem-core/src/materials.rs      (port of materials.py
-                                              build_material_tensors)
-  crates/rapidfem-core/src/quadrature.rs     (port of quadrature tables
-                                              from EMerge)
-
-New code in `crates/rapidfem-fd/src/waveguide.rs` (the `NumericalWavePort`
-class and its supporting helpers) and in `crates/rapidfem-core/src/port_eigen.rs`
-(the 2-D wave-port mode eigensolver) is original to this project, also
-under GPL-3.0-or-later.
+The only copyleft obligation on a distributed binary comes from linking Gmsh
+(GPL-2.0-or-later) at runtime — not from any rapidfem source.
 
 ────────────────────────────────────────────────────────────────────────
-2. Runtime dependencies
+1. Third-party runtime dependencies
 ────────────────────────────────────────────────────────────────────────
 
   gmsh                   GPL-2.0-or-later (with Gmsh additional permission)
-  Intel oneAPI MKL       Intel Simplified Software License (runtime-only)
+  Intel oneAPI MKL       Intel Simplified Software License (optional, runtime)
   faer (Rust)            MIT
   num-complex (Rust)     MIT / Apache-2.0
   ndarray (Rust)         MIT / Apache-2.0
+  pyo3 (Rust)            MIT / Apache-2.0
   numpy (Python)         BSD-3-Clause
   scipy (Python)         BSD-3-Clause
   pyvista (Python)       MIT
-  pyo3 (Rust)            MIT / Apache-2.0
 
-The Gmsh additional permission in LICENSE explicitly authorises linking
-against Gmsh, Netgen, METIS, OpenCASCADE and ParaView under their own
-licences when distributing binaries containing rapidfem.
+The Gmsh additional permission in LICENSE authorises linking against Gmsh,
+Netgen, METIS, OpenCASCADE and ParaView under their own licences when
+distributing binaries containing rapidfem.

@@ -155,6 +155,23 @@ impl PySimulation {
         self.inner.ports.iter().filter(|p| p.is_driven()).count()
     }
 
+    /// Modal characteristic impedance (Ω) of the `driven_idx`-th DRIVEN port at
+    /// `freq_hz`. The index matches the S-matrix column order (driven ports
+    /// only). Modal ports (waveguide / wave) return their frequency-dependent
+    /// modal impedance; lumped ports return their fixed reference z0. Used by
+    /// Python to renormalize the modal-referenced S-parameters to a fixed
+    /// reference impedance. Returns 0.0 if the index is out of range.
+    fn port_z_mode(&self, driven_idx: usize, freq_hz: f64) -> f64 {
+        let exc = rapidfem_fd::excitation::Excitation::new(freq_hz, self.inner.mesh.l0);
+        self.inner
+            .ports
+            .iter()
+            .filter(|p| p.is_driven())
+            .nth(driven_idx)
+            .map(|p| p.z_mode(&exc))
+            .unwrap_or(0.0)
+    }
+
     /// Run an eigenmode analysis. Requires `[eigenmode]` block in the TOML config.
     /// Returns a list of `Eigenmode` (frequency, Q, field).
     fn run_eigenmode(&self) -> PyResult<Vec<PyEigenmode>> {
@@ -176,9 +193,12 @@ impl PySimulation {
     #[getter]
     fn mesh_nodes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         let n = self.inner.mesh.n_nodes();
+        // The mesh is stored in L₀ (characteristic-length) units after lever ④;
+        // report physical coordinates by multiplying back.
+        let l0 = self.inner.mesh.l0;
         let mut flat: Vec<f64> = Vec::with_capacity(n * 3);
         for p in &self.inner.mesh.nodes {
-            flat.extend_from_slice(p);
+            flat.extend_from_slice(&[p[0] * l0, p[1] * l0, p[2] * l0]);
         }
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), flat).expect("shape");
         arr.into_pyarray_bound(py)

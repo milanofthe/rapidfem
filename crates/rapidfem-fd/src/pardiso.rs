@@ -93,9 +93,9 @@ impl PardisoSolver {
         let pt = [0i64; 64];
         let mut iparm = [0i32; 64];
 
-        // Match EMerge's PARDISO config (pardiso_interface.py:380-405)
+        // PARDISO iparm configuration (complex-symmetric, mtype=6)
         iparm[0] = 1;    // Don't use default values, we set them
-        iparm[1] = 3;    // Permutation: METIS-style minimum-degree (EMerge default)
+        iparm[1] = 3;    // Permutation: METIS-style minimum-degree (parallel nested dissection)
         iparm[2] = 4;    // Number of threads
         iparm[7] = 0;    // No iterative refinement
         iparm[9] = 13;   // Pivot perturbation magnitude (1e-13). Critical for ill-conditioned

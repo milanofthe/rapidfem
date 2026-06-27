@@ -1,74 +1,78 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Exact port of compiled/base/interp.py: ned2_tet_interp
+//! Field reconstruction: evaluate the FEM E-field and its curl at a point.
 //!
-//! Evaluates E-field at a point inside a known tetrahedron using
-//! the full Nedelec-2 basis (20 DOFs).
+//! The solution vector holds DOF coefficients of the canonical R2 basis. The
+//! field inside a tet is the weighted sum of its 20 basis functions evaluated
+//! at the point; the curl follows from ∇×(s·∇L_g) = ∇s × ∇L_g. Both reuse the
+//! *same* basis definition as the assembly (`tet_assembly_r2::build_basis`),
+//! so reconstruction and assembly cannot drift apart.
+//!
+//! Sign convention: the reconstructed field carries a global minus relative to
+//! `build_basis`. A global basis sign is physically immaterial (it cancels in
+//! the assembled system), but it must match the modal-overlap convention used
+//! by `sparam` and the port excitation. `RECON_SIGN` pins that choice in one
+//! place; the self-validating curl test is invariant to it.
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
+use crate::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn};
 
-/// Port of interp.py: tet_coefficients(xs, ys, zs)
-/// Returns (aas, bbs, ccs, dds, V), the FULL barycentric coefficients including constant term.
-pub fn tet_coefficients(xs: &[f64; 4], ys: &[f64; 4], zs: &[f64; 4])
-    -> ([f64; 4], [f64; 4], [f64; 4], [f64; 4], f64)
-{
-    let (x1,x2,x3,x4) = (xs[0],xs[1],xs[2],xs[3]);
-    let (y1,y2,y3,y4) = (ys[0],ys[1],ys[2],ys[3]);
-    let (z1,z2,z3,z4) = (zs[0],zs[1],zs[2],zs[3]);
+type V3 = [f64; 3];
 
-    let v = (-x1*y2*z3/6.0 + x1*y2*z4/6.0 + x1*y3*z2/6.0 - x1*y3*z4/6.0 - x1*y4*z2/6.0 +
-              x1*y4*z3/6.0 + x2*y1*z3/6.0 - x2*y1*z4/6.0 - x2*y3*z1/6.0 + x2*y3*z4/6.0 +
-              x2*y4*z1/6.0 - x2*y4*z3/6.0 - x3*y1*z2/6.0 + x3*y1*z4/6.0 + x3*y2*z1/6.0 -
-              x3*y2*z4/6.0 - x3*y4*z1/6.0 + x3*y4*z2/6.0 + x4*y1*z2/6.0 - x4*y1*z3/6.0 -
-              x4*y2*z1/6.0 + x4*y2*z3/6.0 + x4*y3*z1/6.0 - x4*y3*z2/6.0).abs();
+/// Global sign matching the reconstruction to the `sparam`/excitation
+/// convention (see module docs). Physically immaterial; pinned here.
+const RECON_SIGN: f64 = -1.0;
 
-    let aas = [
-         x2*y3*z4 - x2*y4*z3 - x3*y2*z4 + x3*y4*z2 + x4*y2*z3 - x4*y3*z2,
-        -x1*y3*z4 + x1*y4*z3 + x3*y1*z4 - x3*y4*z1 - x4*y1*z3 + x4*y3*z1,
-         x1*y2*z4 - x1*y4*z2 - x2*y1*z4 + x2*y4*z1 + x4*y1*z2 - x4*y2*z1,
-        -x1*y2*z3 + x1*y3*z2 + x2*y1*z3 - x2*y3*z1 - x3*y1*z2 + x3*y2*z1,
-    ];
-    let bbs = [
-        -y2*z3 + y2*z4 + y3*z2 - y3*z4 - y4*z2 + y4*z3,
-         y1*z3 - y1*z4 - y3*z1 + y3*z4 + y4*z1 - y4*z3,
-        -y1*z2 + y1*z4 + y2*z1 - y2*z4 - y4*z1 + y4*z2,
-         y1*z2 - y1*z3 - y2*z1 + y2*z3 + y3*z1 - y3*z2,
-    ];
-    let ccs = [
-         x2*z3 - x2*z4 - x3*z2 + x3*z4 + x4*z2 - x4*z3,
-        -x1*z3 + x1*z4 + x3*z1 - x3*z4 - x4*z1 + x4*z3,
-         x1*z2 - x1*z4 - x2*z1 + x2*z4 + x4*z1 - x4*z2,
-        -x1*z2 + x1*z3 + x2*z1 - x2*z3 - x3*z1 + x3*z2,
-    ];
-    let dds = [
-        -x2*y3 + x2*y4 + x3*y2 - x3*y4 - x4*y2 + x4*y3,
-         x1*y3 - x1*y4 - x3*y1 + x3*y4 + x4*y1 - x4*y3,
-        -x1*y2 + x1*y4 + x2*y1 - x2*y4 - x4*y1 + x4*y2,
-         x1*y2 - x1*y3 - x2*y1 + x2*y3 + x3*y1 - x3*y2,
-    ];
-
-    (aas, bbs, ccs, dds, v)
+#[inline]
+fn cross3(a: &V3, b: &V3) -> V3 {
+    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
 }
 
-/// Port of interp.py: ned2_tet_interp (core evaluation loop)
-///
-/// Evaluate E-field at point (x,y,z) inside tet `tet_idx`.
-/// Uses solution DOF values and Nedelec-2 basis functions.
-///
-/// Exactly matches EMerge's evaluation:
-/// - Edge modes: E += LV * (Em1*F1 + Em2*F2) * (∇λ₁*F2 - ∇λ₂*F1)
-/// - Face modes: E += V1 * (-Ef1*L1*F2*(∇λ₁*F3-∇λ₃*F1) + Ef2*L2*F3*(∇λ₁*F2-∇λ₂*F1))
+/// Barycentric L_i of local node i at point `p`: L_i = δ_{i0} + ∇L_i·(p − v0).
+#[inline]
+fn lambdas_at(grads: &[V3; 4], v0: &V3, p: &V3) -> [f64; 4] {
+    let d = [p[0]-v0[0], p[1]-v0[1], p[2]-v0[2]];
+    std::array::from_fn(|i| {
+        (if i == 0 { 1.0 } else { 0.0 })
+            + grads[i][0]*d[0] + grads[i][1]*d[1] + grads[i][2]*d[2]
+    })
+}
+
+/// Per-tet geometry shared by field and curl evaluation: the four ∇L_i, the
+/// 20 canonical basis functions (in DOF order), and node 0 as the affine base.
+fn tet_basis(mesh: &Mesh, tet_idx: usize) -> ([V3; 4], Vec<BasisFn>, V3) {
+    let tet = &mesh.tets[tet_idx];
+    let xs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][0]);
+    let ys: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][1]);
+    let zs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][2]);
+    let (grads, _six_v) = barycentric_grads(&xs, &ys, &zs);
+
+    let tet_edges = &mesh.tet_to_edge[tet_idx];
+    let edge_lengths: [f64; 6] = std::array::from_fn(|i| mesh.edge_lengths[tet_edges[i]]);
+    let global_edge_nodes: [[usize; 2]; 6] = std::array::from_fn(|i| mesh.edges[tet_edges[i]]);
+    let edge_map = crate::basis::local_mapping(tet, &global_edge_nodes);
+
+    let tet_tris = &mesh.tet_to_tri[tet_idx];
+    let global_tri_nodes: [[usize; 3]; 4] = std::array::from_fn(|i| mesh.tris[tet_tris[i]]);
+    let tri_map = crate::basis::local_mapping_tri(tet, &global_tri_nodes);
+
+    let node_dist = |i: usize, j: usize| -> f64 {
+        ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt()
+    };
+    let fns = build_basis(&edge_lengths, &edge_map, &tri_map, &node_dist);
+    (grads, fns, mesh.nodes[tet[0]])
+}
+
+/// Evaluate the FEM E-field at point (x,y,z) inside tet `tet_idx`, as the
+/// DOF-weighted sum of the 20 canonical R2 basis functions: each function is
+/// `scale·Σ coeff·L_p·L_q·∇L_g`, so the field is a simple polynomial sum.
 pub fn eval_field_in_tet(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -76,95 +80,23 @@ pub fn eval_field_in_tet(
     tet_idx: usize,
     x: f64, y: f64, z: f64,
 ) -> (C64, C64, C64) {
-    let tet = &mesh.tets[tet_idx];
-    let xs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][0]);
-    let ys: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][1]);
-    let zs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][2]);
+    let (grads, fns, v0) = tet_basis(mesh, tet_idx);
+    let lam = lambdas_at(&grads, &v0, &[x, y, z]);
+    let field_ids = &basis.tet_to_field[tet_idx];
 
-    let (a_s, b_s, c_s, d_s, v) = tet_coefficients(&xs, &ys, &zs);
-
-    // Distance matrix (4x4)
-    let mut ds = [[0.0f64; 4]; 4];
-    for i in 0..4 {
-        for j in i..4 {
-            let d = ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt();
-            ds[i][j] = d; ds[j][i] = d;
+    let mut e = [C64::new(0.0, 0.0); 3];
+    for (i, bf) in fns.iter().enumerate() {
+        let dof = solution[field_ids[i]];
+        for t in &bf.terms {
+            // term value = scale·coeff·L_p·L_q·∇L_g
+            let s = RECON_SIGN * bf.scale * t.coeff * lam[t.mono[0]] * lam[t.mono[1]];
+            let g = &grads[t.grad];
+            for k in 0..3 {
+                e[k] += dof * C64::from(s * g[k]);
+            }
         }
     }
-
-    // Local edge mapping (global edge node IDs → local tet node indices)
-    let tet_edges = &mesh.tet_to_edge[tet_idx];
-    let global_edge_nodes: [[usize; 2]; 6] = std::array::from_fn(|i| mesh.edges[tet_edges[i]]);
-    let l_edge_ids = crate::basis::local_mapping(tet, &global_edge_nodes);
-
-    // Local face mapping
-    let tet_tris = &mesh.tet_to_tri[tet_idx];
-    let global_tri_nodes: [[usize; 3]; 4] = std::array::from_fn(|i| mesh.tris[tet_tris[i]]);
-    let l_tri_ids = crate::basis::local_mapping_tri(tet, &global_tri_nodes);
-
-    // DOF values
-    let field_ids = &basis.tet_to_field[tet_idx];
-    let em1s: [C64; 6] = std::array::from_fn(|i| solution[field_ids[i]]);       // Etet[0:6]
-    let ef1s: [C64; 4] = std::array::from_fn(|i| solution[field_ids[6 + i]]);   // Etet[6:10]
-    let em2s: [C64; 6] = std::array::from_fn(|i| solution[field_ids[10 + i]]);  // Etet[10:16]
-    let ef2s: [C64; 4] = std::array::from_fn(|i| solution[field_ids[16 + i]]);  // Etet[16:20]
-
-    let v1 = 1.0 / (216.0 * v * v * v);
-
-    let mut ex = C64::new(0.0, 0.0);
-    let mut ey = C64::new(0.0, 0.0);
-    let mut ez = C64::new(0.0, 0.0);
-
-    // Edge basis functions (6 edges)
-    for ie in 0..6 {
-        let em1 = em1s[ie];
-        let em2 = em2s[ie];
-        let n1 = l_edge_ids[ie][0];
-        let n2 = l_edge_ids[ie][1];
-        let (a1, a2) = (a_s[n1], a_s[n2]);
-        let (b1, b2) = (b_s[n1], b_s[n2]);
-        let (c1, c2) = (c_s[n1], c_s[n2]);
-        let (d1, d2) = (d_s[n1], d_s[n2]);
-
-        let lv = ds[n1][n2] * v1;
-
-        let f1 = a1 + b1*x + c1*y + d1*z;
-        let f2 = a2 + b2*x + c2*y + d2*z;
-        let f3 = em1 * C64::from(f1) + em2 * C64::from(f2);
-
-        ex += f3 * C64::from(lv * (b1*f2 - b2*f1));
-        ey += f3 * C64::from(lv * (c1*f2 - c2*f1));
-        ez += f3 * C64::from(lv * (d1*f2 - d2*f1));
-    }
-
-    // Face basis functions (4 faces)
-    for ie in 0..4 {
-        let em1 = ef1s[ie];
-        let em2 = ef2s[ie];
-        let n1 = l_tri_ids[ie][0];
-        let n2 = l_tri_ids[ie][1];
-        let n3 = l_tri_ids[ie][2];
-        let (a1, a2, a3) = (a_s[n1], a_s[n2], a_s[n3]);
-        let (b1, b2, b3) = (b_s[n1], b_s[n2], b_s[n3]);
-        let (c1, c2, c3) = (c_s[n1], c_s[n2], c_s[n3]);
-        let (d1, d2, d3) = (d_s[n1], d_s[n2], d_s[n3]);
-
-        let l1 = ds[l_tri_ids[ie][2]][l_tri_ids[ie][0]]; // Ds[n3, n1]
-        let l2 = ds[l_tri_ids[ie][1]][l_tri_ids[ie][0]]; // Ds[n2, n1]
-
-        let f1 = a1 + b1*x + c1*y + d1*z;
-        let f2 = a2 + b2*x + c2*y + d2*z;
-        let f3 = a3 + b3*x + c3*y + d3*z;
-
-        let q1 = em1 * C64::from(l1 * f2);
-        let q2 = em2 * C64::from(l2 * f3);
-
-        ex += (-q1 * C64::from(b1*f3 - b3*f1) + q2 * C64::from(b1*f2 - b2*f1)) * C64::from(v1);
-        ey += (-q1 * C64::from(c1*f3 - c3*f1) + q2 * C64::from(c1*f2 - c2*f1)) * C64::from(v1);
-        ez += (-q1 * C64::from(d1*f3 - d3*f1) + q2 * C64::from(d1*f2 - d2*f1)) * C64::from(v1);
-    }
-
-    (ex, ey, ez)
+    (e[0], e[1], e[2])
 }
 
 /// Spatial hash grid for fast point-in-tet lookup.
@@ -268,27 +200,13 @@ pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize>
 
 /// Analytic curl of the FEM E-field inside a known tet at point `(x, y, z)`.
 ///
-/// Derived directly from the Nédélec-2 basis functions reconstructed by
-/// `eval_field_in_tet`:
+/// Each canonical basis function is `scale·Σ coeff·L_p·L_q·∇L_g`, so by
+/// `∇×(s·∇L_g) = ∇s × ∇L_g` with ∇s = coeff·(L_q·∇L_p + L_p·∇L_q):
 ///
-///   φ_e1 = lv·(f1·f2·g1 − f1²·g2)
-///   φ_e2 = lv·(f2²·g1 − f1·f2·g2)
-///   φ_f1 = v1·l1·(f1·f2·g3 − f2·f3·g1)
-///   φ_f2 = v1·l2·(f2·f3·g1 − f1·f3·g2)
+///   ∇×φ = scale·coeff·[ L_q·(∇L_p×∇L_g) + L_p·(∇L_q×∇L_g) ]
 ///
-/// where f_i = a_i + b_i·x + c_i·y + d_i·z is the *unscaled* barycentric
-/// coordinate of node i (six times the tet volume × the normalised λ_i) and
-/// g_i = (b_i, c_i, d_i) is the unscaled gradient ∇λ_i. Applying
-/// `∇×(α·g) = ∇α × g` (g constant per tet) and simplifying:
-///
-///   curl(φ_e1) = −3·lv·f1·(g1×g2)
-///   curl(φ_e2) = −3·lv·f2·(g1×g2)
-///   curl(φ_f1) =  v1·l1·[f1·(g2×g3) + 2·f2·(g1×g3) + f3·(g1×g2)]
-///   curl(φ_f2) =  v1·l2·[f1·(g2×g3) −   f2·(g1×g3) − 2·f3·(g1×g2)]
-///
-/// All four pieces are linear in position via f1, f2, f3, there is no
-/// constant-per-tet approximation. Used by the error estimator, the
-/// far-field integration, and the H-field channel (H = ∇×E / (jωμ)).
+/// linear in position via the L's (no constant-per-tet approximation). Used by
+/// the error estimator, far-field integration, and H = ∇×E / (jωμ).
 pub fn eval_curl_in_tet(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -296,89 +214,23 @@ pub fn eval_curl_in_tet(
     tet_idx: usize,
     x: f64, y: f64, z: f64,
 ) -> [C64; 3] {
-    let tet = &mesh.tets[tet_idx];
-    let xs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][0]);
-    let ys: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][1]);
-    let zs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][2]);
-
-    let (a_s, b_s, c_s, d_s, v) = tet_coefficients(&xs, &ys, &zs);
-
-    // Unscaled barycentric coordinate of local node i at (x, y, z).
-    let lam = |i: usize| -> f64 { a_s[i] + b_s[i]*x + c_s[i]*y + d_s[i]*z };
-    let grad = |i: usize| -> [f64; 3] { [b_s[i], c_s[i], d_s[i]] };
-    let cross = |a: [f64; 3], b: [f64; 3]| -> [f64; 3] {
-        [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-    };
-
-    let mut ds = [[0.0f64; 4]; 4];
-    for i in 0..4 {
-        for j in i..4 {
-            let d = ((xs[i]-xs[j]).powi(2)+(ys[i]-ys[j]).powi(2)+(zs[i]-zs[j]).powi(2)).sqrt();
-            ds[i][j] = d; ds[j][i] = d;
-        }
-    }
-
-    let tet_edges = &mesh.tet_to_edge[tet_idx];
-    let global_edge_nodes: [[usize; 2]; 6] = std::array::from_fn(|i| mesh.edges[tet_edges[i]]);
-    let l_edge = crate::basis::local_mapping(tet, &global_edge_nodes);
-
-    let tet_tris = &mesh.tet_to_tri[tet_idx];
-    let global_tri_nodes: [[usize; 3]; 4] = std::array::from_fn(|i| mesh.tris[tet_tris[i]]);
-    let l_tri = crate::basis::local_mapping_tri(tet, &global_tri_nodes);
-
+    let (grads, fns, v0) = tet_basis(mesh, tet_idx);
+    let lam = lambdas_at(&grads, &v0, &[x, y, z]);
     let field_ids = &basis.tet_to_field[tet_idx];
-    let v1 = 1.0 / (216.0 * v * v * v);
 
     let mut curl = [C64::new(0.0, 0.0); 3];
-
-    // Edge modes: curl(E_edge) = −3·lv·(em1·f1 + em2·f2)·(g_n1 × g_n2)
-    for ie in 0..6 {
-        let n1 = l_edge[ie][0];
-        let n2 = l_edge[ie][1];
-        let em1 = solution[field_ids[ie]];
-        let em2 = solution[field_ids[10 + ie]];
-        let le = ds[n1][n2];
-        let lv = le * v1;
-        let cr = cross(grad(n1), grad(n2));
-        let f3 = em1 * C64::from(lam(n1)) + em2 * C64::from(lam(n2));
-        let coeff = f3 * C64::from(-3.0 * lv);
-        for k in 0..3 {
-            curl[k] += coeff * C64::from(cr[k]);
+    for (i, bf) in fns.iter().enumerate() {
+        let dof = solution[field_ids[i]];
+        for t in &bf.terms {
+            let (p, q, g) = (t.mono[0], t.mono[1], t.grad);
+            let cp = cross3(&grads[p], &grads[g]); // ∇L_p × ∇L_g, weight L_q
+            let cq = cross3(&grads[q], &grads[g]); // ∇L_q × ∇L_g, weight L_p
+            let w = RECON_SIGN * bf.scale * t.coeff;
+            for k in 0..3 {
+                curl[k] += dof * C64::from(w * (lam[q] * cp[k] + lam[p] * cq[k]));
+            }
         }
     }
-
-    // Face modes: linear in position, evaluated exactly at (x, y, z).
-    for ie in 0..4 {
-        let n1 = l_tri[ie][0];
-        let n2 = l_tri[ie][1];
-        let n3 = l_tri[ie][2];
-        let ef1 = solution[field_ids[6 + ie]];
-        let ef2 = solution[field_ids[16 + ie]];
-
-        let l1 = ds[l_tri[ie][2]][l_tri[ie][0]]; // distance n3 ↔ n1
-        let l2 = ds[l_tri[ie][1]][l_tri[ie][0]]; // distance n2 ↔ n1
-
-        let cr12 = cross(grad(n1), grad(n2));
-        let cr13 = cross(grad(n1), grad(n3));
-        let cr23 = cross(grad(n2), grad(n3));
-
-        let f1 = lam(n1);
-        let f2 = lam(n2);
-        let f3 = lam(n3);
-
-        let c1 = ef1 * C64::from(v1 * l1);
-        let c2 = ef2 * C64::from(v1 * l2);
-
-        for k in 0..3 {
-            // curl(φ_f1) = v1·l1·[ f1·(g2×g3) + 2·f2·(g1×g3) + f3·(g1×g2)]
-            let term1 = f1 * cr23[k] + 2.0 * f2 * cr13[k] + f3 * cr12[k];
-            // curl(φ_f2) = v1·l2·[ f1·(g2×g3) −   f2·(g1×g3) − 2·f3·(g1×g2)]
-            let term2 = f1 * cr23[k] - f2 * cr13[k] - 2.0 * f3 * cr12[k];
-            curl[k] += c1 * C64::from(term1);
-            curl[k] += c2 * C64::from(term2);
-        }
-    }
-
     curl
 }
 

@@ -14,7 +14,7 @@
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
-use crate::tet_assembly::assemble_global_matrices;
+use crate::tet_assembly_r2::assemble_global_matrices;
 use crate::constants::*;
 use std::collections::HashSet;
 
@@ -68,7 +68,7 @@ pub fn solve_eigenmode(
     eprintln!("  Eigenmode: {} free DOFs, target={:.4e} Hz", n_free, target_freq);
 
     // Shift σ = (2πf/c)²
-    let k0_target = 2.0 * PI * target_freq / C0;
+    let k0_target = crate::excitation::Excitation::new(target_freq, mesh.l0).k0;
     let sigma = C64::from(k0_target * k0_target);
 
     // Build COO for (E - σB) and B, filtered to free DOFs
@@ -214,7 +214,8 @@ pub fn solve_eigenmode(
     modes.sort_by(|a, b| (a.0 - sigma).norm().partial_cmp(&(b.0 - sigma).norm()).unwrap());
 
     Ok(modes.into_iter().take(n_modes).map(|(lambda, field)| {
-        let k0 = lambda.sqrt();
+        // λ = κ², so √λ = κ = k₀·L₀; recover the physical frequency by /L₀.
+        let k0 = lambda.sqrt() / C64::from(mesh.l0);
         let freq = k0 * C64::from(C0 / (2.0 * PI));
         let q = if freq.im.abs() > SINGULAR_EPS { 0.5 * freq.re / freq.im.abs() } else { f64::INFINITY };
         Eigenmode { frequency: freq, q_factor: q, eigenvalue: lambda, field }

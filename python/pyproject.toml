@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rapidfem"
-version = "0.12.0"
+version = "0.13.1"
 description = "Frequency-domain electromagnetic FEM solver in Rust, with a Python API and an optional local web UI."
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -37,6 +37,17 @@ dependencies = [
 ui = [
     "flask>=3.0",
     "flask-sock>=0.7",
+]
+test = [
+    "pytest>=8.0",
+    "scipy>=1.11",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: full FD sweep / TD transient (minutes); opt out with -m 'not slow'",
+    "phenomenon: a physics-phenomenon geometry test (vs harness self-test)",
 ]
 
 [project.urls]

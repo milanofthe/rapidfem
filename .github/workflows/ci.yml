@@ -5,13 +5,15 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"   # nightly: full physics validation suite
 
 permissions:
   contents: read
 
 jobs:
   rust:
-    name: cargo build + test (workspace)
+    name: cargo test (core + fd + kernel goldens)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -19,21 +21,76 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # The Rust solver crates. rapidfem-python is a pyo3 cdylib built by
-      # maturin, not plain cargo, so it is excluded here.
+      # maturin (see the python jobs), not plain cargo, so it is excluded here.
       - name: Build
         run: cargo build --workspace --exclude rapidfem-python
 
-      # Compile-check the optional OpenCL GPU backend. OpenCL is loaded at
-      # runtime through the ICD loader, so this builds with no OpenCL SDK
-      # on the runner; the GPU unit tests need a real device and run
-      # locally with `cargo test -p rapidfem-td --features gpu`.
+      # Compile-check the optional OpenCL GPU backend (no device needed; the
+      # GPU unit tests run locally with a real device).
       - name: Build (gpu feature)
         run: cargo build -p rapidfem-td --features gpu
 
-      # Element-level accuracy and math-kernel checks only (fast, no real
-      # geometry). The DGTD validation suite (rapidfem-td) runs full
-      # transient solves on meshes - far too slow for CI; run it locally
-      # with `cargo test -p rapidfem-td`. The Build step above still
-      # compile-checks rapidfem-td.
-      - name: Test
+      # core/fd unit + sympy golden tests (element, coefficients, tri-mass,
+      # waveguide-modal, port_eigen cutoffs, Debye, material tensors, interp).
+      - name: Test core + fd
         run: cargo test --release -p rapidfem-core -p rapidfem-fd
+
+      # TD sympy/analytical kernel goldens (fast). The full DGTD transient
+      # validation suite is slow (real meshes) — run it locally with
+      # `cargo test -p rapidfem-td`.
+      - name: Test td kernel goldens
+        run: >
+          cargo test -p rapidfem-td
+          --test dg_basis_golden_test
+          --test rhs_curl_golden_test
+          --test propagator_expm_test
+          --test lserk4_convergence_test
+
+  python-fast:
+    name: pytest (kernel + fast, no solves)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # gmsh (a runtime dep) needs these shared libs on headless Linux.
+      - name: System deps for gmsh
+        run: sudo apt-get update && sudo apt-get install -y libglu1-mesa libxcursor1 libxft2 libxinerama1 libxrender1
+      # pyproject's readme path is relative to python/; stage the repo-root
+      # README there (a gitignored build artifact) as wheels.yml does, else
+      # maturin's metadata step fails on the missing file.
+      - name: Stage README for maturin
+        run: cp README.md python/README.md
+      - name: Build + install rapidfem (with test extras)
+        run: pip install "./python[test]"
+      - name: Fast tests (renormalization math, no FEM solves)
+        run: cd python && python3 -m pytest -m "not slow" -q
+
+  python-full:
+    name: pytest (full physics suite)
+    runs-on: ubuntu-latest
+    # The phenomenon suite runs real FEM solves (minutes). Gate it to master
+    # pushes, the nightly schedule, and manual dispatch — not every PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/master'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: System deps for gmsh
+        run: sudo apt-get update && sudo apt-get install -y libglu1-mesa libxcursor1 libxft2 libxinerama1 libxrender1
+      # pyproject's readme path is relative to python/; stage the repo-root
+      # README there (a gitignored build artifact) as wheels.yml does, else
+      # maturin's metadata step fails on the missing file.
+      - name: Stage README for maturin
+        run: cp README.md python/README.md
+      - name: Build + install rapidfem (with test extras)
+        run: pip install "./python[test]"
+      - name: Full phenomenon suite (all geometries + goldens)
+        run: cd python && python3 -m pytest -q

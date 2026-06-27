@@ -10,6 +10,53 @@ if TYPE_CHECKING:
     from rapidfem import SweepResult
 
 
+def renormalize_sparams(sparams, z_old, z_new):
+    """Renormalize an S-matrix from per-port reference impedances to a new one.
+
+    Modal ports report S-parameters referenced to their own (frequency-
+    dependent) modal impedance, so a matched modal line reads |S11|≈0 against
+    that self-reference regardless of its characteristic impedance. This
+    re-references the S-matrix to a fixed `z_new` (e.g. 50 Ω) via the standard
+    transform S → normalized-Z → S', so mismatches against the chosen reference
+    appear.
+
+    Parameters
+    ----------
+    sparams : array (n_freq, n, n) complex
+        S-matrix referenced to `z_old`.
+    z_old : array (n_freq, n)
+        Per-port, per-frequency reference impedances (e.g. the ports' modal
+        ``z_mode(f)``).
+    z_new : float or array (n,)
+        Target reference impedance(s).
+
+    Returns
+    -------
+    array (n_freq, n, n) complex
+        S-matrix renormalized to `z_new`. With ``z_new == z_old`` this is the
+        identity; lumped ports (already at a fixed z0) are a no-op.
+    """
+    import numpy as np
+
+    s = np.asarray(sparams, dtype=complex)
+    nf, n, _ = s.shape
+    z_old = np.asarray(z_old, dtype=complex)
+    z_new = np.broadcast_to(np.asarray(z_new, dtype=complex), (n,))
+    eye = np.eye(n)
+    sq_new = np.sqrt(z_new)
+    out = np.empty_like(s)
+    for fi in range(nf):
+        sq_old = np.sqrt(z_old[fi])
+        # S (ref z_old) -> normalized impedance  zbar = (I+S)(I-S)^-1
+        zbar = (eye + s[fi]) @ np.linalg.inv(eye - s[fi])
+        # de-normalize to physical Z, then re-normalize to z_new
+        z_phys = (sq_old[:, None] * zbar) * sq_old[None, :]
+        zbar_new = (z_phys / sq_new[:, None]) / sq_new[None, :]
+        # normalized-Z -> S' (ref z_new)
+        out[fi] = (zbar_new - eye) @ np.linalg.inv(zbar_new + eye)
+    return out
+
+
 def to_network(result: "SweepResult", z0: float = 50.0, name: str | None = None) -> Any:
     """Convert a SweepResult to a `skrf.Network` for downstream RF analysis.
 

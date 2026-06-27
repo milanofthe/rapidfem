@@ -81,7 +81,7 @@ fn main() {
             (result.solutions.first(), result.frequencies.first())
         {
             if let Some(first_sol) = first_freq_sols.first() {
-                let k0 = 2.0 * PI * first_freq / rapidfem_fd::constants::C0;
+                let k0 = rapidfem_fd::excitation::Excitation::new(first_freq, sim.mesh.l0).k0;
                 let n_tets = sim.mesh.n_tets();
                 let materials_opt = if sim.materials.is_empty() {
                     None

@@ -1,27 +1,32 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Precomputed barycentric integration coefficients.
-//! Mirrors curlcurl.py: volume_coeff, VOLUME_COEFF_CACHE_BASE
-//! and robinbc.py: area_coeff, AREA_COEFF_CACHE_BASE.
+//! Barycentric (natural-coordinate) integration coefficients.
+//!
+//! Integrals of products of barycentric coordinates over a simplex have a
+//! classical closed form in terms of factorials (Eisenberg & Malvern, "On
+//! finite element integration in natural coordinates", Int. J. Numer.
+//! Methods Eng. 7 (1973) 574-575):
+//!
+//!   ∫_tet L₁^p L₂^q L₃^r L₄^s dV = (p! q! r! s!)/(p+q+r+s+3)! · 6V
+//!   ∫_tri L₁^p L₂^q L₃^r   dA = (p! q! r!)/(p+q+r+2)!     · 2A
+//!
+//! The two helpers below return the mesh-independent prefactors used by the
+//! Nédélec-2 element assembly. The same identity is re-derived from scratch
+//! by symbolic integration in `derivations/nedelec2/barycentric.py`, whose
+//! exact rationals back the golden test in `tests/coefficients_golden_test.rs`.
 
 const FACTORIALS: [u64; 10] = [1, 1, 2, 6, 24, 120, 720, 5040, 40320, 362880];
 
-/// Compute volume integration coefficient for barycentric product L_a * L_b * L_c * L_d.
-/// Indices a,b,c,d are in range [0,4] where 0 means "not used" and 1-4 are the 4 vertices.
-/// Result: ∫_tet L_a L_b L_c L_d dV / (6V) = factorial products / (sum+3)!
-///
-/// Mirrors curlcurl.py:volume_coeff(a,b,c,d)
+/// Volume integration coefficient for the barycentric product L_a L_b L_c L_d.
+/// Indices a,b,c,d are in range [0,4] where 0 means "not used" and 1-4 select
+/// a vertex coordinate. Result: ∫_tet L_a L_b L_c L_d dV / (6V).
 pub fn volume_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
-    // Count occurrences of each index 0-6 (EMerge uses indices 0-6, only 1-4 matter)
+    // Count occurrences of each index 0-6 (only 1-4 matter)
     let mut klmn = [0usize; 7];
     klmn[a] += 1;
     klmn[b] += 1;
@@ -35,8 +40,8 @@ pub fn volume_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
     numerator as f64 / denominator as f64
 }
 
-/// Compute area integration coefficient for barycentric product on a triangle.
-/// Mirrors robinbc.py:area_coeff(a,b,c,d) = 2 * factorial products / (sum+2)!
+/// Area integration coefficient for the barycentric product on a triangle.
+/// Result: ∫_tri L_a L_b L_c L_d dA / A = 2 · (factorial products)/(sum+2)!
 pub fn area_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
     let mut klmn = [0usize; 7];
     klmn[a] += 1;

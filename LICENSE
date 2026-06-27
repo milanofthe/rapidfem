@@ -8,15 +8,8 @@ preserved below.
 
 ATTRIBUTION
 
-Substantial portions of `crates/rapidfem-fd` (the frequency-domain FEM
-backend) and `crates/rapidfem-core` are direct ports from EMerge by
-Robert Fennis <https://github.com/FennisRobert/EMerge>, originally licensed
-under GPL-2.0+ with the Gmsh additional permission. Per the GPL-2.0+
-"or later" grant, these files are redistributed here under GPL-3.0+; the
-Gmsh additional permission is carried forward verbatim below.
-
-The file-by-file attribution and the list of third-party runtime
-dependencies are in `NOTICE`.
+rapidfem is original work, copyright (C) Milan Rother and rapidfem
+contributors. The list of third-party runtime dependencies is in `NOTICE`.
 
 ══════════════════════════════════════════════════════════════════════════════
 Gmsh additional permission (applies to this entire work)

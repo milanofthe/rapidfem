@@ -149,8 +149,15 @@ pub enum PortConfig {
     #[serde(rename = "lumped")]
     Lumped {
         tag: i32,
+        /// Reference resistance R (Ω); S-parameters normalise to this.
         #[serde(default = "default_z0")]
         z0: f64,
+        /// Series inductance L (H) of the port termination; 0 ⇒ none.
+        #[serde(default)]
+        l: f64,
+        /// Series capacitance C (F) of the port termination; None ⇒ none.
+        #[serde(default)]
+        c: Option<f64>,
         direction: [f64; 3],
         #[serde(default)]
         width: f64,
@@ -243,6 +250,26 @@ pub enum PortConfig {
         #[serde(default)]
         zs: Option<[f64; 2]>,
     },
+}
+
+impl PortConfig {
+    /// Physical-group tag of the face this port / boundary condition occupies.
+    /// Every variant carries the face tag as its first field; used to know
+    /// which boundary faces are "assigned" when defaulting the rest to PEC.
+    pub fn tag(&self) -> i32 {
+        match self {
+            PortConfig::Rectangular { tag, .. }
+            | PortConfig::Floquet { tag, .. }
+            | PortConfig::UserDefined { tag, .. }
+            | PortConfig::Coax { tag, .. }
+            | PortConfig::Lumped { tag, .. }
+            | PortConfig::Abc { tag }
+            | PortConfig::Pmc { tag }
+            | PortConfig::LumpedElement { tag, .. }
+            | PortConfig::WaveNumerical { tag, .. }
+            | PortConfig::SurfaceImpedance { tag, .. } => *tag,
+        }
+    }
 }
 
 /// Perfectly Matched Layer region. Tets in `volume_tag` get coordinate-stretched

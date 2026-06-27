@@ -6,11 +6,12 @@
 
 Electromagnetic FEM solver written in Rust, distributed as a Python package
 on PyPI. Two backends behind one geometry/material/physics API: a
-**frequency-domain** solver (second-kind Nedelec edge elements,
+**frequency-domain** solver (Nédélec first-kind order-2 edge elements,
 complex-symmetric sparse linear algebra) and a **time-domain** DGTD solver
-(discontinuous Galerkin, Krylov/ETD exponential time integration, model-order
-reduction). Optional Flask-based local UI with a code editor and live
-geometry viewer.
+(discontinuous Galerkin, Krylov/ETD exponential time integration,
+model-order reduction). The solver is scale-invariant, so sub-micron RFIC
+passives (with GDS / PDK-stack import) solve as reliably as metre-scale
+structures. Optional Flask-based local UI with code editor and live viewer.
 
 ## Install
 
@@ -21,9 +22,8 @@ pip install rapidfem[ui]        # solver + local UI
 
 Wheels for Windows, Linux, and macOS are built via CI. The Rust core is
 compiled ahead of time — no Rust toolchain required on the user's machine.
-
-Gmsh (Python wheel `gmsh`) is pulled in automatically as a dependency and
-provides the OpenCASCADE-based geometry + mesher used by `rapidfem.Geometry`.
+Gmsh (Python wheel `gmsh`) is pulled in automatically and provides the
+OpenCASCADE-based geometry + mesher used by `rapidfem.Geometry`.
 
 ## Quick start (Python API)
 
@@ -43,18 +43,20 @@ rf.PEC(*air.faces.unassigned)
 g.mesh()
 
 # Define the problem once, run any number of analyses on it
-prob = rf.Problem(g)
+prob = rf.Problem(g)                      # Problem is the frequency-domain ProblemFD
 result = prob.sweep(np.linspace(8e9, 12e9, 21))
 print(result.frequencies.shape, result.sparams.shape)
 
 # Same Problem can also drive an eigenmode solve or a far-field pattern:
-# modes  = prob.eigenmode(target_frequency=10e9, n_modes=6)
+# modes   = prob.eigenmode(target_frequency=10e9, n_modes=6)
 # pattern = prob.farfield(result, freq_idx=10, port_idx=0)
 ```
 
-See `python_src/rapidfem/examples/` for end-to-end runs of microstrip lines,
-patch and Vivaldi antennas (PML enclosure + far-field), pyramidal horns, iris
-filters, dielectric resonators, and more.
+See `python_src/rapidfem/examples/` for end-to-end runs: microstrip and
+coupled lines, iris / stepped-impedance filters, patch / Vivaldi / inverted-F
+antennas (PML + far-field), pyramidal horns, dielectric resonators, and the
+`fd_rfic_*` on-chip passives. RFIC geometry comes from a process stack and
+layout via `rapidfem.rfic` (`rfic.Stack`, `Geometry.from_gds`).
 
 ## Importing external CAD and meshes
 
@@ -111,79 +113,57 @@ CAD unit. See `examples/fd_step_import.py` for a full STEP-driven sweep.
 rapidfem serve ./my_project/
 ```
 
-Opens a browser window with:
-
-- a CodeMirror Python editor on the left,
-- a 3D geometry / mesh / field viewer on the right (raw WebGL2, viridis
-  colormap for scalar fields),
-- S-parameter plots in a separate tab,
-- a `Generate Mesh` button (gmsh) and a `Run Simulation` button (FEM sweep).
-
-The geometry view updates automatically every time you save the file
-(`Ctrl+S`). Mesh and solver runs are explicit.
-
-Results stream in as the solve runs (geometry and mesh as they are built,
-S-parameters per frequency during a sweep); fields are fetched on demand as
-you scrub frequency and port. Files are managed in the browser with
-Save / Save As, and bundled examples open as unsaved buffers (nothing is
-written to the working directory until you save it).
-
-Use `rapidfem.show(g)` at the bottom of your script to send a geometry to
-the viewer.
+Opens a browser window with a CodeMirror Python editor, a 3D geometry / mesh /
+field viewer (raw WebGL2), and S-parameter plots. The geometry view updates
+on save (`Ctrl+S`); mesh and solver runs are explicit. Results stream in as
+the solve runs; fields are fetched on demand as you scrub frequency and port.
+Use `rapidfem.show(g)` to send a geometry to the viewer.
 
 ## Features
 
-- **Geometry builder** — OpenCASCADE primitives (box, cylinder, plate,
-  polygon, disc, ...) with boolean ops, transforms (translate, mirror, copy,
-  array) and fillet/chamfer; ready-made RF structures in `rf.structures`
-  (coax, microstrip, CPW, stripline, rectangular / circular waveguide, helix)
-  build geometry and optional ports in one call
+- **Geometry builder** — OpenCASCADE primitives with boolean ops, transforms
+  and fillet/chamfer; ready-made RF structures in `rf.structures` (coax,
+  microstrip, CPW, stripline, waveguides, helix) build geometry + ports in one
+  call
 - **External CAD / mesh import** — `g.load(path)` pulls in STEP / IGES / BREP
   solids as fully composable primitives, heals STL surfaces into meshable
   solids, or loads a pre-built `.msh` and exposes its named physical groups
-  for material / physics binding (GDSII layouts via `g.from_gds`)
-- **Nedelec-2 elements** — 20 DOFs per tetrahedron, vector edge basis for the
-  curl–curl form of Maxwell's equations
+  for material / physics binding
+- **RFIC / GDS** — `rapidfem.rfic` process stacks and `Geometry.from_gds` build
+  on-chip passives, solved scale-invariantly down to sub-micron features
+- **Canonical Nédélec R2 elements** — first-kind order-2 curl–curl vector
+  element, 20 DOFs per tetrahedron
 - **Excitations** — rectangular waveguide ports (arbitrary TE modes), lumped
-  ports (TEM, multi-line voltage integral), coax and wave ports, and a
-  first-order absorbing boundary condition
+  ports (TEM, multi-line voltage integral), coax and wave ports, Floquet
+  plane-wave port (normal incidence), first-order absorbing boundary
 - **PML** — anisotropic stretched-coordinate perfectly matched layer
-- **Lossy materials** — complex permittivity with loss tangent + conductivity;
-  frequency-independent caching speeds up sweeps
+- **Lossy materials** — complex permittivity with loss tangent + conductivity,
+  surface impedance for metals, Debye dispersion; cached across sweeps
 - **Sparse solvers** — pure-Rust [`faer`](https://github.com/sarah-quinones/faer-rs)
-  LU as a no-dependency baseline; optional MKL PARDISO
-  (complex-symmetric LDLᵀ) on Windows / Linux; Apple Accelerate
-  Bunch-Kaufman on macOS (~3× faster than faer)
+  LU baseline; optional MKL PARDISO (complex-symmetric LDLᵀ) on Windows / Linux;
+  Apple Accelerate Bunch-Kaufman on macOS (~3× faster than faer)
 - **Frequency sweep** — assembles E/B once, refactors only the frequency-
   dependent K per point, reuses the symbolic LU pattern
 - **Eigenmode solver** — shift-invert Lanczos on the complex-symmetric system
-- **Adaptive refinement** — residual error estimator (volume residual + face
-  jumps) with Dörfler marking, exports a size field for gmsh re-meshing
+- **Adaptive refinement** — residual error estimator with Dörfler marking,
+  exports a size field for gmsh re-meshing
 - **Output** — Touchstone (.s1p/.s2p/.snp), VTK field export, far-field NFFT
-  (Huygens surface auto-detected from an ABC boundary, or marked with
-  `rf.FarFieldSurface` for a PML-truncated open region)
 - **Parallel assembly** — rayon-based element matrix evaluation
 
 ## Time-domain backend (DGTD)
 
-Alongside the frequency-domain solver, RapidFEM has a **time-domain
-discontinuous-Galerkin (DGTD)** backend — `ProblemTD`, behind the same
-geometry / material / physics API. Where `ProblemFD` answers "what are the
-S-parameters", `ProblemTD` compiles a structure into an explicit linear
-ODE `dy/dt = A·y` and exposes it as a *model* at every level of
-abstraction.
+`ProblemTD`, behind the same API, compiles a structure into an explicit linear
+ODE `dy/dt = A·y` and exposes it as a model at every level:
 
-- **DGTD spatial discretisation** — nodal discontinuous Galerkin on
-  tetrahedra, upwind or energy-conserving central flux
-- **Exponential time integration** — matrix-free Krylov/ETD propagator,
-  exact for the linear system at any step size (no CFL limit)
-- **Model export** — the right-hand side, the verbatim sparse operator
-  `A`, an exponential stepper, or a handoff to an external ODE integrator
-- **Model-order reduction** — Krylov-projected reduced models
-- **Materials** — heterogeneous, lossy, diagonal-anisotropic and Debye
-  dispersive media; matched absorbing layers
-- **Output** — field probes, the RFT transfer function, VTK
-  field-animation export
+- **DGTD** — nodal discontinuous Galerkin on tetrahedra, upwind or
+  energy-conserving central flux
+- **Exponential time integration** — matrix-free Krylov/ETD propagator, exact
+  for the linear system at any step size (no CFL limit)
+- **Model export / reduction** — the RHS, the verbatim sparse operator `A`, an
+  exponential stepper, or Krylov-projected reduced models
+- **Materials** — heterogeneous, lossy, anisotropic and Debye dispersive media;
+  matched absorbing layers; periodic boundaries
+- **Output** — field probes, RFT transfer function, VTK field-animation export
 
 ```python
 import rapidfem as rf
@@ -194,30 +174,20 @@ rom  = ptd.reduce(y0, dim=60)                   # model-order reduction
 A    = ptd.state_space()                        # the verbatim operator
 ```
 
-The time-domain backend is cross-validated against the frequency-domain
-solver (0.04 % agreement on a shared cavity). Full method notes and the
-`ProblemTD` API reference are in [`docs/td-backend.md`](docs/td-backend.md).
+Method notes and the `ProblemTD` API are in [`docs/td-backend.md`](docs/td-backend.md).
 
 ## Solver backends
 
 | Solver | Type | Notes |
 |--------|------|-------|
 | faer | General sparse LU | Pure Rust, no native dependencies — always available |
-| MKL PARDISO | Complex-symmetric LDLᵀ | Fastest path on Windows / Linux; opt-in, requires `mkl_rt` on PATH |
-| Apple Accelerate | Sparse Bunch-Kaufman LDLᵀ | macOS only; ~3× faster than faer, no extra install (ships with macOS) |
+| MKL PARDISO | Complex-symmetric LDLᵀ | Fastest on Windows / Linux; opt-in, needs `mkl_rt` on PATH |
+| Apple Accelerate | Sparse Bunch-Kaufman LDLᵀ | macOS only; ~3× faster than faer, ships with macOS |
 
-Choose at simulation time with the `RAPIDFEM_SOLVER` environment variable
-(`"auto"`, `"pardiso"`, `"accelerate"`, `"faer"`) — set before
-`import rapidfem`. The default `"auto"` tries PARDISO → Accelerate → faer
-in that order, picking the first one that loads.
-
-### Installing MKL (optional)
-
-- **conda**: `conda install mkl`
-- **pip**: `pip install mkl`
-- **Intel oneAPI**: [download](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl-download.html)
-
-Ensure `mkl_rt.dll` (or `mkl_rt.2.dll`) is on the system PATH.
+Select with `RAPIDFEM_SOLVER` (`"auto"`, `"pardiso"`, `"accelerate"`, `"faer"`),
+set before `import rapidfem`. Default `"auto"` tries PARDISO → Accelerate →
+faer. Optional MKL: `conda install mkl` / `pip install mkl` (ensure `mkl_rt`
+is on PATH).
 
 ## Performance
 
@@ -230,41 +200,17 @@ WR-90 iris waveguide driven sweep, 10 GHz, 2-port:
 | 2 595 tets | 19 196 | 0.17 s | 1.39 s |
 | 3 284 tets | 23 968 | 0.21 s | 1.98 s |
 
-Larger problems:
-
-- 327 k DOFs driven sweep (PARDISO): ~5 s per frequency
-- 905 k DOFs eigenmode (3-turn spiral, shift-invert Lanczos): ~54 s
+Larger: 327 k DOFs driven sweep (PARDISO) ~5 s/freq; 905 k DOFs eigenmode
+(3-turn spiral, shift-invert Lanczos) ~54 s.
 
 ## Verification
 
-Element-level functions (curl–curl integrals, Robin BC, second-order ABC,
-mode-power normalization, surface integrals) are checked to machine precision
-(1e-12 – 1e-16) by `cargo test --release`.
+`cargo test --release` checks element-level functions to machine precision
+(1e-12 – 1e-16). End-to-end S-parameter accuracy is tracked in
+`tests/validation/` against analytical solutions and reference solvers.
 
-End-to-end S-parameter accuracy is tracked in `tests/validation/` against
-analytical solutions and external reference solvers.
+## License
 
-```bash
-cargo test --release
-```
-
-## License & attribution
-
-rapidfem is distributed under the [GNU General Public License v3 or
-later](LICENSE), with the original Gmsh additional permission preserved so
-the produced binaries can link Gmsh, Netgen, METIS, OpenCASCADE and ParaView
-under their own licences. For commercial use under different terms, get in
-touch.
-
-Substantial portions of the frequency-domain backend
-(`crates/rapidfem-fd`) and the shared mesh / quadrature / materials code
-(`crates/rapidfem-core`) are direct ports from
-[**EMerge**](https://github.com/FennisRobert/EMerge) by Robert Fennis,
-originally licensed under GPL-2.0+ with the same Gmsh additional permission;
-per the GPL "or later" grant they are redistributed here under GPL-3.0+.
-The wave-port mode eigensolver (`port_eigen.rs`), the time-domain DGTD
-backend (`crates/rapidfem-td`), the Python / web UI layers and the Rust
-build / packaging machinery are original to this project.
-
-See [`NOTICE`](NOTICE) for the file-by-file attribution and the runtime
-third-party dependency list.
+GPL-3.0-or-later with the Gmsh additional permission — see [LICENSE](LICENSE).
+Copyright (C) Milan Rother and rapidfem contributors; commercial terms
+available.

@@ -122,8 +122,13 @@ pub fn compute_farfield_full(
     gq_order: usize,
     radiation_efficiency: Option<f64>,
 ) -> RadiationPattern {
-    let k0 = 2.0 * PI * frequency / C0;
-    let omega = 2.0 * PI * frequency;
+    let exc = crate::excitation::Excitation::new(frequency, mesh.l0);
+    // Lever ④: the near-to-far transform is done entirely in physical units —
+    // surface points/fields are converted to physical below — so use the
+    // physical k₀ here (= κ/L₀), not the length-normalized κ.
+    let l0 = mesh.l0;
+    let k0 = exc.k0 / l0;
+    let omega = exc.omega;
     let j = C64::new(0.0, 1.0);
 
     // Build theta/phi grids
@@ -211,22 +216,25 @@ pub fn compute_farfield_full(
                 });
 
             if let Some(tet) = tet_idx {
-                // E-field
+                // Reconstruct on the (L₀-normalized) mesh, then convert to
+                // physical units: E_recon = L₀·E_phys, curl_recon = L₀²·curl_phys.
+                let il = 1.0 / l0;
                 let (ex, ey, ez) = interp::eval_field_in_tet(mesh, basis, solution, tet, x, y, z);
 
-                // curl(E) = jωμ₀ H  =>  H = curl(E) / (jωμ₀)
+                // curl(E) = jωμ₀ H  =>  H = curl(E) / (jωμ₀); the extra L₀²
+                // (curl normalization) is folded into the denominator.
                 let curl_e = eval_curl_in_tet(mesh, basis, solution, tet, x, y, z);
-                let denom = j * C64::from(omega * MU0);
+                let denom = j * C64::from(omega * MU0 * l0 * l0);
                 let hx = curl_e[0] / denom;
                 let hy = curl_e[1] / denom;
                 let hz = curl_e[2] / denom;
 
                 surf_data.push(SurfPoint {
-                    pos: [x, y, z],
-                    e: [ex, ey, ez],
-                    h: [hx, hy, hz],
-                    normal,
-                    aw: area * w,
+                    pos: [x * l0, y * l0, z * l0],          // physical position
+                    e: [ex * il, ey * il, ez * il],         // physical E (V/m)
+                    h: [hx, hy, hz],                         // physical H (A/m)
+                    normal,                                  // unit vector, scale-free
+                    aw: area * w * l0 * l0,                  // physical area element
                     is_pec,
                 });
             }

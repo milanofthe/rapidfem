@@ -23,6 +23,7 @@ class _GdsMixin:
         flatten: bool = True,
         merge: bool = True,
         thin_conductors: bool = False,
+        scale: float = 1e-6,
     ) -> "Geometry":
         """Load a GDSII layout and extrude all matching polygons into 3D primitives.
 
@@ -86,7 +87,11 @@ class _GdsMixin:
         if bbox is not None:
             xmin, ymin, xmax, ymax = bbox
 
-        g = Geometry(name=cell.name or "gds_import")
+        # scale=1e-6 normalises µm-scale GDS features so gmsh's OCC kernel
+        # applies its relative tolerances at the feature scale; without it,
+        # tight RFIC structures trip OCC "segment/facet intersect" errors and
+        # mesh generation crawls (cf. from_fem_json).
+        g = Geometry(name=cell.name or "gds_import", scale=scale)
         # Group polygons by their PdkLayer (so we name + extrude per-layer).
         per_layer: dict[str, list[np.ndarray]] = {}
         for poly in flat_polys:

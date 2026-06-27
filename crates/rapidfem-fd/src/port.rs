@@ -9,25 +9,26 @@
 //! Assembly uses this trait to handle RectWaveguide, LumpedPort, and ABC uniformly.
 
 use num_complex::Complex64 as C64;
+use crate::excitation::Excitation;
 
-/// Unified port interface matching EMerge's RobinBC abstract class.
+/// Unified port interface for the Robin boundary-condition ports.
 pub trait Port {
     /// Robin BC impedance parameter γ
-    fn get_gamma(&self, k0: f64) -> C64;
+    fn get_gamma(&self, exc: &Excitation) -> C64;
 
     /// Incident field U_inc at a global point (for excitation vector).
     /// Returns None for non-driven ports (e.g. ABC).
-    fn get_uinc(&self, x: f64, y: f64, z: f64, k0: f64) -> Option<[C64; 3]>;
+    fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<[C64; 3]>;
 
     /// Whether this port is driven (has an excitation vector)
     fn is_driven(&self) -> bool;
 
     /// Port mode field at a global point (for S-param extraction).
     /// Returns None for ABC (no S-param extraction).
-    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, k0: f64) -> Option<(f64, f64, f64)>;
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)>;
 
     /// Mode impedance Z_mode (for sparam_field_power/mode_power)
-    fn z_mode(&self, k0: f64) -> f64;
+    fn z_mode(&self, exc: &Excitation) -> f64;
 
     /// Port number (for S-matrix indexing)
     fn port_number(&self) -> usize;
@@ -48,12 +49,12 @@ pub trait Port {
 macro_rules! impl_passive_port {
     ($ty:ty) => {
         impl Port for $ty {
-            fn get_gamma(&self, k0: f64) -> C64 { self.get_gamma(k0) }
-            fn get_uinc(&self, _x: f64, _y: f64, _z: f64, _k0: f64) -> Option<[C64; 3]> { None }
+            fn get_gamma(&self, exc: &Excitation) -> C64 { self.get_gamma(exc) }
+            fn get_uinc(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> Option<[C64; 3]> { None }
             fn is_driven(&self) -> bool { false }
-            fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _k0: f64)
+            fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation)
                 -> Option<(f64, f64, f64)> { None }
-            fn z_mode(&self, _k0: f64) -> f64 { 0.0 }
+            fn z_mode(&self, _exc: &Excitation) -> f64 { 0.0 }
             fn port_number(&self) -> usize { 0 }
         }
     };
@@ -65,16 +66,16 @@ macro_rules! impl_passive_port {
 macro_rules! impl_driven_port {
     ($ty:ty, $z_mode:expr) => {
         impl Port for $ty {
-            fn get_gamma(&self, k0: f64) -> C64 { self.get_gamma(k0) }
-            fn get_uinc(&self, x: f64, y: f64, z: f64, k0: f64) -> Option<[C64; 3]> {
-                Some(self.get_uinc(x, y, z, k0))
+            fn get_gamma(&self, exc: &Excitation) -> C64 { self.get_gamma(exc) }
+            fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<[C64; 3]> {
+                Some(self.get_uinc(x, y, z, exc))
             }
             fn is_driven(&self) -> bool { true }
-            fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, k0: f64)
+            fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation)
                 -> Option<(f64, f64, f64)> {
-                Some(self.port_mode_3d_global(x, y, z, k0))
+                Some(self.port_mode_3d_global(x, y, z, exc))
             }
-            fn z_mode(&self, k0: f64) -> f64 { ($z_mode)(self, k0) }
+            fn z_mode(&self, exc: &Excitation) -> f64 { ($z_mode)(self, exc) }
             fn port_number(&self) -> usize { self.port_number }
         }
     };
@@ -84,25 +85,25 @@ impl_passive_port!(crate::waveguide::LumpedElement);
 impl_passive_port!(crate::waveguide::SurfaceImpedance);
 impl_passive_port!(crate::waveguide::AbsorbingBoundary);
 
-impl_driven_port!(crate::waveguide::RectWaveguide, |p: &crate::waveguide::RectWaveguide, k0| p.z_mode(k0));
-impl_driven_port!(crate::waveguide::FloquetPort, |_p: &crate::waveguide::FloquetPort, _k0| crate::constants::Z0);
+impl_driven_port!(crate::waveguide::RectWaveguide, |p: &crate::waveguide::RectWaveguide, exc| p.z_mode(exc));
+impl_driven_port!(crate::waveguide::FloquetPort, |_p: &crate::waveguide::FloquetPort, _exc: &Excitation| crate::constants::Z0);
 // UserDefinedPort: dummy mode impedance, the user scales via incident power.
-impl_driven_port!(crate::waveguide::UserDefinedPort, |_p: &crate::waveguide::UserDefinedPort, _k0| 1.0);
-impl_driven_port!(crate::waveguide::CoaxPort, |p: &crate::waveguide::CoaxPort, _k0| p.port_z());
-impl_driven_port!(crate::waveguide::NumericalWavePort, |p: &crate::waveguide::NumericalWavePort, k0| p.z_mode(k0));
+impl_driven_port!(crate::waveguide::UserDefinedPort, |_p: &crate::waveguide::UserDefinedPort, _exc: &Excitation| 1.0);
+impl_driven_port!(crate::waveguide::CoaxPort, |p: &crate::waveguide::CoaxPort, _exc: &Excitation| p.port_z());
+impl_driven_port!(crate::waveguide::NumericalWavePort, |p: &crate::waveguide::NumericalWavePort, exc| p.z_mode(exc));
 
 // LumpedPort is driven AND lumped (voltage extraction), so it adds the lumped
 // trait methods on top of the driven pattern and stays hand-written.
 impl Port for crate::waveguide::LumpedPort {
-    fn get_gamma(&self, k0: f64) -> C64 { self.get_gamma(k0) }
-    fn get_uinc(&self, x: f64, y: f64, z: f64, k0: f64) -> Option<[C64; 3]> {
-        Some(self.get_uinc(x, y, z, k0))
+    fn get_gamma(&self, exc: &Excitation) -> C64 { self.get_gamma(exc) }
+    fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<[C64; 3]> {
+        Some(self.get_uinc(x, y, z, exc))
     }
     fn is_driven(&self) -> bool { true }
-    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, k0: f64) -> Option<(f64, f64, f64)> {
-        Some(self.port_mode_3d_global(x, y, z, k0))
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some(self.port_mode_3d_global(x, y, z, exc))
     }
-    fn z_mode(&self, _k0: f64) -> f64 { self.z0 }
+    fn z_mode(&self, _exc: &Excitation) -> f64 { self.z0 }
     fn port_number(&self) -> usize { self.port_number }
     fn is_lumped(&self) -> bool { true }
     fn lumped_voltage_params(&self) -> Option<([f64; 3], f64, f64)> {

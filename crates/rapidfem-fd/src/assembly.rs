@@ -1,33 +1,31 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Exact port of assembler.py: assemble_freq_matrix + solve pipeline.
+//! Frequency-domain assemble-and-solve pipeline.
 //!
-//! Follows EMerge's assembly order exactly:
-//! 1. E, B = tet_mass_stiffness_matrices
-//! 2. K = (E - k0² * B).tocsr()
-//! 3. PEC: collect DOFs from edge_to_field and tri_to_field for PEC faces
-//! 4. Robin: Bempty = empty_tri_matrix(); compute_bc_entries; K += generate_csr(Bempty)
-//! 5. Port vectors: assemble_robin_bc_bvec (generate_points_3d + compute_force_entries)
-//! 6. Eliminate PEC DOFs, solve K*x = b
+//! The standard vector-FEM driven-problem assembly:
+//! 1. element stiffness E and mass B from the R2 volume assembly,
+//! 2. system matrix K = E − k₀²·B,
+//! 3. PEC: drop the DOFs on perfect-conductor faces,
+//! 4. Robin: add the port-surface boundary term to K,
+//! 5. port excitation vector b from the incident modes,
+//! 6. eliminate the constrained DOFs and solve K·x = b per driven port.
+//!
+//! The sweep variant caches E/B for frequency-independent materials and reuses
+//! the solver's symbolic factorisation across frequencies.
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
 use crate::port::Port;
-use crate::tet_assembly::assemble_global_matrices;
-use crate::tri_assembly::{ned2_tri_stiff, ned2_tri_force};
+use crate::tet_assembly_r2::assemble_global_matrices;
+use crate::tri_assembly_r2::{ned2_tri_stiff, ned2_tri_force};
 use crate::coefficients::AreaCoeffCache;
 use crate::quadrature::gaus_quad_tri;
-use crate::constants::PI;
 use std::collections::HashSet;
 
 pub struct SolveResult {
@@ -35,8 +33,36 @@ pub struct SolveResult {
     pub n_field: usize,
 }
 
-/// Exact port of assembler.py:assemble_freq_matrix + solve.
-/// Now accepts any Port type via trait objects.
+/// Symmetric diagonal (Jacobi) equilibration of a COO system: returns S with
+/// S_i = 1/√|K_ii|. Solving (S K S)(S⁻¹x) = S b and recovering x = S y is a
+/// diagonal similarity, so the solution is exact up to the now-better-
+/// conditioned factorisation. It improves the backward error when DOFs span
+/// very different scales (mixed materials/PML, sliver-adjacent rows). On a
+/// uniform, well-shaped mesh S is ≈ constant and the transform is a no-op.
+/// See `derivations/conditioning/`.
+fn equilibration_scaling(n: usize, rows: &[usize], cols: &[usize], vals: &[C64]) -> Vec<f64> {
+    let mut diag = vec![C64::new(0.0, 0.0); n];
+    for k in 0..rows.len() {
+        if rows[k] == cols[k] {
+            diag[rows[k]] += vals[k];
+        }
+    }
+    diag.iter().map(|d| {
+        let m = d.norm();
+        if m > crate::constants::SINGULAR_EPS { 1.0 / m.sqrt() } else { 1.0 }
+    }).collect()
+}
+
+/// Scale a COO system in place to S K S.
+#[inline]
+fn apply_equilibration(rows: &[usize], cols: &[usize], vals: &mut [C64], s: &[f64]) {
+    for k in 0..rows.len() {
+        vals[k] *= s[rows[k]] * s[cols[k]];
+    }
+}
+
+/// Assemble the driven system and solve for each driven port. Accepts any
+/// Port type via trait objects.
 pub fn assemble_and_solve(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -59,12 +85,12 @@ pub fn assemble_and_solve_with_pml(
     materials: Option<&[crate::materials::Material]>,
     pml_regions: Option<&[crate::materials::PmlRegion]>,
 ) -> Result<SolveResult, String> {
-    let c0 = crate::constants::C0;
-    let k0 = 2.0 * PI * freq / c0;
+    let exc = crate::excitation::Excitation::new(freq, mesh.l0);
+    let k0 = exc.k0;
     let n_field = basis.n_field;
     let n_tets = mesh.n_tets();
 
-    // Step 1: Build material tensors (exact port of assembler.py lines 280-303)
+    // Step 1: Build per-tet material tensors.
     let (er, ur) = if let Some(pml) = pml_regions {
         crate::materials::build_material_tensors_with_pml(
             n_tets, materials.unwrap_or(&[]), pml, mesh, freq,
@@ -89,7 +115,7 @@ pub fn assemble_and_solve_with_pml(
     let t1 = web_time::Instant::now();
     let k0_sq = C64::from(k0 * k0);
 
-    // Step 3: PEC DOFs, exact port of assembler.py lines 356-373
+    // Step 3: collect the PEC (perfect-conductor) DOFs to constrain.
     let mut pec_ids: HashSet<usize> = HashSet::new();
 
     for &ti in pec_tri_indices {
@@ -110,8 +136,8 @@ pub fn assemble_and_solve_with_pml(
     }
     eprintln!("  PEC DOFs: {} of {}", pec_ids.len(), n_field);
 
-    // Step 4: Robin BC, exact port of assembler.py lines 380-413
-    // Uses EMerge's flat array mechanism: Bempty + compute_bc_entries + generate_csr
+    // Step 4: Robin / port boundary term, accumulated into a flat per-tri
+    // buffer (Bempty) and added to K as COO triplets.
     let ac_base = AreaCoeffCache::new();
     let gauss_points = gaus_quad_tri(4);
 
@@ -119,7 +145,7 @@ pub fn assemble_and_solve_with_pml(
     let mut bempty = basis.empty_tri_matrix();
 
     for (pi, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
-        let gamma = port.get_gamma(k0);
+        let gamma = port.get_gamma(&exc);
 
         // Robin BC stiffness: for each port tri, compute 8x8 and write into flat array
         for &ti in *tri_ids {
@@ -160,7 +186,7 @@ pub fn assemble_and_solve_with_pml(
                 let x = verts[0][0]*l1 + verts[1][0]*l2 + verts[2][0]*l3;
                 let y = verts[0][1]*l1 + verts[1][1]*l2 + verts[2][1]*l3;
                 let z = verts[0][2]*l1 + verts[1][2]*l2 + verts[2][2]*l3;
-                port.get_uinc(x, y, z, k0)
+                port.get_uinc(x, y, z, &exc)
             }).collect();
 
             if u_inc_at_qp.len() == gauss_points.len() {
@@ -214,6 +240,10 @@ pub fn assemble_and_solve_with_pml(
     }
     eprintln!("  COO: {} entries, built in {:.1}ms", coo_rows.len(), t2.elapsed().as_secs_f64()*1e3);
 
+    // Symmetric diagonal equilibration: solve (S K S)(S⁻¹x) = S b, recover x = S y.
+    let s_eq = equilibration_scaling(n_free, &coo_rows, &coo_cols, &coo_vals);
+    apply_equilibration(&coo_rows, &coo_cols, &mut coo_vals, &s_eq);
+
     // Backend-agnostic factor + solve via the SparseSolver trait. Selection
     // honours RAPIDFEM_SOLVER (auto|pardiso|accelerate|faer).
     let mut solver = crate::solver::pick(crate::solver::SolverChoice::from_env());
@@ -223,11 +253,12 @@ pub fn assemble_and_solve_with_pml(
 
     let mut solutions = Vec::new();
     for (pi, bvec) in port_vectors.iter().enumerate() {
-        let b_free: Vec<C64> = free_dofs.iter().map(|&d| bvec[d]).collect();
+        let b_free: Vec<C64> = free_dofs.iter().enumerate()
+            .map(|(fi, &d)| bvec[d] * C64::from(s_eq[fi])).collect();
         let x_free = solver.solve(&b_free)?;
         let mut x_full = vec![C64::new(0.0, 0.0); n_field];
         for (fi, &d) in free_dofs.iter().enumerate() {
-            x_full[d] = x_free[fi];
+            x_full[d] = x_free[fi] * C64::from(s_eq[fi]);
         }
         let xnorm: f64 = x_full.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
         eprintln!("  Port {} solved ({}) in {:.1}ms, ||x|| = {:.6e}",
@@ -350,7 +381,8 @@ pub fn frequency_sweep_with_pml(
 
     for (fi, &freq) in frequencies.iter().enumerate() {
         let t_freq = web_time::Instant::now();
-        let k0 = 2.0 * PI * freq / crate::constants::C0;
+        let exc = crate::excitation::Excitation::new(freq, mesh.l0);
+        let k0 = exc.k0;
         let k0_sq = C64::from(k0 * k0);
         let n_field = basis.n_field;
 
@@ -371,7 +403,7 @@ pub fn frequency_sweep_with_pml(
         // Robin BC (γ frequency-dependent), reuse bempty buffer
         bempty.fill(C64::new(0.0, 0.0));
         for (_, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
-            let gamma = port.get_gamma(k0);
+            let gamma = port.get_gamma(&exc);
             for &ti in *tri_ids {
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
@@ -395,7 +427,7 @@ pub fn frequency_sweep_with_pml(
                         port.get_uinc(
                             verts[0][0]*l1+verts[1][0]*l2+verts[2][0]*l3,
                             verts[0][1]*l1+verts[1][1]*l2+verts[2][1]*l3,
-                            verts[0][2]*l1+verts[1][2]*l2+verts[2][2]*l3, k0)
+                            verts[0][2]*l1+verts[1][2]*l2+verts[2][2]*l3, &exc)
                     }).collect();
                 if u_at_qp.len() == gauss_points.len() {
                     let b_tri = ned2_tri_force(&verts, &u_at_qp, &gauss_points);
@@ -425,6 +457,12 @@ pub fn frequency_sweep_with_pml(
             coo_vals.push(val);
         }
 
+        // Symmetric diagonal equilibration (recomputed per frequency; the
+        // sparsity pattern is unchanged, so the symbolic factorisation reuse
+        // via `refactorize` still holds).
+        let s_eq = equilibration_scaling(n_free, &coo_rows, &coo_cols, &coo_vals);
+        apply_equilibration(&coo_rows, &coo_cols, &mut coo_vals, &s_eq);
+
         // Factor (symbolic once via `factorize`, then `refactorize` per freq
         // reusing the sparsity pattern) and solve via the backend-agnostic
         // SparseSolver trait.
@@ -437,11 +475,12 @@ pub fn frequency_sweep_with_pml(
 
         let mut solutions = Vec::new();
         for bvec in &port_bvecs {
-            let b_free: Vec<C64> = free_dofs.iter().map(|&d| bvec[d]).collect();
+            let b_free: Vec<C64> = free_dofs.iter().enumerate()
+                .map(|(fi_d, &d)| bvec[d] * C64::from(s_eq[fi_d])).collect();
             let x_free = solver.solve(&b_free)?;
             let mut x_full = vec![C64::new(0.0, 0.0); n_field];
             for (fi_d, &d) in free_dofs.iter().enumerate() {
-                x_full[d] = x_free[fi_d];
+                x_full[d] = x_free[fi_d] * C64::from(s_eq[fi_d]);
             }
             solutions.push(x_full);
         }
@@ -464,4 +503,36 @@ pub fn frequency_sweep_with_pml(
     }
 
     Ok(results)
+}
+#[cfg(test)]
+mod conditioning_tests {
+    use super::*;
+
+    /// Equilibration must drive the diagonal magnitudes to ~1 (it is exactly
+    /// 1/√|K_ii| symmetric scaling) — this is what tames a scale-mixed system.
+    #[test]
+    fn equilibration_unit_diagonal() {
+        // 2-DOF system with a 1e8 spread between the two diagonals.
+        let rows = vec![0, 0, 1, 1];
+        let cols = vec![0, 1, 0, 1];
+        let mut vals = vec![
+            C64::new(1e6, 0.0), C64::new(1.0, 0.0),
+            C64::new(1.0, 0.0), C64::new(1e-2, 0.0),
+        ];
+        let s = equilibration_scaling(2, &rows, &cols, &vals);
+        apply_equilibration(&rows, &cols, &mut vals, &s);
+        // diagonal entries are vals[0] (0,0) and vals[3] (1,1)
+        assert!((vals[0].norm() - 1.0).abs() < 1e-12, "diag0 = {}", vals[0].norm());
+        assert!((vals[3].norm() - 1.0).abs() < 1e-12, "diag1 = {}", vals[3].norm());
+    }
+
+    /// On a system that is already uniformly scaled, equilibration is ~identity.
+    #[test]
+    fn equilibration_noop_on_uniform() {
+        let rows = vec![0, 1];
+        let cols = vec![0, 1];
+        let vals = vec![C64::new(2.0, 0.0), C64::new(2.0, 0.0)];
+        let s = equilibration_scaling(2, &rows, &cols, &vals);
+        for &si in &s { assert!((si - 1.0 / 2.0_f64.sqrt()).abs() < 1e-12); }
+    }
 }

@@ -11,6 +11,7 @@
 pub mod constants;
 pub mod quadrature;
 pub mod mesh;
+pub mod quality;
 pub mod mesh_io;
 pub mod materials;
 pub mod port_eigen;

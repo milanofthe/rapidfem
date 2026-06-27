@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Physical constants (mirrors emerge/_emerge/const.py).
+//! Physical constants and solver tolerances.
+//!
+//! The electromagnetic constants are SI / CODATA reference values; c₀ is the
+//! exact SI definition and the rest follow from ε₀ = 1/(μ₀c₀²), Z₀ = μ₀c₀.
+//! The numerical tolerances below are rapidfem-specific.
 
-pub const C0: f64 = 299_792_458.0;                    // Speed of light (m/s)
-pub const Z0: f64 = 376.73031366857;                   // Free space impedance (Ω)
-pub const EPS0: f64 = 8.854187818814e-12;              // Permittivity of free space (F/m)
-pub const MU0: f64 = 1.0 / (C0 * C0 * EPS0);          // Permeability of free space (H/m)
+pub const C0: f64 = 299_792_458.0;                    // Speed of light (m/s), exact SI
+pub const Z0: f64 = 376.73031366857;                   // Free-space impedance √(μ₀/ε₀) (Ω)
+pub const EPS0: f64 = 8.854187818814e-12;              // Vacuum permittivity ε₀ (F/m)
+pub const MU0: f64 = 1.0 / (C0 * C0 * EPS0);          // Vacuum permeability μ₀ = 1/(ε₀c₀²) (H/m)
 pub const PI: f64 = std::f64::consts::PI;
 
 // --- Numerical tolerances ---
@@ -27,6 +27,17 @@ pub const SINGULAR_EPS: f64 = 1e-30;
 
 /// Barycentric-coordinate slack for point-in-tetrahedron containment.
 pub const POINT_IN_TET_EPS: f64 = 1e-8;
+
+/// Normalized tet volume q = 6V / h_mean³ below which the element is treated as
+/// numerically degenerate and its volume is floored so the assembly cannot emit
+/// NaN/Inf. The conditioning of the canonical R2 element scales like (1/q)², so
+/// q ≈ 1e-9 corresponds to cond ≳ 1/u (numerically singular); see
+/// `derivations/conditioning/`.
+pub const SLIVER_NORMVOL_FLOOR: f64 = 1e-9;
+
+/// Normalized tet volume below which a mesh-load quality warning is emitted
+/// (cond ≳ 1e12 — a real conditioning concern, well before the hard floor).
+pub const SLIVER_NORMVOL_WARN: f64 = 1e-6;
 
 /// Lanczos lucky-breakdown threshold for the eigenmode solver: the Krylov
 /// subspace stops growing once the next vector's norm drops below this.

@@ -1,26 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Exact port of sparam.py: S-parameter extraction via surface integrals.
+//! S-parameter extraction via port surface integrals.
 //!
-//! Functions: sparam_waveport, sparam_field_power, sparam_mode_power, sparam_voltage
-//! Also includes surface_integral from integrals.py.
-//!
-//! All functions accept &dyn Port via the port trait.
+//! Standard modal post-processing (Pozar, *Microwave Engineering*, ch. 4;
+//! Jin, *FEM in Electromagnetics*): a port wave amplitude is the overlap of
+//! the simulated field with the port mode, weighted by the local wave
+//! admittance / Poynting factor. `sparam_waveport` returns the amplitude
+//! ratio S; the `*_power` helpers return the Poynting-normalised powers; and
+//! `sparam_voltage_surface` extracts a lumped port's S from the area-averaged
+//! mode-projected voltage `V = (1/w)∫E·l̂ dS` (derivations/lumped_port/).
+//! All accept `&dyn Port` and integrate over the port triangles by Gaussian
+//! quadrature (`surface_integral`).
 
 use num_complex::Complex64 as C64;
 use crate::quadrature::gaus_quad_tri;
 use crate::port::Port;
+use crate::excitation::Excitation;
 
-/// Port of integrals.py: surface_integral
+/// Gauss-quadrature surface integral of a scalar function over a triangle set.
 pub fn surface_integral(
     nodes: &[[f64; 3]],
     triangles: &[[usize; 3]],
@@ -54,8 +56,8 @@ pub fn surface_integral(
     total
 }
 
-/// Port of sparam.py's modal-port S-parameter (EMerge `_compute_s_data` else
-/// branch: `sparam_field_power` / `sparam_mode_power`).
+/// Modal-port S-parameter: amplitude ratio of the reflected/transmitted
+/// power-wave to the incident, by mode overlap.
 ///
 /// S = ∫ (E_field − Q·E_mode)·conj(E_mode)·c dS / ∫ |E_mode|²·c dS
 ///
@@ -71,7 +73,7 @@ pub fn sparam_waveport(
     nodes: &[[f64; 3]],
     tri_verts: &[[usize; 3]],
     port: &dyn Port,
-    k0: f64,
+    exc: &Excitation,
     active: bool,
     fieldf: &dyn Fn(f64, f64, f64) -> (C64, C64, C64),
     weight: &dyn Fn(f64, f64, f64) -> f64,
@@ -80,7 +82,7 @@ pub fn sparam_waveport(
     let q = if active { 1.0 } else { 0.0 };
 
     let mode_dot_field = surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, k0).unwrap_or((0.0, 0.0, 0.0));
+        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
         let (fx, fy, fz) = fieldf(x, y, z);
         let c = C64::from(weight(x, y, z));
 
@@ -92,7 +94,7 @@ pub fn sparam_waveport(
     }, gq_order);
 
     let norm = surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, k0).unwrap_or((0.0, 0.0, 0.0));
+        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
         C64::from(weight(x, y, z) * (mx*mx + my*my + mz*mz))
     }, gq_order);
 
@@ -103,23 +105,23 @@ pub fn sparam_waveport(
     mode_dot_field / norm
 }
 
-/// Port of sparam.py: sparam_field_power
+/// Field power crossing the port: P = ∫ (E−Q·E_mode)·conj(E_mode)/(2·Z_mode) dS.
 ///
 /// P_field = ∫ (E_field - Q·E_mode) · conj(E_mode) / (2·Z_mode) dS
 pub fn sparam_field_power(
     nodes: &[[f64; 3]],
     tri_verts: &[[usize; 3]],
     port: &dyn Port,
-    k0: f64,
+    exc: &Excitation,
     active: bool,
     fieldf: &dyn Fn(f64, f64, f64) -> (C64, C64, C64),
     gq_order: usize,
 ) -> C64 {
     let q = if active { 1.0 } else { 0.0 };
-    let z_mode = port.z_mode(k0);
+    let z_mode = port.z_mode(exc);
 
     surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, k0).unwrap_or((0.0, 0.0, 0.0));
+        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
         let (fx, fy, fz) = fieldf(x, y, z);
 
         let ex1 = fx - C64::from(q * mx);
@@ -134,20 +136,20 @@ pub fn sparam_field_power(
     }, gq_order)
 }
 
-/// Port of sparam.py: sparam_mode_power
+/// Reference mode power: P = ∫ |E_mode|²/(2·Z_mode) dS.
 ///
 /// P_mode = ∫ |E_mode|² / (2·Z_mode) dS
 pub fn sparam_mode_power(
     nodes: &[[f64; 3]],
     tri_verts: &[[usize; 3]],
     port: &dyn Port,
-    k0: f64,
+    exc: &Excitation,
     gq_order: usize,
 ) -> C64 {
-    let z_mode = port.z_mode(k0);
+    let z_mode = port.z_mode(exc);
 
     surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, k0).unwrap_or((0.0, 0.0, 0.0));
+        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
         let ex2 = C64::from(mx).conj();
         let ey2 = C64::from(my).conj();
         let ez2 = C64::from(mz).conj();
@@ -166,38 +168,62 @@ pub fn sparam_mode_power(
 ///
 /// For active port (self-excitation):  S = (V_total - V_inc) / V_inc
 /// For passive port (observation only): S = V_total / V_inc
-pub fn sparam_voltage_line(
+///
+/// The reference impedance Z₀ cancels in the wave-amplitude ratio (it enters
+/// `a` and `b` identically), so it is not a parameter here.
+/// Area-averaged mode-projected voltage S-parameter for lumped ports.
+///
+/// Clean-room derivation in `derivations/lumped_port/`: the port voltage is the
+/// transverse-averaged path integral of the SOLVED field over the whole port
+/// surface,
+///
+///   V = (1/w) ∫_Γ E·l̂ dS,   w = area/l   ⇒   V = (l/A) ∫_Γ E·l̂ dS
+///
+/// (`l̂` = port direction, `l` = height along it, `A` = port area). For a
+/// uniform mode `a·l̂` this is exactly the gap voltage `a·l`, but unlike a few
+/// discrete `∫E·dl` lines it stays well-defined when the field is non-uniform
+/// over a TALL port (e.g. a 184 µm RFIC feed), where the line integrals
+/// disagree and the extraction degenerates.
+///
+/// `S_ii = (V - V_inc)/V_inc` (active), `S_ij = V/V_inc` (passive).
+pub fn sparam_voltage_surface(
+    nodes: &[[f64; 3]],
+    tri_verts: &[[usize; 3]],
+    direction: [f64; 3],
+    height: f64,
     v_inc: f64,
-    z0: f64,
     active: bool,
     fieldf: &dyn Fn(f64, f64, f64) -> (C64, C64, C64),
-    line_points: &[[f64; 3]],
+    gq_order: usize,
 ) -> C64 {
-    let n_pts = line_points.len();
-    if n_pts < 2 { return C64::new(0.0, 0.0); }
-
-    // Integrate E·dl along the line (trapezoidal-like: evaluate at midpoints)
-    let mut v_total = C64::new(0.0, 0.0);
-    for i in 0..(n_pts - 1) {
-        let p0 = line_points[i];
-        let p1 = line_points[i + 1];
-        let mid = [(p0[0]+p1[0])/2.0, (p0[1]+p1[1])/2.0, (p0[2]+p1[2])/2.0];
-        let dl = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
-
-        let (ex, ey, ez) = fieldf(mid[0], mid[1], mid[2]);
-        v_total += ex * C64::from(dl[0]) + ey * C64::from(dl[1]) + ez * C64::from(dl[2]);
+    // Port area A = Σ triangle areas.
+    let mut area = 0.0_f64;
+    for tri in tri_verts {
+        let v1 = nodes[tri[0]];
+        let v2 = nodes[tri[1]];
+        let v3 = nodes[tri[2]];
+        let e1 = [v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2]];
+        let e2 = [v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2]];
+        let cr = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
+        area += 0.5 * (cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]).sqrt();
+    }
+    if area < crate::constants::SINGULAR_EPS || v_inc == 0.0 {
+        return C64::new(0.0, 0.0);
     }
 
-    let v_inc_c = C64::from(v_inc);
+    // ∫_Γ E·l̂ dS over the port surface.
+    let flux = surface_integral(nodes, tri_verts, &|x, y, z| {
+        let (fx, fy, fz) = fieldf(x, y, z);
+        fx * C64::from(direction[0]) + fy * C64::from(direction[1]) + fz * C64::from(direction[2])
+    }, gq_order);
 
-    // S-parameter: ratio of reflected to incident wave amplitudes
-    // a = V_inc / (2*sqrt(Z0)), b = (V_total - V_inc) / (2*sqrt(Z0)) for active
-    // The sqrt(Z0) normalization cancels in the ratio
+    // V = (l/A) ∫ E·l̂ dS  (the w=A/l normalisation, mode-projected gap voltage).
+    let v_total = flux * C64::from(height / area);
+    let v_inc_c = C64::from(v_inc);
     if active {
-        // S_ii = (V_total - V_inc) / V_inc
         (v_total - v_inc_c) / v_inc_c
     } else {
-        // S_ij = V_total / V_inc
         v_total / v_inc_c
     }
 }
+

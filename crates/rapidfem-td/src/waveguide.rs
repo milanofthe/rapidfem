@@ -375,8 +375,8 @@ impl CoaxPort {
 /// the in-plane perpendicular `(−sinφ·û + cosφ·v̂)`, the TM along
 /// `(cosφ·û + sinφ·v̂)` (both purely transverse).
 ///
-/// The same convention as the FD `FloquetPort` (microwave_bc.py:FloquetPort,
-/// `mode_nr = 1` -> TE, `mode_nr = 2` -> TM).
+/// The same convention as the FD `FloquetPort` (`mode_nr = 1` → TE,
+/// `mode_nr = 2` → TM).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloquetPolarisation {
     /// `s`-polarised, E perpendicular to the plane of incidence.

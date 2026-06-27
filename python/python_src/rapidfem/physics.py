@@ -213,19 +213,23 @@ class LumpedPort(_Physics):
     """Lumped voltage-source driven port between two PEC conductors.
 
     Models a delta-gap source bridging two conductors (e.g. a ground
-    plane and a microstrip trace). The port plane spans the gap;
-    the integration of :math:`\\mathbf{E}` along ``direction`` defines
-    the port voltage,
+    plane and a microstrip trace). The port plane spans the gap; the port
+    voltage is the **area-averaged mode projection** of the solved field
+    over the whole port surface,
 
     .. math::
 
-        V = \\int_{\\text{port}} \\mathbf{E} \\cdot \\mathbf{d}\\ell
+        V = \\frac{1}{w} \\int_{\\text{port}}
+            \\mathbf{E} \\cdot \\hat{\\ell}\\; dS ,
 
-    and the S-parameter normalisation uses the reference impedance
-    :math:`Z_0`. Lumped ports are inherently broadband but assume the
-    line under the port carries a clean travelling-wave mode at
-    :math:`Z_0`; off-resonance reflections show up as standing-wave
-    artefacts in :math:`|S_{11}|^2 + |S_{21}|^2 > 1`.
+    (with :math:`w = A/\\ell` the port width), which stays well defined for
+    tall / non-TEM ports where a single line integral would degenerate.
+    The S-parameter normalises to the reference resistance :math:`R = z_0`.
+
+    The port termination is a series **R-L-C**: :math:`Z(\\omega) = R +
+    j\\omega L + 1/(j\\omega C)`. With ``l = 0`` and ``c = None`` it is the
+    pure resistive reference port; ``l`` / ``c`` add a reactive termination.
+    Derivation: ``derivations/lumped_port/``.
 
 
     Example
@@ -239,6 +243,9 @@ class LumpedPort(_Physics):
                        height=(0, 0, H))
         rf.LumpedPort(feed, direction=(0, 0, 1), z0=50.0)
 
+        # reactive termination: 50 Ω in series with 0.1 nH
+        rf.LumpedPort(feed, direction=(0, 0, 1), z0=50.0, l=0.1e-9)
+
 
     Parameters
     ----------
@@ -247,7 +254,11 @@ class LumpedPort(_Physics):
     direction : Sequence[float]
         voltage-integration axis (3-vector)
     z0 : float
-        reference port impedance in ohms
+        reference resistance R in ohms (S-parameter reference)
+    l : float
+        series termination inductance in henries (0 means none)
+    c : float, optional
+        series termination capacitance in farads (None means none)
     power : float
         incident power in watts
     width : float
@@ -259,21 +270,27 @@ class LumpedPort(_Physics):
     def __init__(self, *targets,
                  direction: Sequence[float],
                  z0: float = 50.0,
+                 l: float = 0.0,
+                 c: float | None = None,
                  power: float = 1.0,
                  width: float = 0.0,
                  height: float = 0.0):
         super().__init__(*targets)
         self.direction = tuple(float(v) for v in direction)
         self.z0 = float(z0)
+        self.l = float(l)
+        self.c = None if c is None else float(c)
         self.power = float(power)
         self.width = float(width)
         self.height = float(height)
 
     def _to_toml(self, tag: int) -> str:
         d = self.direction
+        c_line = f'c = {_f64(self.c)}\n' if self.c is not None else ''
         return (
             f'[[ports]]\ntype = "lumped"\ntag = {tag}\n'
-            f'z0 = {_f64(self.z0)}\npower = {_f64(self.power)}\n'
+            f'z0 = {_f64(self.z0)}\nl = {_f64(self.l)}\n{c_line}'
+            f'power = {_f64(self.power)}\n'
             f'direction = [{_f64(d[0])}, {_f64(d[1])}, {_f64(d[2])}]\n'
             f'width = {_f64(self.width)}\nheight = {_f64(self.height)}\n'
         )
@@ -803,13 +820,35 @@ class SurfaceImpedance(_Physics):
     an explicit ``zs = (re, im)`` in :math:`\\Omega/\\square`.
 
 
+    Note
+    ----
+    Apply this to the **outer face of the actual conductor geometry**, not to a
+    zero-thickness sheet collapsed into the dielectric. Modelling a thick trace
+    (e.g. a 3 µm microstrip line) as a single embedded plate over-estimates the
+    conductor loss — the sharp edges of a zero-thickness strip carry a singular
+    surface-current density, so :math:`\\int |J_s|^2` (hence the loss) and the
+    extracted Z0 both run high (~1.6× the loss, ~10 % on Z0 in a microstrip
+    cross-check). Extrude the conductor to its real thickness and put the
+    surface impedance on its faces; the gap-facing face then carries the current
+    one-sidedly, as the physical conductor does. The boundary condition itself
+    is exact for a sheet of the given :math:`Z_s` — this is purely a geometry
+    fidelity point.
+
+
     Example
     -------
-    Copper surface on a stripline ground:
+    Copper surface on a stripline ground (an outer boundary face):
 
     .. code-block:: python
 
         rf.SurfaceImpedance(ground_face, conductivity=5.8e7)
+
+    A finite-thickness trace, surface impedance on every outer face:
+
+    .. code-block:: python
+
+        trace = g.box(w, length, 3e-6, position=(...))
+        rf.SurfaceImpedance(trace.faces, conductivity=3e7, thickness=3e-6)
 
 
     Parameters

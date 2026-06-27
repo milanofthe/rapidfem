@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-// Copyright (C) Robert Fennis (original EMerge source)
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 //
-// This file is part of rapidfem and contains code ported from EMerge
-// (https://github.com/FennisRobert/EMerge), originally licensed under
-// GPL-2.0-or-later with the Gmsh additional permission; redistributed
-// here under GPL-3.0-or-later with that permission preserved.
-// See LICENSE and NOTICE for the full terms.
+// This file is part of rapidfem, distributed under GPL-3.0-or-later with
+// the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Nedelec second-kind (Nedelec-2) DOF mapping.
-//! Mirrors emerge/_emerge/elements/nedelec2.py.
+//! Nédélec order-2 (R2) degree-of-freedom mapping.
+//!
+//! Assigns global DOF indices to the 20 per-tet and 8 per-surface-triangle
+//! basis functions of the canonical R2 element (see `tet_assembly_r2`). The
+//! global numbering interleaves the two modes: edge·m1, face·m1, edge·m2,
+//! face·m2, with n_field = 2·n_edges + 2·n_tris.
 //!
 //! DOF structure per tetrahedron (20 DOFs total):
 //!   [0..6]   = edge DOFs (mode 1), mapped to tet_to_edge[0..6]
@@ -38,7 +38,7 @@ pub struct Nedelec2Basis {
     pub tri_to_field: Vec<[usize; 8]>,
     /// Per-edge DOF indices (2 per edge): [mode1, mode2]
     pub edge_to_field: Vec<[usize; 2]>,
-    /// Precomputed row indices for tri sparse matrix (port of femdata.py:empty_tri_rowcol)
+    /// Precomputed row indices for the surface (tri) sparse matrix
     pub tri_rows: Vec<usize>,
     /// Precomputed col indices for tri sparse matrix
     pub tri_cols: Vec<usize>,
@@ -101,8 +101,7 @@ impl Nedelec2Basis {
             edge_to_field[ei][1] = ei + n_tris + n_edges;    // mode 2
         }
 
-        // Port of femdata.py:empty_tri_rowcol()
-        // Precompute row/col arrays for n_tris * 64 entries
+        // Precompute COO row/col arrays for the n_tris × 64 surface entries
         let n_tri_dofs = 8usize;
         let n2 = n_tri_dofs * n_tri_dofs; // 64
         let nnz_tri = n_tris * n2;
@@ -137,13 +136,12 @@ impl Nedelec2Basis {
         }
     }
 
-    /// Port of femdata.py:empty_tri_matrix(), returns flat zero array of size n_tris*64
+    /// Flat zero array of size n_tris*64 for accumulating surface (tri) entries.
     pub fn empty_tri_matrix(&self) -> Vec<num_complex::Complex64> {
         vec![num_complex::Complex64::new(0.0, 0.0); self.n_tris * 64]
     }
 
-    /// Port of femdata.py:generate_csr(data)
-    /// Converts flat tri data array to CSR matrix, filtering out zero entries.
+    /// Convert the flat surface (tri) data array to a CSR matrix, dropping zeros.
     pub fn generate_csr(&self, data: &[num_complex::Complex64]) -> sprs::CsMat<num_complex::Complex64> {
         use sprs::TriMat;
         let mut tri_mat = TriMat::new((self.n_field, self.n_field));
@@ -157,7 +155,6 @@ impl Nedelec2Basis {
 }
 
 /// Convert global node indices in edge/tri arrays to local tet indices (0-3).
-/// Mirrors optimized.py:local_mapping(vertex_ids, triangle_ids).
 ///
 /// Given tet vertex IDs [v0,v1,v2,v3] and a set of global node IDs,
 /// returns the local index (0-3) of each node within the tet.

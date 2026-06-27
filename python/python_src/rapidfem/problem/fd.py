@@ -255,6 +255,42 @@ class ProblemFD:
                     ui_cb(freq_idx, freq, s_matrix)
         return self._native.run_sweep(callback)
 
+    def port_impedances(self, frequencies) -> "np.ndarray":
+        """Modal characteristic impedance (Ω) of each driven port.
+
+        Returns an array of shape ``(n_freq, n_driven)``: the (generally
+        frequency-dependent) modal impedance that each driven port's
+        S-parameters are referenced to. Requires a prior analysis call (the
+        native simulation must exist). Useful with :meth:`renormalize`.
+        """
+        if self._native is None:
+            raise RuntimeError(
+                "run a sweep before querying port impedances (no native "
+                "simulation yet)"
+            )
+        freqs = np.asarray(list(frequencies), dtype=float)
+        n = self._native.n_driven_ports
+        return np.array(
+            [[self._native.port_z_mode(p, float(f)) for p in range(n)]
+             for f in freqs]
+        )
+
+    def renormalize(self, result, z_ref: float = 50.0) -> "np.ndarray":
+        """Renormalize a sweep's S-parameters to a fixed reference impedance.
+
+        Modal ports (waveguide / wave) report S-parameters self-referenced to
+        their modal impedance, so a matched modal line reads |S11|≈0 against
+        that reference regardless of its characteristic impedance, and the
+        ``z0`` passed to :meth:`sweep` only *labels* the output. This returns
+        the S-matrix re-referenced to ``z_ref`` (e.g. 50 Ω) so mismatches
+        against a standard reference appear. Lumped ports (already at a fixed
+        z0) are a no-op. Returns a ``(n_freq, n_driven, n_driven)`` array;
+        ``result`` is unchanged.
+        """
+        from .. import io
+        z_old = self.port_impedances(result.frequencies)
+        return io.renormalize_sparams(result.sparams, z_old, z_ref)
+
     def eigenmode(self, target_frequency: float, *,
                   n_modes: int = 6,
                   z0: float = 50.0):

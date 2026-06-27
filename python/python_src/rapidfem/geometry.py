@@ -2241,6 +2241,16 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                       f"(N_pts={len(tags)}, h={h:.3e}, dist={dist_radius:.3e})",
                       file=sys.stderr)
 
+        # Pin the mesh-size options unconditionally. These gmsh options are
+        # process-global, NOT per-model, so a previous mesh() (e.g. one that
+        # took the field branch below and set FromPoints=0) would otherwise
+        # leak into a plain, field-less geometry and silently coarsen it,
+        # making the result depend on call order. Set the field-less defaults
+        # here; the field branch overrides them when refinement is active.
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 1)
+        gmsh.option.setNumber(
+            "Mesh.MeshSizeExtendFromBoundary", 1 if self._grading else 0)
+
         all_field_ids = threshold_field_ids + refinement_field_ids
         if _refdbg:
             print(f"[refine] all_field_ids={all_field_ids}, "

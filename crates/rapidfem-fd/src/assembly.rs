@@ -227,12 +227,17 @@ pub fn assemble_and_solve_with_pml(
         coo_cols.push(dof_to_free[c]);
         coo_vals.push(data_e[i] - k0_sq * data_b[i]);
     }
-    // Precompute non-zero Robin indices (avoids iterating all n_tris*64 entries)
-    let robin_nonzero: Vec<usize> = (0..bempty.len())
-        .filter(|&i| (bempty[i].re != 0.0 || bempty[i].im != 0.0)
-            && !pec_ids.contains(&basis.tri_rows[i])
+    // Robin entries live only on the port triangles; walk just those slots
+    // instead of all n_tris*64 (mirrors the sweep path's port-tri indices).
+    let mut robin_nonzero: Vec<usize> = port_tri_indices
+        .iter()
+        .flat_map(|tri_ids| tri_ids.iter().copied())
+        .flat_map(|ti| ti * 64..(ti + 1) * 64)
+        .filter(|&i| !pec_ids.contains(&basis.tri_rows[i])
             && !pec_ids.contains(&basis.tri_cols[i]))
         .collect();
+    robin_nonzero.sort_unstable();
+    robin_nonzero.dedup();
     for &idx in &robin_nonzero {
         coo_rows.push(dof_to_free[basis.tri_rows[idx]]);
         coo_cols.push(dof_to_free[basis.tri_cols[idx]]);
@@ -357,14 +362,27 @@ pub fn frequency_sweep_with_pml(
     let k_free_rows: Vec<usize> = k_free_indices.iter().map(|&i| dof_to_free[rows[i]]).collect();
     let k_free_cols: Vec<usize> = k_free_indices.iter().map(|&i| dof_to_free[cols[i]]).collect();
 
-    // Precompute non-PEC Robin indices (reused every frequency)
-    let robin_free_indices: Vec<usize> = (0..basis.n_tris * 64)
+    // Precompute non-PEC Robin indices (reused every frequency), restricted
+    // to the PORT triangles: only they carry a Robin term, and the port set
+    // is frequency-independent. The COO entries at these indices are then
+    // emitted UNCONDITIONALLY per frequency (no skip of exact-zero values),
+    // so the sparsity pattern is guaranteed stable across the sweep — which
+    // the backends' numeric-only `refactorize` (PARDISO phase 22, rslab
+    // frozen-pattern factor) silently relies on.
+    let mut robin_free_indices: Vec<usize> = port_tri_indices
+        .iter()
+        .flat_map(|tri_ids| tri_ids.iter().copied())
+        .flat_map(|ti| ti * 64..(ti + 1) * 64)
         .filter(|&idx| {
             let r = basis.tri_rows[idx];
             let c = basis.tri_cols[idx];
             !pec_ids.contains(&r) && !pec_ids.contains(&c)
         })
         .collect();
+    // Ports share no triangles by construction; dedup defends the pattern
+    // (and the entry values) against a config that lists one twice.
+    robin_free_indices.sort_unstable();
+    robin_free_indices.dedup();
 
     // Pick backend once for the whole sweep, symbolic factorisation is
     // amortised across frequencies via `solver.refactorize`.
@@ -449,12 +467,12 @@ pub fn frequency_sweep_with_pml(
             coo_cols.push(k_free_cols[ti]);
             coo_vals.push(data_e[orig_i] - k0_sq * data_b[orig_i]);
         }
+        // Unconditional emit (zeros included): the pattern must not drift
+        // between frequencies, see `robin_free_indices` above.
         for &idx in &robin_free_indices {
-            let val = bempty[idx];
-            if val.re == 0.0 && val.im == 0.0 { continue; }
             coo_rows.push(dof_to_free[basis.tri_rows[idx]]);
             coo_cols.push(dof_to_free[basis.tri_cols[idx]]);
-            coo_vals.push(val);
+            coo_vals.push(bempty[idx]);
         }
 
         // Symmetric diagonal equilibration (recomputed per frequency; the

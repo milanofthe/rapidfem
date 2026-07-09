@@ -180,6 +180,48 @@ impl SparseSolver for RslabSolver {
         solver.solve(b).map_err(|e| format!("rslab solve: {e:?}"))
     }
 
+    /// Batched multi-RHS solve: one factor traversal for all RHS. Falls back
+    /// to sequential solves when the row-major staging buffers (~3·n·nrhs
+    /// complex values: packed input, equilibrated copy, output) would not
+    /// comfortably fit in the currently AVAILABLE RAM.
+    fn solve_many(&mut self, bs: &[Vec<C64>]) -> Result<Vec<Vec<C64>>, String> {
+        let nrhs = bs.len();
+        if nrhs <= 1 || self.solver.is_none() {
+            return bs.iter().map(|b| self.solve(b)).collect();
+        }
+        let n = self.n;
+        for b in bs {
+            if b.len() != n {
+                return Err(format!("rslab: RHS length {} ≠ n = {}", b.len(), n));
+            }
+        }
+        let staging = 3 * n * nrhs * std::mem::size_of::<C64>();
+        let hw = rslab::tuning::HardwareInfo::probe();
+        if staging as u64 > hw.available_ram_bytes / 2 {
+            eprintln!(
+                "  rslab: batched solve would stage ~{:.0} MB (>{:.0} MB free/2), \
+                 solving {} RHS sequentially",
+                staging as f64 / 1e6,
+                hw.available_ram_bytes as f64 / 1e6,
+                nrhs,
+            );
+            return bs.iter().map(|b| self.solve(b)).collect();
+        }
+        let solver = self.solver.as_ref().unwrap();
+        // Pack row-major n×nrhs (rslab's solve_many layout), solve, unpack.
+        let mut packed = vec![C64::new(0.0, 0.0); n * nrhs];
+        for (c, b) in bs.iter().enumerate() {
+            for i in 0..n {
+                packed[i * nrhs + c] = b[i];
+            }
+        }
+        let x = solver.solve_many(&packed, nrhs)
+            .map_err(|e| format!("rslab solve_many: {e:?}"))?;
+        Ok((0..nrhs)
+            .map(|c| (0..n).map(|i| x[i * nrhs + c]).collect())
+            .collect())
+    }
+
     fn name(&self) -> &'static str { "rslab LDLᵀ" }
 }
 
@@ -218,5 +260,32 @@ mod tests {
         let vals2: Vec<C64> = vals.iter().map(|v| v * C64::new(1.3, 0.1)).collect();
         solver.refactorize(3, &rows, &cols, &vals2).unwrap();
         check(&mut solver, &vals2);
+    }
+
+    /// Batched solve must reproduce the sequential per-RHS solutions.
+    #[test]
+    fn solve_many_matches_sequential() {
+        let rows = vec![0, 0, 1, 1, 1, 2, 2];
+        let cols = vec![0, 1, 0, 1, 2, 1, 2];
+        let vals = vec![
+            C64::new(2.0, 0.0),  C64::new(1.0, 0.5),
+            C64::new(1.0, 0.5),  C64::new(4.0, -1.0), C64::new(0.0, 0.3),
+            C64::new(0.0, 0.3),  C64::new(3.0, 0.2),
+        ];
+        let mut solver = RslabSolver::new();
+        solver.factorize(3, &rows, &cols, &vals).unwrap();
+
+        let bs: Vec<Vec<C64>> = (0..3)
+            .map(|k| (0..3)
+                .map(|i| C64::new((i + k) as f64 + 0.5, (i * k) as f64 - 0.25))
+                .collect())
+            .collect();
+        let batched = solver.solve_many(&bs).unwrap();
+        for (b, xb) in bs.iter().zip(&batched) {
+            let xs = solver.solve(b).unwrap();
+            let diff: f64 = xs.iter().zip(xb)
+                .map(|(a, c)| (a - c).norm_sqr()).sum::<f64>().sqrt();
+            assert!(diff < 1e-12, "batched ≠ sequential, diff {diff}");
+        }
     }
 }

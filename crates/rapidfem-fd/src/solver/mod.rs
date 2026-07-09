@@ -55,6 +55,14 @@ pub trait SparseSolver: Send {
     /// Solve `K · x = b` using the cached factorisation.
     fn solve(&mut self, b: &[C64]) -> Result<Vec<C64>, String>;
 
+    /// Solve `K · X = B` for several RHS on the same factorisation (the
+    /// multi-port case: one RHS per driven port). The default loops `solve`;
+    /// backends with a batched kernel (one factor traversal for all RHS)
+    /// override this.
+    fn solve_many(&mut self, bs: &[Vec<C64>]) -> Result<Vec<Vec<C64>>, String> {
+        bs.iter().map(|b| self.solve(b)).collect()
+    }
+
     /// Backend name, for logs.
     fn name(&self) -> &'static str;
 }

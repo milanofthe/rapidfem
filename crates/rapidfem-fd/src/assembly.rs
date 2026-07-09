@@ -256,11 +256,15 @@ pub fn assemble_and_solve_with_pml(
     solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
     eprintln!("  {}: factorized in {:.1}ms", solver.name(), t_solve.elapsed().as_secs_f64()*1e3);
 
+    // All driven-port RHS against the one factorisation, batched (one factor
+    // traversal for all RHS where the backend supports it).
+    let b_frees: Vec<Vec<C64>> = port_vectors.iter()
+        .map(|bvec| free_dofs.iter().enumerate()
+            .map(|(fi, &d)| bvec[d] * C64::from(s_eq[fi])).collect())
+        .collect();
+    let x_frees = solver.solve_many(&b_frees)?;
     let mut solutions = Vec::new();
-    for (pi, bvec) in port_vectors.iter().enumerate() {
-        let b_free: Vec<C64> = free_dofs.iter().enumerate()
-            .map(|(fi, &d)| bvec[d] * C64::from(s_eq[fi])).collect();
-        let x_free = solver.solve(&b_free)?;
+    for (pi, x_free) in x_frees.into_iter().enumerate() {
         let mut x_full = vec![C64::new(0.0, 0.0); n_field];
         for (fi, &d) in free_dofs.iter().enumerate() {
             x_full[d] = x_free[fi] * C64::from(s_eq[fi]);
@@ -491,11 +495,14 @@ pub fn frequency_sweep_with_pml(
             solver.refactorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
         }
 
+        // Batched multi-port solve on the shared factorisation.
+        let b_frees: Vec<Vec<C64>> = port_bvecs.iter()
+            .map(|bvec| free_dofs.iter().enumerate()
+                .map(|(fi_d, &d)| bvec[d] * C64::from(s_eq[fi_d])).collect())
+            .collect();
+        let x_frees = solver.solve_many(&b_frees)?;
         let mut solutions = Vec::new();
-        for bvec in &port_bvecs {
-            let b_free: Vec<C64> = free_dofs.iter().enumerate()
-                .map(|(fi_d, &d)| bvec[d] * C64::from(s_eq[fi_d])).collect();
-            let x_free = solver.solve(&b_free)?;
+        for x_free in x_frees {
             let mut x_full = vec![C64::new(0.0, 0.0); n_field];
             for (fi_d, &d) in free_dofs.iter().enumerate() {
                 x_full[d] = x_free[fi_d] * C64::from(s_eq[fi_d]);

@@ -8,7 +8,7 @@
 //! MKL PARDISO sparse direct solver via dynamic loading.
 //!
 //! Loads `mkl_rt.dll` (or `mkl_rt.2.dll`) at runtime. If MKL is not installed,
-//! `PardisoSolver::try_new()` returns `None` and the caller falls back to faer.
+//! `PardisoSolver::try_new()` returns `None` and the caller falls back to rslab.
 //!
 //! Uses mtype=6 (complex symmetric indefinite) with 0-based CSR indexing.
 //! Upper triangle only, exploits A = Aᵀ for 2× memory/speed savings.

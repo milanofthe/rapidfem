@@ -1750,8 +1750,8 @@ impl PyTdOperator {
 #[pyo3(name = "_native")]
 fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Solver selection is automatic: PARDISO if MKL is loadable (typically
-    // 5–10× faster on complex-symmetric LU), faer otherwise. Force one with
-    // RAPIDFEM_SOLVER=faer or =pardiso before importing.
+    // 5–10× faster on complex-symmetric LU), rslab otherwise. Force one with
+    // RAPIDFEM_SOLVER=rslab or =pardiso before importing.
 
     m.add_class::<PySimulation>()?;
     m.add_class::<PySweepResult>()?;

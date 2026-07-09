@@ -8,7 +8,7 @@
 //! Eigenmode solver: find resonant frequencies and Q-factors.
 //!
 //! Solves E*x = λ*B*x using shift-invert Lanczos.
-//! Uses PARDISO (if available) or faer for the shift-invert linear solve.
+//! Uses PARDISO (if available) or rslab for the shift-invert linear solve.
 //! Handles complex-symmetric matrices (lossy materials).
 
 use num_complex::Complex64 as C64;

@@ -9,9 +9,9 @@ Quick start::
 
 Solver backend
 --------------
-The PyPI wheel defaults to the pure-Rust ``faer`` LU solver (no native
-dependencies). To opt in to MKL PARDISO (faster on large complex-symmetric
-problems), set the env var **before** importing rapidfem::
+The PyPI wheel defaults to the pure-Rust ``rslab`` complex-symmetric LDLᵀ
+solver (no native dependencies). To opt in to MKL PARDISO, set the env var
+**before** importing rapidfem::
 
     import os
     os.environ["RAPIDFEM_SOLVER"] = "pardiso"   # or "auto"

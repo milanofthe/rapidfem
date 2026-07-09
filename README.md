@@ -139,9 +139,10 @@ Use `rapidfem.show(g)` to send a geometry to the viewer.
 - **PML** — anisotropic stretched-coordinate perfectly matched layer
 - **Lossy materials** — complex permittivity with loss tangent + conductivity,
   surface impedance for metals, Debye dispersion; cached across sweeps
-- **Sparse solvers** — pure-Rust [`faer`](https://github.com/sarah-quinones/faer-rs)
-  LU baseline; optional MKL PARDISO (complex-symmetric LDLᵀ) on Windows / Linux;
-  Apple Accelerate Bunch-Kaufman on macOS (~3× faster than faer)
+- **Sparse solvers** — pure-Rust [`rslab`](https://github.com/milanofthe/rslab)
+  complex-symmetric LDLᵀ (Bunch-Kaufman) baseline with a-priori memory
+  estimates; optional MKL PARDISO (complex-symmetric LDLᵀ) where `mkl_rt` is
+  installed
 - **Frequency sweep** — assembles E/B once, refactors only the frequency-
   dependent K per point, reuses the symbolic LU pattern
 - **Eigenmode solver** — shift-invert Lanczos on the complex-symmetric system
@@ -180,14 +181,12 @@ Method notes and the `ProblemTD` API are in [`docs/td-backend.md`](docs/td-backe
 
 | Solver | Type | Notes |
 |--------|------|-------|
-| faer | General sparse LU | Pure Rust, no native dependencies — always available |
-| MKL PARDISO | Complex-symmetric LDLᵀ | Fastest on Windows / Linux; opt-in, needs `mkl_rt` on PATH |
-| Apple Accelerate | Sparse Bunch-Kaufman LDLᵀ | macOS only; ~3× faster than faer, ships with macOS |
+| rslab | Complex-symmetric LDLᵀ (Bunch-Kaufman) | Pure Rust, no native dependencies — always available. Numeric-only refactorisation across sweeps, a-priori RAM gate |
+| MKL PARDISO | Complex-symmetric LDLᵀ | Opt-in, needs `mkl_rt` on PATH |
 
-Select with `RAPIDFEM_SOLVER` (`"auto"`, `"pardiso"`, `"accelerate"`, `"faer"`),
-set before `import rapidfem`. Default `"auto"` tries PARDISO → Accelerate →
-faer. Optional MKL: `conda install mkl` / `pip install mkl` (ensure `mkl_rt`
-is on PATH).
+Select with `RAPIDFEM_SOLVER` (`"auto"`, `"pardiso"`, `"rslab"`), set before
+`import rapidfem`. Default `"auto"` tries PARDISO → rslab. Optional MKL:
+`conda install mkl` / `pip install mkl` (ensure `mkl_rt` is on PATH).
 
 ## Performance
 

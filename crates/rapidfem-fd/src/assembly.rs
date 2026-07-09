@@ -111,7 +111,7 @@ pub fn assemble_and_solve_with_pml(
     let (rows, cols, data_e, data_b) = assemble_global_matrices(mesh, basis, &er, &ur);
     eprintln!("  Assembled E,B in {:.1}ms ({} entries)", t0.elapsed().as_secs_f64()*1e3, rows.len());
 
-    // Step 2: K = E - k0² * B (defer CSR construction, build faer triplets directly later)
+    // Step 2: K = E - k0² * B (defer CSR construction, build solver COO directly later)
     let t1 = web_time::Instant::now();
     let k0_sq = C64::from(k0 * k0);
 
@@ -245,7 +245,7 @@ pub fn assemble_and_solve_with_pml(
     apply_equilibration(&coo_rows, &coo_cols, &mut coo_vals, &s_eq);
 
     // Backend-agnostic factor + solve via the SparseSolver trait. Selection
-    // honours RAPIDFEM_SOLVER (auto|pardiso|accelerate|faer).
+    // honours RAPIDFEM_SOLVER (auto|pardiso|rslab).
     let mut solver = crate::solver::pick(crate::solver::SolverChoice::from_env());
     let t_solve = web_time::Instant::now();
     solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;

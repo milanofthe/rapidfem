@@ -1,0 +1,44 @@
+RSLAB - Rust Sparse Linear Algebra Backend
+Copyright (c) 2026 Milan Rother
+Licensed under the MIT License (see LICENSE).
+
+RSLAB is a fork of feral (https://github.com/jkitchin/feral),
+Copyright (c) 2026 John Kitchin, distributed under the MIT License. feral is the
+basis of this project; its MIT license text is retained in LICENSE. RSLAB builds on
+feral's sparse LDLᵀ core, adds an unsymmetric LU path, complex-symmetric support,
+and solver-in-the-loop tooling (a-priori estimates, diagnostics, tuning).
+
+================================================================================
+Third-Party Attributions
+================================================================================
+
+RSLAB (via feral) incorporates algorithmic content derived from the SPRAL library
+(Science and Technology Facilities Council), specifically the Hungarian matching
+and MC64-style scaling routines. The Rust implementations in:
+
+    src/scaling/hungarian.rs
+    src/scaling/mc64.rs
+
+are translations of the corresponding Fortran routines `hungarian_match`,
+`hungarian_init_heuristic`, and `hungarian_wrapper` in `src/scaling.f90` of
+SPRAL. SPRAL is distributed under the BSD-3-Clause license; the full license
+text is reproduced in LICENSE-THIRD-PARTY.
+
+A small number of numerical constants from SPRAL SSIDS (e.g. the
+`SSIDS_DET_SMALL = 1e-20` zero-pivot threshold from `src/ssids/datatypes.f90`)
+are also used and are cited in source comments.
+
+--------------------------------------------------------------------------------
+
+feral's source comments cite the following projects for scholarly purposes
+(algorithm references, parameter names, design rationale). No source code from
+these projects is incorporated into RSLAB or feral:
+
+  - MUMPS 5.8.2 (CeCILL-C)        https://mumps-solver.org/
+  - Ipopt 3.14   (EPL-2.0)        https://github.com/coin-or/Ipopt
+  - faer-rs      (MIT)            https://github.com/sarah-quinones/faer-rs
+
+Citations of the form `ref/<project>/path/file.ext:LINE` in source comments
+refer to these upstream sources as scholarly references and do not indicate
+incorporation of code. An audit of distinctive identifiers and constants from
+each project found no matches outside the SPRAL-derived files listed above.

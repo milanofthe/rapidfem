@@ -1,0 +1,21 @@
+[package]
+name = "rslab-metis"
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+description = "Multilevel nested-dissection fill-reducing ordering (Karypis & Kumar 1998). Pure Rust, clean-room, standalone. Implements the RSLAB ordering-crate contract."
+authors = ["John Kitchin <jkitchin@andrew.cmu.edu>"]
+repository = "https://github.com/jkitchin/rslab"
+homepage = "https://github.com/jkitchin/rslab"
+readme = "README.md"
+keywords = ["sparse", "ordering", "metis", "nested-dissection", "linear-algebra"]
+categories = ["mathematics", "science"]
+
+[lib]
+name = "rslab_metis"
+
+[dependencies]
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
+rslab-amd = { path = "../rslab-amd", version = "0.2" }
+
+[dev-dependencies]

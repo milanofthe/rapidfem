@@ -1,0 +1,24 @@
+[package]
+name = "rslab-scotch"
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+description = "SCOTCH-style nested-dissection fill-reducing ordering (Pellegrini 1996). Pure Rust, clean-room, standalone. Implements the RSLAB ordering-crate contract."
+authors = ["John Kitchin <jkitchin@andrew.cmu.edu>"]
+repository = "https://github.com/jkitchin/rslab"
+homepage = "https://github.com/jkitchin/rslab"
+readme = "README.md"
+keywords = ["sparse", "ordering", "scotch", "nested-dissection", "linear-algebra"]
+categories = ["mathematics", "science"]
+
+[lib]
+name = "rslab_scotch"
+
+[dependencies]
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
+rslab-amd = { path = "../rslab-amd", version = "0.2" }
+rslab-metis = { path = "../rslab-metis", version = "0.2" }
+
+[dev-dependencies]
+rslab-amd = { path = "../rslab-amd", version = "0.2" }
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }

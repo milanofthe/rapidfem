@@ -1723,7 +1723,6 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 [[package]]
 name = "rslab"
 version = "0.17.0"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "gemm 0.18.2",
  "num-complex 0.4.6",
@@ -1743,7 +1742,6 @@ dependencies = [
 [[package]]
 name = "rslab-amd"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "rslab-ordering-core",
 ]
@@ -1751,7 +1749,6 @@ dependencies = [
 [[package]]
 name = "rslab-amf"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "rslab-ordering-core",
 ]
@@ -1759,7 +1756,6 @@ dependencies = [
 [[package]]
 name = "rslab-kahip"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "rslab-amd",
  "rslab-metis",
@@ -1769,7 +1765,6 @@ dependencies = [
 [[package]]
 name = "rslab-metis"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "rslab-amd",
  "rslab-ordering-core",
@@ -1778,12 +1773,10 @@ dependencies = [
 [[package]]
 name = "rslab-ordering-core"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 
 [[package]]
 name = "rslab-scotch"
 version = "0.2.1"
-source = "git+https://github.com/milanofthe/rslab?tag=v0.17.0#0db36f9fabd5fcd44e02dc48b59fbc62dc41c5b8"
 dependencies = [
  "rslab-amd",
  "rslab-metis",

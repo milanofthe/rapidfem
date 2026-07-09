@@ -6,6 +6,8 @@ members = [
     "crates/rapidfem-td",
     "python",
 ]
+# Vendored dependencies carry their own workspace (vendor/rslab).
+exclude = ["vendor"]
 
 [profile.release]
 opt-level = 3

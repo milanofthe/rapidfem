@@ -1,0 +1,222 @@
+# VENDORED into rapidfem from https://github.com/milanofthe/rslab tag v0.17.0
+# (git archive, dev/tooling dirs pruned, workspace members trimmed to the crates
+# that ship). Upstream fixes go to the rslab repo first, then re-vendor.
+[workspace]
+members = [".", "crates/rslab-ordering-core", "crates/rslab-amd", "crates/rslab-amf", "crates/rslab-metis", "crates/rslab-scotch", "crates/rslab-kahip"]
+resolver = "2"
+
+[package]
+name = "rslab"
+version = "0.17.0"
+edition = "2021"
+license = "MIT"
+description = "RSLAB - pure-Rust sparse complex/real direct solver (symmetric LDLᵀ + unsymmetric LU) and preconditioner, a PARDISO-style embeddable replacement."
+authors = ["Milan Rother"]
+repository = "https://github.com/milanofthe/rslab"
+homepage = "https://github.com/milanofthe/rslab"
+readme = "README.md"
+keywords = ["sparse", "solver", "linear-algebra", "ldlt", "kkt"]
+categories = ["mathematics", "science"]
+autobins = true
+autoexamples = false
+autotests = true
+exclude = [
+    "/dev",
+    "/external_benchmarks",
+    "/data",
+    "/manuscript",
+    "/ref",
+    "/scripts",
+    "/assets",
+    "/book",
+    "/examples",
+    "/src/bin",
+    "/tests",
+    "/.crucible",
+    "/.github",
+    "/.pre-commit-config.yaml",
+    "/CLAUDE.md",
+    "/RSLAB-PROJECT-SPEC.md",
+    "/tasks.org",
+]
+
+[lib]
+name = "rslab"
+
+[features]
+# Parametrized test-matrix generators (pure Rust, no extra deps). Off by default
+# so downstream solver users don't pull it in; enable for tests/benches.
+matgen = []
+# Adds a SuiteSparse / Matrix Market downloader (pure-Rust HTTP/TLS + gzip + tar).
+matgen-download = ["matgen", "dep:ureq", "dep:flate2", "dep:tar"]
+# Hardware-aware auto-tuning + resource governor (HardwareInfo via sysinfo,
+# calibration cache, budget planner). Pure-Rust dep.
+tuning = ["dep:sysinfo"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Complex scalar field for the complex-symmetric (PARDISO mtype 6) path.
+# Pure-Rust, already in the dependency tree transitively. Used by the
+# `Scalar` trait in src/scalar.rs and the generic numeric kernels.
+num-complex = "0.4"
+# SIMD backbone for the Schur-update micro-kernel (Phase 2.4.2).
+# Pinned to faer 0.22.x's exact version. Usage is confined to
+# src/dense/schur_kernel.rs; see dev/decisions.md for the
+# replacement trigger and interface boundary.
+pulp = { version = "0.22.2", default-features = false, features = ["x86-v3"] }
+# Data-parallelism for the multifrontal assembly tree (Phase 2.5.2).
+# Pure-Rust, fits the zero-non-Rust-dep constraint. Used only by
+# the opt-in parallel driver in src/numeric/factorize.rs; the
+# sequential path remains the default and reference implementation.
+rayon = "1.10"
+# Complex/real SIMD GEMM (sarah-quinones, the faer author) for the trailing
+# Schur-complement update in the generic multifrontal front kernel. `c64` is
+# `num_complex::Complex<f64>`, so our `Scalar` values pass through unchanged;
+# runtime AVX2/AVX-512 dispatch. The small panel Bunch-Kaufman stays scalar
+# (PARDISO-style: tiny panel scalar, BLAS-3 trailing update). f64 production
+# keeps its own kernel in src/numeric/factorize.rs - this is the complex path.
+gemm = "0.18"
+# Ordering crates are consumed by `symbolic_factorize_with_method`
+# via the OrderingMethod enum in src/symbolic/mod.rs. The in-tree
+# src/ordering/amd.rs is still the default (OrderingMethod::Amd)
+# pending retirement per dev/decisions.md.
+rslab-ordering-core = { path = "crates/rslab-ordering-core", version = "0.2" }
+rslab-amd = { path = "crates/rslab-amd", version = "0.2" }
+rslab-amf = { path = "crates/rslab-amf", version = "0.2" }
+rslab-metis = { path = "crates/rslab-metis", version = "0.2" }
+rslab-scotch = { path = "crates/rslab-scotch", version = "0.2" }
+rslab-kahip = { path = "crates/rslab-kahip", version = "0.2" }
+# Optional, only for the `matgen-download` feature (SuiteSparse/Matrix Market
+# fetcher). Pure Rust: ureq+rustls (no OpenSSL), flate2/miniz_oxide, tar.
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+# Hardware probe (cores + RAM) for the `tuning` feature. Pure Rust.
+sysinfo = { version = "0.31", optional = true, default-features = false, features = ["system"] }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+# Reference competitor for the complex-symmetric benchmark. faer's sparse
+# path has no complex-*symmetric* LDLᵀ (its BK/LDLT is Hermitian), so the
+# fair analogue is its sparse LU on the full matrix - exactly the 2×
+# storage/flops we beat by exploiting A = Aᵀ. Dev-only: pulls its own pulp,
+# independent of our pinned 0.22.2. faer's `c64` is `num_complex::Complex<f64>`.
+faer = "0.22"
+# Dynamic loader for the MKL PARDISO reference comparison (bench-only FFI; the
+# solver library stays 100% pure Rust). `bench_suite` loads `mkl_rt` at runtime.
+libloading = "0.8"
+# rmumps used only for reference timing comparisons in benchmarks:
+# rmumps = { path = "../ripopt/rmumps" }  # uncomment when needed
+
+[[bench]]
+name = "klu_circuit"
+harness = false
+
+[[bench]]
+name = "catalog"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "bench_suite"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "sweep"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "validate_axes"
+harness = false
+required-features = ["matgen-download"]
+
+[[bench]]
+name = "perf_axes"
+harness = false
+required-features = ["matgen-download"]
+
+[[bench]]
+name = "probe_complex"
+harness = false
+required-features = ["matgen-download"]
+
+[[bench]]
+name = "front_profile"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "phased_reuse"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "leftlook_mem"
+harness = false
+
+[[bench]]
+name = "block_gmres"
+harness = false
+
+[[bench]]
+name = "block_gmres_scaling"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "precond_gmres"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "recycle_study"
+harness = false
+
+[[bench]]
+name = "deflation_study"
+harness = false
+
+[[bench]]
+name = "fgmres_accounting"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "adaptive_restart"
+harness = false
+required-features = ["matgen"]
+
+[[bench]]
+name = "solve_many"
+harness = false
+
+[[bench]]
+name = "precond"
+harness = false
+
+[[bench]]
+name = "mom_loop"
+harness = false
+
+[[bench]]
+name = "mom_factor_probe"
+harness = false
+
+[[bench]]
+name = "mom_diag"
+harness = false
+
+[[bench]]
+name = "gemm_peak"
+harness = false
+
+[[bench]]
+name = "front_mem"
+harness = false
+
+[profile.release]
+debug = true

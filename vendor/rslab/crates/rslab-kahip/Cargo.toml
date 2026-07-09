@@ -1,0 +1,22 @@
+[package]
+name = "rslab-kahip"
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+description = "KaHIP-style flow-based nested-dissection fill-reducing ordering (Sanders & Schulz 2011; data reduction per Ost, Schulz & Strash 2021). Pure Rust, clean-room, standalone. Implements the RSLAB ordering-crate contract."
+authors = ["John Kitchin <jkitchin@andrew.cmu.edu>"]
+repository = "https://github.com/jkitchin/rslab"
+homepage = "https://github.com/jkitchin/rslab"
+readme = "README.md"
+keywords = ["sparse", "ordering", "kahip", "nested-dissection", "linear-algebra"]
+categories = ["mathematics", "science"]
+
+[lib]
+name = "rslab_kahip"
+
+[dependencies]
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
+rslab-amd = { path = "../rslab-amd", version = "0.2" }
+rslab-metis = { path = "../rslab-metis", version = "0.2" }
+
+[dev-dependencies]

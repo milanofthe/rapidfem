@@ -18,9 +18,11 @@ vtk = ["dep:vtkio"]
 
 [dependencies]
 rapidfem-core = { path = "../rapidfem-core" }
-# Default sparse direct solver (complex-symmetric LDLᵀ). `tuning` provides the
-# hardware probe for the a-priori RAM gate in solver/rslab_ldlt.rs.
-rslab = { git = "https://github.com/milanofthe/rslab", tag = "v0.17.0", features = ["tuning"] }
+# Default sparse direct solver (complex-symmetric LDLᵀ), vendored from
+# https://github.com/milanofthe/rslab (see vendor/rslab/Cargo.toml header).
+# `tuning` provides the hardware probe for the a-priori RAM gate and the
+# batched-solve gate in solver/rslab_ldlt.rs.
+rslab = { path = "../../vendor/rslab", features = ["tuning"] }
 # faer is used for the dense eigendecompositions (eigenmode.rs); the sparse
 # solve path is PARDISO/rslab via the SparseSolver trait.
 faer = { version = "0.24.0", default-features = false, features = ["std", "sparse-linalg"] }

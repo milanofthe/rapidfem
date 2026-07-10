@@ -1,0 +1,46 @@
+# Build artifacts
+/target
+
+# OS / editor / agent runtime junk
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+# PyO3 binding build artifacts (maturin builds in python/, separate target dir)
+/python/target
+/python/dist
+*.so
+*.pyd
+*.pdb
+.venv/
+build/
+*.egg-info/
+
+# Benchmark run artifacts (regeneratable). The figures (*.png) are committed so the
+# README renders; the raw JSONL data and run logs are not.
+benches/bench_out/*.jsonl
+benches/bench_out/*.log
+
+# Exception: the pre-BCGS2 (v0.11 MGS) block-GMRES reference is *not* regeneratable
+# from HEAD (it needs the old binary), so it is committed as a frozen baseline the
+# block_gmres_plot overlays against the current build.
+!benches/bench_out/block_gmres_mgs_ref.jsonl
+
+# Exception: the iterative-layer study data is committed so the report figures are
+# reproducible and the headline numbers are inspectable without re-running the benches.
+!benches/bench_out/recycle_study.jsonl
+!benches/bench_out/deflation_study.jsonl
+!benches/bench_out/fgmres_accounting.jsonl
+!benches/bench_out/adaptive_restart.jsonl
+
+# Local calibration cache (the `tuning` feature also writes this to the OS temp dir)
+rslab-calib/
+rla-calib/
+
+# Local backups + regenerated tuner parity fixture (opt-in test)
+*.bak
+src/tuner_parity*.json

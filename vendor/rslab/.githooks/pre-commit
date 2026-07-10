@@ -1,0 +1,13 @@
+#!/bin/sh
+# Native pre-commit gate (no external tooling): the same static checks as the CI
+# fmt/clippy gates. Activate once per clone:   git config core.hooksPath .githooks
+# Skip clippy in a hurry with RSLAB_SKIP_CLIPPY=1.
+set -e
+
+echo "[pre-commit] cargo fmt --check"
+cargo fmt --check
+
+if [ "${RSLAB_SKIP_CLIPPY:-0}" != "1" ]; then
+    echo "[pre-commit] cargo clippy --all-targets -- -D warnings   (RSLAB_SKIP_CLIPPY=1 skips)"
+    cargo clippy --all-targets -- -D warnings
+fi

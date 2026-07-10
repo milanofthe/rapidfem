@@ -1445,7 +1445,11 @@ mod tests {
         let s = KluSolver::factor(&a, &KluSettings::default()).unwrap();
         assert!(s.n_blocks() >= 2, "bridge structure must be reducible");
         let x = s.solve_transpose(&b).unwrap();
-        assert!(resid_t(&a, &x, &b) < 1e-12, "residual {}", resid_t(&a, &x, &b));
+        assert!(
+            resid_t(&a, &x, &b) < 1e-12,
+            "residual {}",
+            resid_t(&a, &x, &b)
+        );
         let st = KluSolver::factor(&a.transpose(), &KluSettings::default()).unwrap();
         let xr = st.solve(&b).unwrap();
         let diff = x
@@ -1453,7 +1457,10 @@ mod tests {
             .zip(&xr)
             .map(|(&p, &q)| (p - q).abs())
             .fold(0.0, f64::max);
-        assert!(diff < 1e-9, "transpose solve vs factored transpose differ by {diff}");
+        assert!(
+            diff < 1e-9,
+            "transpose solve vs factored transpose differ by {diff}"
+        );
     }
 
     #[test]
@@ -1493,13 +1500,24 @@ mod tests {
             }
         }
         let a = GeneralCsc::<Complex<f64>>::from_triplets(n, &rr, &cc, &vv).unwrap();
-        let b: Vec<Complex<f64>> = (0..n).map(|i| c((i % 5) as f64 - 2.0, (i % 3) as f64)).collect();
+        let b: Vec<Complex<f64>> = (0..n)
+            .map(|i| c((i % 5) as f64 - 2.0, (i % 3) as f64))
+            .collect();
         let s = KluSolver::factor(&a, &KluSettings::default()).unwrap();
         let x = s.solve_transpose(&b).unwrap();
-        assert!(resid_t(&a, &x, &b) < 1e-12, "residual {}", resid_t(&a, &x, &b));
+        assert!(
+            resid_t(&a, &x, &b) < 1e-12,
+            "residual {}",
+            resid_t(&a, &x, &b)
+        );
         // Aᴴ x = b via the documented conjugation recipe.
         let bc: Vec<Complex<f64>> = b.iter().map(|v| v.conj()).collect();
-        let xh: Vec<Complex<f64>> = s.solve_transpose(&bc).unwrap().iter().map(|v| v.conj()).collect();
+        let xh: Vec<Complex<f64>> = s
+            .solve_transpose(&bc)
+            .unwrap()
+            .iter()
+            .map(|v| v.conj())
+            .collect();
         let ah = {
             let t = a.transpose();
             GeneralCsc::<Complex<f64>> {
@@ -1540,7 +1558,9 @@ mod tests {
         for settings in [
             KluSettings::default().with_btf(false),
             KluSettings::default().with_row_scaling(false),
-            KluSettings::default().with_btf(false).with_row_scaling(false),
+            KluSettings::default()
+                .with_btf(false)
+                .with_row_scaling(false),
         ] {
             let s = KluSolver::factor(&a, &settings).unwrap();
             let x = s.solve_transpose(&b).unwrap();
@@ -1572,7 +1592,11 @@ mod tests {
         s.refactor(&a2).unwrap();
         let b: Vec<f64> = (0..a.n).map(|i| (i % 9) as f64 - 4.0).collect();
         let x = s.solve_transpose(&b).unwrap();
-        assert!(resid_t(&a2, &x, &b) < 1e-11, "residual {}", resid_t(&a2, &x, &b));
+        assert!(
+            resid_t(&a2, &x, &b) < 1e-11,
+            "residual {}",
+            resid_t(&a2, &x, &b)
+        );
     }
 
     #[test]

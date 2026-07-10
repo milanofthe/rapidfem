@@ -23,6 +23,18 @@ use crate::numeric::multifrontal_ldlt::{
 use crate::scalar::Scalar;
 use crate::sparse::csc::CscMatrix;
 
+/// Floor for the [`LdltSolver::tuned`] nested-dissection bakeoff: below this
+/// predicted factor cost the numeric phase is seconds at most and the extra
+/// symbolic analysis isn't worth scheduling. Above it, a missed ND win on a
+/// 3D-mesh pattern costs 10x the analysis price (measured on 87k-DOF
+/// Nedelec-2 curl-curl: 2e11 flops AMD vs 1.8e10 MetisND).
+const ND_BAKEOFF_MIN_FLOPS: u64 = 5_000_000_000;
+/// Small systems never enter the bakeoff regardless of predicted flops -
+/// dense-ish small matrices can post huge flops without an ND story.
+const ND_BAKEOFF_MIN_N: usize = 10_000;
+/// Adopt ND only on a clear predicted win, not a coin flip.
+const ND_BAKEOFF_ADOPT_RATIO: f64 = 0.75;
+
 /// A factored sparse symmetric matrix, ready to solve against many right-hand
 /// sides. Generic over the scalar field `T` (`f64` or `Complex<f64>`).
 pub struct LdltSolver<T> {
@@ -132,20 +144,71 @@ impl<T: Scalar> LdltSolver<T> {
                 }
             };
         // Reuse the default analysis unless the tuner changed an analyze-time knob.
-        if (s.reorder, s.ordering, s.nemin, s.relax) == (d.reorder, d.ordering, d.nemin, d.relax) {
+        let (sym, s) = if (s.reorder, s.ordering, s.nemin, s.relax)
+            == (d.reorder, d.ordering, d.nemin, d.relax)
+        {
             if mem_ok(&est, s.method, default_fill) {
-                Ok((sym, s))
+                (sym, s)
             } else {
-                Ok((sym, d))
+                (sym, d)
             }
         } else {
             let sym2 = LdltSymbolic::analyze_with(a, &s)?;
             let est2 = sym2.estimate_memory::<T>();
             if mem_ok(&est2, s.method, sym2.symbolic_factor_nnz()) {
-                Ok((sym2, s))
+                (sym2, s)
             } else {
-                Ok((sym, d)) // memory regression by the estimate -> safe default
+                (sym, d) // memory regression by the estimate -> safe default
             }
+        };
+        // Large systems: measured nested-dissection bakeoff (see below). The
+        // model's corpus cannot see matrix provenance, and on 3D-mesh
+        // patterns a minimum-degree pick misses ND wins of 10x in factor
+        // time; here the extra analysis is a small fraction of the numeric
+        // factorization it can save.
+        if a.n >= ND_BAKEOFF_MIN_N
+            && sym.estimate_memory::<T>().factor_flops >= ND_BAKEOFF_MIN_FLOPS
+        {
+            return Self::nd_bakeoff(a, sym, s);
+        }
+        Ok((sym, s))
+    }
+
+    /// Re-analyze with [`OrderingMethod::MetisND`] and keep whichever
+    /// ordering the *exact* symbolic quantities favour: ND is adopted only
+    /// on a clear predicted-flops win with no regression in exact fill or
+    /// in the method-relevant transient peak, so the pick is Pareto-safe at
+    /// any tune weight. Deterministic - both candidates are measured on
+    /// this matrix, nothing is modeled.
+    fn nd_bakeoff(
+        a: &CscMatrix<T>,
+        sym: LdltSymbolic,
+        s: SolverSettings,
+    ) -> Result<(LdltSymbolic, SolverSettings), RslabError> {
+        use crate::symbolic::OrderingMethod;
+        if s.ordering == OrderingMethod::MetisND {
+            return Ok((sym, s));
+        }
+        let mut s_nd = s.clone();
+        s_nd.ordering = OrderingMethod::MetisND;
+        let sym_nd = match LdltSymbolic::analyze_with(a, &s_nd) {
+            Ok(x) => x,
+            Err(_) => return Ok((sym, s)), // ND analysis failed -> keep the pick
+        };
+        let est = sym.estimate_memory::<T>();
+        let est_nd = sym_nd.estimate_memory::<T>();
+        let peak = |e: &crate::diagnostics::MemoryEstimate| match s.method {
+            crate::FactorMethod::Multifrontal => e.mf_transient_peak_bytes,
+            _ => e.panel_live_peak_bytes,
+        };
+        let flops_win =
+            (est_nd.factor_flops as f64) < est.factor_flops as f64 * ND_BAKEOFF_ADOPT_RATIO;
+        let fill_ok = sym_nd.symbolic_factor_nnz() <= sym.symbolic_factor_nnz();
+        let mem_ok = peak(&est_nd) <= peak(&est);
+        if flops_win && fill_ok && mem_ok {
+            Ok((sym_nd, s_nd))
+        } else {
+            Ok((sym, s))
         }
     }
 
@@ -565,6 +628,112 @@ impl LdltSymbolic {
 mod tests {
     use super::*;
     use num_complex::Complex;
+
+    /// 7-point 3D grid Laplacian (SPD-shifted), the canonical pattern where
+    /// nested dissection beats minimum degree.
+    fn grid3d(k: usize) -> CscMatrix<f64> {
+        let n = k * k * k;
+        let idx = |x: usize, y: usize, z: usize| (z * k + y) * k + x;
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        for z in 0..k {
+            for y in 0..k {
+                for x in 0..k {
+                    let i = idx(x, y, z);
+                    rows.push(i);
+                    cols.push(i);
+                    vals.push(6.5);
+                    for (nb, is_lower) in [
+                        (x.checked_sub(1).map(|xx| idx(xx, y, z)), true),
+                        (y.checked_sub(1).map(|yy| idx(x, yy, z)), true),
+                        (z.checked_sub(1).map(|zz| idx(x, y, zz)), true),
+                    ] {
+                        if let (Some(j), true) = (nb, is_lower) {
+                            rows.push(i);
+                            cols.push(j);
+                            vals.push(-1.0);
+                        }
+                    }
+                }
+            }
+        }
+        CscMatrix::from_triplets(n, &rows, &cols, &vals).unwrap()
+    }
+
+    /// The ND bakeoff must never return a pick with worse exact symbolic
+    /// fill or worse predicted flops than the incumbent — on a plain 7-point
+    /// Laplacian rslab's AMD is genuinely competitive (measured tied at 32³),
+    /// so this pins the Pareto guarantee, not an adoption.
+    #[test]
+    fn nd_bakeoff_pareto_plain_grid() {
+        let a = grid3d(24); // n = 13824
+        let s_amd = SolverSettings::default();
+        let sym_amd = LdltSymbolic::analyze_with(&a, &s_amd).unwrap();
+        let amd_fill = sym_amd.symbolic_factor_nnz();
+        let amd_flops = sym_amd.estimate_memory::<f64>().factor_flops;
+
+        let (sym_pick, s_pick) = LdltSolver::<f64>::nd_bakeoff(&a, sym_amd, s_amd).unwrap();
+
+        assert!(
+            sym_pick.symbolic_factor_nnz() <= amd_fill,
+            "fill regressed: {} > {amd_fill}",
+            sym_pick.symbolic_factor_nnz()
+        );
+        assert!(
+            sym_pick.estimate_memory::<f64>().factor_flops <= amd_flops,
+            "flops regressed"
+        );
+        // Whatever the pick, it must factor + solve correctly.
+        let solver = sym_pick.factor(&a, &s_pick).unwrap();
+        let b: Vec<f64> = (0..a.n).map(|i| (i % 7) as f64 - 3.0).collect();
+        let x = solver.solve(&b).unwrap();
+        assert!(residual_inf(&a, &x, &b) < 1e-8);
+    }
+
+    /// Direct bakeoff on the edge-element curl-curl pattern (the rapidfem
+    /// case that motivated it: 87k DOFs, ~2e11 AMD flops vs 1.8e10 MetisND):
+    /// nested dissection wins clearly, so the bakeoff must adopt it.
+    #[cfg(feature = "matgen")]
+    #[test]
+    fn nd_bakeoff_adopts_on_curl_curl() {
+        let a = crate::matgen::fem::curl_curl(&[16, 16, 16], 0.8, 0.1); // n = 12288
+        let s_amd = SolverSettings::default();
+        let sym_amd = LdltSymbolic::analyze_with(&a, &s_amd).unwrap();
+        let amd_flops = sym_amd.estimate_memory::<Complex<f64>>().factor_flops;
+
+        let (sym, s) = LdltSolver::<Complex<f64>>::nd_bakeoff(&a, sym_amd, s_amd).unwrap();
+        assert_eq!(s.ordering, crate::symbolic::OrderingMethod::MetisND);
+        assert!(
+            (sym.estimate_memory::<Complex<f64>>().factor_flops as f64)
+                < amd_flops as f64 * ND_BAKEOFF_ADOPT_RATIO
+        );
+    }
+
+    /// End-to-end guarantee on `tuned` for a large curl-curl system: whatever
+    /// mechanism resolves it (model, OOD ordering race, or the ND bakeoff),
+    /// the returned pick must realise the nested-dissection-class win over
+    /// the AMD default - this is the regression that cost 10x factor time
+    /// in the rapidfem FEM sweep.
+    #[cfg(feature = "matgen")]
+    #[test]
+    fn tuned_finds_nd_class_win_on_curl_curl() {
+        let a = crate::matgen::fem::curl_curl(&[22, 22, 22], 0.8, 0.1); // n = 31944
+        let sym_amd = LdltSymbolic::analyze_with(&a, &SolverSettings::default()).unwrap();
+        let amd_flops = sym_amd.estimate_memory::<Complex<f64>>().factor_flops;
+
+        let (sym, s) =
+            LdltSolver::<Complex<f64>>::tuned(&a, crate::auto_tune::DEFAULT_TUNE_WEIGHT).unwrap();
+        eprintln!(
+            "curl_curl pick {:?}: fill {} flops {}",
+            s.ordering,
+            sym.symbolic_factor_nnz(),
+            sym.estimate_memory::<Complex<f64>>().factor_flops
+        );
+        assert_ne!(s.ordering, crate::symbolic::OrderingMethod::Amd);
+        assert!(
+            (sym.estimate_memory::<Complex<f64>>().factor_flops as f64)
+                < amd_flops as f64 * ND_BAKEOFF_ADOPT_RATIO
+        );
+    }
 
     fn residual_inf<T: Scalar>(a: &CscMatrix<T>, x: &[T], b: &[T]) -> f64 {
         let mut ax = vec![T::zero(); a.n];

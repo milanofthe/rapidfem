@@ -1,13 +1,24 @@
-# VENDORED into rapidfem from https://github.com/milanofthe/rslab tag v0.17.0
+# VENDORED into rapidfem from https://github.com/milanofthe/rslab tag v0.18.0
 # (git archive, dev/tooling dirs pruned, workspace members trimmed to the crates
 # that ship). Upstream fixes go to the rslab repo first, then re-vendor.
 [workspace]
 members = [".", "crates/rslab-ordering-core", "crates/rslab-amd", "crates/rslab-amf", "crates/rslab-metis", "crates/rslab-scotch", "crates/rslab-kahip"]
+# The PyO3 bindings live in `python/` and are built by maturin, not cargo. They
+# depend on `rslab` via path and carry a `cdylib` linking libpython, so they are
+# explicitly excluded from the pure-Rust workspace (FFI lives only in tooling /
+# bindings, never the solver core). Build them with `maturin` from `python/`.
+exclude = ["python"]
+# Root commands (`cargo build`/`test`/`clippy` with no -p/--workspace) operate
+# on the `rslab` package only. `rslab-diagnostics` is a member so it shares the
+# lockfile and `cargo run -p rslab-diagnostics --bin <name>` works, but it is
+# NOT a dependency of `rslab`, so the default build/test set never compiles its
+# ~144 one-off binaries (issue #71). Build them explicitly with
+# `cargo build -p rslab-diagnostics`.
 resolver = "2"
 
 [package]
 name = "rslab"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 license = "MIT"
 description = "RSLAB - pure-Rust sparse complex/real direct solver (symmetric LDLᵀ + unsymmetric LU) and preconditioner, a PARDISO-style embeddable replacement."

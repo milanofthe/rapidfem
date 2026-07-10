@@ -27,6 +27,7 @@
 
 use num_complex::Complex64 as C64;
 use rslab::{CscMatrix, FactorMethod, LdltSolver, LdltSymbolic, SolverSettings};
+use rslab::OrderingMethod;
 use super::SparseSolver;
 
 /// Refuse to factor when the estimated transient peak exceeds this fraction
@@ -120,10 +121,44 @@ impl SparseSolver for RslabSolver {
         vals: &[C64],
     ) -> Result<(), String> {
         let a = self.build_matrix(n, rows, cols, vals)?;
-        let (sym, settings) = LdltSolver::<C64>::tuned(&a, rslab::DEFAULT_TUNE_WEIGHT)
+        let (mut sym, mut settings) = LdltSolver::<C64>::tuned(&a, rslab::DEFAULT_TUNE_WEIGHT)
             .map_err(|e| format!("rslab analyze/tune: {e:?}"))?;
+        // Escape hatches over the tuner's picks (rslab >= 0.18 already runs a
+        // measured nested-dissection bakeoff for large systems, so these are
+        // for experiments, not correctness).
+        // RAPIDFEM_RSLAB_ORDERING=amd|amf|metis|scotch, RAPIDFEM_RSLAB_METHOD=ll|mf.
+        if let Ok(v) = std::env::var("RAPIDFEM_RSLAB_ORDERING") {
+            let ord = match v.to_ascii_lowercase().as_str() {
+                "amd" => Some(OrderingMethod::Amd),
+                "amf" => Some(OrderingMethod::Amf),
+                "metis" => Some(OrderingMethod::MetisND),
+                "scotch" => Some(OrderingMethod::ScotchND),
+                other => {
+                    eprintln!("  rslab: unknown RAPIDFEM_RSLAB_ORDERING={other:?}, ignoring");
+                    None
+                }
+            };
+            if let Some(ord) = ord {
+                if ord != settings.ordering {
+                    settings.ordering = ord;
+                    sym = LdltSymbolic::analyze_with(&a, &settings)
+                        .map_err(|e| format!("rslab analyze ({v}): {e:?}"))?;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("RAPIDFEM_RSLAB_METHOD") {
+            match v.to_ascii_lowercase().as_str() {
+                "ll" => settings.method = FactorMethod::LeftLooking,
+                "mf" => settings.method = FactorMethod::Multifrontal,
+                other => eprintln!("  rslab: unknown RAPIDFEM_RSLAB_METHOD={other:?}, ignoring"),
+            }
+        }
         let mem_line = check_memory(&sym, &settings)?;
-        eprintln!("  rslab: {mem_line}");
+        eprintln!(
+            "  rslab: {:?}/{:?}, {mem_line}, est. {:.2e} flops",
+            settings.method, settings.ordering,
+            sym.estimate_memory::<C64>().factor_flops as f64,
+        );
         let solver = sym.factor(&a, &settings)
             .map_err(|e| format!("rslab factor: {e:?}"))?;
         if solver.n_perturbed() > 0 {

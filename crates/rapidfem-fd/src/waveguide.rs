@@ -385,6 +385,22 @@ pub fn cs_from_origin_zaxis(origin: [f64; 3], z_axis: [f64; 3]) -> CoordinateSys
 ///
 /// Robin BC with γ = j·k₀·Z₀/R, where R = surface resistivity.
 /// Supports either user-supplied surface impedance or computation from σ via skin depth.
+///
+/// The finite-thickness correction Zs = Zs,∞·coth(γₘ·t_eff) has two regimes:
+///
+/// * `two_sided = false` — the sheet is exposed to fields on one side only
+///   (e.g. a ground plane on the domain boundary). The face owns the full
+///   metal cross-section: t_eff = t, and Zs → 1/(σt) at DC.
+/// * `two_sided = true` — the face is one side of a conductor carrying SIBC
+///   on opposing faces (a shell around an extruded trace). Each face owns
+///   half the metal: t_eff = t/2, so per-face Zs → 2/(σt) at DC and the two
+///   opposing faces in parallel recover the physical 1/(σt). This is
+///   algebraically identical to Palace's (sinh ν ± sin ν)/(cosh ν − cos ν)
+///   thin-sheet correction with ν = t/δ.
+///
+/// With `two_sided = false` on a closed shell, the opposing faces each claim
+/// the full cross-section and the low-frequency resistance comes out a factor
+/// 2 low (and Im Zs stays high through the t ≲ 2δ transition band).
 pub struct SurfaceImpedance {
     /// Surface conductivity in S/m (used to compute skin-depth R)
     pub sigma: f64,
@@ -394,17 +410,20 @@ pub struct SurfaceImpedance {
     pub er: f64,
     /// Optional finite layer thickness (m); if None, treated as semi-infinite
     pub thickness: Option<f64>,
+    /// Sheet carries SIBC on opposing faces of the same metal volume
+    /// (shell): each face owns half the thickness in the coth term.
+    pub two_sided: bool,
     /// Optional explicit surface impedance Zs (Ω/sq); overrides σ-based calc when Some
     pub zs: Option<C64>,
 }
 
 impl SurfaceImpedance {
     pub fn from_conductivity(sigma: f64) -> Self {
-        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, zs: None }
+        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, two_sided: false, zs: None }
     }
 
     pub fn from_zs(zs: C64) -> Self {
-        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, zs: Some(zs) }
+        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, two_sided: false, zs: Some(zs) }
     }
 
     /// Robin γ-coefficient from the surface impedance Zs: γ = j·k₀·Z₀/Zs.
@@ -429,11 +448,13 @@ impl SurfaceImpedance {
         // R = (1 + j) ρ / δ
         let mut r = C64::new(1.0, 1.0) * C64::from(rho / d_skin);
         if let Some(t) = self.thickness {
-            // Finite thickness scaler: R / tanh(γ_m * t), γ_m = j ω √(με_c)
+            // Finite thickness scaler: R / tanh(γ_m * t_eff), γ_m = j ω √(με_c).
+            // Two-sided sheets (shell faces) own half the metal each.
+            let t_eff = if self.two_sided { 0.5 * t } else { t };
             let eps_c = C64::new(eps, -self.sigma / w0);
             let mu_c = C64::new(mu, 0.0);
             let gamma_m = C64::new(0.0, w0) * (mu_c * eps_c).sqrt();
-            r = r / (gamma_m * C64::from(t)).tanh();
+            r = r / (gamma_m * C64::from(t_eff)).tanh();
         }
         r
     }
@@ -866,5 +887,71 @@ impl NumericalWavePort {
             n_eff,
             is_vector,
         }
+    }
+}
+
+#[cfg(test)]
+mod sibc_tests {
+    use super::*;
+
+    const SIGMA: f64 = 3.03e7; // TopMetal2-like, S/m
+    const T: f64 = 3.0e-6;
+
+    fn exc(freq: f64) -> Excitation {
+        let omega = 2.0 * std::f64::consts::PI * freq;
+        Excitation { freq, k0: omega / C0, omega, l0: 1.0 }
+    }
+
+    fn sibc(thickness: Option<f64>, two_sided: bool) -> SurfaceImpedance {
+        let mut s = SurfaceImpedance::from_conductivity(SIGMA);
+        s.thickness = thickness;
+        s.two_sided = two_sided;
+        s
+    }
+
+    /// Two-sided coth(γt/2) is algebraically Palace's thin-sheet correction
+    /// (sinh ν ± sin ν)/(cosh ν − cos ν) with ν = t/δ (surfaceconductivityoperator).
+    #[test]
+    fn two_sided_matches_palace_thin_sheet_form() {
+        for freq in [1.0e9, 5.0e9, 5.0e10] {
+            let e = exc(freq);
+            let z = sibc(Some(T), true).surface_impedance(&e);
+            let omega = e.omega;
+            let delta = (2.0 / (MU0 * SIGMA * omega)).sqrt();
+            let rs = 1.0 / (SIGMA * delta);
+            let nu = T / delta;
+            let den = nu.cosh() - nu.cos();
+            let z_ref = C64::new(
+                rs * (nu.sinh() + nu.sin()) / den,
+                rs * (nu.sinh() - nu.sin()) / den,
+            );
+            assert!((z - z_ref).norm() / z_ref.norm() < 1e-3,
+                "f={freq:.1e}: {z} vs palace {z_ref}");
+        }
+    }
+
+    /// DC limits: one-sided face owns the full cross-section (Zs → 1/(σt)),
+    /// a two-sided shell face owns half (Zs → 2/(σt); opposing faces in
+    /// parallel recover 1/(σt)).
+    #[test]
+    fn dc_limits() {
+        let e = exc(1.0e3);
+        let one = sibc(Some(T), false).surface_impedance(&e);
+        let two = sibc(Some(T), true).surface_impedance(&e);
+        let r_dc = 1.0 / (SIGMA * T);
+        assert!((one.re - r_dc).abs() / r_dc < 1e-3, "one-sided {one} vs {r_dc}");
+        assert!((two.re - 2.0 * r_dc).abs() / (2.0 * r_dc) < 1e-3, "two-sided {two} vs {}", 2.0 * r_dc);
+    }
+
+    /// Deep in the skin-effect regime (t >> δ) the finite-thickness variants
+    /// and the semi-infinite Leontovich value must all coincide.
+    #[test]
+    fn thick_limit_side_independent() {
+        let e = exc(1.0e11); // δ ≈ 0.29 µm << t
+        let inf = sibc(None, false).surface_impedance(&e);
+        let one = sibc(Some(T), false).surface_impedance(&e);
+        let two = sibc(Some(T), true).surface_impedance(&e);
+        assert!((one - inf).norm() / inf.norm() < 1e-3);
+        assert!((two - inf).norm() / inf.norm() < 1e-3);
     }
 }

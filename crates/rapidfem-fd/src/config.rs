@@ -246,6 +246,11 @@ pub enum PortConfig {
         er: f64,
         #[serde(default)]
         thickness: Option<f64>,
+        /// Sheet carries SIBC on opposing faces of the same metal volume
+        /// (shell around an extruded conductor): each face owns half the
+        /// thickness in the finite-thickness coth term.
+        #[serde(default)]
+        two_sided: bool,
         /// Explicit surface impedance [re, im] in Ω/sq (overrides conductivity if present).
         #[serde(default)]
         zs: Option<[f64; 2]>,

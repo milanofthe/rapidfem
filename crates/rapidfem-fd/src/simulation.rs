@@ -825,7 +825,7 @@ fn build_ports(
                 port_tris.push(tri_ids);
                 ports.push(Box::new(bc));
             }
-            PortConfig::SurfaceImpedance { tag, conductivity, mur, er, thickness, zs } => {
+            PortConfig::SurfaceImpedance { tag, conductivity, mur, er, thickness, two_sided, zs } => {
                 let tri_ids = mesh.tris_for_tag(*tag).to_vec();
                 if tri_ids.is_empty() {
                     eprintln!("  WARNING: tag {} has no triangles, skipping SurfaceImpedance", tag);
@@ -833,15 +833,15 @@ fn build_ports(
                 }
                 let bc = if let Some(zs_arr) = zs {
                     let mut s = SurfaceImpedance::from_zs(C64::new(zs_arr[0], zs_arr[1]));
-                    s.mur = *mur; s.er = *er; s.thickness = *thickness;
+                    s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided;
                     s
                 } else {
                     let mut s = SurfaceImpedance::from_conductivity(*conductivity);
-                    s.mur = *mur; s.er = *er; s.thickness = *thickness;
+                    s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided;
                     s
                 };
-                eprintln!("  SurfaceImpedance: tag={}, sigma={:.2e}S/m, ur={:.2}, er={:.2}, t={:?}",
-                    tag, conductivity, mur, er, thickness);
+                eprintln!("  SurfaceImpedance: tag={}, sigma={:.2e}S/m, ur={:.2}, er={:.2}, t={:?}, two_sided={}",
+                    tag, conductivity, mur, er, thickness, two_sided);
                 port_tris.push(tri_ids);
                 ports.push(Box::new(bc));
             }

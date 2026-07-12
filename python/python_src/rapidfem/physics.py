@@ -819,6 +819,26 @@ class SurfaceImpedance(_Physics):
     the solver compute :math:`Z_s` analytically, or override with
     an explicit ``zs = (re, im)`` in :math:`\\Omega/\\square`.
 
+    The finite-thickness correction
+    :math:`Z_s = Z_{s,\\infty} \\coth(\\gamma_m t_\\mathrm{eff})` has two
+    regimes, selected by ``two_sided``:
+
+    * ``two_sided=False`` (default) — the sheet sees fields on **one side
+      only** (e.g. a ground plane on the domain boundary). The face owns the
+      full metal cross-section, :math:`t_\\mathrm{eff} = t`, and
+      :math:`Z_s \\to 1/(\\sigma t)` at DC.
+    * ``two_sided=True`` — the face is one side of a conductor that carries
+      the BC on **opposing faces** (the shell of an extruded trace). Each
+      face owns half the metal, :math:`t_\\mathrm{eff} = t/2`; the opposing
+      faces in parallel then recover the physical :math:`1/(\\sigma t)` DC
+      resistance. Algebraically identical to Palace's thin-sheet correction.
+
+    Leaving ``two_sided=False`` on a closed shell halves the low-frequency
+    resistance (both faces claim the full cross-section) and keeps
+    :math:`\\mathrm{Im}\\,Z_s` high through the :math:`t \\lesssim 2\\delta`
+    transition band — inductor R and Q come out visibly wrong below the
+    skin-effect regime. For :math:`t \\gg \\delta` the flag has no effect.
+
 
     Note
     ----
@@ -829,10 +849,10 @@ class SurfaceImpedance(_Physics):
     surface-current density, so :math:`\\int |J_s|^2` (hence the loss) and the
     extracted Z0 both run high (~1.6× the loss, ~10 % on Z0 in a microstrip
     cross-check). Extrude the conductor to its real thickness and put the
-    surface impedance on its faces; the gap-facing face then carries the current
-    one-sidedly, as the physical conductor does. The boundary condition itself
-    is exact for a sheet of the given :math:`Z_s` — this is purely a geometry
-    fidelity point.
+    surface impedance on its faces with ``two_sided=True``; the gap-facing
+    face then carries the current one-sidedly, as the physical conductor does.
+    The boundary condition itself is exact for a sheet of the given
+    :math:`Z_s` — this is purely a geometry fidelity point.
 
 
     Example
@@ -848,7 +868,8 @@ class SurfaceImpedance(_Physics):
     .. code-block:: python
 
         trace = g.box(w, length, 3e-6, position=(...))
-        rf.SurfaceImpedance(trace.faces, conductivity=3e7, thickness=3e-6)
+        rf.SurfaceImpedance(trace.faces, conductivity=3e7, thickness=3e-6,
+                            two_sided=True)
 
 
     Parameters
@@ -863,6 +884,10 @@ class SurfaceImpedance(_Physics):
         relative permittivity
     thickness : float, optional
         physical sheet thickness in metres (lossy thin-sheet model)
+    two_sided : bool
+        the BC sits on opposing faces of the same metal volume (shell of an
+        extruded conductor): each face owns half the thickness in the coth
+        term. Keep ``False`` for one-sided boundary sheets (ground planes).
     zs : tuple[float, float], optional
         explicit ``(Re, Im)`` surface impedance in :math:`\\Omega/\\square`,
         overrides the analytic value
@@ -873,12 +898,14 @@ class SurfaceImpedance(_Physics):
                  mur: float = 1.0,
                  er: float = 1.0,
                  thickness: float | None = None,
+                 two_sided: bool = False,
                  zs: tuple[float, float] | None = None):
         super().__init__(*targets)
         self.conductivity = float(conductivity)
         self.mur = float(mur)
         self.er = float(er)
         self.thickness = float(thickness) if thickness is not None else None
+        self.two_sided = bool(two_sided)
         self.zs = (float(zs[0]), float(zs[1])) if zs is not None else None
 
     def _to_toml(self, tag: int) -> str:
@@ -889,6 +916,8 @@ class SurfaceImpedance(_Physics):
         )
         if self.thickness is not None:
             s += f'thickness = {_f64(self.thickness)}\n'
+        if self.two_sided:
+            s += 'two_sided = true\n'
         if self.zs is not None:
             s += f'zs = [{_f64(self.zs[0])}, {_f64(self.zs[1])}]\n'
         return s

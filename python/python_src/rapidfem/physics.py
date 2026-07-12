@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 from typing import Sequence
 
 from .geometry import EntityCollection, GeoObject, _Entity
@@ -884,10 +886,13 @@ class SurfaceImpedance(_Physics):
         relative permittivity
     thickness : float, optional
         physical sheet thickness in metres (lossy thin-sheet model)
-    two_sided : bool
+    two_sided : bool, optional
         the BC sits on opposing faces of the same metal volume (shell of an
         extruded conductor): each face owns half the thickness in the coth
         term. Keep ``False`` for one-sided boundary sheets (ground planes).
+        Defaults to ``False``; if left unspecified while ``thickness`` is set
+        and the targets cover the complete shell of a solid, a
+        :class:`UserWarning` suggests the physically correct choice.
     zs : tuple[float, float], optional
         explicit ``(Re, Im)`` surface impedance in :math:`\\Omega/\\square`,
         overrides the analytic value
@@ -898,15 +903,39 @@ class SurfaceImpedance(_Physics):
                  mur: float = 1.0,
                  er: float = 1.0,
                  thickness: float | None = None,
-                 two_sided: bool = False,
+                 two_sided: bool | None = None,
                  zs: tuple[float, float] | None = None):
         super().__init__(*targets)
         self.conductivity = float(conductivity)
         self.mur = float(mur)
         self.er = float(er)
         self.thickness = float(thickness) if thickness is not None else None
-        self.two_sided = bool(two_sided)
+        self.two_sided = bool(two_sided) if two_sided is not None else False
         self.zs = (float(zs[0]), float(zs[1])) if zs is not None else None
+        if two_sided is None and self.thickness is not None and self._covers_solid_shell():
+            warnings.warn(
+                "SurfaceImpedance: thickness is set and the targets cover the "
+                "complete shell of an extruded conductor, but two_sided was "
+                "not specified. Opposing shell faces each own half the metal "
+                "— pass two_sided=True for the physical low-frequency "
+                "resistance, or two_sided=False explicitly for a one-sided "
+                "sheet (silences this warning).",
+                UserWarning, stacklevel=2)
+
+    def _covers_solid_shell(self) -> bool:
+        """True if the target faces include the complete shell of at least
+        one 3-D object of the geometry (the two-sided SIBC situation)."""
+        ids = {id(e) for e in self._entities}
+        try:
+            for obj in getattr(self._geometry, "_objects", []):
+                if getattr(obj, "dim", None) != 3:
+                    continue
+                shell = obj.faces._entities
+                if shell and all(id(e) in ids for e in shell):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def _to_toml(self, tag: int) -> str:
         s = (

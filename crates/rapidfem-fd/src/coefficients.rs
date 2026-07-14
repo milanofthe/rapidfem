@@ -72,13 +72,12 @@ pub fn volume_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
 
 /// Area coefficient by vertex indices, same convention as `volume_coeff`.
 ///
-/// Index 4 names a coordinate a triangle does not have. The historic formula
-/// counted it anyway, in both the factorial product and the degree sum, so
-/// `area_coeff(4, ..)` returns a value that is not a triangle integral at all.
-/// `AreaCoeffCache` still fills those slots (its loop runs 0..5 on every axis)
-/// and nothing reads them: the only caller, `tri_assembly_r2`, passes local
-/// triangle nodes, i.e. indices 1-3. The behaviour is preserved verbatim rather
-/// than "fixed", so this stays a refactor.
+/// Index 4 names a coordinate a triangle does not have. The formula counts it
+/// anyway, in both the factorial product and the degree sum, so `area_coeff(4,..)`
+/// returns a value that is not a triangle integral at all. That behaviour is kept
+/// verbatim because `derivations/nedelec2/barycentric.py` reproduces it and the
+/// golden test pins it; no caller reaches it, the element code goes through
+/// `area_coeff_exps` with the triangle's three real coordinates.
 pub fn area_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
     let e = indices_to_exps4(a, b, c, d);
     let mut num: u64 = 2;
@@ -101,60 +100,6 @@ fn indices_to_exps4(a: usize, b: usize, c: usize, d: usize) -> [u8; 4] {
         }
     }
     e
-}
-
-/// Precomputed 5×5×5×5 volume coefficient cache (indices 0-4).
-/// VOLUME_COEFF_CACHE[i][j][k][l] = volume_coeff(i,j,k,l)
-/// Note: at runtime, multiply by 6*V for physical scaling.
-pub struct VolumeCoeffCache {
-    pub data: [[[[f64; 5]; 5]; 5]; 5],
-}
-
-impl VolumeCoeffCache {
-    pub fn new() -> Self {
-        let mut data = [[[[0.0f64; 5]; 5]; 5]; 5];
-        for i in 0..5 {
-            for j in 0..5 {
-                for k in 0..5 {
-                    for l in 0..5 {
-                        data[i][j][k][l] = volume_coeff(i, j, k, l);
-                    }
-                }
-            }
-        }
-        VolumeCoeffCache { data }
-    }
-
-    #[inline]
-    pub fn get(&self, i: usize, j: usize, k: usize, l: usize) -> f64 {
-        self.data[i][j][k][l]
-    }
-}
-
-/// Precomputed 5×5×5×5 area coefficient cache.
-pub struct AreaCoeffCache {
-    pub data: [[[[f64; 5]; 5]; 5]; 5],
-}
-
-impl AreaCoeffCache {
-    pub fn new() -> Self {
-        let mut data = [[[[0.0f64; 5]; 5]; 5]; 5];
-        for i in 0..5 {
-            for j in 0..5 {
-                for k in 0..5 {
-                    for l in 0..5 {
-                        data[i][j][k][l] = area_coeff(i, j, k, l);
-                    }
-                }
-            }
-        }
-        AreaCoeffCache { data }
-    }
-
-    #[inline]
-    pub fn get(&self, i: usize, j: usize, k: usize, l: usize) -> f64 {
-        self.data[i][j][k][l]
-    }
 }
 
 #[cfg(test)]
@@ -187,16 +132,22 @@ mod tests {
         assert!((area_coeff(1, 1, 0, 0) - 1.0/6.0).abs() < 1e-15);
     }
 
+    /// The index-based and the exponent-based forms are the same integral. The
+    /// element code uses the exponent form; the derivation and its golden test are
+    /// written against the index form.
     #[test]
-    fn test_cache_matches_function() {
-        let vc = VolumeCoeffCache::new();
-        let ac = AreaCoeffCache::new();
-        for i in 0..5 {
-            for j in 0..5 {
-                for k in 0..5 {
-                    for l in 0..5 {
-                        assert!((vc.get(i,j,k,l) - volume_coeff(i,j,k,l)).abs() < 1e-15);
-                        assert!((ac.get(i,j,k,l) - area_coeff(i,j,k,l)).abs() < 1e-15);
+    fn index_and_exponent_forms_agree() {
+        for a in 0..5 {
+            for b in 0..5 {
+                for c in 0..5 {
+                    for d in 0..5 {
+                        let e = indices_to_exps4(a, b, c, d);
+                        assert_eq!(volume_coeff(a, b, c, d), volume_coeff_exps(e));
+                        // The area form has no fourth coordinate: only compare
+                        // where the indices name none.
+                        if e[3] == 0 {
+                            assert_eq!(area_coeff(a, b, c, d), area_coeff_exps([e[0], e[1], e[2]]));
+                        }
                     }
                 }
             }

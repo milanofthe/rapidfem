@@ -7,31 +7,51 @@
 
 //! Surface (boundary-triangle) assembly for the Robin / port BC.
 //!
-//! On a boundary face the curl-conforming element restricts to the canonical
-//! R2 *surface* element: 8 DOFs = 3 edges × 2 modes + 1 face × 2 modes, with
-//! the same Whitney-times-nodal-weight form as the volume basis but in the
-//! triangle's tangent plane (W_ab = L_a ∇L_b − L_b ∇L_a, 2-D gradients):
+//! The surface element is the **tangential trace of the volume element**, not a
+//! second element. On a boundary face F of a tetrahedron:
 //!
-//!   edge e=(a,b): φ_e1 = ℓ L_a W_ab,  φ_e2 = ℓ L_b W_ab
-//!   face (0,1,2): φ_f1 = |0,2| L_1 W_02 (sign-matched),  φ_f2 = |0,1| L_2 W_01
+//!   * the barycentric coordinate of the opposite vertex vanishes on F, and
+//!   * the tangential part of its gradient vanishes on F as well, while for the
+//!     three vertices of F the tangential part of ∇L is exactly the triangle's own
+//!     2-D barycentric gradient.
+//!
+//! So the trace of a volume function whose terms name only F's vertices is
+//! obtained by reading the same terms with 2-D gradients, and the volume functions
+//! that name the opposite vertex trace to zero. Exactly 8 of the 20 volume DOFs
+//! survive: F's three edges × 2 modes, and F itself × 2 modes. That is the
+//! surface element.
+//!
+//! `build_surface_basis` therefore calls `tet_assembly_r2::r2_edge_fns` and
+//! `r2_face_fns` — the same generators the volume element is built from — on the
+//! triangle's own three nodes. It does not restate the functions, so it cannot
+//! disagree with the volume element about their sign. (It used to restate them,
+//! with a comment claiming the signs had been matched by hand.) The identity is
+//! proved symbolically in `derivations/nedelec2/face_trace.py` and checked against
+//! the volume element on real tetrahedra in `tests/face_trace_test.rs`.
 //!
 //! The Robin term ∫ γ (n̂×φ_i)·(n̂×φ_j) dA reduces, for tangential fields, to
-//! γ ∫ φ_i·φ_j dA — the surface mass matrix. The forcing is ∫ φ_i·u_inc dA.
-//! Both integrate exactly with the barycentric area coefficients.
+//! γ ∫ φ_i·φ_j dA — the surface mass matrix. The forcing is ∫ φ_i·u_inc dA. Both
+//! integrate exactly with the barycentric area coefficients; no quadrature is
+//! needed for the mass.
 //!
-//! DOF order matches `basis::Nedelec2Basis`: [e0 e1 e2 (m1)], face·m1,
-//! [e0 e1 e2 (m2)], face·m2 → indices 0,1,2,3,4,5,6,7.
+//! DOF order matches `basis::R2_TRI_OWNERS`: [e0 e1 e2]·m1, face·m1,
+//! [e0 e1 e2]·m2, face·m2 → indices 0..8.
 
 use num_complex::Complex64 as C64;
-use crate::coefficients::AreaCoeffCache;
+use rapidfem_core::mesh::TRI_EDGE_LOCAL;
+
+use crate::coefficients::area_coeff_exps;
+use crate::tet_assembly_r2::{r2_edge_fns, r2_face_fns, BasisFn};
 
 type V2 = [f64; 2];
 
-/// Surface local edge order (sorted-triangle convention, matches `mesh`).
-const TRI_EDGE_MAP: [[usize; 2]; 3] = [[0, 1], [1, 2], [0, 2]];
+/// Number of DOFs on the R2 surface element: 3 edges × 2 modes + 1 face × 2.
+pub const N_TRI_DOFS: usize = 8;
 
 #[inline]
-fn dot2(a: &V2, b: &V2) -> f64 { a[0]*b[0] + a[1]*b[1] }
+fn dot2(a: &V2, b: &V2) -> f64 {
+    a[0] * b[0] + a[1] * b[1]
+}
 
 #[inline]
 fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -46,7 +66,7 @@ fn norm3(a: [f64; 3]) -> [f64; 3] {
 
 /// Local right-handed 2-D frame of a triangle: returns (rotation rows, xs, ys)
 /// with vertex 0 at the origin, edge 0→1 along x̂, n̂ = ê1×ê2 as ẑ.
-fn tri_local_cs(v: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [f64; 3]) {
+pub fn tri_local_cs(v: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [f64; 3]) {
     let o = v[0];
     let e1 = [v[1][0]-o[0], v[1][1]-o[1], v[1][2]-o[2]];
     let e2 = [v[2][0]-o[0], v[2][1]-o[1], v[2][2]-o[2]];
@@ -65,7 +85,7 @@ fn tri_local_cs(v: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [f64; 3]) {
 }
 
 /// 2-D barycentric gradients ∇L_i = (b_i, c_i)/(2A) and the signed 2A.
-fn bary_grads_2d(xs: &[f64; 3], ys: &[f64; 3]) -> ([V2; 3], f64) {
+pub fn bary_grads_2d(xs: &[f64; 3], ys: &[f64; 3]) -> ([V2; 3], f64) {
     let (x1, x2, x3) = (xs[0], xs[1], xs[2]);
     let (y1, y2, y3) = (ys[0], ys[1], ys[2]);
     let two_a = x1*(y2-y3) + x2*(y3-y1) + x3*(y1-y2); // signed 2·Area
@@ -75,7 +95,7 @@ fn bary_grads_2d(xs: &[f64; 3], ys: &[f64; 3]) -> ([V2; 3], f64) {
     // Sliver guard (2-D analogue of the tet floor): a near-collinear boundary
     // triangle has 2A → 0; floor it so ∇L stays finite.
     let mut sum_len = 0.0;
-    for &(i, j) in &[(0, 1), (1, 2), (0, 2)] {
+    for &[i, j] in &TRI_EDGE_LOCAL {
         let dx = xs[i] - xs[j];
         let dy = ys[i] - ys[j];
         sum_len += (dx * dx + dy * dy).sqrt();
@@ -93,80 +113,91 @@ fn bary_grads_2d(xs: &[f64; 3], ys: &[f64; 3]) -> ([V2; 3], f64) {
     (grads, two_a_eff)
 }
 
-#[derive(Clone, Copy)]
-struct Term { coeff: f64, mono: [usize; 2], grad: usize }
-struct SurfFn { scale: f64, terms: [Term; 2] }
-
 fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
     ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2)).sqrt()
 }
 
-/// Build the 8 surface basis functions in DOF order.
-fn build_surface_basis(xs: &[f64; 3], ys: &[f64; 3]) -> [SurfFn; 8] {
-    let d = |i, j| node_dist(xs, ys, i, j);
-    let mk = |scale: f64, c0: f64, m0: [usize; 2], g0: usize,
-              c1: f64, m1: [usize; 2], g1: usize| SurfFn {
-        scale, terms: [Term { coeff: c0, mono: m0, grad: g0 },
-                       Term { coeff: c1, mono: m1, grad: g1 }],
-    };
-    // edges m1: ℓ L_a (L_a ∇L_b − L_b ∇L_a)
-    let e = |a: usize, b: usize, weight: usize| {
-        let l = d(a, b);
-        mk(l, 1.0, [weight, a], b, -1.0, [weight, b], a)
-    };
-    let e0 = TRI_EDGE_MAP[0]; let e1 = TRI_EDGE_MAP[1]; let e2 = TRI_EDGE_MAP[2];
-    // face: φ_f1 = |0,2| L_1 (L_2 ∇L_0 − L_0 ∇L_2) (sign-matched to volume),
-    //       φ_f2 = |0,1| L_2 (L_0 ∇L_1 − L_1 ∇L_0)
-    let f1 = mk(d(0, 2), -1.0, [1, 0], 2, 1.0, [1, 2], 0);
-    let f2 = mk(d(0, 1), 1.0, [2, 0], 1, -1.0, [2, 1], 0);
-    [
-        e(e0[0], e0[1], e0[0]),   // 0: edge0 m1
-        e(e1[0], e1[1], e1[0]),   // 1: edge1 m1
-        e(e2[0], e2[1], e2[0]),   // 2: edge2 m1
-        f1,                        // 3: face m1
-        e(e0[0], e0[1], e0[1]),   // 4: edge0 m2
-        e(e1[0], e1[1], e1[1]),   // 5: edge1 m2
-        e(e2[0], e2[1], e2[1]),   // 6: edge2 m2
-        f2,                        // 7: face m2
-    ]
+/// The 8 surface basis functions, in DOF order.
+///
+/// Built from the volume element's own generators on the triangle's three nodes
+/// (see the module docs). The triangle has no fourth node, so `exps[3]` is zero
+/// and no term gradients it — asserted below, because that is precisely the trace
+/// property the construction relies on.
+pub fn build_surface_basis(xs: &[f64; 3], ys: &[f64; 3]) -> Vec<BasisFn> {
+    let d = |i: usize, j: usize| node_dist(xs, ys, i, j);
+
+    let edges: Vec<[BasisFn; 2]> = TRI_EDGE_LOCAL
+        .iter()
+        .map(|&[a, b]| r2_edge_fns(a, b, d(a, b)))
+        .collect();
+    let face = r2_face_fns(0, 1, 2, d(0, 2), d(0, 1));
+
+    let mut fns = Vec::with_capacity(N_TRI_DOFS);
+    for m in 0..2 {
+        fns.extend(edges.iter().map(|e| e[m].clone()));
+        fns.push(face[m].clone());
+    }
+    debug_assert_eq!(fns.len(), N_TRI_DOFS);
+    debug_assert!(
+        fns.iter().all(|f| f.terms.iter().all(|t| t.exps[3] == 0 && t.grad < 3)),
+        "a surface function names the opposite vertex: it is not a tangential trace"
+    );
+    fns
 }
 
-/// ∫ L_p L_q L_r L_s dA over the triangle (local 0-based node indices).
+/// Evaluate one surface function's tangential vector at barycentric `lam`.
 #[inline]
-fn integ_area(p: usize, q: usize, r: usize, s: usize, area: f64, ac: &AreaCoeffCache) -> f64 {
-    // area_coeff returns ∫/A for 1-based indices, 0 = unused.
-    ac.get(p + 1, q + 1, r + 1, s + 1) * area
+fn eval_surface_fn(f: &BasisFn, lam: &[f64; 3], grads: &[V2; 3]) -> V2 {
+    let mut v = [0.0_f64; 2];
+    for t in &f.terms {
+        let mut mono = f.scale * t.coeff;
+        for (i, &e) in t.exps[..3].iter().enumerate() {
+            for _ in 0..e {
+                mono *= lam[i];
+            }
+        }
+        let g = &grads[t.grad as usize];
+        v[0] += mono * g[0];
+        v[1] += mono * g[1];
+    }
+    v
+}
+
+/// Surface mass matrix `∫ φ_i·φ_j dA`, row-major n×n, for any surface basis.
+///
+/// Exact: a product of two functions is a sum of terms `c · L^e · (∇L_a·∇L_b)`
+/// with constant gradients, and `∫ L^e dA / A` is the closed-form area
+/// coefficient. The 2-D counterpart of `tet_assembly_r2::element_stiff_mass`; the
+/// Robin term needs no curl, so there is no stiffness half.
+pub fn surface_mass(basis: &[BasisFn], grads: &[V2; 3], area: f64) -> Vec<f64> {
+    let n = basis.len();
+    let mut m = vec![0.0_f64; n * n];
+    for i in 0..n {
+        for j in i..n {
+            let mut acc = 0.0;
+            for ti in &basis[i].terms {
+                for tj in &basis[j].terms {
+                    let g = dot2(&grads[ti.grad as usize], &grads[tj.grad as usize]);
+                    let e: [u8; 3] = std::array::from_fn(|k| ti.exps[k] + tj.exps[k]);
+                    acc += ti.coeff * tj.coeff * g * (area_coeff_exps(e) * area);
+                }
+            }
+            let val = basis[i].scale * basis[j].scale * acc;
+            m[i * n + j] = val;
+            m[j * n + i] = val;
+        }
+    }
+    m
 }
 
 /// Surface Robin stiffness: `γ ∫ φ_i·φ_j dA`, an 8×8 complex matrix.
-pub fn ned2_tri_stiff(
-    glob_vertices: &[[f64; 3]; 3],
-    gamma: C64,
-    ac_base: &AreaCoeffCache,
-) -> [[C64; 8]; 8] {
+pub fn ned2_tri_stiff(glob_vertices: &[[f64; 3]; 3], gamma: C64) -> [[C64; 8]; 8] {
     let (_, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
-    let area = 0.5 * two_a.abs();
     let fns = build_surface_basis(&xs, &ys);
+    let m = surface_mass(&fns, &grads, 0.5 * two_a.abs());
 
-    let mut bmat = [[C64::new(0.0, 0.0); 8]; 8];
-    for i in 0..8 {
-        for j in i..8 {
-            let sc = fns[i].scale * fns[j].scale;
-            let mut acc = 0.0;
-            for ti in &fns[i].terms {
-                for tj in &fns[j].terms {
-                    let g = dot2(&grads[ti.grad], &grads[tj.grad]);
-                    let intg = integ_area(ti.mono[0], ti.mono[1], tj.mono[0], tj.mono[1], area, ac_base);
-                    acc += ti.coeff * tj.coeff * g * intg;
-                }
-            }
-            let val = gamma * C64::from(sc * acc);
-            bmat[i][j] = val;
-            bmat[j][i] = val;
-        }
-    }
-    bmat
+    std::array::from_fn(|i| std::array::from_fn(|j| gamma * C64::from(m[i * N_TRI_DOFS + j])))
 }
 
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.
@@ -176,37 +207,31 @@ pub fn ned2_tri_force(
     glob_uinc: &[[C64; 3]],
     dpts: &[[f64; 4]],
 ) -> [C64; 8] {
-    let (basis, xs, ys) = tri_local_cs(glob_vertices);
+    let (frame, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
     let area = 0.5 * two_a.abs();
     let fns = build_surface_basis(&xs, &ys);
 
-    // incident field rotated into the local frame (tangential x,y components)
-    let lcs_uinc: Vec<[C64; 3]> = glob_uinc.iter().map(|c| [
-        C64::from(basis[0][0])*c[0] + C64::from(basis[0][1])*c[1] + C64::from(basis[0][2])*c[2],
-        C64::from(basis[1][0])*c[0] + C64::from(basis[1][1])*c[1] + C64::from(basis[1][2])*c[2],
-        C64::from(basis[2][0])*c[0] + C64::from(basis[2][1])*c[1] + C64::from(basis[2][2])*c[2],
-    ]).collect();
+    // Incident field rotated into the local frame; only the tangential (x,y)
+    // components pair with φ.
+    let lcs_uinc: Vec<[C64; 2]> = glob_uinc
+        .iter()
+        .map(|c| {
+            std::array::from_fn(|r| {
+                C64::from(frame[r][0]) * c[0]
+                    + C64::from(frame[r][1]) * c[1]
+                    + C64::from(frame[r][2]) * c[2]
+            })
+        })
+        .collect();
 
-    // barycentric L_i at a quad point from its (L1,L2,L3) — direct.
-    let mut bvec = [C64::new(0.0, 0.0); 8];
+    let mut bvec = [C64::new(0.0, 0.0); N_TRI_DOFS];
     for (fi, f) in fns.iter().enumerate() {
         let mut sum = C64::new(0.0, 0.0);
         for (qi, qp) in dpts.iter().enumerate() {
-            let w = qp[0];
-            let lam = [qp[1], qp[2], qp[3]];
-            // φ(point) tangential vector = scale·Σ coeff·L_p·L_q·∇L_g
-            // force pairs with the volume assembly basis (build_basis sign),
-            // not the interp reconstruction sign.
-            let mut phi = [0.0_f64; 2];
-            for t in &f.terms {
-                let s = f.scale * t.coeff * lam[t.mono[0]] * lam[t.mono[1]];
-                phi[0] += s * grads[t.grad][0];
-                phi[1] += s * grads[t.grad][1];
-            }
-            let ux = lcs_uinc[qi][0];
-            let uy = lcs_uinc[qi][1];
-            sum += C64::from(w) * (C64::from(phi[0])*ux + C64::from(phi[1])*uy);
+            let phi = eval_surface_fn(f, &[qp[1], qp[2], qp[3]], &grads);
+            sum += C64::from(qp[0])
+                * (C64::from(phi[0]) * lcs_uinc[qi][0] + C64::from(phi[1]) * lcs_uinc[qi][1]);
         }
         bvec[fi] = C64::from(area) * sum;
     }

@@ -24,7 +24,6 @@ use crate::basis::Nedelec2Basis;
 use crate::port::Port;
 use crate::tet_assembly_r2::assemble_global_matrices;
 use crate::tri_assembly_r2::{ned2_tri_stiff, ned2_tri_force};
-use crate::coefficients::AreaCoeffCache;
 use crate::quadrature::gaus_quad_tri;
 use std::collections::HashSet;
 
@@ -136,7 +135,6 @@ pub fn assemble_and_solve_with_pml(
 
     // Step 4: Robin / port boundary term, accumulated into a flat per-tri
     // buffer (Bempty) and added to K as COO triplets.
-    let ac_base = AreaCoeffCache::new();
     let gauss_points = gaus_quad_tri(4);
 
     let mut bempty = basis.empty_tri_matrix();
@@ -148,7 +146,7 @@ pub fn assemble_and_solve_with_pml(
         for &ti in *tri_ids {
             let tri = &mesh.tris[ti];
             let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
-            let bsub = ned2_tri_stiff(&verts, gamma, &ac_base);
+            let bsub = ned2_tri_stiff(&verts, gamma);
             // The block reserved for this triangle is n×n, with n from the DOF
             // map; the surface element itself is still fixed at R2's 8.
             let n = basis.tri_dofs(ti).len();
@@ -355,7 +353,6 @@ pub fn frequency_sweep_with_pml(
     let mut dof_to_free = vec![usize::MAX; basis.n_field];
     for (fi, &d) in free_dofs.iter().enumerate() { dof_to_free[d] = fi; }
 
-    let ac_base = crate::coefficients::AreaCoeffCache::new();
     let gauss_points = crate::quadrature::gaus_quad_tri(4);
 
     let mut results = Vec::with_capacity(frequencies.len());
@@ -430,7 +427,7 @@ pub fn frequency_sweep_with_pml(
             for &ti in *tri_ids {
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
-                let bsub = ned2_tri_stiff(&verts, gamma, &ac_base);
+                let bsub = ned2_tri_stiff(&verts, gamma);
                 let n = basis.tri_dofs(ti).len();
                 let p = basis.tri_block(ti);
                 for ii in 0..n { for jj in 0..n { bempty[p + ii*n + jj] += bsub[ii][jj]; } }

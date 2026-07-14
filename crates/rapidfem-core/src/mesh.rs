@@ -28,6 +28,13 @@ pub const TET_EDGE_LOCAL: [[usize; 2]; 6] = [
     [2, 3],
 ];
 
+/// Local edge order within a triangle, as 0-indexed node pairs of the SORTED
+/// triangle. Because the triangle's nodes are stored ascending, each pair is also
+/// ascending globally, so an edge carries the same orientation whether it is
+/// reached through a triangle or through a tetrahedron. That is what lets the
+/// surface element share the volume element's edge DOFs.
+pub const TRI_EDGE_LOCAL: [[usize; 2]; 3] = [[0, 1], [1, 2], [0, 2]];
+
 /// Local face order within a tetrahedron, as 0-indexed node triples.
 /// The 3rd entry (0,3,1) is intentionally not in ascending order.
 pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [
@@ -115,17 +122,12 @@ impl Mesh {
             }
         }
 
-        // Per-tri edge order convention: (0,1), (1,2), (0,2) of the sorted
-        // triangle nodes — matches the surface DOF layout in `basis`.
         let n_tris = tris.len();
         let mut tri_to_edge = vec![[0usize; 3]; n_tris];
         for (ti, tri) in tris.iter().enumerate() {
-            let edge_pairs = [
-                (tri[0].min(tri[1]), tri[0].max(tri[1])), // edge(0,1)
-                (tri[1].min(tri[2]), tri[1].max(tri[2])), // edge(1,2)
-                (tri[0].min(tri[2]), tri[0].max(tri[2])), // edge(0,2)
-            ];
-            for (ei, &key) in edge_pairs.iter().enumerate() {
+            for (ei, &[li, lj]) in TRI_EDGE_LOCAL.iter().enumerate() {
+                let (a, b) = (tri[li], tri[lj]);
+                let key = if a < b { (a, b) } else { (b, a) };
                 tri_to_edge[ti][ei] = inv_edges[&key];
             }
         }

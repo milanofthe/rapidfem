@@ -181,57 +181,69 @@ pub struct BasisFn {
 
 impl BasisFn {
     #[inline]
-    fn new(scale: f64, terms: Vec<Term>) -> BasisFn {
+    pub fn new(scale: f64, terms: Vec<Term>) -> BasisFn {
         BasisFn { scale, terms }
     }
 }
 
+/// The two R2 functions of the edge (a, b) of length ℓ, in mode order:
+///
+///   φ_e1 = ℓ · L_a · W_ab,   φ_e2 = ℓ · L_b · W_ab,
+///   with the Whitney function W_ab = L_a ∇L_b − L_b ∇L_a.
+///
+/// `a` and `b` are node indices in whatever local numbering the caller uses, so
+/// this serves the tetrahedron and the triangle alike.
+///
+/// This, and `r2_face_fns`, are the ONLY places the R2 functions are written
+/// down. The surface element is the tangential trace of this one and is built by
+/// calling the same two functions, so the two cannot drift apart in sign — which
+/// they previously could, being written out twice.
+pub fn r2_edge_fns(a: usize, b: usize, len: f64) -> [BasisFn; 2] {
+    [
+        BasisFn::new(len, vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)]),
+        BasisFn::new(len, vec![Term::quad(1.0, a, b, b), Term::quad(-1.0, b, b, a)]),
+    ]
+}
+
+/// The two R2 functions of the face (n0, n1, n2), in mode order:
+///
+///   φ_f1 = |n0 n2| · L_n1 (L_n2 ∇L_n0 − L_n0 ∇L_n2)
+///   φ_f2 = |n0 n1| · L_n2 (L_n0 ∇L_n1 − L_n1 ∇L_n0)
+///
+/// `d02` and `d01` are the distances |n0 n2| and |n0 n1|. Both functions have a
+/// vanishing tangential trace on the tetrahedron's other three faces (proved in
+/// `derivations/nedelec2/`), which is what makes them face-interior DOFs.
+pub fn r2_face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [BasisFn; 2] {
+    [
+        BasisFn::new(d02, vec![Term::quad(-1.0, n1, n0, n2), Term::quad(1.0, n1, n2, n0)]),
+        BasisFn::new(d01, vec![Term::quad(1.0, n2, n0, n1), Term::quad(-1.0, n2, n1, n0)]),
+    ]
+}
+
 /// Build the 20 R2 basis functions for this tet from its local edge/face maps.
-/// DOF order matches `basis::Nedelec2Basis`: edge·m1, face·m1, edge·m2, face·m2.
+/// DOF order matches `basis::R2_TET_OWNERS`: edge·m1, face·m1, edge·m2, face·m2.
 pub fn build_basis(
     edge_len: &[f64; 6],
     edge_map: &[[usize; 2]; 6],
     tri_map: &[[usize; 3]; 4],
     node_dist: &dyn Fn(usize, usize) -> f64,
 ) -> Vec<BasisFn> {
-    let mut edge_m1 = Vec::with_capacity(6);
-    let mut edge_m2 = Vec::with_capacity(6);
-    for e in 0..6 {
-        let (a, b) = (edge_map[e][0], edge_map[e][1]);
-        let l = edge_len[e];
-        // φ_e1 = ℓ L_a (L_a ∇L_b − L_b ∇L_a)
-        edge_m1.push(BasisFn::new(
-            l,
-            vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)],
-        ));
-        // φ_e2 = ℓ L_b (L_a ∇L_b − L_b ∇L_a)
-        edge_m2.push(BasisFn::new(
-            l,
-            vec![Term::quad(1.0, a, b, b), Term::quad(-1.0, b, b, a)],
-        ));
-    }
-    let mut face_m1 = Vec::with_capacity(4);
-    let mut face_m2 = Vec::with_capacity(4);
-    for f in 0..4 {
-        let (n0, n1, n2) = (tri_map[f][0], tri_map[f][1], tri_map[f][2]);
-        // φ_f1 = |n0 n2| L_n1 (L_n2 ∇L_n0 − L_n0 ∇L_n2)
-        // (sign convention matched to the pipeline's face-mode-1 DOF)
-        face_m1.push(BasisFn::new(
-            node_dist(n0, n2),
-            vec![Term::quad(-1.0, n1, n0, n2), Term::quad(1.0, n1, n2, n0)],
-        ));
-        // φ_f2 = |n0 n1| L_n2 (L_n0 ∇L_n1 − L_n1 ∇L_n0)
-        face_m2.push(BasisFn::new(
-            node_dist(n0, n1),
-            vec![Term::quad(1.0, n2, n0, n1), Term::quad(-1.0, n2, n1, n0)],
-        ));
-    }
-    // DOF order: edge·m1, face·m1, edge·m2, face·m2
+    let edges: Vec<[BasisFn; 2]> = (0..6)
+        .map(|e| r2_edge_fns(edge_map[e][0], edge_map[e][1], edge_len[e]))
+        .collect();
+    let faces: Vec<[BasisFn; 2]> = (0..4)
+        .map(|f| {
+            let (n0, n1, n2) = (tri_map[f][0], tri_map[f][1], tri_map[f][2]);
+            r2_face_fns(n0, n1, n2, node_dist(n0, n2), node_dist(n0, n1))
+        })
+        .collect();
+
+    // DOF order: edge·m1, face·m1, edge·m2, face·m2.
     let mut basis = Vec::with_capacity(20);
-    basis.extend(edge_m1);
-    basis.extend(face_m1);
-    basis.extend(edge_m2);
-    basis.extend(face_m2);
+    for m in 0..2 {
+        basis.extend(edges.iter().map(|e| e[m].clone()));
+        basis.extend(faces.iter().map(|f| f[m].clone()));
+    }
     basis
 }
 

@@ -239,6 +239,51 @@ a constant.
 
 Each stage is independently shippable and has its own oracle.
 
+### Status
+
+Stages 0-2 are done, on `feat/fd-modular-element`. What actually landed:
+
+| Stage | Commit | Outcome |
+|---|---|---|
+| oracle | `c5bd7d0` | `tests/global_assembly_pin_test.rs`: DOF map, scatter order, matrix values |
+| 0 | `48e57c6` | bit-identical, and **15% faster** (31.3 ms vs 36.7 ms on 10 368 tets) |
+| 1 | `1815b40` | values bit-identical; the DOF numbering is a proven permutation of the old |
+| 2 | `c792f4f` | surface element built from the volume element's generators; trace identity proved |
+
+Two things came out differently from the plan.
+
+**Stage 0 got faster, not slower.** The general term representation made it natural
+to hoist the curls out of the `(i,j)` double loop and compute them once per basis
+function. The old code recomputed both curls inside the loop, so it did O(n²) cross
+products where O(n) suffice.
+
+**Stage 1 changes the DOF numbering.** The old layout was mode-major
+(`[all edges m1][all faces m1][all edges m2][all faces m2]`), which only exists if
+every entity has the same count — the exact assumption being removed. The new one is
+entity-major, so an entity's DOFs are contiguous and its count is free. That is a
+relabelling of the unknowns, not a change of the discretisation: the assembled
+system is `P·K·Pᵀ`. `numbering_is_a_relabelling_of_the_mode_major_layout` proves the
+permutation is a bijection, and the pin's abs-sum / Frobenius values (invariant under
+a permutation) did not move a single digit. Only the pattern hash did.
+
+**Stage 2 did not need the adjacent tetrahedron.** The plan proposed restricting the
+volume element of the neighbouring tet onto the face at runtime. That is unnecessary:
+the trace of the volume function on a face is the *same formula* read with 2-D
+gradients (`derivations/nedelec2/face_trace.py`, lemmas L1-L3), so it is enough for
+the surface element to call the volume element's own generators (`r2_edge_fns`,
+`r2_face_fns`) on the triangle's three nodes. The surface path stays tet-free and
+cheap, and the signs cannot drift because they are no longer written down twice.
+`tests/face_trace_test.rs` closes the loop numerically: it integrates the traced
+volume functions over the face and gets `ned2_tri_stiff` back, using the DOF
+correspondence the *assembler* uses (a shared global index) rather than a
+hand-derived one. That correspondence turns out to be permuted — the triangle's edges
+map to tet-local edges `[0, 3, 1]`, not `[0, 1, 3]` — which is precisely the kind of
+thing the old "sign-matched to volume" comment was silently carrying.
+
+Removed on the way: `AreaCoeffCache` and `VolumeCoeffCache` (625-entry tables built
+per solve, no longer read by anything), and the `ac_base` parameter of
+`ned2_tri_stiff`. The regenerated `tri_mass_golden_test` values are byte-identical.
+
 ### Stage 0 — general term representation (pure refactor)
 
 - `Term { coeff, exps: [u8; 4], grad: u8 }`; `BasisFn.terms: SmallVec<[Term; 4]>`.

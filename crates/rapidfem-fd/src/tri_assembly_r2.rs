@@ -41,12 +41,15 @@ use num_complex::Complex64 as C64;
 use rapidfem_core::mesh::TRI_EDGE_LOCAL;
 
 use crate::coefficients::area_coeff_exps;
+use crate::dofmap::DofOwner;
 use crate::tet_assembly_r2::{r2_edge_fns, r2_face_fns, BasisFn, BasisKind};
 
 type V2 = [f64; 2];
 
-/// Number of DOFs on the R2 surface element: 3 edges × 2 modes + 1 face × 2.
-pub const N_TRI_DOFS: usize = 8;
+/// Number of DOFs on the surface element at uniform order 2: 3 edges × 2 modes
+/// + 1 face × 2. Under the minimum rule it can be less; ask the DOF map, do not
+/// assume this.
+pub const N_TRI_DOFS_P2: usize = 8;
 
 #[inline]
 fn dot2(a: &V2, b: &V2) -> f64 {
@@ -123,7 +126,12 @@ fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
 /// (see the module docs). The triangle has no fourth node, so `exps[3]` is zero
 /// and no term gradients it — asserted below, because that is precisely the trace
 /// property the construction relies on.
-pub fn build_surface_basis(kind: BasisKind, xs: &[f64; 3], ys: &[f64; 3]) -> Vec<BasisFn> {
+pub fn build_surface_basis(
+    kind: BasisKind,
+    owners: &[DofOwner],
+    xs: &[f64; 3],
+    ys: &[f64; 3],
+) -> Vec<BasisFn> {
     let d = |i: usize, j: usize| node_dist(xs, ys, i, j);
 
     let edges: Vec<[BasisFn; 2]> = TRI_EDGE_LOCAL
@@ -132,12 +140,14 @@ pub fn build_surface_basis(kind: BasisKind, xs: &[f64; 3], ys: &[f64; 3]) -> Vec
         .collect();
     let face = r2_face_fns(0, 1, 2, d(0, 2), d(0, 1));
 
-    let mut fns = Vec::with_capacity(N_TRI_DOFS);
-    for m in 0..2 {
-        fns.extend(edges.iter().map(|e| e[m].clone()));
-        fns.push(face[m].clone());
-    }
-    debug_assert_eq!(fns.len(), N_TRI_DOFS);
+    let fns: Vec<BasisFn> = owners
+        .iter()
+        .map(|o| match *o {
+            DofOwner::Edge { entity, k } => edges[entity as usize][k as usize].clone(),
+            DofOwner::Face { k, .. } => face[k as usize].clone(),
+            DofOwner::Cell { .. } => unreachable!("a triangle has no cell DOFs"),
+        })
+        .collect();
     debug_assert!(
         fns.iter().all(|f| f.terms.iter().all(|t| t.exps[3] == 0 && t.grad < 3)),
         "a surface function names the opposite vertex: it is not a tangential trace"
@@ -190,28 +200,35 @@ pub fn surface_mass(basis: &[BasisFn], grads: &[V2; 3], area: f64) -> Vec<f64> {
     m
 }
 
-/// Surface Robin stiffness: `γ ∫ φ_i·φ_j dA`, an 8×8 complex matrix.
-pub fn ned2_tri_stiff(kind: BasisKind, glob_vertices: &[[f64; 3]; 3], gamma: C64) -> [[C64; 8]; 8] {
+/// Surface Robin stiffness: `γ ∫ φ_i·φ_j dA`, row-major n×n with n = owners.len().
+/// n is 8 at uniform order 2 and smaller where the minimum rule has reduced the
+/// triangle's entities.
+pub fn ned2_tri_stiff(
+    kind: BasisKind,
+    owners: &[DofOwner],
+    glob_vertices: &[[f64; 3]; 3],
+    gamma: C64,
+) -> Vec<C64> {
     let (_, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
-    let fns = build_surface_basis(kind, &xs, &ys);
+    let fns = build_surface_basis(kind, owners, &xs, &ys);
     let m = surface_mass(&fns, &grads, 0.5 * two_a.abs());
-
-    std::array::from_fn(|i| std::array::from_fn(|j| gamma * C64::from(m[i * N_TRI_DOFS + j])))
+    m.iter().map(|&v| gamma * C64::from(v)).collect()
 }
 
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.
 /// `dpts[q] = [w, L1, L2, L3]`, `glob_uinc[q]` the incident field at that point.
 pub fn ned2_tri_force(
     kind: BasisKind,
+    owners: &[DofOwner],
     glob_vertices: &[[f64; 3]; 3],
     glob_uinc: &[[C64; 3]],
     dpts: &[[f64; 4]],
-) -> [C64; 8] {
+) -> Vec<C64> {
     let (frame, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
     let area = 0.5 * two_a.abs();
-    let fns = build_surface_basis(kind, &xs, &ys);
+    let fns = build_surface_basis(kind, owners, &xs, &ys);
 
     // Incident field rotated into the local frame; only the tangential (x,y)
     // components pair with φ.
@@ -226,7 +243,7 @@ pub fn ned2_tri_force(
         })
         .collect();
 
-    let mut bvec = [C64::new(0.0, 0.0); N_TRI_DOFS];
+    let mut bvec = vec![C64::new(0.0, 0.0); fns.len()];
     for (fi, f) in fns.iter().enumerate() {
         let mut sum = C64::new(0.0, 0.0);
         for (qi, qp) in dpts.iter().enumerate() {

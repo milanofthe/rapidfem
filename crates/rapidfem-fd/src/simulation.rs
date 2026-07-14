@@ -92,17 +92,62 @@ impl Simulation {
             eprintln!("  Geometry normalized: L0 = {:.6e} m (mean edge length)", l0);
         }
         let kind = config.element.kind().unwrap_or_else(|e| panic!("{e}"));
-        let basis = Nedelec2Basis::with_kind(&mesh, kind);
-        eprintln!(
-            "RapidFEM - {} tets, {} DOFs, {:?} basis",
-            mesh.n_tets(),
-            basis.n_field,
-            kind
-        );
+        let policy = config.element.policy().unwrap_or_else(|e| panic!("{e}"));
 
         // Materials before ports so `wave_numerical` can consult per-tet ε_r
-        // when running the vector-hybrid mode solve on the port face.
+        // when running the vector-hybrid mode solve on the port face — and before
+        // the basis, because the order policy reads them.
         let materials = build_materials(&mesh, &config);
+
+        let orders = match policy {
+            crate::config::OrderPolicy::Uniform => crate::order::OrderMap::uniform(&mesh, 2),
+            crate::config::OrderPolicy::Adaptive => {
+                // Choose the orders at the HIGHEST frequency of the sweep. The
+                // wavelength is shortest there, so k·h is largest and the policy
+                // reduces the fewest cells: the order map that is adequate at the
+                // top of the band is adequate across it. (One map for the whole
+                // sweep is also what lets the symbolic factorisation be reused.)
+                let f_max = config
+                    .frequency
+                    .frequencies()
+                    .into_iter()
+                    .fold(0.0_f64, f64::max);
+                let (er, ur) = crate::materials::build_material_tensors(
+                    mesh.n_tets(),
+                    &materials,
+                    f_max,
+                );
+                let k = crate::order::cell_wavenumbers(&mesh, &er, &ur, f_max);
+                let om = crate::order::wavelength_policy(&mesh, &k, config.element.theta);
+                let n1 = om.cell.iter().filter(|&&p| p == 1).count();
+                eprintln!(
+                    "  Order policy (θ = {}, f = {:.4e} Hz): {} of {} cells at order 1",
+                    config.element.theta,
+                    f_max,
+                    n1,
+                    mesh.n_tets()
+                );
+                om
+            }
+        };
+
+        let uniform = crate::order::OrderMap::uniform(&mesh, 2);
+        let full_dofs = uniform.n_dofs();
+        let basis = Nedelec2Basis::with_orders(&mesh, kind, orders);
+        eprintln!(
+            "RapidFEM - {} tets, {} DOFs, {:?} basis{}",
+            mesh.n_tets(),
+            basis.n_field,
+            kind,
+            if basis.n_field < full_dofs {
+                format!(
+                    " ({:.0}% fewer than uniform order 2)",
+                    100.0 * (1.0 - basis.n_field as f64 / full_dofs as f64)
+                )
+            } else {
+                String::new()
+            }
+        );
         let (ports, port_tris) = build_ports(&mesh, &config, &materials);
         let pec_tris = build_pec_tris(&mesh, &config);
         let pml_regions = build_pml_regions(&mesh, &config);

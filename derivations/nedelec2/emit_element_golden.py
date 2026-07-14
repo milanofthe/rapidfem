@@ -92,6 +92,7 @@ HEADER = """\
 // derivation, entrywise.
 
 use num_complex::Complex64 as C64;
+use rapidfem_fd::basis::tet_dof_owners;
 use rapidfem_fd::tet_assembly_r2::{r2_tet_stiff_mass, BasisKind};
 
 const EDGE_MAP: [[usize; 2]; 6] = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
@@ -130,7 +131,8 @@ def emit_case(name, verts, eps, mu_inv):
     out += f"""
 #[test]
 fn r2_element_matches_derivation_{name}() {{
-    let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory, &XS_{name}, &YS_{name}, &ZS_{name}, &EL_{name},
+    let owners = tet_dof_owners(&[2; 6], &[2; 4]);
+    let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory, &owners, &XS_{name}, &YS_{name}, &ZS_{name}, &EL_{name},
         &EDGE_MAP, &TRI_MAP, &MUINV_{name}, &EPS_{name});
     let derr = maxdiff(&d, &D_{name});
     let ferr = maxdiff(&f, &F_{name});

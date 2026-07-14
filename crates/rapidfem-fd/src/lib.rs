@@ -16,6 +16,7 @@ pub use rapidfem_core::{constants, materials, mesh, mesh_io, quadrature};
 pub mod excitation;
 pub mod coefficients;
 pub mod dofmap;
+pub mod order;
 pub mod basis;
 pub mod tet_assembly_r2;
 pub mod tri_assembly_r2;

@@ -46,19 +46,68 @@ pub struct Config {
 pub struct ElementConfig {
     #[serde(default = "default_basis")]
     pub basis: String,
+    /// `uniform` (every cell at order 2) or `adaptive` (the a-priori wavelength
+    /// policy of `order::wavelength_policy`). `adaptive` implies the hierarchical
+    /// basis, because the interpolatory one does not nest.
+    #[serde(default = "default_order_policy")]
+    pub order_policy: String,
+    /// The policy's threshold: a cell with `k·h < theta` drops to order 1.
+    #[serde(default = "default_element_theta")]
+    pub theta: f64,
 }
 
 fn default_basis() -> String {
     "interpolatory".to_string()
 }
 
+fn default_order_policy() -> String {
+    "uniform".to_string()
+}
+
+fn default_element_theta() -> f64 {
+    crate::order::DEFAULT_THETA
+}
+
+/// How the per-cell orders are chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrderPolicy {
+    /// Every cell at order 2. What the solver has always done.
+    Uniform,
+    /// `order::wavelength_policy`: order 1 where `k·h < theta`, order 2 elsewhere.
+    Adaptive,
+}
+
 impl ElementConfig {
     pub fn kind(&self) -> Result<crate::tet_assembly_r2::BasisKind, String> {
-        match self.basis.as_str() {
-            "interpolatory" => Ok(crate::tet_assembly_r2::BasisKind::Interpolatory),
-            "hierarchical" => Ok(crate::tet_assembly_r2::BasisKind::Hierarchical),
+        // An adaptive order needs a nesting basis, whether or not the user asked for
+        // one. Silently running the interpolatory basis at mixed order would
+        // discretise a space that is neither order 1 nor order 2; refuse instead.
+        let requested = match self.basis.as_str() {
+            "interpolatory" => crate::tet_assembly_r2::BasisKind::Interpolatory,
+            "hierarchical" => crate::tet_assembly_r2::BasisKind::Hierarchical,
+            other => {
+                return Err(format!(
+                    "unknown element basis '{other}': expected 'interpolatory' or 'hierarchical'"
+                ))
+            }
+        };
+        if self.policy()? == OrderPolicy::Adaptive
+            && requested != crate::tet_assembly_r2::BasisKind::Hierarchical
+        {
+            return Err(
+                "order_policy = 'adaptive' requires basis = 'hierarchical': only the                  hierarchical basis nests, so only there does reducing a cell to order 1 mean                  dropping DOFs rather than changing the space"
+                    .to_string(),
+            );
+        }
+        Ok(requested)
+    }
+
+    pub fn policy(&self) -> Result<OrderPolicy, String> {
+        match self.order_policy.as_str() {
+            "uniform" => Ok(OrderPolicy::Uniform),
+            "adaptive" => Ok(OrderPolicy::Adaptive),
             other => Err(format!(
-                "unknown element basis '{other}': expected 'interpolatory' or 'hierarchical'"
+                "unknown order_policy '{other}': expected 'uniform' or 'adaptive'"
             )),
         }
     }

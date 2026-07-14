@@ -5,72 +5,88 @@
 // This file is part of rapidfem, distributed under GPL-3.0-or-later with
 // the Gmsh additional permission. See LICENSE for the full terms.
 
-//! The global degree-of-freedom layout for the volume and surface elements.
+//! The degree-of-freedom layout of the volume and surface elements.
 //!
-//! The numbering itself lives in [`crate::dofmap::DofMap`], which is a prefix-sum
-//! over the mesh entities and so carries no assumption that every entity holds the
-//! same number of DOFs. This module is what connects it to the elements: it says
-//! which entity each of an element's local DOFs sits on ([`R2_TET_OWNERS`],
-//! [`R2_TRI_OWNERS`]), resolves that against the mesh, and caches the resulting
-//! local-to-global lists in flat, offset-indexed arrays.
+//! Three things meet here, and it is worth being precise about which does what.
 //!
-//! Nothing here is `[usize; 20]` or `[usize; 8]` any more. The counts come from
-//! the map, so an element with a different DOF count needs no change on this side
-//! (docs/fd-basis-plan.md, stage 1).
+//! [`crate::order::OrderMap`] says what order every cell and every entity is.
+//! [`crate::dofmap::DofMap`] turns the per-entity DOF counts into global indices, by
+//! a prefix sum, so it assumes nothing about those counts being equal. This module
+//! is the join: [`tet_dof_owners`] and [`tri_dof_owners`] enumerate an element's
+//! local DOFs from its entities' orders, and `Nedelec2Basis` resolves that against
+//! the mesh once and caches the local-to-global lists in flat, offset-indexed
+//! arrays.
 //!
-//! Local DOF order of the R2 tetrahedron (20 DOFs), as emitted by
-//! `tet_assembly_r2::build_basis`:
+//! **The owner list is the element definition.** `tet_assembly_r2::build_basis`
+//! builds one basis function per entry of it and enumerates nothing itself. So
+//! there is no second enumeration that could disagree with the DOF map about how
+//! many DOFs an element has, which they are, or what order they come in. At a
+//! uniform order that would be a nicety; once the count varies per cell it is the
+//! only thing keeping the two in step.
 //!
-//!   [0..6]   edge functions, first mode, on local edges 0-5
-//!   [6..10]  face functions, first mode, on local faces 0-3
-//!   [10..16] edge functions, second mode
-//!   [16..20] face functions, second mode
+//! At uniform order 2 a tetrahedron has 20 DOFs and a boundary triangle 8, in the
+//! mode-major order the goldens are pinned to:
 //!
-//! Local DOF order of the R2 triangle (8 DOFs):
+//!   tet:  [0..6] edges m0, [6..10] faces m0, [10..16] edges m1, [16..20] faces m1
+//!   tri:  [0..3] edges m0, [3] face m0,      [4..7] edges m1,   [7] face m1
 //!
-//!   [0..3] edge, first mode   [3] face, first mode
-//!   [4..7] edge, second mode  [7] face, second mode
+//! Under the minimum rule an entity that did not reach a given mode is simply
+//! skipped, and both counts shrink. Nothing outside this module may assume 20 or 8.
 
 use crate::dofmap::{DofMap, DofOwner};
 use crate::mesh::Mesh;
+use crate::order::{self, OrderMap};
 use crate::tet_assembly_r2::BasisKind;
 
-/// The entity each local DOF of the R2 tetrahedron belongs to.
-pub const R2_TET_OWNERS: [DofOwner; 20] = [
-    DofOwner::Edge { entity: 0, k: 0 },
-    DofOwner::Edge { entity: 1, k: 0 },
-    DofOwner::Edge { entity: 2, k: 0 },
-    DofOwner::Edge { entity: 3, k: 0 },
-    DofOwner::Edge { entity: 4, k: 0 },
-    DofOwner::Edge { entity: 5, k: 0 },
-    DofOwner::Face { entity: 0, k: 0 },
-    DofOwner::Face { entity: 1, k: 0 },
-    DofOwner::Face { entity: 2, k: 0 },
-    DofOwner::Face { entity: 3, k: 0 },
-    DofOwner::Edge { entity: 0, k: 1 },
-    DofOwner::Edge { entity: 1, k: 1 },
-    DofOwner::Edge { entity: 2, k: 1 },
-    DofOwner::Edge { entity: 3, k: 1 },
-    DofOwner::Edge { entity: 4, k: 1 },
-    DofOwner::Edge { entity: 5, k: 1 },
-    DofOwner::Face { entity: 0, k: 1 },
-    DofOwner::Face { entity: 1, k: 1 },
-    DofOwner::Face { entity: 2, k: 1 },
-    DofOwner::Face { entity: 3, k: 1 },
-];
+/// The local DOFs of a tetrahedral element, as the entities they belong to.
+///
+/// **This list IS the element definition.** `tet_assembly_r2::build_basis` builds
+/// one basis function per entry, by asking the entity's generator for its `k`-th
+/// function — it does not enumerate anything itself. So the basis and the DOF map
+/// cannot disagree about how many DOFs there are, which ones they are, or what
+/// order they come in. With a variable order that is not a nicety; it is the only
+/// way to keep the two in step.
+///
+/// The order within the list is mode-major — all entities' function 0, then all
+/// entities' function 1 — because that is the order the uniform order-2 element
+/// has always used and the goldens are pinned to. Entities whose order does not
+/// reach a given mode are simply skipped.
+///
+/// `edge_order` and `face_order` are the entity orders after the minimum rule
+/// (see [`crate::order`]), in local `TET_EDGE_LOCAL` / `TET_FACE_LOCAL` order.
+pub fn tet_dof_owners(edge_order: &[u8; 6], face_order: &[u8; 4]) -> Vec<DofOwner> {
+    let mut out = Vec::with_capacity(20);
+    for k in 0..order::P_MAX as usize {
+        for e in 0..6 {
+            if k < order::n_edge_dofs(edge_order[e]) {
+                out.push(DofOwner::Edge { entity: e as u8, k: k as u8 });
+            }
+        }
+        for f in 0..4 {
+            if k < order::n_face_dofs(face_order[f]) {
+                out.push(DofOwner::Face { entity: f as u8, k: k as u8 });
+            }
+        }
+    }
+    out
+}
 
-/// The entity each local DOF of the R2 surface triangle belongs to. The triangle
-/// is its own face, hence `entity: 0` on the face DOFs.
-pub const R2_TRI_OWNERS: [DofOwner; 8] = [
-    DofOwner::Edge { entity: 0, k: 0 },
-    DofOwner::Edge { entity: 1, k: 0 },
-    DofOwner::Edge { entity: 2, k: 0 },
-    DofOwner::Face { entity: 0, k: 0 },
-    DofOwner::Edge { entity: 0, k: 1 },
-    DofOwner::Edge { entity: 1, k: 1 },
-    DofOwner::Edge { entity: 2, k: 1 },
-    DofOwner::Face { entity: 0, k: 1 },
-];
+/// The same, for a surface triangle. The triangle is its own single face entity,
+/// hence `entity: 0` on the face DOFs.
+pub fn tri_dof_owners(edge_order: &[u8; 3], face_order: u8) -> Vec<DofOwner> {
+    let mut out = Vec::with_capacity(8);
+    for k in 0..order::P_MAX as usize {
+        for e in 0..3 {
+            if k < order::n_edge_dofs(edge_order[e]) {
+                out.push(DofOwner::Edge { entity: e as u8, k: k as u8 });
+            }
+        }
+        if k < order::n_face_dofs(face_order) {
+            out.push(DofOwner::Face { entity: 0, k: k as u8 });
+        }
+    }
+    out
+}
 
 /// A ragged list of per-entity DOF indices: `data[off[i]..off[i+1]]`.
 struct Ragged {
@@ -86,11 +102,10 @@ impl Ragged {
 }
 
 pub struct Nedelec2Basis {
-    /// Which basis of the R2 space the elements are built from. The DOF layout is
-    /// identical either way — only the functions differ — so nothing in this
-    /// module depends on it; it is carried here because it is the one place every
-    /// consumer of the basis already reaches for.
+    /// Which basis of the R2 space the elements are built from.
     pub kind: BasisKind,
+    /// The order of every cell and, by the minimum rule, of every entity.
+    pub orders: OrderMap,
     /// Total number of DOFs in the system.
     pub n_field: usize,
     pub n_tets: usize,
@@ -124,42 +139,69 @@ fn square_offsets(counts: impl Iterator<Item = usize>) -> Vec<usize> {
 }
 
 impl Nedelec2Basis {
-    /// The default element: the interpolatory R2 basis.
+    /// The default element: the interpolatory R2 basis, uniform order 2.
     pub fn new(mesh: &Mesh) -> Self {
         Nedelec2Basis::with_kind(mesh, BasisKind::Interpolatory)
     }
 
+    /// A uniform order-2 space in the given basis.
     pub fn with_kind(mesh: &Mesh, kind: BasisKind) -> Self {
+        Nedelec2Basis::with_orders(mesh, kind, OrderMap::uniform(mesh, 2))
+    }
+
+    /// A space of arbitrary per-cell order.
+    ///
+    /// Anything other than uniform order 2 requires the hierarchical basis: the
+    /// minimum rule works by keeping the functions *up to* an entity's order, which
+    /// is only meaningful when the lower-order space is a coordinate subspace of the
+    /// higher one. It is for `Hierarchical` (mode 0 of an edge is the Whitney
+    /// function); it is not for `Interpolatory`, whose mode-0 block contains no
+    /// Whitney function at all (`derivations/nedelec2/hierarchical.py`, P2).
+    /// Allowing it there would silently discretise a space that is neither order 1
+    /// nor order 2 and is not conforming across an order jump.
+    pub fn with_orders(mesh: &Mesh, kind: BasisKind, orders: OrderMap) -> Self {
+        assert!(
+            orders.is_uniform(2) || kind == BasisKind::Hierarchical,
+            "variable or reduced order requires BasisKind::Hierarchical: the interpolatory \
+             basis does not nest, so 'the functions up to order p' is not a subset of its DOFs"
+        );
+
         let n_edges = mesh.n_edges();
         let n_tris = mesh.n_tris();
         let n_tets = mesh.n_tets();
 
-        let dofs = DofMap::uniform_r2(mesh);
+        let dofs = DofMap::new(
+            n_edges,
+            n_tris,
+            n_tets,
+            |e| order::n_edge_dofs(orders.edge[e]) as u32,
+            |f| order::n_face_dofs(orders.face[f]) as u32,
+            |c| order::n_cell_dofs(orders.cell[c]) as u32,
+        );
 
-        // Volume elements: resolve the R2 owner list against each tet's entities.
-        let mut tet_data = Vec::with_capacity(n_tets * R2_TET_OWNERS.len());
+        // Volume elements: the owner list of each tet, from its entities' orders.
+        let mut tet_data = Vec::with_capacity(n_tets * 20);
         let mut tet_off = Vec::with_capacity(n_tets + 1);
         let mut scratch = Vec::new();
         tet_off.push(0u32);
         for ti in 0..n_tets {
-            dofs.resolve(
-                &R2_TET_OWNERS,
-                ti,
-                &mesh.tet_to_edge[ti],
-                &mesh.tet_to_tri[ti],
-                &mut scratch,
+            let owners = tet_dof_owners(
+                &orders.tet_edge_orders(mesh, ti),
+                &orders.tet_face_orders(mesh, ti),
             );
+            dofs.resolve(&owners, ti, &mesh.tet_to_edge[ti], &mesh.tet_to_tri[ti], &mut scratch);
             tet_data.extend_from_slice(&scratch);
             tet_off.push(tet_data.len() as u32);
         }
 
         // Surface elements: the triangle is face `ti` of the mesh, and is its own
         // single face entity.
-        let mut tri_data = Vec::with_capacity(n_tris * R2_TRI_OWNERS.len());
+        let mut tri_data = Vec::with_capacity(n_tris * 8);
         let mut tri_off = Vec::with_capacity(n_tris + 1);
         tri_off.push(0u32);
         for ti in 0..n_tris {
-            dofs.resolve(&R2_TRI_OWNERS, ti, &mesh.tri_to_edge[ti], &[ti], &mut scratch);
+            let owners = tri_dof_owners(&orders.tri_edge_orders(mesh, ti), orders.face[ti]);
+            dofs.resolve(&owners, ti, &mesh.tri_to_edge[ti], &[ti], &mut scratch);
             tri_data.extend_from_slice(&scratch);
             tri_off.push(tri_data.len() as u32);
         }
@@ -200,6 +242,7 @@ impl Nedelec2Basis {
 
         Nedelec2Basis {
             kind,
+            orders,
             n_field: dofs.n_field,
             n_tets,
             n_tris,

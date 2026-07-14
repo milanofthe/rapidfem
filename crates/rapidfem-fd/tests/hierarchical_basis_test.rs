@@ -26,7 +26,7 @@
 // The symbolic counterpart, with the same conclusion plus the exact-sequence and
 // conformity properties, is `derivations/nedelec2/hierarchical.py`.
 
-use rapidfem_fd::basis::{local_mapping, local_mapping_tri};
+use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners};
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::tet_assembly_r2::{
     barycentric_grads, build_basis, cross_mass, r2_tet_stiff_mass, BasisFn, BasisKind,
@@ -69,7 +69,8 @@ fn basis_of(kind: BasisKind, verts: &[V3; 4]) -> (Vec<BasisFn>, [V3; 4], f64) {
     let node_dist = |i: usize, j: usize| {
         ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt()
     };
-    (build_basis(kind, &edge_len, &edge_map, &tri_map, &node_dist), grads, six_v)
+    let owners = tet_dof_owners(&[2; 6], &[2; 4]);
+    (build_basis(kind, &owners, &edge_len, &edge_map, &tri_map, &node_dist), grads, six_v)
 }
 
 /// Cholesky solve for an SPD system, row-major. The Gram matrix of a basis is SPD
@@ -164,7 +165,8 @@ fn the_gradient_dofs_are_curl_free() {
     };
     for (ti, verts) in test_tets().iter().enumerate() {
         let (xs, ys, zs, el, em, tm) = tet_setup(verts);
-        let (d, f) = r2_tet_stiff_mass(BasisKind::Hierarchical, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
+        let owners = tet_dof_owners(&[2; 6], &[2; 4]);
+        let (d, f) = r2_tet_stiff_mass(BasisKind::Hierarchical, &owners, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
 
         // Scale by the biggest stiffness entry, so "zero" means zero relative to
         // the matrix and not to an absolute constant that depends on the mesh size.

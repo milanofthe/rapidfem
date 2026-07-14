@@ -5,34 +5,42 @@
 // This file is part of rapidfem, distributed under GPL-3.0-or-later with
 // the Gmsh additional permission. See LICENSE for the full terms.
 
-//! Canonical Nédélec first-kind order-2 (R2) tetrahedral element.
+//! The curl-conforming tetrahedral element: Nédélec first kind, orders 1 and 2.
 //!
-//! Element assembly for the 20-DOF curl-conforming element. The 20 basis
-//! functions are built from the Whitney function
-//! W_ab = L_a ∇L_b − L_b ∇L_a scaled by a nodal barycentric weight:
+//! The space is the canonical R2 = (P1)³ ⊕ {p ∈ H̃2³ : x·p = 0}, 20-dimensional on a
+//! tetrahedron, with the lowest-order (Whitney/Nédélec-0) space, 6-dimensional,
+//! nested inside it. All of it is built from the Whitney function
+//! W_ab = L_a ∇L_b − L_b ∇L_a. Two bases of that same space are available; see
+//! [`BasisKind`] for which and why.
 //!
-//!   edge e=(a,b), length ℓ:   φ_e1 = ℓ L_a W_ab,   φ_e2 = ℓ L_b W_ab
-//!   face f=(n0,n1,n2):
-//!       φ_f1 = |n0 n2| · L_n1 (L_n0 ∇L_n2 − L_n2 ∇L_n0)
-//!       φ_f2 = |n0 n1| · L_n2 (L_n0 ∇L_n1 − L_n1 ∇L_n0)
+//!   edge (a,b), length ℓ    interpolatory: ℓ·L_a·W_ab and ℓ·L_b·W_ab
+//!                           hierarchical:  ℓ·W_ab      and ℓ·∇(L_a·L_b)
+//!   face (n0,n1,n2)         φ_f0 = |n0 n2| · L_n1 (L_n2 ∇L_n0 − L_n0 ∇L_n2)
+//!                           φ_f1 = |n0 n1| · L_n2 (L_n0 ∇L_n1 − L_n1 ∇L_n0)
 //!
-//! This basis spans the canonical R2 space (P1)³ ⊕ {p ∈ H̃2³ : x·p = 0};
-//! the derivation, completeness proof and spectral identification live in
-//! `derivations/nedelec2/` (element.py, canonical_r2.py). Element matrices:
+//! The derivation, completeness proof and spectral identification live in
+//! `derivations/nedelec2/` (element.py, canonical_r2.py); the proof that the two
+//! bases span one space, and that only the hierarchical one nests, is in
+//! hierarchical.py. Element matrices:
 //!
 //!   stiffness  D_ij = ∫ (∇×φ_i)·μ⁻¹·(∇×φ_j) dV
 //!   mass       F_ij = ∫  φ_i·ε·φ_j           dV
 //!
-//! Every basis function is a sum of terms `coeff · L_p L_q · ∇L_g`. Products
-//! of barycentric coordinates integrate in closed form (see `coefficients`),
-//! so the whole element is assembled exactly with small fixed loops — no
-//! quadrature. DOF order matches the assembler: [6 edge·m1][4 face·m1]
-//! [6 edge·m2][4 face·m2].
+//! Every basis function is a sum of terms `coeff · L^e · ∇L_g` over a barycentric
+//! exponent multi-index. Products of barycentric coordinates integrate in closed
+//! form (see `coefficients`), so the element is assembled exactly, with no
+//! quadrature.
+//!
+//! **The element does not decide how many DOFs it has.** `build_basis` takes the
+//! owner list that `basis::tet_dof_owners` produced from the entity orders, and
+//! builds one function per entry. Under a mixed order that list is shorter than 20,
+//! and nothing here notices or cares.
 
 use num_complex::Complex64 as C64;
 use crate::coefficients::volume_coeff_exps;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
+use crate::dofmap::DofOwner;
 
 type V3 = [f64; 3];
 
@@ -264,14 +272,17 @@ pub fn r2_face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [Basi
     ]
 }
 
-/// Build the 20 R2 basis functions for this tet from its local edge/face maps.
-/// DOF order matches `basis::R2_TET_OWNERS`: edge·m0, face·m0, edge·m1, face·m1.
+/// Build one basis function per entry of `owners`.
 ///
-/// The DOF order and the entity ownership are the same for both `BasisKind`s, so
-/// the DOF map, the assembly and the surface trace need no knowledge of which one
-/// is in use. Only the functions themselves change.
+/// The element does not enumerate its own DOFs. The owner list — produced by
+/// `basis::tet_dof_owners` from the entity orders — says which entity each local
+/// DOF belongs to and which of that entity's functions it is, and this reads that
+/// list off. So a DOF exists in the element exactly when it exists in the DOF map,
+/// in the same position, whatever the orders happen to be. There is no second
+/// enumeration that could disagree.
 pub fn build_basis(
     kind: BasisKind,
+    owners: &[DofOwner],
     edge_len: &[f64; 6],
     edge_map: &[[usize; 2]; 6],
     tri_map: &[[usize; 3]; 4],
@@ -287,13 +298,16 @@ pub fn build_basis(
         })
         .collect();
 
-    // DOF order: edge·m1, face·m1, edge·m2, face·m2.
-    let mut basis = Vec::with_capacity(20);
-    for m in 0..2 {
-        basis.extend(edges.iter().map(|e| e[m].clone()));
-        basis.extend(faces.iter().map(|f| f[m].clone()));
-    }
-    basis
+    owners
+        .iter()
+        .map(|o| match *o {
+            DofOwner::Edge { entity, k } => edges[entity as usize][k as usize].clone(),
+            DofOwner::Face { entity, k } => faces[entity as usize][k as usize].clone(),
+            DofOwner::Cell { .. } => {
+                unreachable!("no cell-interior DOFs below order 3")
+            }
+        })
+        .collect()
 }
 
 /// `∫ L^(ea + eb) dV`, the mass integrand of two terms. Exponents add.
@@ -437,6 +451,7 @@ pub fn cross_mass(a: &[BasisFn], b: &[BasisFn], grads: &[V3; 4], six_v: f64) -> 
 /// to the basis-agnostic `element_stiff_mass`. Returns row-major `20×20`.
 pub fn r2_tet_stiff_mass(
     kind: BasisKind,
+    owners: &[DofOwner],
     xs: &[f64; 4],
     ys: &[f64; 4],
     zs: &[f64; 4],
@@ -450,7 +465,7 @@ pub fn r2_tet_stiff_mass(
     let node_dist = |i: usize, j: usize| -> f64 {
         ((xs[i] - xs[j]).powi(2) + (ys[i] - ys[j]).powi(2) + (zs[i] - zs[j]).powi(2)).sqrt()
     };
-    let basis = build_basis(kind, edge_lengths, local_edge_map, local_tri_map, &node_dist);
+    let basis = build_basis(kind, owners, edge_lengths, local_edge_map, local_tri_map, &node_dist);
     element_stiff_mass(&basis, &grads, six_v, ms, mm)
 }
 
@@ -526,8 +541,13 @@ pub fn assemble_global_matrices(
         let ms = matinv3(&ur[itet]);
         let mm = &er[itet];
 
+        let owners = crate::basis::tet_dof_owners(
+            &basis.orders.tet_edge_orders(mesh, itet),
+            &basis.orders.tet_face_orders(mesh, itet),
+        );
         let (esub, bsub) = r2_tet_stiff_mass(
-            basis.kind, &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map, &ms, mm,
+            basis.kind, &owners, &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map,
+            &ms, mm,
         );
 
         // The element matrices are row-major n×n, and the block reserved for this
@@ -584,7 +604,8 @@ mod tests {
         let el = [1.0, 1.0, 1.0, s2, s2, s2];
         let em = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
         let tm = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
-        let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory,&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
+        let owners = crate::basis::tet_dof_owners(&[2;6], &[2;4]);
+        let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory,&owners,&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
         assert_eq!(d.len(), 400);
         for (dv, fv) in d.iter().zip(f.iter()) {
             assert!(dv.re.is_finite() && dv.im.is_finite(), "D finite");

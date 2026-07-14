@@ -26,7 +26,7 @@
 // symbolic counterpart is `derivations/nedelec2/face_trace.py`.
 
 use rapidfem_core::quadrature::gaus_quad_tri;
-use rapidfem_fd::basis::{local_mapping, local_mapping_tri, Nedelec2Basis};
+use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners, tri_dof_owners, Nedelec2Basis};
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn, BasisKind};
 use rapidfem_fd::tri_assembly_r2::ned2_tri_stiff;
@@ -105,7 +105,8 @@ fn volume_basis(mesh: &Mesh, kind: BasisKind) -> (Vec<BasisFn>, [V3; 4]) {
     let node_dist = |i: usize, j: usize| {
         ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt()
     };
-    (build_basis(kind, &edge_len, &edge_map, &tri_map, &node_dist), grads)
+    let owners = tet_dof_owners(&[2; 6], &[2; 4]);
+    (build_basis(kind, &owners, &edge_len, &edge_map, &tri_map, &node_dist), grads)
 }
 
 /// The trace-carrying volume DOFs of face `f`, in the surface element's DOF order:
@@ -226,16 +227,17 @@ fn the_traced_robin_matrix_is_the_surface_element() {
             }
 
             // The surface element, on the same triangle, with γ = 1.
-            let want = ned2_tri_stiff(kind, &tv, gamma);
+            let tri_owners = tri_dof_owners(&[2; 3], 2);
+            let want = ned2_tri_stiff(kind, &tri_owners, &tv, gamma);
 
             let mut peak = 0.0_f64;
             let mut scale = 1e-300_f64;
             for s in 0..8 {
                 for t in 0..8 {
-                    scale = scale.max(want[s][t].norm());
-                    peak = peak.max((m[s][t] - want[s][t].re).abs());
+                    scale = scale.max(want[s * 8 + t].norm());
+                    peak = peak.max((m[s][t] - want[s * 8 + t].re).abs());
                     assert!(
-                        want[s][t].im.abs() < 1e-30,
+                        want[s * 8 + t].im.abs() < 1e-30,
                         "the γ=1 surface element must be real"
                     );
                 }

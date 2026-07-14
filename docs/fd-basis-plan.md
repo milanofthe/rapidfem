@@ -241,7 +241,7 @@ Each stage is independently shippable and has its own oracle.
 
 ### Status
 
-Stages 0-3 are done, on `feat/fd-modular-element`. What actually landed:
+**All stages are done**, on `feat/fd-modular-element`. What actually landed:
 
 | Stage | Commit | Outcome |
 |---|---|---|
@@ -250,6 +250,57 @@ Stages 0-3 are done, on `feat/fd-modular-element`. What actually landed:
 | 1 | `1815b40` | values bit-identical; the DOF numbering is a proven permutation of the old |
 | 2 | `c792f4f` | surface element built from the volume element's generators; trace identity proved |
 | 3 | `5c809fd` | hierarchical basis; same space to 1e-14 across the whole cavity spectrum |
+| 4 + 5 | (this) | variable order and the a-priori policy; Courant-Fischer holds index by index |
+
+### Stages 4 and 5
+
+The owner list became the element definition. `basis::tet_dof_owners` enumerates the
+local DOFs from the entity orders, and `tet_assembly_r2::build_basis` builds one
+function per entry rather than enumerating anything itself. So the element and the
+DOF map cannot disagree about how many DOFs exist, which they are, or what order
+they come in — which, once the count varies per cell, is the only way to keep them
+in step.
+
+`order::OrderMap` carries the per-cell orders and applies the minimum rule
+(`p_E = min{p_K : K ∋ E}`). A cell then uses, on each of its entities, only the
+functions up to that entity's order, so a `p = 2` cell next to a `p = 1` cell simply
+drops the second function on the shared edge and both sides see the same trace.
+`Nedelec2Basis::with_orders` **refuses** anything but uniform order 2 on the
+interpolatory basis: the minimum rule assumes the lower-order space is a coordinate
+subspace of the higher one, which is true for the hierarchical basis and false for
+the interpolatory one.
+
+What the oracles establish (`tests/cavity_spectrum_test.rs`):
+
+- **The kernel dimension is exactly the number of discrete gradients.** At order 2 on
+  the test cavity: 35 = 0 interior nodes + 35 interior edges, i.e. `dim grad(P2)` with
+  the boundary removed. The exact sequence, checked on the assembled system rather
+  than on one element.
+- **Order 1 is the Whitney element and converges like one:** measured rate 1.94 on the
+  finest mesh pair (the O(h²) of the lowest-order Nédélec element). The 3.02 on the
+  coarsest pair is pre-asymptotic — 36 tetrahedra across a whole cavity.
+- **Mixed order is conforming, proved by Courant-Fischer.** `V(p=1) ⊂ V(mixed) ⊂ V(p=2)`,
+  so `λ_k(p=2) ≤ λ_k(mixed) ≤ λ_k(p=1)` must hold *index by index in the full spectra*.
+  It does, for all 35 eigenvalues of the p=1 space and all 216 of the mixed one. A
+  non-conforming element could not satisfy this.
+
+  The first version of that test compared "the first resonance of each", which is
+  **wrong**: the three spaces hold different numbers of discrete gradients, so their
+  kernels have different dimensions and the first resonance sits at a different index
+  in each. Courant-Fischer says nothing about `λ_i` versus `λ_j` for `i ≠ j`. The test
+  failed, and the element was not at fault — the test was.
+
+- **The policy pays.** On a mesh graded toward a corner, `wavelength_policy` reduces
+  6-30 of 144 cells and saves 5-19% of the DOFs with the eigenvalue error unchanged to
+  three digits, while blanket order 1 is 3.2× worse. Note the diameter is the cell's
+  *longest* edge, so grading a single axis reduces nothing: only a cell that is small
+  in every direction is genuinely geometry-refined.
+
+Config: `[element] basis = "hierarchical"`, `order_policy = "adaptive"`, `theta = 0.35`.
+`adaptive` requires `hierarchical` and says so rather than silently doing the wrong
+thing. The orders are chosen once, at the highest frequency of the sweep (shortest
+wavelength, so the fewest reductions), which also keeps the symbolic factorisation
+reusable across the sweep.
 
 Two things came out differently from the plan.
 

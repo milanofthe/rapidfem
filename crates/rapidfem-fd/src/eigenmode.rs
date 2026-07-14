@@ -18,6 +18,28 @@ use crate::tet_assembly_r2::assemble_global_matrices;
 use crate::constants::*;
 use std::collections::HashSet;
 
+// KNOWN DEFECT, to be fixed separately (it predates the modular-element work and
+// is not caused by it).
+//
+// The Lanczos recurrence below is run in the EUCLIDEAN inner product on the
+// shift-invert operator (E − σB)⁻¹B. That operator is not self-adjoint there; it
+// is self-adjoint in the B inner product. The recurrence also reorthogonalises
+// against only the previous vector, and every Ritz value of the tridiagonal is
+// accepted without a residual check.
+//
+// The consequences are measured, not guessed. On the PEC cavity of
+// `tests/cavity_spectrum_test.rs`, whose true spectrum that test computes densely:
+//
+//   * the returned eigenVALUES land near the true ones (the fundamental comes out
+//     to ~2e-4 of the closed form), but
+//   * every returned eigenVECTOR has an eigenpair residual ‖Ex − λBx‖/‖λBx‖ of
+//     order 1, so the FIELDS are not trustworthy, and
+//   * ghost modes are reported BELOW the fundamental — a cluster near 5.3 GHz in a
+//     cavity whose true spectrum has nothing between 0 and 8.245 GHz.
+//
+// The fix is a proper B-inner-product Lanczos with full reorthogonalisation and a
+// residual-based convergence test. Until then, treat `field` as unreliable and
+// cross-check any eigenvalue against the dense spectrum on a small problem.
 pub struct Eigenmode {
     pub frequency: C64,
     pub q_factor: f64,

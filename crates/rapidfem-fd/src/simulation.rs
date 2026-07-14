@@ -91,11 +91,13 @@ impl Simulation {
             let l0 = mesh.normalize_characteristic_length();
             eprintln!("  Geometry normalized: L0 = {:.6e} m (mean edge length)", l0);
         }
-        let basis = Nedelec2Basis::new(&mesh);
+        let kind = config.element.kind().unwrap_or_else(|e| panic!("{e}"));
+        let basis = Nedelec2Basis::with_kind(&mesh, kind);
         eprintln!(
-            "RapidFEM - {} tets, {} DOFs",
+            "RapidFEM - {} tets, {} DOFs, {:?} basis",
             mesh.n_tets(),
-            basis.n_field
+            basis.n_field,
+            kind
         );
 
         // Materials before ports so `wave_numerical` can consult per-tet ε_r

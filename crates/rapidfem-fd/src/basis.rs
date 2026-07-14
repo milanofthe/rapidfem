@@ -33,6 +33,7 @@
 
 use crate::dofmap::{DofMap, DofOwner};
 use crate::mesh::Mesh;
+use crate::tet_assembly_r2::BasisKind;
 
 /// The entity each local DOF of the R2 tetrahedron belongs to.
 pub const R2_TET_OWNERS: [DofOwner; 20] = [
@@ -85,6 +86,11 @@ impl Ragged {
 }
 
 pub struct Nedelec2Basis {
+    /// Which basis of the R2 space the elements are built from. The DOF layout is
+    /// identical either way — only the functions differ — so nothing in this
+    /// module depends on it; it is carried here because it is the one place every
+    /// consumer of the basis already reaches for.
+    pub kind: BasisKind,
     /// Total number of DOFs in the system.
     pub n_field: usize,
     pub n_tets: usize,
@@ -118,7 +124,12 @@ fn square_offsets(counts: impl Iterator<Item = usize>) -> Vec<usize> {
 }
 
 impl Nedelec2Basis {
+    /// The default element: the interpolatory R2 basis.
     pub fn new(mesh: &Mesh) -> Self {
+        Nedelec2Basis::with_kind(mesh, BasisKind::Interpolatory)
+    }
+
+    pub fn with_kind(mesh: &Mesh, kind: BasisKind) -> Self {
         let n_edges = mesh.n_edges();
         let n_tris = mesh.n_tris();
         let n_tets = mesh.n_tets();
@@ -188,6 +199,7 @@ impl Nedelec2Basis {
         }
 
         Nedelec2Basis {
+            kind,
             n_field: dofs.n_field,
             n_tets,
             n_tris,

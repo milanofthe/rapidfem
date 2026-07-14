@@ -29,6 +29,39 @@ pub struct Config {
     pub pml: Vec<PmlConfig>,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub element: ElementConfig,
+}
+
+/// Which basis of the R2 element space to discretise with. Both span the same
+/// space (`derivations/nedelec2/hierarchical.py`), so this changes the numbers in
+/// the element matrices but not the discrete solution — see
+/// `tests/cavity_spectrum_test.rs`, where the two agree to 1e-14 across the whole
+/// cavity spectrum.
+///
+/// `interpolatory` is the default. `hierarchical` nests the lowest-order (Whitney)
+/// space as a coordinate subspace and makes the curl kernel explicit, which is what
+/// variable order and a p-decay indicator need (docs/fd-basis-plan.md, stages 4-5).
+#[derive(Deserialize, Default)]
+pub struct ElementConfig {
+    #[serde(default = "default_basis")]
+    pub basis: String,
+}
+
+fn default_basis() -> String {
+    "interpolatory".to_string()
+}
+
+impl ElementConfig {
+    pub fn kind(&self) -> Result<crate::tet_assembly_r2::BasisKind, String> {
+        match self.basis.as_str() {
+            "interpolatory" => Ok(crate::tet_assembly_r2::BasisKind::Interpolatory),
+            "hierarchical" => Ok(crate::tet_assembly_r2::BasisKind::Hierarchical),
+            other => Err(format!(
+                "unknown element basis '{other}': expected 'interpolatory' or 'hierarchical'"
+            )),
+        }
+    }
 }
 
 #[derive(Deserialize)]

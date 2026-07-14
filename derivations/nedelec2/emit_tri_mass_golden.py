@@ -178,6 +178,7 @@ HEADER = """\
 // basis (exact barycentric area integration). Pins ned2_tri_stiff entrywise.
 
 use num_complex::Complex64 as C64;
+use rapidfem_fd::tet_assembly_r2::BasisKind;
 use rapidfem_fd::tri_assembly_r2::ned2_tri_stiff;
 
 fn maxdiff(a: &[[C64; 8]; 8], b: &[[C64; 8]; 8]) -> f64 {
@@ -201,7 +202,7 @@ def emit_case(name, verts3, gamma):
     out += f"""
 #[test]
 fn ned2_tri_stiff_matches_derivation_{name}() {{
-    let got = ned2_tri_stiff(&V_{name}, {g});
+    let got = ned2_tri_stiff(BasisKind::Interpolatory, &V_{name}, {g});
     let err = maxdiff(&got, &M_{name});
     eprintln!("{name}: max rel err {{:.2e}}", err);
     assert!(err < 1e-10, "mismatch ({name}): {{:.2e}}", err);

@@ -41,7 +41,7 @@ use num_complex::Complex64 as C64;
 use rapidfem_core::mesh::TRI_EDGE_LOCAL;
 
 use crate::coefficients::area_coeff_exps;
-use crate::tet_assembly_r2::{r2_edge_fns, r2_face_fns, BasisFn};
+use crate::tet_assembly_r2::{r2_edge_fns, r2_face_fns, BasisFn, BasisKind};
 
 type V2 = [f64; 2];
 
@@ -123,12 +123,12 @@ fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
 /// (see the module docs). The triangle has no fourth node, so `exps[3]` is zero
 /// and no term gradients it — asserted below, because that is precisely the trace
 /// property the construction relies on.
-pub fn build_surface_basis(xs: &[f64; 3], ys: &[f64; 3]) -> Vec<BasisFn> {
+pub fn build_surface_basis(kind: BasisKind, xs: &[f64; 3], ys: &[f64; 3]) -> Vec<BasisFn> {
     let d = |i: usize, j: usize| node_dist(xs, ys, i, j);
 
     let edges: Vec<[BasisFn; 2]> = TRI_EDGE_LOCAL
         .iter()
-        .map(|&[a, b]| r2_edge_fns(a, b, d(a, b)))
+        .map(|&[a, b]| r2_edge_fns(kind, a, b, d(a, b)))
         .collect();
     let face = r2_face_fns(0, 1, 2, d(0, 2), d(0, 1));
 
@@ -191,10 +191,10 @@ pub fn surface_mass(basis: &[BasisFn], grads: &[V2; 3], area: f64) -> Vec<f64> {
 }
 
 /// Surface Robin stiffness: `γ ∫ φ_i·φ_j dA`, an 8×8 complex matrix.
-pub fn ned2_tri_stiff(glob_vertices: &[[f64; 3]; 3], gamma: C64) -> [[C64; 8]; 8] {
+pub fn ned2_tri_stiff(kind: BasisKind, glob_vertices: &[[f64; 3]; 3], gamma: C64) -> [[C64; 8]; 8] {
     let (_, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
-    let fns = build_surface_basis(&xs, &ys);
+    let fns = build_surface_basis(kind, &xs, &ys);
     let m = surface_mass(&fns, &grads, 0.5 * two_a.abs());
 
     std::array::from_fn(|i| std::array::from_fn(|j| gamma * C64::from(m[i * N_TRI_DOFS + j])))
@@ -203,6 +203,7 @@ pub fn ned2_tri_stiff(glob_vertices: &[[f64; 3]; 3], gamma: C64) -> [[C64; 8]; 8
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.
 /// `dpts[q] = [w, L1, L2, L3]`, `glob_uinc[q]` the incident field at that point.
 pub fn ned2_tri_force(
+    kind: BasisKind,
     glob_vertices: &[[f64; 3]; 3],
     glob_uinc: &[[C64; 3]],
     dpts: &[[f64; 4]],
@@ -210,7 +211,7 @@ pub fn ned2_tri_force(
     let (frame, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
     let area = 0.5 * two_a.abs();
-    let fns = build_surface_basis(&xs, &ys);
+    let fns = build_surface_basis(kind, &xs, &ys);
 
     // Incident field rotated into the local frame; only the tangential (x,y)
     // components pair with φ.

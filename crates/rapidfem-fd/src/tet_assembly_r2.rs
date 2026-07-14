@@ -163,6 +163,15 @@ impl Term {
         exps[q] += 1;
         Term { coeff, exps, grad: g as u8 }
     }
+
+    /// A degree-1 term `coeff · L_p · ∇L_g`. The hierarchical basis needs it: its
+    /// Whitney and gradient functions are degree 1, not degree 2.
+    #[inline]
+    pub fn lin(coeff: f64, p: usize, g: usize) -> Term {
+        let mut exps = [0u8; 4];
+        exps[p] += 1;
+        Term { coeff, exps, grad: g as u8 }
+    }
 }
 
 /// A basis function = `scale · Σ terms`.
@@ -186,10 +195,39 @@ impl BasisFn {
     }
 }
 
-/// The two R2 functions of the edge (a, b) of length ℓ, in mode order:
+/// Which basis of the R2 space to use.
 ///
-///   φ_e1 = ℓ · L_a · W_ab,   φ_e2 = ℓ · L_b · W_ab,
-///   with the Whitney function W_ab = L_a ∇L_b − L_b ∇L_a.
+/// Both span the same 20-dimensional space — that is proved, not assumed, in
+/// `derivations/nedelec2/hierarchical.py` and checked in Rust by
+/// `tests/hierarchical_basis_test.rs`. They differ in which functions carry the
+/// DOFs, and that difference is what stages 4-5 of `docs/fd-basis-plan.md` need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BasisKind {
+    /// `ℓ·L_a·W_ab` and `ℓ·L_b·W_ab`. Both edge functions are degree 2, so the
+    /// lowest-order (Whitney) space is **not** spanned by any subset of the DOFs:
+    /// there is no way to run a cell at order 1 by dropping DOFs. This is the
+    /// element the goldens were generated from and the default.
+    #[default]
+    Interpolatory,
+    /// `ℓ·W_ab` and `ℓ·∇(L_a·L_b)`. Mode 0 *is* the Whitney space, so order 1 is a
+    /// coordinate subspace and the hierarchy nests. Mode 1 is a pure gradient,
+    /// hence curl-free, which makes the kernel of the curl operator explicit —
+    /// the local exact-sequence property (Schöberl & Zaglmayr, COMPEL 24 (2005)
+    /// 374). Better conditioned, and the only basis a p-decay indicator can be
+    /// read off.
+    Hierarchical,
+}
+
+/// The two R2 functions of the edge (a, b) of length ℓ, in mode order.
+///
+/// Interpolatory:  φ_e0 = ℓ·L_a·W_ab,   φ_e1 = ℓ·L_b·W_ab
+/// Hierarchical:   φ_e0 = ℓ·W_ab,       φ_e1 = ℓ·∇(L_a L_b)
+///
+/// with the Whitney function W_ab = L_a ∇L_b − L_b ∇L_a and, expanded,
+/// ∇(L_a L_b) = L_a ∇L_b + L_b ∇L_a. Note the hierarchical pair is degree 1 and
+/// the interpolatory pair degree 2: **per edge they span different 2-D spaces.**
+/// Only the total 20-dimensional spaces coincide, once the face functions are
+/// included. The derivation proves exactly that.
 ///
 /// `a` and `b` are node indices in whatever local numbering the caller uses, so
 /// this serves the tetrahedron and the triangle alike.
@@ -198,11 +236,17 @@ impl BasisFn {
 /// down. The surface element is the tangential trace of this one and is built by
 /// calling the same two functions, so the two cannot drift apart in sign — which
 /// they previously could, being written out twice.
-pub fn r2_edge_fns(a: usize, b: usize, len: f64) -> [BasisFn; 2] {
-    [
-        BasisFn::new(len, vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)]),
-        BasisFn::new(len, vec![Term::quad(1.0, a, b, b), Term::quad(-1.0, b, b, a)]),
-    ]
+pub fn r2_edge_fns(kind: BasisKind, a: usize, b: usize, len: f64) -> [BasisFn; 2] {
+    match kind {
+        BasisKind::Interpolatory => [
+            BasisFn::new(len, vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)]),
+            BasisFn::new(len, vec![Term::quad(1.0, a, b, b), Term::quad(-1.0, b, b, a)]),
+        ],
+        BasisKind::Hierarchical => [
+            BasisFn::new(len, vec![Term::lin(1.0, a, b), Term::lin(-1.0, b, a)]),
+            BasisFn::new(len, vec![Term::lin(1.0, a, b), Term::lin(1.0, b, a)]),
+        ],
+    }
 }
 
 /// The two R2 functions of the face (n0, n1, n2), in mode order:
@@ -221,15 +265,20 @@ pub fn r2_face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [Basi
 }
 
 /// Build the 20 R2 basis functions for this tet from its local edge/face maps.
-/// DOF order matches `basis::R2_TET_OWNERS`: edge·m1, face·m1, edge·m2, face·m2.
+/// DOF order matches `basis::R2_TET_OWNERS`: edge·m0, face·m0, edge·m1, face·m1.
+///
+/// The DOF order and the entity ownership are the same for both `BasisKind`s, so
+/// the DOF map, the assembly and the surface trace need no knowledge of which one
+/// is in use. Only the functions themselves change.
 pub fn build_basis(
+    kind: BasisKind,
     edge_len: &[f64; 6],
     edge_map: &[[usize; 2]; 6],
     tri_map: &[[usize; 3]; 4],
     node_dist: &dyn Fn(usize, usize) -> f64,
 ) -> Vec<BasisFn> {
     let edges: Vec<[BasisFn; 2]> = (0..6)
-        .map(|e| r2_edge_fns(edge_map[e][0], edge_map[e][1], edge_len[e]))
+        .map(|e| r2_edge_fns(kind, edge_map[e][0], edge_map[e][1], edge_len[e]))
         .collect();
     let faces: Vec<[BasisFn; 2]> = (0..4)
         .map(|f| {
@@ -355,9 +404,39 @@ pub fn element_stiff_mass(
     (d, f)
 }
 
+/// `∫ φ_i · ψ_j dV` for two bases on the same tetrahedron. Row-major `|a| × |b|`.
+///
+/// The cross-Gram matrix of two bases is what decides whether they span the same
+/// space: `ψ_j` lies in `span(φ)` exactly when the L² projection of `ψ_j` onto
+/// `span(φ)` has zero residual, and both the projection and the residual are built
+/// from this matrix and the two Gram matrices. `tests/hierarchical_basis_test.rs`
+/// uses it to prove the interpolatory and hierarchical bases span one space —
+/// an if-and-only-if, not a spot check.
+pub fn cross_mass(a: &[BasisFn], b: &[BasisFn], grads: &[V3; 4], six_v: f64) -> Vec<f64> {
+    let mut m = vec![0.0_f64; a.len() * b.len()];
+    for (i, fi) in a.iter().enumerate() {
+        for (j, fj) in b.iter().enumerate() {
+            let mut acc = 0.0;
+            for ti in &fi.terms {
+                for tj in &fj.terms {
+                    let g = grads[ti.grad as usize]
+                        .iter()
+                        .zip(grads[tj.grad as usize].iter())
+                        .map(|(x, y)| x * y)
+                        .sum::<f64>();
+                    acc += ti.coeff * tj.coeff * g * integ_mass(ti.exps, tj.exps, six_v);
+                }
+            }
+            m[i * b.len() + j] = fi.scale * fj.scale * acc;
+        }
+    }
+    m
+}
+
 /// Per-tet stiffness and mass for the R2 element: build the basis, then hand it
 /// to the basis-agnostic `element_stiff_mass`. Returns row-major `20×20`.
 pub fn r2_tet_stiff_mass(
+    kind: BasisKind,
     xs: &[f64; 4],
     ys: &[f64; 4],
     zs: &[f64; 4],
@@ -371,7 +450,7 @@ pub fn r2_tet_stiff_mass(
     let node_dist = |i: usize, j: usize| -> f64 {
         ((xs[i] - xs[j]).powi(2) + (ys[i] - ys[j]).powi(2) + (zs[i] - zs[j]).powi(2)).sqrt()
     };
-    let basis = build_basis(edge_lengths, local_edge_map, local_tri_map, &node_dist);
+    let basis = build_basis(kind, edge_lengths, local_edge_map, local_tri_map, &node_dist);
     element_stiff_mass(&basis, &grads, six_v, ms, mm)
 }
 
@@ -448,7 +527,7 @@ pub fn assemble_global_matrices(
         let mm = &er[itet];
 
         let (esub, bsub) = r2_tet_stiff_mass(
-            &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map, &ms, mm,
+            basis.kind, &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map, &ms, mm,
         );
 
         // The element matrices are row-major n×n, and the block reserved for this
@@ -505,7 +584,7 @@ mod tests {
         let el = [1.0, 1.0, 1.0, s2, s2, s2];
         let em = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
         let tm = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
-        let (d, f) = r2_tet_stiff_mass(&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
+        let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory,&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
         assert_eq!(d.len(), 400);
         for (dv, fv) in d.iter().zip(f.iter()) {
             assert!(dv.re.is_finite() && dv.im.is_finite(), "D finite");

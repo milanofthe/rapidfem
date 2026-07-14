@@ -22,7 +22,7 @@
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
-use crate::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn};
+use crate::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn, BasisKind};
 
 type V3 = [f64; 3];
 
@@ -47,7 +47,7 @@ fn lambdas_at(grads: &[V3; 4], v0: &V3, p: &V3) -> [f64; 4] {
 
 /// Per-tet geometry shared by field and curl evaluation: the four ∇L_i, the
 /// 20 canonical basis functions (in DOF order), and node 0 as the affine base.
-fn tet_basis(mesh: &Mesh, tet_idx: usize) -> ([V3; 4], Vec<BasisFn>, V3) {
+fn tet_basis(mesh: &Mesh, tet_idx: usize, kind: BasisKind) -> ([V3; 4], Vec<BasisFn>, V3) {
     let tet = &mesh.tets[tet_idx];
     let xs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][0]);
     let ys: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][1]);
@@ -66,7 +66,7 @@ fn tet_basis(mesh: &Mesh, tet_idx: usize) -> ([V3; 4], Vec<BasisFn>, V3) {
     let node_dist = |i: usize, j: usize| -> f64 {
         ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt()
     };
-    let fns = build_basis(&edge_lengths, &edge_map, &tri_map, &node_dist);
+    let fns = build_basis(kind, &edge_lengths, &edge_map, &tri_map, &node_dist);
     (grads, fns, mesh.nodes[tet[0]])
 }
 
@@ -80,7 +80,7 @@ pub fn eval_field_in_tet(
     tet_idx: usize,
     x: f64, y: f64, z: f64,
 ) -> (C64, C64, C64) {
-    let (grads, fns, v0) = tet_basis(mesh, tet_idx);
+    let (grads, fns, v0) = tet_basis(mesh, tet_idx, basis.kind);
     let lam = lambdas_at(&grads, &v0, &[x, y, z]);
     let field_ids = basis.tet_dofs(tet_idx);
 
@@ -228,7 +228,7 @@ pub fn eval_curl_in_tet(
     tet_idx: usize,
     x: f64, y: f64, z: f64,
 ) -> [C64; 3] {
-    let (grads, fns, v0) = tet_basis(mesh, tet_idx);
+    let (grads, fns, v0) = tet_basis(mesh, tet_idx, basis.kind);
     let lam = lambdas_at(&grads, &v0, &[x, y, z]);
     let field_ids = basis.tet_dofs(tet_idx);
 

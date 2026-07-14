@@ -8,6 +8,7 @@
 // basis (exact barycentric area integration). Pins ned2_tri_stiff entrywise.
 
 use num_complex::Complex64 as C64;
+use rapidfem_fd::tet_assembly_r2::BasisKind;
 use rapidfem_fd::tri_assembly_r2::ned2_tri_stiff;
 
 fn maxdiff(a: &[[C64; 8]; 8], b: &[[C64; 8]; 8]) -> f64 {
@@ -35,7 +36,7 @@ const M_unit_real: [[C64; 8]; 8] = [
 
 #[test]
 fn ned2_tri_stiff_matches_derivation_unit_real() {
-    let got = ned2_tri_stiff(&V_unit_real, C64::new(1.00000000000000000e+00, 0.00000000000000000e+00));
+    let got = ned2_tri_stiff(BasisKind::Interpolatory, &V_unit_real, C64::new(1.00000000000000000e+00, 0.00000000000000000e+00));
     let err = maxdiff(&got, &M_unit_real);
     eprintln!("unit_real: max rel err {:.2e}", err);
     assert!(err < 1e-10, "mismatch (unit_real): {:.2e}", err);
@@ -56,7 +57,7 @@ const M_unit_complex: [[C64; 8]; 8] = [
 
 #[test]
 fn ned2_tri_stiff_matches_derivation_unit_complex() {
-    let got = ned2_tri_stiff(&V_unit_complex, C64::new(2.99999999999999989e-01, 1.19999999999999996e+00));
+    let got = ned2_tri_stiff(BasisKind::Interpolatory, &V_unit_complex, C64::new(2.99999999999999989e-01, 1.19999999999999996e+00));
     let err = maxdiff(&got, &M_unit_complex);
     eprintln!("unit_complex: max rel err {:.2e}", err);
     assert!(err < 1e-10, "mismatch (unit_complex): {:.2e}", err);
@@ -77,7 +78,7 @@ const M_scaled_real: [[C64; 8]; 8] = [
 
 #[test]
 fn ned2_tri_stiff_matches_derivation_scaled_real() {
-    let got = ned2_tri_stiff(&V_scaled_real, C64::new(2.50000000000000000e+00, 0.00000000000000000e+00));
+    let got = ned2_tri_stiff(BasisKind::Interpolatory, &V_scaled_real, C64::new(2.50000000000000000e+00, 0.00000000000000000e+00));
     let err = maxdiff(&got, &M_scaled_real);
     eprintln!("scaled_real: max rel err {:.2e}", err);
     assert!(err < 1e-10, "mismatch (scaled_real): {:.2e}", err);
@@ -98,7 +99,7 @@ const M_skew_complex: [[C64; 8]; 8] = [
 
 #[test]
 fn ned2_tri_stiff_matches_derivation_skew_complex() {
-    let got = ned2_tri_stiff(&V_skew_complex, C64::new(1.50000000000000000e+00, -6.99999999999999956e-01));
+    let got = ned2_tri_stiff(BasisKind::Interpolatory, &V_skew_complex, C64::new(1.50000000000000000e+00, -6.99999999999999956e-01));
     let err = maxdiff(&got, &M_skew_complex);
     eprintln!("skew_complex: max rel err {:.2e}", err);
     assert!(err < 1e-10, "mismatch (skew_complex): {:.2e}", err);

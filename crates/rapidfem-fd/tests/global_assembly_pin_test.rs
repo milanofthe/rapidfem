@@ -115,19 +115,69 @@ fn global_dof_map_is_pinned() {
     assert_eq!(mesh.n_tris(), 18, "faces");
     // n_field = 2*edges + 2*faces
     assert_eq!(basis.n_field, 2 * 19 + 2 * 18, "n_field");
-    assert_eq!(basis.tet_to_field.len(), 6);
-    assert_eq!(basis.tri_to_field.len(), 18);
+    assert_eq!(basis.tet_dofs(0).len(), 20);
+    assert_eq!(basis.tri_dofs(0).len(), 8);
 
     // Every global DOF must be reachable from some tetrahedron, and no DOF may
-    // be claimed outside the range. A stride bug shows up here immediately.
+    // be claimed outside the range. An offset bug shows up here immediately.
     let mut seen = vec![false; basis.n_field];
-    for t in &basis.tet_to_field {
-        for &d in t {
+    for t in 0..mesh.n_tets() {
+        for &d in basis.tet_dofs(t) {
             assert!(d < basis.n_field, "DOF {d} out of range");
             seen[d] = true;
         }
     }
     assert!(seen.iter().all(|&s| s), "some global DOF is on no tetrahedron");
+}
+
+/// The entity-major layout (stage 1) replaced a mode-major one. A relabelling of
+/// the unknowns is not a change of the discretisation: the assembled system must
+/// be the *same* matrix, permuted. This proves it, rather than asserting it.
+///
+/// The previous layout, in closed form:
+///   edge e, mode m -> e + m·(n_edges + n_tris)
+///   face f, mode m -> f + n_edges + m·(n_edges + n_tris)
+/// which is exactly what `Nedelec2Basis::new` used to compute.
+#[test]
+fn numbering_is_a_relabelling_of_the_mode_major_layout() {
+    let mesh = cube_6tet();
+    let basis = Nedelec2Basis::new(&mesh);
+    let (ne, nt) = (mesh.n_edges(), mesh.n_tris());
+    let stride = ne + nt;
+
+    // perm[old] = new, built from the two maps agreeing on every local DOF.
+    let mut perm = vec![usize::MAX; basis.n_field];
+    for ti in 0..mesh.n_tets() {
+        let edges = &mesh.tet_to_edge[ti];
+        let faces = &mesh.tet_to_tri[ti];
+        let old: Vec<usize> = (0..6)
+            .map(|i| edges[i])
+            .chain((0..4).map(|i| faces[i] + ne))
+            .chain((0..6).map(|i| edges[i] + stride))
+            .chain((0..4).map(|i| faces[i] + ne + stride))
+            .collect();
+        let new = basis.tet_dofs(ti);
+        assert_eq!(old.len(), new.len());
+        for (&o, &n) in old.iter().zip(new) {
+            assert!(
+                perm[o] == usize::MAX || perm[o] == n,
+                "DOF {o} maps to both {} and {n}: not a function",
+                perm[o]
+            );
+            perm[o] = n;
+        }
+    }
+    assert!(perm.iter().all(|&p| p != usize::MAX), "the old layout has an unmapped DOF");
+
+    let mut hit = vec![false; basis.n_field];
+    for &p in &perm {
+        assert!(!hit[p], "two old DOFs map to new DOF {p}: not injective");
+        hit[p] = true;
+    }
+    // Bijective on a finite set of equal size: the two layouts are a permutation
+    // of one another, so the assembled systems are P·K·Pᵀ. The abs-sum and the
+    // Frobenius norm pinned below are invariant under that, which is why they did
+    // not move when the layout did.
 }
 
 #[test]
@@ -183,8 +233,16 @@ fn global_assembly_is_pinned_anisotropic_material() {
 
 // ---------------------------------------------------------------------------
 // Captured from the interpolatory R2 element, before the modular-basis work.
+//
+// The four abs-sum / Frobenius pins are the real oracle: they are invariant under
+// a relabelling of the unknowns, so they hold across stage 1's move from the
+// mode-major to the entity-major layout, and they would still catch a wrong VALUE.
+//
+// PATTERN_HASH is not invariant, and did move at stage 1 (from 0xc6a1417eefe03ae5).
+// That is licensed by `numbering_is_a_relabelling_of_the_mode_major_layout`, which
+// proves the new numbering is a permutation of the old. Nothing else may move it.
 // ---------------------------------------------------------------------------
-const PATTERN_HASH: u64 = 0xc6a1_417e_efe0_3ae5;
+const PATTERN_HASH: u64 = 0x2cb6_abad_262c_36f9;
 
 const E_ABS_IDENT: f64 = 2.38082947741327047e2;
 const E_FRO_IDENT: f64 = 6.96409442146721247e0;

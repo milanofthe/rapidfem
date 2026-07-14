@@ -363,10 +363,28 @@ pub fn r2_tet_stiff_mass(
     element_stiff_mass(&basis, &grads, six_v, ms, mm)
 }
 
+/// Cut `s` into consecutive mutable blocks of the widths given by the prefix-sum
+/// table `off` (`off[i]..off[i+1]` is block `i`). The variable-width counterpart
+/// of `chunks_mut`: each element writes only into its own block, so the scatter
+/// stays lock-free even when the elements have different DOF counts.
+fn ragged_chunks_mut<'a, T>(s: &'a mut [T], off: &[usize]) -> Vec<&'a mut [T]> {
+    let mut out = Vec::with_capacity(off.len().saturating_sub(1));
+    let mut rest = s;
+    for w in off.windows(2) {
+        let (head, tail) = rest.split_at_mut(w[1] - w[0]);
+        out.push(head);
+        rest = tail;
+    }
+    out
+}
+
 /// Assemble global stiffness (E) and mass (B) COO triplets from all tets using
-/// the canonical R2 element. Drop-in replacement for the legacy
-/// `tet_assembly::assemble_global_matrices` (same signature and DOF mapping);
-/// `ur` is permeability (inverted per tet to μ⁻¹), `er` is permittivity.
+/// the canonical R2 element. `ur` is permeability (inverted per tet to μ⁻¹), `er`
+/// is permittivity.
+///
+/// The triplet layout comes from the basis, not from a constant: element `i` owns
+/// `basis.tet_nnz_offsets()[i] .. [i+1]`, which is n_i² wide. For a uniform R2
+/// space that is 400 for every element; for a mixed-order space it is not.
 pub fn assemble_global_matrices(
     mesh: &Mesh,
     basis: &Nedelec2Basis,
@@ -377,17 +395,18 @@ pub fn assemble_global_matrices(
     use rayon::prelude::*;
 
     let n_tets = mesh.n_tets();
-    let nnz = n_tets * 400;
+    let off = basis.tet_nnz_offsets();
+    let nnz = basis.n_tet_nnz();
     let mut rows = vec![0usize; nnz];
     let mut cols = vec![0usize; nnz];
     let mut data_e = vec![C64::new(0.0, 0.0); nnz];
     let mut data_b = vec![C64::new(0.0, 0.0); nnz];
 
     let chunks: Vec<(usize, &mut [usize], &mut [usize], &mut [C64], &mut [C64])> = {
-        let rc: Vec<&mut [usize]> = rows.chunks_mut(400).collect();
-        let cc: Vec<&mut [usize]> = cols.chunks_mut(400).collect();
-        let de: Vec<&mut [C64]> = data_e.chunks_mut(400).collect();
-        let db: Vec<&mut [C64]> = data_b.chunks_mut(400).collect();
+        let rc = ragged_chunks_mut(&mut rows, off);
+        let cc = ragged_chunks_mut(&mut cols, off);
+        let de = ragged_chunks_mut(&mut data_e, off);
+        let db = ragged_chunks_mut(&mut data_b, off);
         (0..n_tets).zip(rc).zip(cc).zip(de).zip(db)
             .map(|((((i, r), c), e), b)| (i, r, c, e, b))
             .collect()
@@ -420,15 +439,15 @@ pub fn assemble_global_matrices(
             &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map, &ms, mm,
         );
 
-        // The element matrices are row-major n×n; n is 20 for R2, and the chunk
-        // size above still assumes it. Stage 1 of docs/fd-basis-plan.md replaces
-        // the constant chunking with a prefix-sum offset table, at which point n
-        // may vary per element.
-        let indices = &basis.tet_to_field[itet];
-        debug_assert_eq!(esub.len(), 20 * 20);
-        for ii in 0..20 {
-            for jj in 0..20 {
-                let idx = ii * 20 + jj;
+        // The element matrices are row-major n×n, and the block reserved for this
+        // element is n² wide. Neither side knows what n is.
+        let indices = basis.tet_dofs(itet);
+        let n = indices.len();
+        debug_assert_eq!(esub.len(), n * n);
+        debug_assert_eq!(row_slice.len(), n * n);
+        for ii in 0..n {
+            for jj in 0..n {
+                let idx = ii * n + jj;
                 row_slice[idx] = indices[ii];
                 col_slice[idx] = indices[jj];
                 de_slice[idx] = esub[idx];

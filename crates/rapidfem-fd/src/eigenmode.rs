@@ -56,9 +56,9 @@ pub fn solve_eigenmode(
     let mut pec_ids: HashSet<usize> = HashSet::new();
     for &ti in pec_tri_indices {
         for &ei in &mesh.tri_to_edge[ti] {
-            for &d in &basis.edge_to_field[ei] { pec_ids.insert(d); }
+            for &d in basis.edge_dofs(ei) { pec_ids.insert(d); }
         }
-        for &d in &basis.tri_to_field[ti] { pec_ids.insert(d); }
+        for &d in basis.tri_dofs(ti) { pec_ids.insert(d); }
     }
     let free_dofs: Vec<usize> = (0..n_field).filter(|d| !pec_ids.contains(d)).collect();
     let n_free = free_dofs.len();

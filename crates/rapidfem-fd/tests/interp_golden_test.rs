@@ -33,10 +33,10 @@ fn check_dof(local_dof: usize, pts: &[[f64; 3]], e_exp: &[[f64; 3]], curl_exp: &
     let mesh = build_mesh();
     let basis = Nedelec2Basis::new(&mesh);
     assert_eq!(basis.n_field, 20);
-    // Single-tet mesh: tet_to_field[0] is the identity, but route through it
+    // Single-tet mesh: the local-to-global map is a permutation, but route through it
     // anyway so the test stays correct under any DOF-numbering change.
     let mut sol = vec![C64::new(0.0, 0.0); basis.n_field];
-    sol[basis.tet_to_field[0][local_dof]] = C64::new(1.0, 0.0);
+    sol[basis.tet_dofs(0)[local_dof]] = C64::new(1.0, 0.0);
 
     for (pi, p) in pts.iter().enumerate() {
         let (ex, ey, ez) = eval_field_in_tet(&mesh, &basis, &sol, 0, p[0], p[1], p[2]);

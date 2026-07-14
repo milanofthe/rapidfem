@@ -122,14 +122,12 @@ pub fn assemble_and_solve_with_pml(
         // edge_ids = list(mesh.tri_to_edge[:,tri_ids].flatten())
         let edges = &mesh.tri_to_edge[ti];
         for &ei in edges {
-            // eids = field.edge_to_field[:, ii]
-            let edofs = &basis.edge_to_field[ei];
+            let edofs = basis.edge_dofs(ei);
             for &d in edofs {
                 pec_ids.insert(d);
             }
         }
-        // tids = field.tri_to_field[:, ii]
-        let tdofs = &basis.tri_to_field[ti];
+        let tdofs = basis.tri_dofs(ti);
         for &d in tdofs {
             pec_ids.insert(d);
         }
@@ -141,7 +139,6 @@ pub fn assemble_and_solve_with_pml(
     let ac_base = AreaCoeffCache::new();
     let gauss_points = gaus_quad_tri(4);
 
-    // Bempty = field.empty_tri_matrix()
     let mut bempty = basis.empty_tri_matrix();
 
     for (pi, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
@@ -152,10 +149,14 @@ pub fn assemble_and_solve_with_pml(
             let tri = &mesh.tris[ti];
             let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
             let bsub = ned2_tri_stiff(&verts, gamma, &ac_base);
-            let p = ti * 64;
-            for ii in 0..8 {
-                for jj in 0..8 {
-                    bempty[p + ii * 8 + jj] += bsub[ii][jj];
+            // The block reserved for this triangle is n×n, with n from the DOF
+            // map; the surface element itself is still fixed at R2's 8.
+            let n = basis.tri_dofs(ti).len();
+            debug_assert_eq!(n, 8);
+            let p = basis.tri_block(ti);
+            for ii in 0..n {
+                for jj in 0..n {
+                    bempty[p + ii * n + jj] += bsub[ii][jj];
                 }
             }
         }
@@ -191,7 +192,7 @@ pub fn assemble_and_solve_with_pml(
 
             if u_inc_at_qp.len() == gauss_points.len() {
                 let b_tri = ned2_tri_force(&verts, &u_inc_at_qp, &gauss_points);
-                let dofs = &basis.tri_to_field[ti];
+                let dofs = basis.tri_dofs(ti);
                 for i in 0..8 {
                     bvec[dofs[i]] += b_tri[i];
                 }
@@ -227,12 +228,12 @@ pub fn assemble_and_solve_with_pml(
         coo_cols.push(dof_to_free[c]);
         coo_vals.push(data_e[i] - k0_sq * data_b[i]);
     }
-    // Robin entries live only on the port triangles; walk just those slots
-    // instead of all n_tris*64 (mirrors the sweep path's port-tri indices).
+    // Robin entries live only on the port triangles; walk just those blocks
+    // instead of every triangle's.
     let mut robin_nonzero: Vec<usize> = port_tri_indices
         .iter()
         .flat_map(|tri_ids| tri_ids.iter().copied())
-        .flat_map(|ti| ti * 64..(ti + 1) * 64)
+        .flat_map(|ti| basis.tri_block(ti)..basis.tri_block(ti + 1))
         .filter(|&i| !pec_ids.contains(&basis.tri_rows[i])
             && !pec_ids.contains(&basis.tri_cols[i]))
         .collect();
@@ -344,9 +345,9 @@ pub fn frequency_sweep_with_pml(
     let mut pec_ids: HashSet<usize> = HashSet::new();
     for &ti in pec_tri_indices {
         for &ei in &mesh.tri_to_edge[ti] {
-            for &d in &basis.edge_to_field[ei] { pec_ids.insert(d); }
+            for &d in basis.edge_dofs(ei) { pec_ids.insert(d); }
         }
-        for &d in &basis.tri_to_field[ti] { pec_ids.insert(d); }
+        for &d in basis.tri_dofs(ti) { pec_ids.insert(d); }
     }
 
     let free_dofs: Vec<usize> = (0..basis.n_field).filter(|d| !pec_ids.contains(d)).collect();
@@ -376,7 +377,7 @@ pub fn frequency_sweep_with_pml(
     let mut robin_free_indices: Vec<usize> = port_tri_indices
         .iter()
         .flat_map(|tri_ids| tri_ids.iter().copied())
-        .flat_map(|ti| ti * 64..(ti + 1) * 64)
+        .flat_map(|ti| basis.tri_block(ti)..basis.tri_block(ti + 1))
         .filter(|&idx| {
             let r = basis.tri_rows[idx];
             let c = basis.tri_cols[idx];
@@ -430,8 +431,9 @@ pub fn frequency_sweep_with_pml(
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
                 let bsub = ned2_tri_stiff(&verts, gamma, &ac_base);
-                let p = ti * 64;
-                for ii in 0..8 { for jj in 0..8 { bempty[p + ii*8 + jj] += bsub[ii][jj]; } }
+                let n = basis.tri_dofs(ti).len();
+                let p = basis.tri_block(ti);
+                for ii in 0..n { for jj in 0..n { bempty[p + ii*n + jj] += bsub[ii][jj]; } }
             }
         }
 
@@ -453,7 +455,7 @@ pub fn frequency_sweep_with_pml(
                     }).collect();
                 if u_at_qp.len() == gauss_points.len() {
                     let b_tri = ned2_tri_force(&verts, &u_at_qp, &gauss_points);
-                    let dofs = &basis.tri_to_field[ti];
+                    let dofs = basis.tri_dofs(ti);
                     for i in 0..8 { bvec[dofs[i]] += b_tri[i]; }
                 }
             }

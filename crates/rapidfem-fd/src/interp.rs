@@ -82,7 +82,7 @@ pub fn eval_field_in_tet(
 ) -> (C64, C64, C64) {
     let (grads, fns, v0) = tet_basis(mesh, tet_idx);
     let lam = lambdas_at(&grads, &v0, &[x, y, z]);
-    let field_ids = &basis.tet_to_field[tet_idx];
+    let field_ids = basis.tet_dofs(tet_idx);
 
     let mut e = [C64::new(0.0, 0.0); 3];
     for (i, bf) in fns.iter().enumerate() {
@@ -230,7 +230,7 @@ pub fn eval_curl_in_tet(
 ) -> [C64; 3] {
     let (grads, fns, v0) = tet_basis(mesh, tet_idx);
     let lam = lambdas_at(&grads, &v0, &[x, y, z]);
-    let field_ids = &basis.tet_to_field[tet_idx];
+    let field_ids = basis.tet_dofs(tet_idx);
 
     let mut curl = [C64::new(0.0, 0.0); 3];
     for (i, bf) in fns.iter().enumerate() {

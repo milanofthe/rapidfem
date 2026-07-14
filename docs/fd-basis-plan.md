@@ -241,7 +241,7 @@ Each stage is independently shippable and has its own oracle.
 
 ### Status
 
-Stages 0-2 are done, on `feat/fd-modular-element`. What actually landed:
+Stages 0-3 are done, on `feat/fd-modular-element`. What actually landed:
 
 | Stage | Commit | Outcome |
 |---|---|---|
@@ -249,6 +249,7 @@ Stages 0-2 are done, on `feat/fd-modular-element`. What actually landed:
 | 0 | `48e57c6` | bit-identical, and **15% faster** (31.3 ms vs 36.7 ms on 10 368 tets) |
 | 1 | `1815b40` | values bit-identical; the DOF numbering is a proven permutation of the old |
 | 2 | `c792f4f` | surface element built from the volume element's generators; trace identity proved |
+| 3 | `5c809fd` | hierarchical basis; same space to 1e-14 across the whole cavity spectrum |
 
 Two things came out differently from the plan.
 
@@ -283,6 +284,25 @@ thing the old "sign-matched to volume" comment was silently carrying.
 Removed on the way: `AreaCoeffCache` and `VolumeCoeffCache` (625-entry tables built
 per solve, no longer read by anything), and the `ac_base` parameter of
 `ned2_tri_stiff`. The regenerated `tri_mass_golden_test` values are byte-identical.
+
+**Stage 3's conditioning claim was wrong.** The plan said to expect `cond(D+F)`
+51.1 → 25.7 on a regular tet. Measured (`hierarchical.py`, P5): 567 → 499 on the
+unit tet (1.14× better), 527 → **727** on a general tet (*worse*), 570 772 → 376 115
+on a sliver (1.52× better). The hierarchical basis is not a conditioning win in
+general. Its reason to exist is the nesting, and that is what the measurements do
+confirm: mode 0 of the edges *is* the Whitney space (rank 6, identical), whereas the
+interpolatory mode-0 block is disjoint from it (rank 12 = 6 + 6) and contains no
+Whitney function at all. Without that, stage 4 is impossible.
+
+**A pre-existing defect surfaced while building stage 3's oracle.**
+`eigenmode::solve_eigenmode` runs its Lanczos recurrence in the Euclidean inner
+product on `(E − σB)⁻¹B`, which is self-adjoint only in the `B` inner product, with
+local-only reorthogonalisation and no residual check. Its eigenvalues land near the
+truth, but every returned eigenVECTOR has an O(1) eigenpair residual, and it reports
+ghost modes below the fundamental (a cluster near 5.3 GHz in a cavity whose true
+spectrum, computed densely, has nothing between 0 and 8.245 GHz). This is unrelated
+to the element work and is to be fixed separately. It is documented at the top of
+`eigenmode.rs`; the stage-3 oracle deliberately does not use it.
 
 ### Stage 0 — general term representation (pure refactor)
 

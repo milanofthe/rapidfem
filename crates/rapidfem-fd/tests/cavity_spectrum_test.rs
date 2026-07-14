@@ -7,198 +7,38 @@
 //
 // The discrete spectrum of a PEC cavity, computed densely and exactly.
 //
-// This is the stage-3 oracle of docs/fd-basis-plan.md, and it is deliberately
-// built without `eigenmode::solve_eigenmode`. That routine runs a Lanczos
-// recurrence in the Euclidean inner product on the operator (E−σB)⁻¹B, which is
-// NOT self-adjoint there (it is self-adjoint in the B inner product), and it
-// accepts every Ritz value of the tridiagonal without a residual check. Its
-// eigenVALUES come out roughly right; its eigenVECTORS have an O(1) eigenpair
-// residual, and it reports ghost modes below the fundamental. That is a
-// pre-existing defect, unrelated to the element basis, and an oracle must not be
-// built on it.
+// The dense spectrum lives in `common`, and is deliberately built without
+// `eigenmode::solve_eigenmode`: it assembles E and B, eliminates the PEC DOFs, and
+// solves E·x = λ·B·x by a Cholesky reduction to standard form. No shift, no
+// iteration, no convergence criterion. It is the reference the iterative solver is
+// checked against in `eigensolver_test.rs`, so it must share no machinery with it.
 //
-// So the spectrum is computed here from first principles: assemble E and B,
-// eliminate the PEC DOFs, and solve the dense generalised symmetric problem
-// E·x = λ·B·x by reducing it to standard form with a Cholesky factor of B.
-//
-// What this establishes:
+// What the tests here establish:
 //
 //   1. The physics. The lowest nonzero eigenvalue is the cavity's fundamental,
 //      TE101, which has a closed form. That checks the element, the DOF map, the
 //      orientation convention and the PEC elimination together.
-//   2. The kernel. The curl-curl operator's null space (the discrete gradients)
-//      sits at exactly λ = 0. Its dimension is a property of the space and must
-//      match between the two bases.
-//   3. The oracle. An eigenvalue of the discrete operator is a property of the
-//      SPACE, not of the basis chosen for it. `hierarchical_basis_test` proves the
-//      two bases span one space algebraically, on a single element. Here that
-//      claim has to survive assembly, the global DOF map and the constraint
-//      elimination — which is exactly where an ownership or orientation mistake
-//      would hide.
+//   2. The kernel. The curl operator's null space — the discrete gradients — sits at
+//      λ = 0, and its dimension is exactly countable.
+//   3. Stage 3: an eigenvalue is a property of the SPACE, not of the basis chosen
+//      for it, so the interpolatory and hierarchical bases must give one spectrum.
+//   4. Stages 4 and 5: variable order is conforming (Courant-Fischer, index by
+//      index), order 1 converges at the Whitney rate, and the order policy gives back
+//      DOFs without giving back accuracy.
 
-use faer::Mat;
+mod common;
+
+use common::*;
 use num_complex::Complex64 as C64;
 use rapidfem_fd::basis::Nedelec2Basis;
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::order::{cell_diameter, cell_wavenumbers, wavelength_policy, OrderMap};
-use rapidfem_fd::tet_assembly_r2::{assemble_global_matrices, BasisKind};
+use rapidfem_fd::tet_assembly_r2::BasisKind;
 use std::collections::HashSet;
 
-const C0: f64 = 299_792_458.0;
-
-/// A box of nx×ny×nz cubes, each cut into six tetrahedra (Kuhn subdivision).
-fn box_mesh(lx: f64, ly: f64, lz: f64, nx: usize, ny: usize, nz: usize) -> Mesh {
-    let idx = |i: usize, j: usize, k: usize| (i * (ny + 1) + j) * (nz + 1) + k;
-    let mut nodes = Vec::new();
-    for i in 0..=nx {
-        for j in 0..=ny {
-            for k in 0..=nz {
-                nodes.push([
-                    lx * i as f64 / nx as f64,
-                    ly * j as f64 / ny as f64,
-                    lz * k as f64 / nz as f64,
-                ]);
-            }
-        }
-    }
-    let mut tets = Vec::new();
-    for i in 0..nx {
-        for j in 0..ny {
-            for k in 0..nz {
-                let c = [
-                    idx(i, j, k), idx(i + 1, j, k), idx(i + 1, j + 1, k), idx(i, j + 1, k),
-                    idx(i, j, k + 1), idx(i + 1, j, k + 1), idx(i + 1, j + 1, k + 1), idx(i, j + 1, k + 1),
-                ];
-                for t in [
-                    [c[0], c[1], c[2], c[6]],
-                    [c[0], c[2], c[3], c[6]],
-                    [c[0], c[3], c[7], c[6]],
-                    [c[0], c[7], c[4], c[6]],
-                    [c[0], c[4], c[5], c[6]],
-                    [c[0], c[5], c[1], c[6]],
-                ] {
-                    tets.push(t);
-                }
-            }
-        }
-    }
-    Mesh::from_tets(nodes, tets)
-}
-
-fn boundary_tris(mesh: &Mesh) -> Vec<usize> {
-    (0..mesh.n_tris())
-        .filter(|&t| mesh.tri_to_tet[t][1] == usize::MAX)
-        .collect()
-}
-
-/// The generalised eigenvalues of E·x = λ·B·x on the free DOFs, ascending.
-///
-/// B (the mass matrix) is symmetric positive definite, so B = LLᵀ and the pencil
-/// reduces to the standard symmetric problem (L⁻¹EL⁻ᵀ)y = λy with y = Lᵀx. No
-/// iteration, no shift, no convergence criterion: this is the whole spectrum.
-fn dense_spectrum(kind: BasisKind, mesh: &Mesh, pec_tris: &[usize]) -> Vec<f64> {
-    spectrum_of(&Nedelec2Basis::with_kind(mesh, kind), mesh, pec_tris)
-}
-
-/// The same, for an arbitrary order map.
-fn spectrum_of(basis: &Nedelec2Basis, mesh: &Mesh, pec_tris: &[usize]) -> Vec<f64> {
-    let basis = basis;
-
-    let mut pec: HashSet<usize> = HashSet::new();
-    for &t in pec_tris {
-        for &e in &mesh.tri_to_edge[t] {
-            pec.extend(basis.edge_dofs(e));
-        }
-        pec.extend(basis.tri_dofs(t));
-    }
-    let free: Vec<usize> = (0..basis.n_field).filter(|d| !pec.contains(d)).collect();
-    let mut to_free = vec![usize::MAX; basis.n_field];
-    for (i, &d) in free.iter().enumerate() {
-        to_free[d] = i;
-    }
-    let n = free.len();
-
-    let id = {
-        let (z, o) = (C64::new(0.0, 0.0), C64::new(1.0, 0.0));
-        [[o, z, z], [z, o, z], [z, z, o]]
-    };
-    let (rows, cols, de, db) = assemble_global_matrices(
-        mesh,
-        &basis,
-        &vec![id; mesh.n_tets()],
-        &vec![id; mesh.n_tets()],
-    );
-
-    // Air and vacuum: the tensors are real, so E and B are real symmetric.
-    let mut e = Mat::<f64>::zeros(n, n);
-    let mut b = Mat::<f64>::zeros(n, n);
-    for k in 0..rows.len() {
-        let (r, c) = (to_free[rows[k]], to_free[cols[k]]);
-        if r == usize::MAX || c == usize::MAX {
-            continue;
-        }
-        e[(r, c)] += de[k].re;
-        b[(r, c)] += db[k].re;
-    }
-
-    // B = L Lᵀ, in place, lower triangle.
-    let mut l = Mat::<f64>::zeros(n, n);
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = b[(i, j)];
-            for k in 0..j {
-                s -= l[(i, k)] * l[(j, k)];
-            }
-            if i == j {
-                assert!(s > 0.0, "the mass matrix is not positive definite");
-                l[(i, i)] = s.sqrt();
-            } else {
-                l[(i, j)] = s / l[(j, j)];
-            }
-        }
-    }
-
-    // C = L⁻¹ E L⁻ᵀ, by two triangular solves.
-    let mut c = e.clone();
-    for col in 0..n {
-        for i in 0..n {
-            let mut s = c[(i, col)];
-            for k in 0..i {
-                s -= l[(i, k)] * c[(k, col)];
-            }
-            c[(i, col)] = s / l[(i, i)];
-        }
-    }
-    for row in 0..n {
-        for j in 0..n {
-            let mut s = c[(row, j)];
-            for k in 0..j {
-                s -= c[(row, k)] * l[(j, k)];
-            }
-            c[(row, j)] = s / l[(j, j)];
-        }
-    }
-
-    let eig = c.eigen().expect("the dense eigendecomposition must succeed");
-    let vals = eig.S().column_vector();
-    let mut out: Vec<f64> = (0..n).map(|i| vals[i].re).collect();
-    out.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    out
-}
-
-/// A cavity small enough for a dense eigendecomposition, coarse but resolved.
-fn cavity() -> (Mesh, Vec<usize>, f64) {
-    let (a, b, d) = (0.02286, 0.01016, 0.030);
-    let mesh = box_mesh(a, b, d, 3, 1, 4);
-    let pec = boundary_tris(&mesh);
-    // TE101: f = (c₀/2)·√((1/a)² + (1/d)²)
-    let f101 = 0.5 * C0 * ((1.0 / a).powi(2) + (1.0 / d).powi(2)).sqrt();
-    (mesh, pec, f101)
-}
-
-/// λ = k₀², so f = c₀·√λ / 2π.
-fn to_ghz(lambda: f64) -> f64 {
-    C0 * lambda.max(0.0).sqrt() / (2.0 * std::f64::consts::PI) / 1e9
+/// The dense spectrum, for a basis chosen by kind at uniform order 2.
+fn spectrum_by_kind(kind: BasisKind, mesh: &Mesh, pec: &[usize]) -> Vec<f64> {
+    dense_spectrum(&Nedelec2Basis::with_kind(mesh, kind), mesh, pec)
 }
 
 #[test]
@@ -212,7 +52,7 @@ fn the_cavity_fundamental_matches_the_closed_form() {
     );
 
     for kind in [BasisKind::Interpolatory, BasisKind::Hierarchical] {
-        let s = dense_spectrum(kind, &mesh, &pec);
+        let s = spectrum_by_kind(kind, &mesh, &pec);
         // The discrete gradients sit at λ = 0. Everything above them is physical;
         // there is no spurious branch in between, which is the whole point of a
         // curl-conforming element.
@@ -248,8 +88,8 @@ fn the_cavity_fundamental_matches_the_closed_form() {
 fn both_bases_give_the_same_discrete_spectrum() {
     let (mesh, pec, _) = cavity();
 
-    let si = dense_spectrum(BasisKind::Interpolatory, &mesh, &pec);
-    let sh = dense_spectrum(BasisKind::Hierarchical, &mesh, &pec);
+    let si = spectrum_by_kind(BasisKind::Interpolatory, &mesh, &pec);
+    let sh = spectrum_by_kind(BasisKind::Hierarchical, &mesh, &pec);
     assert_eq!(si.len(), sh.len(), "the two bases produced different DOF counts");
 
     let scale = si.last().copied().unwrap();
@@ -296,14 +136,6 @@ fn both_bases_give_the_same_discrete_spectrum() {
 // Stage 4: variable order.
 // ===========================================================================
 
-/// The nonzero part of a spectrum, and the size of the kernel it sat on.
-fn resonances_of(basis: &Nedelec2Basis, mesh: &Mesh, pec: &[usize]) -> (Vec<f64>, usize) {
-    let s = spectrum_of(basis, mesh, pec);
-    let scale = s.last().copied().unwrap();
-    let k = s.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();
-    (s[k..].to_vec(), k)
-}
-
 /// The kernel of the discrete curl is the space of discrete gradients. That is not
 /// a vague statement: it has an exactly countable dimension, because the scalar
 /// potentials are the DOFs of the Lagrange space one rung down the de Rham
@@ -328,7 +160,7 @@ fn the_kernel_dimension_is_the_number_of_discrete_gradients() {
     for (p, want) in [(1u8, interior_nodes), (2u8, interior_nodes + interior_edges)] {
         let basis =
             Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, p));
-        let (_, kernel) = resonances_of(&basis, &mesh, &pec);
+        let (_, kernel) = resonances(&basis, &mesh, &pec);
         eprintln!(
             "  p = {p}: {} DOFs, kernel dim {kernel} (discrete gradients: {want})",
             basis.n_field
@@ -358,7 +190,7 @@ fn order_1_converges_at_the_whitney_rate() {
         let pec = boundary_tris(&mesh);
         let basis =
             Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
-        let (res, _) = resonances_of(&basis, &mesh, &pec);
+        let (res, _) = resonances(&basis, &mesh, &pec);
         let err = (res[0] - lambda).abs() / lambda;
         eprintln!(
             "  h/{m}: {} tets, {} DOFs, lambda error {err:.4e}",
@@ -454,9 +286,9 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
     // kernels have different dimensions and the first resonance sits at a different
     // index in each. Comparing those compares λ_i to λ_j with i ≠ j, about which
     // Courant-Fischer says nothing at all.
-    let s1 = spectrum_of(&b1, &mesh, &pec);
-    let sm = spectrum_of(&bm, &mesh, &pec);
-    let s2 = spectrum_of(&b2, &mesh, &pec);
+    let s1 = dense_spectrum(&b1, &mesh, &pec);
+    let sm = dense_spectrum(&bm, &mesh, &pec);
+    let s2 = dense_spectrum(&b2, &mesh, &pec);
 
     let slack = |x: f64| 1e-8 * x.abs().max(1.0);
     for k in 0..sm.len() {
@@ -483,9 +315,9 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
         sm.len()
     );
 
-    let (r1, k1) = resonances_of(&b1, &mesh, &pec);
-    let (rm, km) = resonances_of(&bm, &mesh, &pec);
-    let (r2, k2) = resonances_of(&b2, &mesh, &pec);
+    let (r1, k1) = resonances(&b1, &mesh, &pec);
+    let (rm, km) = resonances(&bm, &mesh, &pec);
+    let (r2, k2) = resonances(&b2, &mesh, &pec);
     eprintln!("  kernel dims: p1 {k1}, mixed {km}, p2 {k2}");
     eprintln!(
         "  fundamental: p1 {:.6} GHz, mixed {:.6} GHz, p2 {:.6} GHz",
@@ -512,49 +344,6 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
 // ===========================================================================
 // Stage 5: the a-priori order policy.
 // ===========================================================================
-
-/// A box graded in z: the cells near z = 0 are small for a reason that has nothing
-/// to do with the wavelength. This is the situation the policy exists for. A
-/// uniform mesh has nothing to decide.
-fn graded_box(lx: f64, ly: f64, lz: f64, nx: usize, ny: usize, nz: usize, grade: f64) -> Mesh {
-    let idx = |i: usize, j: usize, k: usize| (i * (ny + 1) + j) * (nz + 1) + k;
-    // Graded in ALL THREE axes toward the corner at the origin. Grading only one
-    // axis would be pointless: a cell's diameter is its LONGEST edge, so a cell that
-    // is thin in z but full-width in x and y has the same diameter as a coarse one,
-    // and the policy would rightly refuse to reduce it. Only a cell that is small in
-    // every direction is genuinely geometry-refined.
-    let g = |n: usize, i: usize| (i as f64 / n as f64).powf(grade);
-    let mut nodes = Vec::new();
-    for i in 0..=nx {
-        for j in 0..=ny {
-            for k in 0..=nz {
-                nodes.push([lx * g(nx, i), ly * g(ny, j), lz * g(nz, k)]);
-            }
-        }
-    }
-    let mut tets = Vec::new();
-    for i in 0..nx {
-        for j in 0..ny {
-            for k in 0..nz {
-                let c = [
-                    idx(i, j, k), idx(i + 1, j, k), idx(i + 1, j + 1, k), idx(i, j + 1, k),
-                    idx(i, j, k + 1), idx(i + 1, j, k + 1), idx(i + 1, j + 1, k + 1), idx(i, j + 1, k + 1),
-                ];
-                for t in [
-                    [c[0], c[1], c[2], c[6]],
-                    [c[0], c[2], c[3], c[6]],
-                    [c[0], c[3], c[7], c[6]],
-                    [c[0], c[7], c[4], c[6]],
-                    [c[0], c[4], c[5], c[6]],
-                    [c[0], c[5], c[1], c[6]],
-                ] {
-                    tets.push(t);
-                }
-            }
-        }
-    }
-    Mesh::from_tets(nodes, tets)
-}
 
 /// The policy's oracle: on a mesh with geometry-driven refinement, it must give back
 /// DOFs without giving back accuracy.
@@ -589,7 +378,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     eprintln!("  {} tets, k*h from {kh_min:.3} to {kh_max:.3}", mesh.n_tets());
 
     let full = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
-    let (r_full, _) = resonances_of(&full, &mesh, &pec);
+    let (r_full, _) = resonances(&full, &mesh, &pec);
     let e_full = (r_full[0] - lambda).abs() / lambda;
     eprintln!("  uniform p=2: {} DOFs, error {e_full:.3e}", full.n_field);
 
@@ -604,7 +393,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
         }
         any = true;
         let basis = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, orders);
-        let (r, _) = resonances_of(&basis, &mesh, &pec);
+        let (r, _) = resonances(&basis, &mesh, &pec);
         let err = (r[0] - lambda).abs() / lambda;
         let saved = 1.0 - basis.n_field as f64 / full.n_field as f64;
         eprintln!(
@@ -638,7 +427,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     // corner cells contribute nothing either way, which is exactly the situation the
     // policy is supposed to detect and exploit.)
     let all_p1 = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
-    let (r1, _) = resonances_of(&all_p1, &mesh, &pec);
+    let (r1, _) = resonances(&all_p1, &mesh, &pec);
     let e1 = (r1[0] - lambda).abs() / lambda;
     eprintln!(
         "  uniform p=1: {} DOFs, error {e1:.3e} ({:.1}x the uniform-p2 error)",

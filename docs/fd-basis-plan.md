@@ -346,14 +346,21 @@ interpolatory mode-0 block is disjoint from it (rank 12 = 6 + 6) and contains no
 Whitney function at all. Without that, stage 4 is impossible.
 
 **A pre-existing defect surfaced while building stage 3's oracle.**
-`eigenmode::solve_eigenmode` runs its Lanczos recurrence in the Euclidean inner
-product on `(E − σB)⁻¹B`, which is self-adjoint only in the `B` inner product, with
-local-only reorthogonalisation and no residual check. Its eigenvalues land near the
-truth, but every returned eigenVECTOR has an O(1) eigenpair residual, and it reports
-ghost modes below the fundamental (a cluster near 5.3 GHz in a cavity whose true
-spectrum, computed densely, has nothing between 0 and 8.245 GHz). This is unrelated
-to the element work and is to be fixed separately. It is documented at the top of
-`eigenmode.rs`; the stage-3 oracle deliberately does not use it.
+`eigenmode::solve_eigenmode` ran its whole Lanczos recurrence in the **Euclidean**
+bilinear form on `(E − σB)⁻¹B` — `α = vᵀw`, `β = ‖w‖₂`, the reorthogonalisation and
+the normalisation all of them — but that operator is self-adjoint only in the form
+induced by `B`, `⟨x,y⟩_B = xᵀBy`. It also added the transpose in the `B` matvec, to a
+COO that already carries the full element block, and so computed `(2B − diag B)·x`;
+and it accepted every Ritz value of the tridiagonal without a residual check. The
+result: eigenvalues near the truth, but every returned eigenVECTOR with an O(1)
+eigenpair residual, and ghost modes below the fundamental (a cluster near 5.3 GHz in
+a cavity whose true spectrum, computed densely, has nothing between 0 and 8.245 GHz).
+
+(It did *not* lack full reorthogonalisation, as an earlier version of this note
+claimed — it reorthogonalised against the whole basis, in the wrong form.)
+
+Unrelated to the element work; fixed separately, and the stage-3 oracle deliberately
+does not use the iterative solver at all.
 
 ### Stage 0 — general term representation (pure refactor)
 

@@ -42,30 +42,36 @@ pub struct Config {
 /// `interpolatory` is the default. `hierarchical` nests the lowest-order (Whitney)
 /// space as a coordinate subspace and makes the curl kernel explicit, which is what
 /// variable order and a p-decay indicator need (docs/fd-basis-plan.md, stages 4-5).
-#[derive(Deserialize, Default)]
+///
+/// Note the `#[serde(default)]` on the STRUCT, and the hand-written `Default`.
+///
+/// A `#[serde(default = "f")]` on a FIELD only fires when that field is missing from
+/// a section that is itself present. It has nothing to do with `Default::default()`,
+/// which a `#[derive(Default)]` would fill with `String::new()` — the empty string.
+/// So a config with no `[element]` section at all, which is every config written
+/// before this section existed, would have arrived here with `basis = ""` and
+/// panicked. Deriving `Default` here is a trap; the defaults have to live in one
+/// place that both paths go through.
+#[derive(Deserialize)]
+#[serde(default)]
 pub struct ElementConfig {
-    #[serde(default = "default_basis")]
     pub basis: String,
     /// `uniform` (every cell at order 2) or `adaptive` (the a-priori wavelength
     /// policy of `order::wavelength_policy`). `adaptive` implies the hierarchical
     /// basis, because the interpolatory one does not nest.
-    #[serde(default = "default_order_policy")]
     pub order_policy: String,
     /// The policy's threshold: a cell with `k·h < theta` drops to order 1.
-    #[serde(default = "default_element_theta")]
     pub theta: f64,
 }
 
-fn default_basis() -> String {
-    "interpolatory".to_string()
-}
-
-fn default_order_policy() -> String {
-    "uniform".to_string()
-}
-
-fn default_element_theta() -> f64 {
-    crate::order::DEFAULT_THETA
+impl Default for ElementConfig {
+    fn default() -> Self {
+        ElementConfig {
+            basis: "interpolatory".to_string(),
+            order_policy: "uniform".to_string(),
+            theta: crate::order::DEFAULT_THETA,
+        }
+    }
 }
 
 /// How the per-cell orders are chosen.
@@ -475,4 +481,97 @@ pub fn load_config(path: &str) -> Result<Config, String> {
 /// Parse a config from a TOML string. Used by Python and WASM bindings to avoid file I/O.
 pub fn parse_config(toml_str: &str) -> Result<Config, String> {
     toml::from_str(toml_str).map_err(|e| format!("Cannot parse TOML: {}", e))
+}
+
+#[cfg(test)]
+mod element_config_tests {
+    use super::*;
+
+    /// Every config written before the `[element]` section existed has no `[element]`
+    /// section. Those must keep working, at the old behaviour: the interpolatory basis
+    /// at uniform order 2.
+    ///
+    /// This is what a `#[derive(Default)]` on `ElementConfig` silently broke — it
+    /// filled `basis` with the empty string, and the solver panicked on every such
+    /// config. The field-level `#[serde(default = "...")]` attributes do not fire for
+    /// a section that is absent entirely.
+    #[test]
+    fn a_config_with_no_element_section_gets_the_old_behaviour() {
+        let cfg: Config = parse_config(
+            r#"
+            [mesh]
+            file = "x.msh"
+            [frequency]
+            values = [1.0e9]
+            [pec]
+            tags = []
+            "#,
+        )
+        .expect("a config without an [element] section must parse");
+
+        assert_eq!(cfg.element.basis, "interpolatory");
+        assert_eq!(cfg.element.order_policy, "uniform");
+        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly_r2::BasisKind::Interpolatory);
+        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
+    }
+
+    /// And a partially specified section keeps the defaults for what it omits.
+    #[test]
+    fn a_partial_element_section_keeps_the_other_defaults() {
+        let cfg: Config = parse_config(
+            r#"
+            [mesh]
+            file = "x.msh"
+            [frequency]
+            values = [1.0e9]
+            [pec]
+            tags = []
+            [element]
+            basis = "hierarchical"
+            "#,
+        )
+        .expect("a partial [element] section must parse");
+
+        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly_r2::BasisKind::Hierarchical);
+        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
+        assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
+    }
+
+    /// An adaptive order needs a nesting basis. Asking for it with the interpolatory
+    /// one must be refused, not silently obeyed: the minimum rule would then discard
+    /// functions from a basis in which the lower-order space is not a subspace at all.
+    #[test]
+    fn adaptive_order_with_the_interpolatory_basis_is_refused() {
+        let cfg: Config = parse_config(
+            r#"
+            [mesh]
+            file = "x.msh"
+            [frequency]
+            values = [1.0e9]
+            [pec]
+            tags = []
+            [element]
+            basis = "interpolatory"
+            order_policy = "adaptive"
+            "#,
+        )
+        .expect("it must parse; the objection is semantic, not syntactic");
+
+        let err = cfg.element.kind().unwrap_err();
+        assert!(
+            err.contains("hierarchical"),
+            "the error must say what to do about it, got: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_basis_or_policy_is_named_in_the_error() {
+        let mut e = ElementConfig::default();
+        e.basis = "legendre".to_string();
+        assert!(e.kind().unwrap_err().contains("legendre"));
+
+        let mut e = ElementConfig::default();
+        e.order_policy = "magic".to_string();
+        assert!(e.policy().unwrap_err().contains("magic"));
+    }
 }

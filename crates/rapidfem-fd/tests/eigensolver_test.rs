@@ -22,8 +22,8 @@
 //   2. It returns the ones NEAREST THE TARGET, which is what shift-invert is for.
 //   3. Every eigenPAIR it returns actually satisfies E·x = λ·B·x. An eigenvalue that
 //      is right by luck, carried by a vector that solves nothing, is not a mode —
-//      and it is exactly what a Lanczos without reorthogonalisation in the right
-//      inner product produces.
+//      and it is exactly what a Lanczos run in the wrong inner product produces, with
+//      or without reorthogonalisation.
 
 mod common;
 

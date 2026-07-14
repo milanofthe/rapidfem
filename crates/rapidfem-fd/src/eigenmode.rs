@@ -24,13 +24,17 @@
 //!   ⟨x, y⟩_B = xᵀ·B·y      (bilinear, NOT conjugated: E and B are complex
 //!                           SYMMETRIC under loss, not Hermitian)
 //!
-//! Run in the Euclidean product instead and the recurrence is a three-term
-//! recurrence for an operator that has no such recurrence. The tridiagonal matrix it
-//! produces is not similar to anything, its Ritz values are not eigenvalues, and the
-//! Ritz vectors solve nothing. That is what this solver used to do, and it is why it
-//! reported ghost modes below a cavity's fundamental and eigenvectors with an O(1)
-//! eigenpair residual. All of it is now checked against a densely computed spectrum
-//! in `tests/eigensolver_test.rs`.
+//! Run it in the Euclidean form instead — `α = vᵀw`, `β = ‖w‖₂`, and both the
+//! reorthogonalisation and the normalisation to match — and it is a three-term
+//! recurrence for an operator that has no three-term recurrence. The tridiagonal
+//! matrix it produces is not similar to anything, its Ritz values are not
+//! eigenvalues, and its Ritz vectors solve nothing.
+//!
+//! That is what this solver used to do, and it is why it reported ghost modes below a
+//! cavity's fundamental and eigenvectors with an O(1) eigenpair residual. (It was not
+//! for want of reorthogonalisation: it reorthogonalised against the whole basis, just
+//! in the wrong form.) All of it is now checked against a densely computed spectrum in
+//! `tests/eigensolver_test.rs`.
 //!
 //! # The residual test is not optional either
 //!

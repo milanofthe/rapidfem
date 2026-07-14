@@ -237,7 +237,7 @@ def main():
         body += emit_case(case)
         print(f"emitted case {case['name']}: "
               f"beta={case['beta']:.6e} Z_TE={case['zmode']:.6e} qmode={case['qmode']:.6f}")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

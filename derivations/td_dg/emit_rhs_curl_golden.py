@@ -184,7 +184,7 @@ fn rhs_curl_matches_exact_polynomial_curl() {{
     assert!(err < 1e-9, "curl mismatch: {{:.2e}}", err);
 }}
 """
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}  (Np={n}, dof={dof})")
 

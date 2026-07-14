@@ -141,7 +141,7 @@ def export_golden(path):
             {"idx": list(k), "value": float(v)} for k, v in sorted(area_table.items())
         ],
     }
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(out, f, indent=1)
     return out
 

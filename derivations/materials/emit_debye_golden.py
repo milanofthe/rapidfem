@@ -102,7 +102,7 @@ def main():
     for name, er_inf, er_static, tau_s in CASES:
         body += emit_case(name, er_inf, er_static, tau_s)
         print(f"emitted case {name}")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

@@ -245,7 +245,7 @@ def main():
         body += emit_diel_case(*case)
         print(f"emitted dielectric case {case[0]}")
 
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

@@ -181,7 +181,7 @@ def main() -> None:
     lines.append("}")
     lines.append("")
 
-    with open(out, "w") as f:
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
     print(f"wrote {out}")
 

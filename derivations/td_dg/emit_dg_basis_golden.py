@@ -186,7 +186,7 @@ def main() -> None:
     for p in ORDERS:
         body += emit_case(p)
         print(f"emitted order p={p}")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

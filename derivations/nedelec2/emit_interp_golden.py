@@ -234,7 +234,7 @@ fn interp_recon_dof_{local_dof}_{label}() {{
 """
         print(f"emitted DOF {local_dof} ({label})")
 
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

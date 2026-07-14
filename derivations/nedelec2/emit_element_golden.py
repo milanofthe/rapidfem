@@ -97,12 +97,15 @@ use rapidfem_fd::tet_assembly_r2::r2_tet_stiff_mass;
 const EDGE_MAP: [[usize; 2]; 6] = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
 const TRI_MAP: [[usize; 3]; 4] = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
 
-fn maxdiff(a: &[[C64; 20]; 20], b: &[[C64; 20]; 20]) -> f64 {
+/// `a` is the element matrix as the kernel returns it: ROW-MAJOR, n*n. `b` is
+/// the golden, kept as a 2-D literal for readability.
+fn maxdiff(a: &[C64], b: &[[C64; 20]; 20]) -> f64 {
+    assert_eq!(a.len(), 20 * 20, "element matrix is row-major 20x20");
     let mut m = 0.0_f64;
     let mut scale = 1e-300_f64;
     for i in 0..20 { for j in 0..20 {
         scale = scale.max(b[i][j].norm());
-        m = m.max((a[i][j] - b[i][j]).norm());
+        m = m.max((a[i * 20 + j] - b[i][j]).norm());
     }}
     m / scale
 }
@@ -147,7 +150,7 @@ def main():
     for name, verts, eps, mu in CASES:
         body += emit_case(name, verts, eps, mu)
         print(f"emitted case {name}")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

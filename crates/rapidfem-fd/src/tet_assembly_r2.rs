@@ -30,7 +30,7 @@
 //! [6 edge·m2][4 face·m2].
 
 use num_complex::Complex64 as C64;
-use crate::coefficients::volume_coeff;
+use crate::coefficients::volume_coeff_exps;
 use crate::mesh::Mesh;
 use crate::basis::Nedelec2Basis;
 
@@ -139,20 +139,51 @@ pub fn barycentric_grads(xs: &[f64; 4], ys: &[f64; 4], zs: &[f64; 4]) -> ([V3; 4
     (grads, six_v_eff.abs())
 }
 
-/// One term of a basis function: `coeff · L_mono[0] · L_mono[1] · ∇L_grad`.
-#[derive(Clone, Copy)]
+/// One term of a basis function:
+///
+///   `coeff · L_1^e1 L_2^e2 L_3^e3 L_4^e4 · ∇L_grad`
+///
+/// The exponent multi-index is the general form (it is what
+/// `derivations/nedelec2/element.py` uses), so this type carries any polynomial
+/// H(curl) basis, not only R2. Order 2 happens to produce degree-2 monomials;
+/// nothing here assumes that.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Term {
     pub coeff: f64,
-    pub mono: [usize; 2],
-    pub grad: usize,
+    pub exps: [u8; 4],
+    pub grad: u8,
 }
 
-/// A basis function = `scale · Σ terms`. Every R2 function has exactly 2 terms.
-/// This is the single source of truth for the canonical R2 basis, shared by
-/// the element assembly here and the field reconstruction in `interp`.
+impl Term {
+    /// A degree-2 term `coeff · L_p L_q · ∇L_g` from local node indices 0-3.
+    #[inline]
+    pub fn quad(coeff: f64, p: usize, q: usize, g: usize) -> Term {
+        let mut exps = [0u8; 4];
+        exps[p] += 1;
+        exps[q] += 1;
+        Term { coeff, exps, grad: g as u8 }
+    }
+}
+
+/// A basis function = `scale · Σ terms`.
+///
+/// The term count is not fixed: an R2 function has two, a higher-order or
+/// hierarchical one may have more. `TERMS_INLINE` is sized so that R2 needs no
+/// heap allocation; a longer function spills to the heap without any other code
+/// noticing.
+pub const TERMS_INLINE: usize = 4;
+
+#[derive(Clone, Debug)]
 pub struct BasisFn {
     pub scale: f64,
-    pub terms: [Term; 2],
+    pub terms: Vec<Term>,
+}
+
+impl BasisFn {
+    #[inline]
+    fn new(scale: f64, terms: Vec<Term>) -> BasisFn {
+        BasisFn { scale, terms }
+    }
 }
 
 /// Build the 20 R2 basis functions for this tet from its local edge/face maps.
@@ -169,43 +200,31 @@ pub fn build_basis(
         let (a, b) = (edge_map[e][0], edge_map[e][1]);
         let l = edge_len[e];
         // φ_e1 = ℓ L_a (L_a ∇L_b − L_b ∇L_a)
-        edge_m1.push(BasisFn {
-            scale: l,
-            terms: [
-                Term { coeff: 1.0, mono: [a, a], grad: b },
-                Term { coeff: -1.0, mono: [a, b], grad: a },
-            ],
-        });
+        edge_m1.push(BasisFn::new(
+            l,
+            vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)],
+        ));
         // φ_e2 = ℓ L_b (L_a ∇L_b − L_b ∇L_a)
-        edge_m2.push(BasisFn {
-            scale: l,
-            terms: [
-                Term { coeff: 1.0, mono: [a, b], grad: b },
-                Term { coeff: -1.0, mono: [b, b], grad: a },
-            ],
-        });
+        edge_m2.push(BasisFn::new(
+            l,
+            vec![Term::quad(1.0, a, b, b), Term::quad(-1.0, b, b, a)],
+        ));
     }
     let mut face_m1 = Vec::with_capacity(4);
     let mut face_m2 = Vec::with_capacity(4);
     for f in 0..4 {
         let (n0, n1, n2) = (tri_map[f][0], tri_map[f][1], tri_map[f][2]);
-        // φ_f1 = |n0 n2| L_n1 (L_n0 ∇L_n2 − L_n2 ∇L_n0)
-        // (sign convention flipped to match the pipeline's face-mode-1 DOF)
-        face_m1.push(BasisFn {
-            scale: node_dist(n0, n2),
-            terms: [
-                Term { coeff: -1.0, mono: [n1, n0], grad: n2 },
-                Term { coeff: 1.0, mono: [n1, n2], grad: n0 },
-            ],
-        });
+        // φ_f1 = |n0 n2| L_n1 (L_n2 ∇L_n0 − L_n0 ∇L_n2)
+        // (sign convention matched to the pipeline's face-mode-1 DOF)
+        face_m1.push(BasisFn::new(
+            node_dist(n0, n2),
+            vec![Term::quad(-1.0, n1, n0, n2), Term::quad(1.0, n1, n2, n0)],
+        ));
         // φ_f2 = |n0 n1| L_n2 (L_n0 ∇L_n1 − L_n1 ∇L_n0)
-        face_m2.push(BasisFn {
-            scale: node_dist(n0, n1),
-            terms: [
-                Term { coeff: 1.0, mono: [n2, n0], grad: n1 },
-                Term { coeff: -1.0, mono: [n2, n1], grad: n0 },
-            ],
-        });
+        face_m2.push(BasisFn::new(
+            node_dist(n0, n1),
+            vec![Term::quad(1.0, n2, n0, n1), Term::quad(-1.0, n2, n1, n0)],
+        ));
     }
     // DOF order: edge·m1, face·m1, edge·m2, face·m2
     let mut basis = Vec::with_capacity(20);
@@ -216,23 +235,116 @@ pub fn build_basis(
     basis
 }
 
-/// ∫ L_p L_q L_r L_s dV with local node indices 0-3 (degree-4 monomial).
+/// `∫ L^(ea + eb) dV`, the mass integrand of two terms. Exponents add.
 #[inline]
-fn integ4(p: usize, q: usize, r: usize, s: usize, six_v: f64) -> f64 {
-    // volume_coeff takes 1-based indices, 0 = unused; our nodes are 0-3.
-    volume_coeff(p + 1, q + 1, r + 1, s + 1) * six_v
+fn integ_mass(ea: [u8; 4], eb: [u8; 4], six_v: f64) -> f64 {
+    let e = [ea[0] + eb[0], ea[1] + eb[1], ea[2] + eb[2], ea[3] + eb[3]];
+    volume_coeff_exps(e) * six_v
 }
 
-/// ∫ L_p L_q dV with local node indices 0-3 (degree-2 monomial).
+/// `∫ L^(ea + eb) dV` for two CURL terms, whose exponents are one degree lower
+/// than the functions they came from. Same closed form; the separate name keeps
+/// the two call sites readable.
 #[inline]
-fn integ2(p: usize, q: usize, six_v: f64) -> f64 {
-    volume_coeff(p + 1, q + 1, 0, 0) * six_v
+fn integ_stiff(ea: [u8; 4], eb: [u8; 4], six_v: f64) -> f64 {
+    integ_mass(ea, eb, six_v)
 }
 
-/// Per-tet 20×20 stiffness (`D`) and mass (`F`) matrices for the R2 element.
+/// The curl of one term, as a list of terms with a CONSTANT vector instead of a
+/// `∇L`:
 ///
-/// `ms` is μ⁻¹ and `mm` is ε (per-tet constant tensors), matching the
-/// assembler's convention.
+///   ∇×(L^e · ∇L_g) = Σ_k e_k · L^(e − 1_k) · (∇L_k × ∇L_g)
+///
+/// One input term produces at most four output terms (one per nonzero exponent).
+/// This is `element.py::curl_field`, ported.
+#[inline]
+fn curl_term(t: &Term, grads: &[V3; 4], out: &mut Vec<(f64, [u8; 4], V3)>) {
+    for k in 0..4 {
+        let ek = t.exps[k];
+        if ek == 0 {
+            continue;
+        }
+        let mut e = t.exps;
+        e[k] -= 1;
+        out.push((
+            t.coeff * ek as f64,
+            e,
+            cross(&grads[k], &grads[t.grad as usize]),
+        ));
+    }
+}
+
+/// Element stiffness (`D`) and mass (`F`), row-major `n×n`, for ANY basis given
+/// as a term list. This is the whole `O(n²)` cost of the element assembly, and
+/// it does not know which element it is integrating:
+///
+///   D_ij = ∫ (∇×φ_i) · μ⁻¹ · (∇×φ_j) dV
+///   F_ij = ∫  φ_i     ·  ε   ·  φ_j    dV
+///
+/// Every term is `c · L^e · ∇L_g`, so both integrands are barycentric monomials
+/// times a constant tensor contraction and integrate exactly by the closed form
+/// in `coefficients` (no quadrature). `ms` is μ⁻¹, `mm` is ε.
+pub fn element_stiff_mass(
+    basis: &[BasisFn],
+    grads: &[V3; 4],
+    six_v: f64,
+    ms: &[[C64; 3]; 3], // μ⁻¹
+    mm: &[[C64; 3]; 3], // ε
+) -> (Vec<C64>, Vec<C64>) {
+    let n = basis.len();
+    let zero = C64::new(0.0, 0.0);
+    let mut d = vec![zero; n * n];
+    let mut f = vec![zero; n * n];
+
+    // Curls are needed once per function, not once per (i, j) pair.
+    let mut curls: Vec<Vec<(f64, [u8; 4], V3)>> = Vec::with_capacity(n);
+    for b in basis {
+        let mut c = Vec::with_capacity(b.terms.len() * 4);
+        for t in &b.terms {
+            curl_term(t, grads, &mut c);
+        }
+        curls.push(c);
+    }
+
+    for i in 0..n {
+        for j in i..n {
+            let (bi, bj) = (&basis[i], &basis[j]);
+            let sc = bi.scale * bj.scale;
+
+            // --- mass: φ_i · ε · φ_j ---
+            let mut fij = zero;
+            for ti in &bi.terms {
+                for tj in &bj.terms {
+                    let coeff = ti.coeff * tj.coeff;
+                    let quad = vtv(&grads[ti.grad as usize], mm, &grads[tj.grad as usize]);
+                    let intg = integ_mass(ti.exps, tj.exps, six_v);
+                    fij += quad * (coeff * intg);
+                }
+            }
+            fij *= C64::new(sc, 0.0);
+
+            // --- stiffness: (∇×φ_i) · μ⁻¹ · (∇×φ_j) ---
+            let mut dij = zero;
+            for (ci, ei, vi) in &curls[i] {
+                for (cj, ej, vj) in &curls[j] {
+                    let quad = vtv(vi, ms, vj);
+                    let intg = integ_stiff(*ei, *ej, six_v);
+                    dij += quad * (ci * cj * intg);
+                }
+            }
+            dij *= C64::new(sc, 0.0);
+
+            d[i * n + j] = dij;
+            d[j * n + i] = dij;
+            f[i * n + j] = fij;
+            f[j * n + i] = fij;
+        }
+    }
+    (d, f)
+}
+
+/// Per-tet stiffness and mass for the R2 element: build the basis, then hand it
+/// to the basis-agnostic `element_stiff_mass`. Returns row-major `20×20`.
 pub fn r2_tet_stiff_mass(
     xs: &[f64; 4],
     ys: &[f64; 4],
@@ -242,67 +354,13 @@ pub fn r2_tet_stiff_mass(
     local_tri_map: &[[usize; 3]; 4],
     ms: &[[C64; 3]; 3], // μ⁻¹
     mm: &[[C64; 3]; 3], // ε
-) -> ([[C64; 20]; 20], [[C64; 20]; 20]) {
+) -> (Vec<C64>, Vec<C64>) {
     let (grads, six_v) = barycentric_grads(xs, ys, zs);
     let node_dist = |i: usize, j: usize| -> f64 {
         ((xs[i] - xs[j]).powi(2) + (ys[i] - ys[j]).powi(2) + (zs[i] - zs[j]).powi(2)).sqrt()
     };
     let basis = build_basis(edge_lengths, local_edge_map, local_tri_map, &node_dist);
-
-    let zero = C64::new(0.0, 0.0);
-    let mut d = [[zero; 20]; 20];
-    let mut f = [[zero; 20]; 20];
-
-    for i in 0..20 {
-        for j in i..20 {
-            let bi = &basis[i];
-            let bj = &basis[j];
-            let sc = bi.scale * bj.scale;
-
-            // --- mass: φ_i · ε · φ_j ---
-            let mut fij = zero;
-            for ti in &bi.terms {
-                for tj in &bj.terms {
-                    let coeff = ti.coeff * tj.coeff;
-                    let quad = vtv(&grads[ti.grad], mm, &grads[tj.grad]);
-                    let intg = integ4(ti.mono[0], ti.mono[1], tj.mono[0], tj.mono[1], six_v);
-                    fij += quad * (coeff * intg);
-                }
-            }
-            fij *= C64::new(sc, 0.0);
-
-            // --- stiffness: (∇×φ_i) · μ⁻¹ · (∇×φ_j) ---
-            // curl(L_p L_q ∇L_g) = L_q (∇L_p×∇L_g) + L_p (∇L_q×∇L_g)
-            let mut dij = zero;
-            for ti in &bi.terms {
-                let curls_i = [
-                    (ti.mono[1], cross(&grads[ti.mono[0]], &grads[ti.grad])),
-                    (ti.mono[0], cross(&grads[ti.mono[1]], &grads[ti.grad])),
-                ];
-                for tj in &bj.terms {
-                    let curls_j = [
-                        (tj.mono[1], cross(&grads[tj.mono[0]], &grads[tj.grad])),
-                        (tj.mono[0], cross(&grads[tj.mono[1]], &grads[tj.grad])),
-                    ];
-                    let coeff = ti.coeff * tj.coeff;
-                    for (mi, ci) in &curls_i {
-                        for (mj, cj) in &curls_j {
-                            let quad = vtv(ci, ms, cj);
-                            let intg = integ2(*mi, *mj, six_v);
-                            dij += quad * (coeff * intg);
-                        }
-                    }
-                }
-            }
-            dij *= C64::new(sc, 0.0);
-
-            d[i][j] = dij;
-            d[j][i] = dij;
-            f[i][j] = fij;
-            f[j][i] = fij;
-        }
-    }
-    (d, f)
+    element_stiff_mass(&basis, &grads, six_v, ms, mm)
 }
 
 /// Assemble global stiffness (E) and mass (B) COO triplets from all tets using
@@ -362,14 +420,19 @@ pub fn assemble_global_matrices(
             &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map, &ms, mm,
         );
 
+        // The element matrices are row-major n×n; n is 20 for R2, and the chunk
+        // size above still assumes it. Stage 1 of docs/fd-basis-plan.md replaces
+        // the constant chunking with a prefix-sum offset table, at which point n
+        // may vary per element.
         let indices = &basis.tet_to_field[itet];
+        debug_assert_eq!(esub.len(), 20 * 20);
         for ii in 0..20 {
             for jj in 0..20 {
                 let idx = ii * 20 + jj;
                 row_slice[idx] = indices[ii];
                 col_slice[idx] = indices[jj];
-                de_slice[idx] = esub[ii][jj];
-                db_slice[idx] = bsub[ii][jj];
+                de_slice[idx] = esub[idx];
+                db_slice[idx] = bsub[idx];
             }
         }
     });
@@ -412,9 +475,40 @@ mod tests {
         let em = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
         let tm = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
         let (d, f) = r2_tet_stiff_mass(&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
-        for i in 0..20 { for j in 0..20 {
-            assert!(d[i][j].re.is_finite() && d[i][j].im.is_finite(), "D finite");
-            assert!(f[i][j].re.is_finite() && f[i][j].im.is_finite(), "F finite");
-        }}
+        assert_eq!(d.len(), 400);
+        for (dv, fv) in d.iter().zip(f.iter()) {
+            assert!(dv.re.is_finite() && dv.im.is_finite(), "D finite");
+            assert!(fv.re.is_finite() && fv.im.is_finite(), "F finite");
+        }
+    }
+
+    /// The curl of a term must be what the exponent rule says it is:
+    /// ∇×(L^e ∇L_g) = Σ_k e_k · L^(e−1_k) · (∇L_k × ∇L_g).
+    ///
+    /// The old code special-cased a degree-2 monomial as `L_p L_q` and emitted
+    /// two curl terms even when p == q. The general rule emits ONE term with a
+    /// doubled coefficient instead. Both are the same field; this pins that.
+    #[test]
+    fn curl_of_a_repeated_exponent_term_is_the_doubled_single_term() {
+        let xs = [0.0, 1.0, 0.0, 0.0];
+        let ys = [0.0, 0.0, 1.0, 0.0];
+        let zs = [0.0, 0.0, 0.0, 1.0];
+        let (grads, _) = barycentric_grads(&xs, &ys, &zs);
+
+        // t = 1.0 · L_0^2 · ∇L_1   (this is exactly the p == q case)
+        let t = Term::quad(1.0, 0, 0, 1);
+        assert_eq!(t.exps, [2, 0, 0, 0]);
+
+        let mut out = Vec::new();
+        curl_term(&t, &grads, &mut out);
+        assert_eq!(out.len(), 1, "one nonzero exponent -> one curl term");
+
+        let (coeff, exps, vec) = out[0];
+        assert_eq!(coeff, 2.0, "e_0 = 2 -> coefficient 2");
+        assert_eq!(exps, [1, 0, 0, 0], "L_0^2 -> L_0");
+        let want = cross(&grads[0], &grads[1]);
+        for k in 0..3 {
+            assert!((vec[k] - want[k]).abs() < 1e-14);
+        }
     }
 }

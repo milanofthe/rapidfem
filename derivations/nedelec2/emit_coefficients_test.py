@@ -73,7 +73,7 @@ fn area_coeff_matches_symbolic_derivation() {
     eprintln!("area_coeff: {} golden values, max rel err {:.2e}", AREA_GOLDEN.len(), max_err);
 }
 """
-    with open(out_path, "w") as f:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(body)
     print(f"wrote {out_path}")
     print(f"  {len(vol_table)} volume + {len(area_table)} area golden values")

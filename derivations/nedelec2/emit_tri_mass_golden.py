@@ -222,7 +222,7 @@ def main():
     for name, verts3, gamma in CASES:
         body += emit_case(name, verts3, gamma)
         print(f"emitted case {name}")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(body)
     print(f"wrote {out_path}")
 

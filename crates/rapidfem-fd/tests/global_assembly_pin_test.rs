@@ -90,10 +90,17 @@ fn summarise(rows: &[usize], cols: &[usize], vals: &[C64]) -> (f64, f64, u64) {
     (abs_sum, sq_sum.sqrt(), h)
 }
 
+/// The generalised term representation regroups the curl of a repeated-exponent
+/// term (`L_a^2 ∇L_g`) from two identical contributions into one with a doubled
+/// coefficient. That is a change of summation order, so exact equality is not
+/// guaranteed in principle. It does in fact hold here (the regrouping introduces
+/// only powers of two, which scale exactly), and it was checked with `rel == 0`.
+/// The permanent gate is a tight relative bound rather than bitwise equality,
+/// because FMA contraction and instruction selection are not portable.
 fn close(got: f64, want: f64, what: &str) {
     let rel = (got - want).abs() / want.abs().max(1e-300);
     assert!(
-        rel < 1e-13,
+        rel < 1e-14,
         "{what}: got {got:.17e}, want {want:.17e}, rel {rel:.2e}"
     );
 }

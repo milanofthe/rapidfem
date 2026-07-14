@@ -351,8 +351,8 @@ pub struct NumericalMode {
     /// (`from_scalar`); `e_profile` barycentric-interpolates it. Empty
     /// when the Ned-2 representation is used.
     e_uv_node: Vec<[f64; 2]>,
-    /// The **vector**-path profile (`from_vector`): the full Nédélec-2
-    /// second-kind edge + face coefficient set plus the per-triangle edge
+    /// The **vector**-path profile (`from_vector`): the full Nédélec
+    /// first-kind order-2 edge + face coefficient set plus the per-triangle edge
     /// data, so `e_profile` evaluates the degree-2 vector field *directly*
     /// at each query point. This matches the basis the 3-D `Nedelec2Basis`
     /// carries on a port face, so the mode projection in `sparam_waveport`
@@ -463,7 +463,7 @@ impl NumericalMode {
     }
 
     /// Build a numerical mode from a full-vector hybrid solve. Stores the
-    /// Ned-2 second-kind edge + face coefficients and evaluates the
+    /// order-2 edge + face coefficients and evaluates the
     /// degree-2 vector field **directly** at query points (no nodal
     /// averaging), so the mode projection in the FD `sparam_waveport`
     /// matches the 3-D `Nedelec2Basis` representation exactly. Zero
@@ -628,12 +628,12 @@ pub struct VectorMode {
     /// edge-element solution. Convenience for inspection; the sharp profile
     /// uses the Ned-2 / face / P2 coefficient arrays directly.
     pub e_uv_node: Vec<[f64; 2]>,
-    /// Nédélec-2 second-kind edge solution, 2 coefficients per global
+    /// Nédélec first-kind order-2 edge solution, 2 coefficients per global
     /// cross-section edge `[mode0, mode1]`. Mode 0 is "λ_a-weighted", mode
     /// 1 is "λ_b-weighted" where (a, b) is the edge's canonical endpoint
     /// ordering. Zero on PEC-constrained edges.
     pub e_edge_ned2: Vec<[f64; 2]>,
-    /// Nédélec-2 face (bubble) coefficients, 2 per triangle. These are
+    /// Nédélec first-kind order-2 face (bubble) coefficients, 2 per triangle. These are
     /// interior degrees of freedom not shared with neighbours.
     pub e_face_ned2: Vec<[f64; 2]>,
     /// Longitudinal field `E_z` coefficients on the P2 vertex DOFs (one
@@ -655,7 +655,11 @@ struct TriEdges {
 }
 
 // =====================================================================
-// Nédélec-2 (second-kind) 2-D basis on a triangle, basis evaluators.
+// Nédélec first-kind order-2 2-D basis on a triangle, basis evaluators.
+//
+// This is the SAME space the 3-D volume element spans (dim 8 on a triangle:
+// k(k+2) with k=2), written in a HIERARCHICAL basis rather than the volume
+// element's. See the note on `ned2_edge_basis`.
 //
 // Per-triangle local DOF layout (8 transverse + 6 P2-nodal for E_z = 14):
 //   [0..6]   = edge DOFs (3 edges x 2 modes per edge)
@@ -670,13 +674,15 @@ struct TriEdges {
 // triangle (no orientation/sign tracking needed). P2 vertex DOFs alias the
 // PortMesh2D node index; P2 edge midpoints alias the global edge index.
 //
-// The Ned-2 transverse basis functions are degree-2 vector polynomials:
-//   edge mode 0:   φ_e^(0)(l) = sign·len · l[a] · W_e(l)
-//   edge mode 1:   φ_e^(1)(l) = sign·len · l[b] · W_e(l)
-//   face mode 0:   φ_f^(0)(l) = |edge_1| · l[1] · W_(edge_1)(l)
-//   face mode 1:   φ_f^(1)(l) = |edge_2| · l[2] · W_(edge_2)(l)
-// where W_e(l) = l[a] · g[b] - l[b] · g[a] is the unsigned Whitney basis
-// for local edge e (endpoints a, b), g[k] = ∇λ_k.
+// The transverse basis functions, with W_e(l) = l[a]·g[b] − l[b]·g[a] the
+// unsigned Whitney field of local edge e (endpoints a, b) and g[k] = ∇λ_k:
+//   edge mode 0:   φ_e^(0)(l) = sign · W_e(l)              (degree 1)
+//   edge mode 1:   φ_e^(1)(l) = (l[a] − l[b]) · W_e(l)     (degree 2)
+//   face mode 0/1: the two interior bubbles (see `ned2_face_basis`)
+// Mode 0 is the Whitney function itself, mode 1 the order-2 increment: the
+// basis is hierarchical, so the lowest-order subspace is spanned by a subset
+// of the DOFs. The 3-D volume element (`rapidfem-fd::tet_assembly_r2`) spans
+// the same space with the non-hierarchical pair {l[a]·W_e, l[b]·W_e}.
 //
 // The curl in 2D is the scalar z-component, ∇×φ_z = ∂φ_y/∂x − ∂φ_x/∂y:
 //   ∇×W_e (z)            = 2·c_ab               (constant, c_ab = (g[a]×g[b])_z)
@@ -691,15 +697,20 @@ fn wedge2(a: [f64; 2], b: [f64; 2]) -> f64 {
     a[0] * b[1] - a[1] * b[0]
 }
 
-/// Evaluate the Ned-2 second-kind transverse edge basis function for one of
-/// the triangle's 6 edge DOFs at barycentric coordinates `l`. For edge `e`
-/// with local
-/// endpoints `a=(e+1)%3`, `b=(e+2)%3` and Whitney field
-/// `W = λ_a∇λ_b − λ_b∇λ_a`,
+/// Evaluate the transverse edge basis function for one of the triangle's 6 edge
+/// DOFs at barycentric coordinates `l`. For edge `e` with local endpoints
+/// `a=(e+1)%3`, `b=(e+2)%3` and Whitney field `W = λ_a∇λ_b − λ_b∇λ_a`,
 ///   mode 0 (`ne1`) = W,                 (orientation-odd → carries `sign`)
 ///   mode 1 (`ne2`) = (λ_a − λ_b)·W.     (orientation-even → no `sign`)
-/// `span{W, (λ_a−λ_b)W}` is the genuine second-kind Nédélec edge space, NOT
-/// `span{λ_a W, λ_b W}`, which is a different (wrong) space.
+///
+/// `span{W, (λ_a−λ_b)W}` and the volume element's `span{λ_a W, λ_b W}` are the
+/// same 2-D space, because λ_a + λ_b + λ_c = 1 makes `W = λ_a W + λ_b W + λ_c W`
+/// and the leftover `λ_c W` is absorbed by the face bubbles. Together with the
+/// two bubbles both give the 8-dimensional Nédélec first-kind order-2 space on
+/// the triangle. The difference is the BASIS, not the space: this one is
+/// hierarchical (mode 0 is the Whitney function itself, mode 1 the order-2
+/// increment), which is what lets the orientation sign attach to mode 0 alone —
+/// mode 1 is even under edge reversal.
 #[inline]
 fn ned2_edge_basis(
     e: usize,
@@ -1046,7 +1057,7 @@ fn solve_vector_modes_core(
 
     // DOF numbering for the Ned-2 + P2 hybrid eigenproblem.
     //
-    // Block 1, transverse Et (Ned-2 second-kind, degree 2):
+    // Block 1, transverse Et (Nédélec first-kind order 2, hierarchical):
     //   2 coefs per cross-section edge (PEC-constrained edges drop both)
     //   2 coefs per triangle (interior face bubbles, never PEC)
     // Block 2, longitudinal Ez (P2 Lagrange):

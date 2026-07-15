@@ -60,7 +60,12 @@ pub struct ElementConfig {
 impl Default for ElementConfig {
     fn default() -> Self {
         ElementConfig {
-            order_policy: "uniform".to_string(),
+            // Adaptive is the default: order 1 where the mesh is geometry-fine, order
+            // 2 elsewhere. It gives back DOFs where order 2 buys accuracy nothing can
+            // measure, and reduces to plain uniform order 2 on a mesh with no
+            // geometry-driven refinement. `uniform` remains available for a fully
+            // predictable, every-cell-order-2 discretisation.
+            order_policy: "adaptive".to_string(),
             theta: crate::order::DEFAULT_THETA,
         }
     }
@@ -456,7 +461,7 @@ mod element_config_tests {
     use super::*;
 
     /// Every config written before the `[element]` section existed has no `[element]`
-    /// section. Those must keep parsing, at the default: uniform order 2.
+    /// section. Those must keep parsing, at the default: adaptive order.
     ///
     /// This is what a `#[derive(Default)]` on `ElementConfig` silently broke — it
     /// filled the string fields with the empty string, and the solver failed on
@@ -476,8 +481,8 @@ mod element_config_tests {
         )
         .expect("a config without an [element] section must parse");
 
-        assert_eq!(cfg.element.order_policy, "uniform");
-        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
+        assert_eq!(cfg.element.order_policy, "adaptive");
+        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Adaptive);
         assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
     }
 
@@ -493,12 +498,12 @@ mod element_config_tests {
             [pec]
             tags = []
             [element]
-            order_policy = "adaptive"
+            order_policy = "uniform"
             "#,
         )
         .expect("a partial [element] section must parse");
 
-        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Adaptive);
+        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
         assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
     }
 

@@ -93,7 +93,7 @@ def lambda_maxh(*, f_max: float, er_max: float = 1.0,
 
     Note
     ----
-    For second-kind Nédélec-2 (rapidfem's basis) ``per_lambda = 8-12``
+    For rapidfem's element (Nédélec first kind, order 2) ``per_lambda = 8-12``
     is the usual range. Raise to 15 for stringent accuracy near a
     feature, drop to 6-8 for fast preview meshes.
 

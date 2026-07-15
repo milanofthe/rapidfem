@@ -33,7 +33,7 @@ use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::eigenmode::solve_eigenmode;
 use rapidfem_fd::materials::{Dispersion, Material};
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly::{assemble_global_matrices, BasisKind};
+use rapidfem_fd::tet_assembly::assemble_global_matrices;
 
 /// ‖E·x − λ·B·x‖ / ‖λ·B·x‖ on the free DOFs, from the true matrices.
 ///
@@ -75,7 +75,7 @@ fn eigenpair_residual(
 #[test]
 fn every_returned_mode_is_an_eigenpair() {
     let (mesh, pec, f101) = cavity();
-    let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+    let basis = NedelecBasis::new(&mesh);
 
     let modes = solve_eigenmode(&mesh, &basis, &pec, None, f101, 4).expect("the solve must succeed");
     assert!(!modes.is_empty(), "the solver returned nothing");
@@ -109,7 +109,7 @@ fn every_returned_mode_is_an_eigenpair() {
 #[test]
 fn the_modes_are_the_true_ones_nearest_the_target() {
     let (mesh, pec, f101) = cavity();
-    let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+    let basis = NedelecBasis::new(&mesh);
 
     let sigma = to_lambda(f101);
 
@@ -154,7 +154,7 @@ fn the_modes_are_the_true_ones_nearest_the_target() {
 #[test]
 fn no_mode_is_reported_below_the_fundamental() {
     let (mesh, pec, f101) = cavity();
-    let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+    let basis = NedelecBasis::new(&mesh);
 
     let (res, _) = resonances(&basis, &mesh, &pec);
     let fundamental = to_ghz(res[0]);
@@ -180,7 +180,7 @@ fn no_mode_is_reported_below_the_fundamental() {
 #[test]
 fn the_static_kernel_is_not_reported_as_a_resonance() {
     let (mesh, pec, f101) = cavity();
-    let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+    let basis = NedelecBasis::new(&mesh);
     let (_, kernel) = resonances(&basis, &mesh, &pec);
     eprintln!("  the discrete curl kernel has dimension {kernel}");
     assert!(kernel > 0, "this cavity has no kernel, so the test checks nothing");
@@ -225,7 +225,7 @@ fn a_uniformly_lossy_cavity_has_q_equal_to_one_over_tan_delta() {
             ur_diag: None,
             dispersion: Dispersion::None,
         };
-        let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+        let basis = NedelecBasis::new(&mesh);
 
         // The dielectric drags the resonance down by √ε'.
         let target = f101_vac / eps.sqrt();
@@ -274,7 +274,7 @@ fn a_uniformly_lossy_cavity_has_q_equal_to_one_over_tan_delta() {
 #[test]
 fn the_reachable_band_is_below_root_two_times_the_target() {
     let (mesh, pec, f101) = cavity();
-    let basis = NedelecBasis::with_kind(&mesh, BasisKind::Interpolatory);
+    let basis = NedelecBasis::new(&mesh);
     let (truth, kernel) = resonances(&basis, &mesh, &pec);
     assert!(kernel > 0, "no kernel: this test checks nothing");
 

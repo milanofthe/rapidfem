@@ -36,6 +36,7 @@ import os
 import sympy as sp
 
 import element
+import hierarchical
 
 # interp.rs ordering: mesh stores edge/face node tuples sorted (min..max).
 # These are TET_EDGE_LOCAL / TET_FACE_LOCAL from rapidfem-core/src/mesh.rs with
@@ -50,21 +51,25 @@ x, y, z = sp.symbols("x y z")
 
 
 def build_basis_mesh(verts):
-    """20 basis functions in DOF order [edge.m1][face.m1][edge.m2][face.m2],
-    built with the interp.rs (mesh-sorted) edge/tri maps. Mirrors the Rust
-    `tet_assembly::build_basis` term-for-term."""
+    """20 basis functions in DOF order [edge.m0][face.m0][edge.m1][face.m1],
+    built with the interp.rs (mesh-sorted) edge/tri maps, in the HIERARCHICAL basis.
+    Mirrors the Rust `tet_assembly::build_basis` term-for-term.
+
+      edge mode 0:  le*W_ab       = le*(L_a ∇L_b − L_b ∇L_a)
+      edge mode 1:  le*∇(L_a L_b) = le*(L_a ∇L_b + L_b ∇L_a)
+      face modes:   unchanged from the interpolatory element."""
     _sixV, grads = element.barycentric_gradients(verts)
-    edge_m1, edge_m2, face_m1, face_m2 = [], [], [], []
+    edge_m0, edge_m1, face_m0, face_m1 = [], [], [], []
     for (a, b) in EDGE_MAP:
         le = element.dist(verts, a, b)
-        edge_m1.append(element.weighted_whitney(grads, a, a, b, le))  # le*L_a*W_ab
-        edge_m2.append(element.weighted_whitney(grads, b, a, b, le))  # le*L_b*W_ab
+        edge_m0.append(hierarchical.whitney(grads, a, b, le))        # le*W_ab
+        edge_m1.append(hierarchical.edge_gradient(grads, a, b, le))  # le*∇(L_a L_b)
     for (n0, n1, n2) in TRI_MAP:
         l_f1 = element.dist(verts, n0, n2)
         l_f2 = element.dist(verts, n0, n1)
-        face_m1.append(element.weighted_whitney(grads, n1, n2, n0, l_f1))
-        face_m2.append(element.weighted_whitney(grads, n2, n0, n1, l_f2))
-    basis = edge_m1 + face_m1 + edge_m2 + face_m2
+        face_m0.append(element.weighted_whitney(grads, n1, n2, n0, l_f1))
+        face_m1.append(element.weighted_whitney(grads, n2, n0, n1, l_f2))
+    basis = edge_m0 + face_m0 + edge_m1 + face_m1
     assert len(basis) == 20
     return basis, grads
 

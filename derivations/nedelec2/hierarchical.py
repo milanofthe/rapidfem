@@ -184,6 +184,24 @@ VERTS = [
 ]
 
 
+def element_matrices_hier(verts, eps, mu_inv):
+    """The 20x20 (D, F) stiffness/mass of the HIERARCHICAL element, exact.
+
+    The counterpart of `element.element_matrices` for the hierarchical basis. Used
+    by `emit_element_golden.py` to pin the Rust `tet_stiff_mass`, which now builds
+    the hierarchical basis and only the hierarchical basis.
+    """
+    basis, sixV, grads = build_basis_hierarchical(verts)
+    curls = [element.curl_field(f, grads) for f in basis]
+    D = sp.zeros(20, 20)
+    F = sp.zeros(20, 20)
+    for i in range(20):
+        for j in range(i, 20):
+            D[i, j] = D[j, i] = element.integrate_dot(curls[i], curls[j], mu_inv, sixV)
+            F[i, j] = F[j, i] = element.integrate_dot(basis[i], basis[j], eps, sixV)
+    return D, F
+
+
 def main():
     print("=" * 74)
     print("P1: both bases have rank 20 and span the same space")

@@ -26,12 +26,12 @@
 //! neighbours' shared entities down with it. That is inherent to the minimum rule
 //! and is why the order policy (stage 5) should not produce isolated `p = 1` cells.
 //!
-//! **This requires a hierarchical basis.** The rule assumes that "the functions up
-//! to order p" is a meaningful subset of the DOFs — that the order-1 space is a
-//! coordinate subspace of the order-2 space. It is, for `BasisKind::Hierarchical`
-//! (mode 0 of an edge is exactly the Whitney function), and it is *not* for
-//! `BasisKind::Interpolatory`, whose mode-0 block is disjoint from the Whitney
-//! space. `NedelecBasis` enforces that.
+//! **This requires the hierarchical basis**, and is why it is the only basis. The
+//! rule assumes that "the functions up to order p" is a meaningful subset of the
+//! DOFs — that the order-1 space is a coordinate subspace of the order-2 space. It
+//! is, because mode 0 of an edge is exactly the Whitney function
+//! (`tet_assembly::edge_fns`). The interpolatory basis, whose mode-0 block was
+//! disjoint from the Whitney space, could not do this and was removed.
 
 use crate::mesh::Mesh;
 

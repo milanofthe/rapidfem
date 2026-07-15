@@ -42,7 +42,7 @@ use rapidfem_core::mesh::TRI_EDGE_LOCAL;
 
 use crate::coefficients::area_coeff_exps;
 use crate::dofmap::DofOwner;
-use crate::tet_assembly::{edge_fns, face_fns, BasisFn, BasisKind};
+use crate::tet_assembly::{edge_fns, face_fns, BasisFn};
 
 type V2 = [f64; 2];
 
@@ -127,7 +127,6 @@ fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
 /// and no term gradients it — asserted below, because that is precisely the trace
 /// property the construction relies on.
 pub fn build_surface_basis(
-    kind: BasisKind,
     owners: &[DofOwner],
     xs: &[f64; 3],
     ys: &[f64; 3],
@@ -136,7 +135,7 @@ pub fn build_surface_basis(
 
     let edges: Vec<[BasisFn; 2]> = TRI_EDGE_LOCAL
         .iter()
-        .map(|&[a, b]| edge_fns(kind, a, b, d(a, b)))
+        .map(|&[a, b]| edge_fns(a, b, d(a, b)))
         .collect();
     let face = face_fns(0, 1, 2, d(0, 2), d(0, 1));
 
@@ -204,14 +203,13 @@ pub fn surface_mass(basis: &[BasisFn], grads: &[V2; 3], area: f64) -> Vec<f64> {
 /// n is 8 at uniform order 2 and smaller where the minimum rule has reduced the
 /// triangle's entities.
 pub fn tri_stiff(
-    kind: BasisKind,
     owners: &[DofOwner],
     glob_vertices: &[[f64; 3]; 3],
     gamma: C64,
 ) -> Vec<C64> {
     let (_, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
-    let fns = build_surface_basis(kind, owners, &xs, &ys);
+    let fns = build_surface_basis(owners, &xs, &ys);
     let m = surface_mass(&fns, &grads, 0.5 * two_a.abs());
     m.iter().map(|&v| gamma * C64::from(v)).collect()
 }
@@ -219,7 +217,6 @@ pub fn tri_stiff(
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.
 /// `dpts[q] = [w, L1, L2, L3]`, `glob_uinc[q]` the incident field at that point.
 pub fn tri_force(
-    kind: BasisKind,
     owners: &[DofOwner],
     glob_vertices: &[[f64; 3]; 3],
     glob_uinc: &[[C64; 3]],
@@ -228,7 +225,7 @@ pub fn tri_force(
     let (frame, xs, ys) = tri_local_cs(glob_vertices);
     let (grads, two_a) = bary_grads_2d(&xs, &ys);
     let area = 0.5 * two_a.abs();
-    let fns = build_surface_basis(kind, owners, &xs, &ys);
+    let fns = build_surface_basis(owners, &xs, &ys);
 
     // Incident field rotated into the local frame; only the tangential (x,y)
     // components pair with φ.

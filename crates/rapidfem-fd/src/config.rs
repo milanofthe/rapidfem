@@ -33,32 +33,25 @@ pub struct Config {
     pub element: ElementConfig,
 }
 
-/// Which basis of the R2 element space to discretise with. Both span the same
-/// space (`derivations/nedelec2/hierarchical.py`), so this changes the numbers in
-/// the element matrices but not the discrete solution — see
-/// `tests/cavity_spectrum_test.rs`, where the two agree to 1e-14 across the whole
-/// cavity spectrum.
+/// The element: a Nédélec first-kind space in the hierarchical basis, at a
+/// per-cell order chosen by `order_policy`.
 ///
-/// `interpolatory` is the default. `hierarchical` nests the lowest-order (Whitney)
-/// space as a coordinate subspace and makes the curl kernel explicit, which is what
-/// variable order and a p-decay indicator need (docs/fd-basis-plan.md, stages 4-5).
+/// There is only one basis now (the interpolatory one was removed because it does
+/// not nest), so nothing here selects it. What is configurable is how the per-cell
+/// orders are chosen.
 ///
-/// Note the `#[serde(default)]` on the STRUCT, and the hand-written `Default`.
-///
-/// A `#[serde(default = "f")]` on a FIELD only fires when that field is missing from
-/// a section that is itself present. It has nothing to do with `Default::default()`,
-/// which a `#[derive(Default)]` would fill with `String::new()` — the empty string.
-/// So a config with no `[element]` section at all, which is every config written
-/// before this section existed, would have arrived here with `basis = ""` and
-/// panicked. Deriving `Default` here is a trap; the defaults have to live in one
+/// Note the `#[serde(default)]` on the STRUCT, and the hand-written `Default`. A
+/// `#[serde(default = "f")]` on a FIELD only fires when that field is missing from a
+/// section that is itself present; it has nothing to do with `Default::default()`,
+/// which a `#[derive(Default)]` would fill with `String::new()`. So a config with no
+/// `[element]` section at all — every config written before this section existed —
+/// would arrive here with `order_policy = ""` and fail. The defaults live in one
 /// place that both paths go through.
 #[derive(Deserialize)]
 #[serde(default)]
 pub struct ElementConfig {
-    pub basis: String,
     /// `uniform` (every cell at order 2) or `adaptive` (the a-priori wavelength
-    /// policy of `order::wavelength_policy`). `adaptive` implies the hierarchical
-    /// basis, because the interpolatory one does not nest.
+    /// policy of `order::wavelength_policy`, order 1 where the mesh is geometry-fine).
     pub order_policy: String,
     /// The policy's threshold: a cell with `k·h < theta` drops to order 1.
     pub theta: f64,
@@ -67,7 +60,6 @@ pub struct ElementConfig {
 impl Default for ElementConfig {
     fn default() -> Self {
         ElementConfig {
-            basis: "interpolatory".to_string(),
             order_policy: "uniform".to_string(),
             theta: crate::order::DEFAULT_THETA,
         }
@@ -77,37 +69,13 @@ impl Default for ElementConfig {
 /// How the per-cell orders are chosen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderPolicy {
-    /// Every cell at order 2. What the solver has always done.
+    /// Every cell at order 2.
     Uniform,
     /// `order::wavelength_policy`: order 1 where `k·h < theta`, order 2 elsewhere.
     Adaptive,
 }
 
 impl ElementConfig {
-    pub fn kind(&self) -> Result<crate::tet_assembly::BasisKind, String> {
-        // An adaptive order needs a nesting basis, whether or not the user asked for
-        // one. Silently running the interpolatory basis at mixed order would
-        // discretise a space that is neither order 1 nor order 2; refuse instead.
-        let requested = match self.basis.as_str() {
-            "interpolatory" => crate::tet_assembly::BasisKind::Interpolatory,
-            "hierarchical" => crate::tet_assembly::BasisKind::Hierarchical,
-            other => {
-                return Err(format!(
-                    "unknown element basis '{other}': expected 'interpolatory' or 'hierarchical'"
-                ))
-            }
-        };
-        if self.policy()? == OrderPolicy::Adaptive
-            && requested != crate::tet_assembly::BasisKind::Hierarchical
-        {
-            return Err(
-                "order_policy = 'adaptive' requires basis = 'hierarchical': only the                  hierarchical basis nests, so only there does reducing a cell to order 1 mean                  dropping DOFs rather than changing the space"
-                    .to_string(),
-            );
-        }
-        Ok(requested)
-    }
-
     pub fn policy(&self) -> Result<OrderPolicy, String> {
         match self.order_policy.as_str() {
             "uniform" => Ok(OrderPolicy::Uniform),
@@ -488,15 +456,14 @@ mod element_config_tests {
     use super::*;
 
     /// Every config written before the `[element]` section existed has no `[element]`
-    /// section. Those must keep working, at the old behaviour: the interpolatory basis
-    /// at uniform order 2.
+    /// section. Those must keep parsing, at the default: uniform order 2.
     ///
     /// This is what a `#[derive(Default)]` on `ElementConfig` silently broke — it
-    /// filled `basis` with the empty string, and the solver panicked on every such
-    /// config. The field-level `#[serde(default = "...")]` attributes do not fire for
-    /// a section that is absent entirely.
+    /// filled the string fields with the empty string, and the solver failed on
+    /// every such config. The field-level `#[serde(default = "...")]` attributes do
+    /// not fire for a section that is absent entirely.
     #[test]
-    fn a_config_with_no_element_section_gets_the_old_behaviour() {
+    fn a_config_with_no_element_section_gets_the_default() {
         let cfg: Config = parse_config(
             r#"
             [mesh]
@@ -509,13 +476,12 @@ mod element_config_tests {
         )
         .expect("a config without an [element] section must parse");
 
-        assert_eq!(cfg.element.basis, "interpolatory");
         assert_eq!(cfg.element.order_policy, "uniform");
-        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly::BasisKind::Interpolatory);
         assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
+        assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
     }
 
-    /// And a partially specified section keeps the defaults for what it omits.
+    /// A partially specified section keeps the defaults for what it omits.
     #[test]
     fn a_partial_element_section_keeps_the_other_defaults() {
         let cfg: Config = parse_config(
@@ -527,49 +493,17 @@ mod element_config_tests {
             [pec]
             tags = []
             [element]
-            basis = "hierarchical"
+            order_policy = "adaptive"
             "#,
         )
         .expect("a partial [element] section must parse");
 
-        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly::BasisKind::Hierarchical);
-        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
+        assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Adaptive);
         assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
     }
 
-    /// An adaptive order needs a nesting basis. Asking for it with the interpolatory
-    /// one must be refused, not silently obeyed: the minimum rule would then discard
-    /// functions from a basis in which the lower-order space is not a subspace at all.
     #[test]
-    fn adaptive_order_with_the_interpolatory_basis_is_refused() {
-        let cfg: Config = parse_config(
-            r#"
-            [mesh]
-            file = "x.msh"
-            [frequency]
-            values = [1.0e9]
-            [pec]
-            tags = []
-            [element]
-            basis = "interpolatory"
-            order_policy = "adaptive"
-            "#,
-        )
-        .expect("it must parse; the objection is semantic, not syntactic");
-
-        let err = cfg.element.kind().unwrap_err();
-        assert!(
-            err.contains("hierarchical"),
-            "the error must say what to do about it, got: {err}"
-        );
-    }
-
-    #[test]
-    fn an_unknown_basis_or_policy_is_named_in_the_error() {
-        let mut e = ElementConfig::default();
-        e.basis = "legendre".to_string();
-        assert!(e.kind().unwrap_err().contains("legendre"));
-
+    fn an_unknown_policy_is_named_in_the_error() {
         let mut e = ElementConfig::default();
         e.order_policy = "magic".to_string();
         assert!(e.policy().unwrap_err().contains("magic"));

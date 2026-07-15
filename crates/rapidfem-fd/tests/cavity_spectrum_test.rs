@@ -33,13 +33,7 @@ use num_complex::Complex64 as C64;
 use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::order::{cell_diameter, cell_wavenumbers, wavelength_policy, OrderMap};
-use rapidfem_fd::tet_assembly::BasisKind;
 use std::collections::HashSet;
-
-/// The dense spectrum, for a basis chosen by kind at uniform order 2.
-fn spectrum_by_kind(kind: BasisKind, mesh: &Mesh, pec: &[usize]) -> Vec<f64> {
-    dense_spectrum(&NedelecBasis::with_kind(mesh, kind), mesh, pec)
-}
 
 #[test]
 fn the_cavity_fundamental_matches_the_closed_form() {
@@ -51,84 +45,28 @@ fn the_cavity_fundamental_matches_the_closed_form() {
         f101 / 1e9
     );
 
-    for kind in [BasisKind::Interpolatory, BasisKind::Hierarchical] {
-        let s = spectrum_by_kind(kind, &mesh, &pec);
-        // The discrete gradients sit at λ = 0. Everything above them is physical;
-        // there is no spurious branch in between, which is the whole point of a
-        // curl-conforming element.
-        let scale = s.last().copied().unwrap();
-        let n_kernel = s.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();
-        let first = s
-            .iter()
-            .cloned()
-            .find(|&l| l.abs() >= 1e-9 * scale)
-            .expect("the spectrum is entirely kernel");
-
-        eprintln!(
-            "  {kind:?}: {} DOFs, kernel dim {n_kernel}, lowest resonance {:.6} GHz",
-            s.len(),
-            to_ghz(first)
-        );
-
-        let err = (to_ghz(first) * 1e9 - f101).abs() / f101;
-        assert!(
-            err < 1e-2,
-            "{kind:?}: the fundamental came out at {:.6} GHz, closed form {:.6} GHz (rel {err:.3e})",
-            to_ghz(first),
-            f101 / 1e9
-        );
-    }
-}
-
-/// The oracle. Same space => same spectrum, all of it: the kernel dimension, every
-/// resonance, in order. Not bit-identical — the element matrices are genuinely
-/// different numbers and the roundoff differs — but far tighter than any
-/// discretisation error.
-#[test]
-fn both_bases_give_the_same_discrete_spectrum() {
-    let (mesh, pec, _) = cavity();
-
-    let si = spectrum_by_kind(BasisKind::Interpolatory, &mesh, &pec);
-    let sh = spectrum_by_kind(BasisKind::Hierarchical, &mesh, &pec);
-    assert_eq!(si.len(), sh.len(), "the two bases produced different DOF counts");
-
-    let scale = si.last().copied().unwrap();
-    let ki = si.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();
-    let kh = sh.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();
-    eprintln!("  kernel dimension: interpolatory {ki}, hierarchical {kh}");
-    assert_eq!(ki, kh, "the two bases disagree on the dimension of the curl kernel");
-
-    // Compare the nonzero part: the kernel eigenvalues are all "zero" and their
-    // roundoff is meaningless to compare relatively.
-    let mut worst = 0.0_f64;
-    let mut worst_at = 0;
-    for i in ki..si.len() {
-        let rel = (si[i] - sh[i]).abs() / si[i].abs();
-        if rel > worst {
-            worst = rel;
-            worst_at = i;
-        }
-    }
+    let s = dense_spectrum(&NedelecBasis::new(&mesh), &mesh, &pec);
+    // The discrete gradients sit at λ = 0. Everything above them is physical; there
+    // is no spurious branch in between, which is the whole point of a curl-conforming
+    // element.
+    let scale = s.last().copied().unwrap();
+    let n_kernel = s.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();
+    let first = s
+        .iter()
+        .cloned()
+        .find(|&l| l.abs() >= 1e-9 * scale)
+        .expect("the spectrum is entirely kernel");
     eprintln!(
-        "  {} resonances compared; worst relative disagreement {worst:.3e} at index {worst_at} \
-         ({:.6} vs {:.6} GHz)",
-        si.len() - ki,
-        to_ghz(si[worst_at]),
-        to_ghz(sh[worst_at])
+        "  {} DOFs, kernel dim {n_kernel}, lowest resonance {:.6} GHz",
+        s.len(),
+        to_ghz(first)
     );
-    for i in ki..(ki + 6).min(si.len()) {
-        eprintln!(
-            "    mode {}: {:.9} GHz  vs  {:.9} GHz",
-            i - ki,
-            to_ghz(si[i]),
-            to_ghz(sh[i])
-        );
-    }
-
+    let err = (to_ghz(first) * 1e9 - f101).abs() / f101;
     assert!(
-        worst < 1e-9,
-        "the two bases give different spectra (worst rel {worst:.3e}): they do not span the same \
-         space"
+        err < 1e-2,
+        "the fundamental came out at {:.6} GHz, closed form {:.6} GHz (rel {err:.3e})",
+        to_ghz(first),
+        f101 / 1e9
     );
 }
 
@@ -159,7 +97,7 @@ fn the_kernel_dimension_is_the_number_of_discrete_gradients() {
 
     for (p, want) in [(1u8, interior_nodes), (2u8, interior_nodes + interior_edges)] {
         let basis =
-            NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, p));
+            NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, p));
         let (_, kernel) = resonances(&basis, &mesh, &pec);
         eprintln!(
             "  p = {p}: {} DOFs, kernel dim {kernel} (discrete gradients: {want})",
@@ -189,7 +127,7 @@ fn order_1_converges_at_the_whitney_rate() {
         let mesh = box_mesh(a, b, d, 2 * m, m, 3 * m);
         let pec = boundary_tris(&mesh);
         let basis =
-            NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
+            NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 1));
         let (res, _) = resonances(&basis, &mesh, &pec);
         let err = (res[0] - lambda).abs() / lambda;
         eprintln!(
@@ -258,14 +196,10 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
     );
 
     let b1 =
-        NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
-    let bm = NedelecBasis::with_orders(
-        &mesh,
-        BasisKind::Hierarchical,
-        OrderMap::from_cells(&mesh, cells),
-    );
+        NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 1));
+    let bm = NedelecBasis::with_orders(&mesh, OrderMap::from_cells(&mesh, cells));
     let b2 =
-        NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
+        NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 2));
 
     eprintln!(
         "  {} of {} cells reduced to p=1; DOFs: p1 {}, mixed {}, p2 {}",
@@ -377,7 +311,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     let kh_max = khs.iter().cloned().fold(0.0_f64, f64::max);
     eprintln!("  {} tets, k*h from {kh_min:.3} to {kh_max:.3}", mesh.n_tets());
 
-    let full = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
+    let full = NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 2));
     let (r_full, _) = resonances(&full, &mesh, &pec);
     let e_full = (r_full[0] - lambda).abs() / lambda;
     eprintln!("  uniform p=2: {} DOFs, error {e_full:.3e}", full.n_field);
@@ -392,7 +326,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
             continue;
         }
         any = true;
-        let basis = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, orders);
+        let basis = NedelecBasis::with_orders(&mesh, orders);
         let (r, _) = resonances(&basis, &mesh, &pec);
         let err = (r[0] - lambda).abs() / lambda;
         let saved = 1.0 - basis.n_field as f64 / full.n_field as f64;
@@ -426,7 +360,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     // only good to ~2%. That is what makes the comparison meaningful — the fine
     // corner cells contribute nothing either way, which is exactly the situation the
     // policy is supposed to detect and exploit.)
-    let all_p1 = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
+    let all_p1 = NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 1));
     let (r1, _) = resonances(&all_p1, &mesh, &pec);
     let e1 = (r1[0] - lambda).abs() / lambda;
     eprintln!(

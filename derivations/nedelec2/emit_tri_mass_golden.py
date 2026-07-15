@@ -18,8 +18,8 @@ Surface element (8 DOF = 3 edges × 2 modes + 1 face × 2 modes), with the exact
 DOF order, weights, gradient pairings and signs read off the Rust source:
 
   TRI_EDGE_MAP = [[0,1],[1,2],[0,2]]
-  edge e=(a,b) m1 (weight a): φ = ℓ·(  L_a·L_a·∇L_b − L_a·L_b·∇L_a )
-  edge e=(a,b) m2 (weight b): φ = ℓ·(  L_b·L_a·∇L_b − L_b·L_b·∇L_a )
+  edge e=(a,b) m0 (Whitney):  φ = ℓ·(  L_a·∇L_b − L_b·∇L_a )
+  edge e=(a,b) m1 (gradient): φ = ℓ·(  L_a·∇L_b + L_b·∇L_a )
   face m1: φ = |0,2|·( −L_1·L_0·∇L_2 + L_1·L_2·∇L_0 )
   face m2: φ = |0,1|·(  L_2·L_0·∇L_1 − L_2·L_1·∇L_0 )
   DOF order: [edge0 e1 e2 (m1)], face·m1, [edge0 e1 e2 (m2)], face·m2.
@@ -74,33 +74,44 @@ def node_dist(xs, ys, i, j):
 
 # A surface basis function: (scale, [(coeff, (m0, m1), grad), ...]).
 def build_surface_basis(xs, ys):
+    """The 8 surface functions, in DOF order, in the HIERARCHICAL basis.
+
+    A term is (coeff, monomial, grad) where `monomial` is a tuple of node indices
+    naming the product of barycentric coordinates. The edge functions are degree 1
+    (a single index); the face functions are degree 2 (two indices), unchanged.
+
+      edge (a,b) mode 0:  ℓ·W_ab      = ℓ·( L_a·∇L_b − L_b·∇L_a )
+      edge (a,b) mode 1:  ℓ·∇(L_a L_b) = ℓ·( L_a·∇L_b + L_b·∇L_a )
+    """
     d = lambda i, j: node_dist(xs, ys, i, j)
 
-    def e(a, b, weight):
-        # ℓ·( L_weight·L_a·∇L_b − L_weight·L_b·∇L_a )
-        return (d(a, b), [(1, (weight, a), b), (-1, (weight, b), a)])
+    def w(a, b):   # mode 0: Whitney
+        return (d(a, b), [(1, (a,), b), (-1, (b,), a)])
+
+    def g(a, b):   # mode 1: gradient of L_a L_b
+        return (d(a, b), [(1, (a,), b), (1, (b,), a)])
 
     e0, e1, e2 = TRI_EDGE_MAP
     f1 = (d(0, 2), [(-1, (1, 0), 2), (1, (1, 2), 0)])
     f2 = (d(0, 1), [(1, (2, 0), 1), (-1, (2, 1), 0)])
     return [
-        e(e0[0], e0[1], e0[0]),   # 0: edge0 m1
-        e(e1[0], e1[1], e1[0]),   # 1: edge1 m1
-        e(e2[0], e2[1], e2[0]),   # 2: edge2 m1
-        f1,                        # 3: face m1
-        e(e0[0], e0[1], e0[1]),   # 4: edge0 m2
-        e(e1[0], e1[1], e1[1]),   # 5: edge1 m2
-        e(e2[0], e2[1], e2[1]),   # 6: edge2 m2
-        f2,                        # 7: face m2
+        w(e0[0], e0[1]),   # 0: edge0 m0
+        w(e1[0], e1[1]),   # 1: edge1 m0
+        w(e2[0], e2[1]),   # 2: edge2 m0
+        f1,                 # 3: face m0
+        g(e0[0], e0[1]),   # 4: edge0 m1
+        g(e1[0], e1[1]),   # 5: edge1 m1
+        g(e2[0], e2[1]),   # 6: edge2 m1
+        f2,                 # 7: face m1
     ]
 
 
-def area_integral(p, q, r, s, area):
-    """∫_tri L_p L_q L_r L_s dA over the triangle (0-based node indices 0,1,2).
+def area_integral(nodes, area):
+    """∫_tri ∏_i L_{nodes[i]} dA over the triangle (0-based node indices 0,1,2).
 
     = 2·Area·∏ m_i!/(Σ m_i + 2)!  with m_i the multiplicity of node i."""
     mult = [0, 0, 0]
-    for idx in (p, q, r, s):
+    for idx in nodes:
         mult[idx] += 1
     num = 1
     for mi in mult:
@@ -124,7 +135,7 @@ def tri_mass_matrix(verts3, gamma):
             for (ci, mi, gi) in terms_i:
                 for (cj, mj, gj) in terms_j:
                     g = (grads[gi].T * grads[gj])[0]
-                    intg = area_integral(mi[0], mi[1], mj[0], mj[1], area)
+                    intg = area_integral(tuple(mi) + tuple(mj), area)
                     acc += ci * cj * g * intg
             val = sp.simplify(gamma * sc_i * sc_j * acc)
             M[i, j] = M[j, i] = val
@@ -179,7 +190,6 @@ HEADER = """\
 
 use num_complex::Complex64 as C64;
 use rapidfem_fd::basis::tri_dof_owners;
-use rapidfem_fd::tet_assembly::BasisKind;
 use rapidfem_fd::tri_assembly::tri_stiff;
 
 fn maxdiff(a: &[C64], b: &[[C64; 8]; 8]) -> f64 {
@@ -204,7 +214,7 @@ def emit_case(name, verts3, gamma):
 #[test]
 fn tri_stiff_matches_derivation_{name}() {{
     let owners = tri_dof_owners(&[2; 3], 2);
-    let got = tri_stiff(BasisKind::Interpolatory, &owners, &V_{name}, {g});
+    let got = tri_stiff(&owners, &V_{name}, {g});
     let err = maxdiff(&got, &M_{name});
     eprintln!("{name}: max rel err {{:.2e}}", err);
     assert!(err < 1e-10, "mismatch ({name}): {{:.2e}}", err);

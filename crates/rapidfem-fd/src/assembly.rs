@@ -154,7 +154,7 @@ pub fn assemble_and_solve_with_pml(
             let tri = &mesh.tris[ti];
             let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
             let owners = tri_owners(basis, mesh, ti);
-            let bsub = tri_stiff(basis.kind, &owners, &verts, gamma);
+            let bsub = tri_stiff(&owners, &verts, gamma);
             // The block reserved for this triangle is n×n, with n from the DOF
             // map, and the element produced exactly n functions from the same
             // owner list. Under the minimum rule n need not be 8.
@@ -199,7 +199,7 @@ pub fn assemble_and_solve_with_pml(
 
             if u_inc_at_qp.len() == gauss_points.len() {
                 let owners = tri_owners(basis, mesh, ti);
-                let b_tri = tri_force(basis.kind, &owners, &verts, &u_inc_at_qp, &gauss_points);
+                let b_tri = tri_force(&owners, &verts, &u_inc_at_qp, &gauss_points);
                 let dofs = basis.tri_dofs(ti);
                 for (i, &d) in dofs.iter().enumerate() {
                     bvec[d] += b_tri[i];
@@ -438,7 +438,7 @@ pub fn frequency_sweep_with_pml(
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
                 let owners = tri_owners(basis, mesh, ti);
-                let bsub = tri_stiff(basis.kind, &owners, &verts, gamma);
+                let bsub = tri_stiff(&owners, &verts, gamma);
                 let n = basis.tri_dofs(ti).len();
                 let p = basis.tri_block(ti);
                 for ii in 0..n { for jj in 0..n { bempty[p + ii*n + jj] += bsub[ii*n + jj]; } }
@@ -463,7 +463,7 @@ pub fn frequency_sweep_with_pml(
                     }).collect();
                 if u_at_qp.len() == gauss_points.len() {
                     let owners = tri_owners(basis, mesh, ti);
-                    let b_tri = tri_force(basis.kind, &owners, &verts, &u_at_qp, &gauss_points);
+                    let b_tri = tri_force(&owners, &verts, &u_at_qp, &gauss_points);
                     let dofs = basis.tri_dofs(ti);
                     for (i, &d) in dofs.iter().enumerate() { bvec[d] += b_tri[i]; }
                 }

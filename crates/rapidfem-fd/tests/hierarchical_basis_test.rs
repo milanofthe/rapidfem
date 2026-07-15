@@ -5,32 +5,24 @@
 // This file is part of rapidfem, distributed under GPL-3.0-or-later with
 // the Gmsh additional permission. See LICENSE for the full terms.
 //
-// The hierarchical basis is a second basis of the SAME R2 space.
+// Properties of the hierarchical basis — the only basis, once the interpolatory
+// one was removed.
 //
-// Everything downstream depends on that. If it were a different space, the
-// hierarchical element would silently solve a different problem, and no golden
-// test would notice: goldens pin one basis against its own derivation, not two
-// bases against each other.
+// The two things that make it the basis, checked directly on the element matrix:
 //
-// So this proves it, and proves it as an if-and-only-if rather than a spot check.
-// Two bases of a finite-dimensional inner-product space span the same subspace iff
-// every function of each lies in the span of the other. "Lies in the span" is
-// exactly "the L² projection has zero residual", and the residual is
+//   1. Mode 1 of every edge is a pure gradient, so it is exactly curl-free and its
+//      row of the stiffness matrix is identically zero. That is the local
+//      exact-sequence property: the curl kernel is explicit in the element.
+//   2. Mode 0 of every edge IS the Whitney function (times the edge length),
+//      exactly, so order 1 is a coordinate subspace and the hierarchy nests.
 //
-//     r_j = ||ψ_j||² − n_jᵀ M⁻¹ n_j,   M = Gram(φ),  n_j = (∫φ_i·ψ_j)_i
-//
-// which is computable from the two Gram matrices and the cross-Gram matrix, all of
-// which the element integrates exactly. Zero residual both ways, and equal
-// dimension, gives span equality.
-//
-// The symbolic counterpart, with the same conclusion plus the exact-sequence and
-// conformity properties, is `derivations/nedelec2/hierarchical.py`.
+// That the basis spans the full R2 space, and the earlier fact that it spans the
+// same space the removed interpolatory basis did, are proved symbolically in
+// `derivations/nedelec2/hierarchical.py`.
 
 use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners};
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly::{
-    barycentric_grads, build_basis, cross_mass, tet_stiff_mass, BasisFn, BasisKind,
-};
+use rapidfem_fd::tet_assembly::{barycentric_grads, build_basis, tet_stiff_mass, BasisFn};
 
 type V3 = [f64; 3];
 
@@ -63,94 +55,14 @@ fn tet_setup(verts: &[V3; 4]) -> ([f64; 4], [f64; 4], [f64; 4], [f64; 6], [[usiz
     (xs, ys, zs, edge_len, edge_map, tri_map)
 }
 
-fn basis_of(kind: BasisKind, verts: &[V3; 4]) -> (Vec<BasisFn>, [V3; 4], f64) {
+fn basis_of(verts: &[V3; 4]) -> (Vec<BasisFn>, [V3; 4], f64) {
     let (xs, ys, zs, edge_len, edge_map, tri_map) = tet_setup(verts);
     let (grads, six_v) = barycentric_grads(&xs, &ys, &zs);
     let node_dist = |i: usize, j: usize| {
         ((xs[i]-xs[j]).powi(2) + (ys[i]-ys[j]).powi(2) + (zs[i]-zs[j]).powi(2)).sqrt()
     };
     let owners = tet_dof_owners(&[2; 6], &[2; 4]);
-    (build_basis(kind, &owners, &edge_len, &edge_map, &tri_map, &node_dist), grads, six_v)
-}
-
-/// Cholesky solve for an SPD system, row-major. The Gram matrix of a basis is SPD
-/// by construction, so this cannot fail unless the "basis" is degenerate — which
-/// is itself something worth failing on.
-fn spd_solve(a: &[f64], n: usize, rhs: &[f64]) -> Vec<f64> {
-    let mut l = vec![0.0_f64; n * n];
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[i * n + j];
-            for k in 0..j {
-                s -= l[i * n + k] * l[j * n + k];
-            }
-            if i == j {
-                assert!(s > 0.0, "Gram matrix is not positive definite: the basis is degenerate");
-                l[i * n + i] = s.sqrt();
-            } else {
-                l[i * n + j] = s / l[j * n + j];
-            }
-        }
-    }
-    // forward, then back
-    let mut y = vec![0.0_f64; n];
-    for i in 0..n {
-        let mut s = rhs[i];
-        for k in 0..i {
-            s -= l[i * n + k] * y[k];
-        }
-        y[i] = s / l[i * n + i];
-    }
-    let mut x = vec![0.0_f64; n];
-    for i in (0..n).rev() {
-        let mut s = y[i];
-        for k in i + 1..n {
-            s -= l[k * n + i] * x[k];
-        }
-        x[i] = s / l[i * n + i];
-    }
-    x
-}
-
-/// The largest relative L² residual of projecting each function of `b` onto
-/// span(`a`). Zero iff span(b) ⊆ span(a).
-fn projection_residual(a: &[BasisFn], b: &[BasisFn], grads: &[V3; 4], six_v: f64) -> f64 {
-    let n = a.len();
-    let m = b.len();
-    let gram_a = cross_mass(a, a, grads, six_v);
-    let gram_b = cross_mass(b, b, grads, six_v);
-    let cross = cross_mass(a, b, grads, six_v); // n x m
-
-    let mut worst = 0.0_f64;
-    for j in 0..m {
-        let nj: Vec<f64> = (0..n).map(|i| cross[i * m + j]).collect();
-        let c = spd_solve(&gram_a, n, &nj);
-        // ||ψ_j − Σ c_i φ_i||² = ||ψ_j||² − n_jᵀ c
-        let sq_norm = gram_b[j * m + j];
-        let residual = sq_norm - nj.iter().zip(c.iter()).map(|(x, y)| x * y).sum::<f64>();
-        worst = worst.max(residual.abs() / sq_norm);
-    }
-    worst
-}
-
-#[test]
-fn both_bases_span_the_same_space() {
-    for (ti, verts) in test_tets().iter().enumerate() {
-        let (interp, grads, six_v) = basis_of(BasisKind::Interpolatory, verts);
-        let (hier, _, _) = basis_of(BasisKind::Hierarchical, verts);
-        assert_eq!(interp.len(), 20);
-        assert_eq!(hier.len(), 20);
-
-        let h_in_i = projection_residual(&interp, &hier, &grads, six_v);
-        let i_in_h = projection_residual(&hier, &interp, &grads, six_v);
-        eprintln!("tet {ti}: hier ⊆ interp residual {h_in_i:.3e}, interp ⊆ hier residual {i_in_h:.3e}");
-
-        assert!(h_in_i < 1e-12, "tet {ti}: the hierarchical basis leaves R2 (residual {h_in_i:.3e})");
-        assert!(i_in_h < 1e-12, "tet {ti}: the interpolatory basis leaves the hierarchical span (residual {i_in_h:.3e})");
-        // Both are 20 functions, each set inside the other's span, and each set is
-        // linearly independent (spd_solve would have panicked otherwise). Hence the
-        // spans are equal.
-    }
+    (build_basis(&owners, &edge_len, &edge_map, &tri_map, &node_dist), grads, six_v)
 }
 
 /// The point of the hierarchical basis: mode 1 of every edge is a pure gradient,
@@ -166,7 +78,7 @@ fn the_gradient_dofs_are_curl_free() {
     for (ti, verts) in test_tets().iter().enumerate() {
         let (xs, ys, zs, el, em, tm) = tet_setup(verts);
         let owners = tet_dof_owners(&[2; 6], &[2; 4]);
-        let (d, f) = tet_stiff_mass(BasisKind::Hierarchical, &owners, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
+        let (d, f) = tet_stiff_mass(&owners, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
 
         // Scale by the biggest stiffness entry, so "zero" means zero relative to
         // the matrix and not to an absolute constant that depends on the mesh size.
@@ -203,7 +115,7 @@ fn hierarchical_mode0_is_the_whitney_function() {
     for (ti, verts) in test_tets().iter().enumerate() {
         let (xs, ys, zs, el, em, _tm) = tet_setup(verts);
         let (grads, _) = barycentric_grads(&xs, &ys, &zs);
-        let (hier, _, _) = basis_of(BasisKind::Hierarchical, verts);
+        let (hier, _, _) = basis_of(verts);
 
         // Sample points inside the tet, in barycentric coordinates.
         let samples = [

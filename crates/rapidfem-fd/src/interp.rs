@@ -70,7 +70,7 @@ fn tet_basis(mesh: &Mesh, tet_idx: usize, basis: &NedelecBasis) -> ([V3; 4], Vec
         &basis.orders.tet_edge_orders(mesh, tet_idx),
         &basis.orders.tet_face_orders(mesh, tet_idx),
     );
-    let fns = build_basis(basis.kind, &owners, &edge_lengths, &edge_map, &tri_map, &node_dist);
+    let fns = build_basis(&owners, &edge_lengths, &edge_map, &tri_map, &node_dist);
     (grads, fns, mesh.nodes[tet[0]])
 }
 

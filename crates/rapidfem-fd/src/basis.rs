@@ -36,7 +36,6 @@
 use crate::dofmap::{DofMap, DofOwner};
 use crate::mesh::Mesh;
 use crate::order::{self, OrderMap};
-use crate::tet_assembly::BasisKind;
 
 /// The local DOFs of a tetrahedral element, as the entities they belong to.
 ///
@@ -102,8 +101,6 @@ impl Ragged {
 }
 
 pub struct NedelecBasis {
-    /// Which basis of the R2 space the elements are built from.
-    pub kind: BasisKind,
     /// The order of every cell and, by the minimum rule, of every entity.
     pub orders: OrderMap,
     /// Total number of DOFs in the system.
@@ -139,33 +136,20 @@ fn square_offsets(counts: impl Iterator<Item = usize>) -> Vec<usize> {
 }
 
 impl NedelecBasis {
-    /// The default element: the interpolatory R2 basis, uniform order 2.
+    /// A uniform order-2 space. The simple constructor; `with_orders` takes a
+    /// per-cell order map.
     pub fn new(mesh: &Mesh) -> Self {
-        NedelecBasis::with_kind(mesh, BasisKind::Interpolatory)
-    }
-
-    /// A uniform order-2 space in the given basis.
-    pub fn with_kind(mesh: &Mesh, kind: BasisKind) -> Self {
-        NedelecBasis::with_orders(mesh, kind, OrderMap::uniform(mesh, 2))
+        NedelecBasis::with_orders(mesh, OrderMap::uniform(mesh, 2))
     }
 
     /// A space of arbitrary per-cell order.
     ///
-    /// Anything other than uniform order 2 requires the hierarchical basis: the
-    /// minimum rule works by keeping the functions *up to* an entity's order, which
-    /// is only meaningful when the lower-order space is a coordinate subspace of the
-    /// higher one. It is for `Hierarchical` (mode 0 of an edge is the Whitney
-    /// function); it is not for `Interpolatory`, whose mode-0 block contains no
-    /// Whitney function at all (`derivations/nedelec2/hierarchical.py`, P2).
-    /// Allowing it there would silently discretise a space that is neither order 1
-    /// nor order 2 and is not conforming across an order jump.
-    pub fn with_orders(mesh: &Mesh, kind: BasisKind, orders: OrderMap) -> Self {
-        assert!(
-            orders.is_uniform(2) || kind == BasisKind::Hierarchical,
-            "variable or reduced order requires BasisKind::Hierarchical: the interpolatory \
-             basis does not nest, so 'the functions up to order p' is not a subset of its DOFs"
-        );
-
+    /// There is one basis, the hierarchical one (`tet_assembly::edge_fns`), so any
+    /// order map is admissible: the minimum rule keeps "the functions up to an
+    /// entity's order", and that is a genuine subset here because mode 0 is the
+    /// Whitney space and the hierarchy nests. (The interpolatory basis, which did
+    /// not nest, was removed for exactly this reason.)
+    pub fn with_orders(mesh: &Mesh, orders: OrderMap) -> Self {
         let n_edges = mesh.n_edges();
         let n_tris = mesh.n_tris();
         let n_tets = mesh.n_tets();
@@ -241,7 +225,6 @@ impl NedelecBasis {
         }
 
         NedelecBasis {
-            kind,
             orders,
             n_field: dofs.n_field,
             n_tets,

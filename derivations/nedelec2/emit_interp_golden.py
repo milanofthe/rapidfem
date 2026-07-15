@@ -23,7 +23,7 @@ edge/face node tuples SORTED. For a single tet [0,1,2,3] this differs from
 element.py's LOCAL_EDGE_MAP / LOCAL_TRI_MAP at the two intentionally-reversed
 entries (edge 4: [1,3] not (3,1); face 2: [0,1,3] not (0,3,1)). We rebuild the
 basis here with the mesh ordering so the symbolic phi_i matches the Rust DOF i
-exactly. `tet_to_field[0]` is the identity for a single-tet mesh.
+exactly. `tet_dofs(0)` is the identity for a single-tet mesh.
 
 RECON_SIGN = -1.0 in interp.rs (a physically-immaterial global basis sign,
 pinned to the sparam/excitation convention); we bake it into the expected
@@ -52,7 +52,7 @@ x, y, z = sp.symbols("x y z")
 def build_basis_mesh(verts):
     """20 basis functions in DOF order [edge.m1][face.m1][edge.m2][face.m2],
     built with the interp.rs (mesh-sorted) edge/tri maps. Mirrors the Rust
-    `tet_assembly_r2::build_basis` term-for-term."""
+    `tet_assembly::build_basis` term-for-term."""
     _sixV, grads = element.barycentric_gradients(verts)
     edge_m1, edge_m2, face_m1, face_m2 = [], [], [], []
     for (a, b) in EDGE_MAP:
@@ -139,7 +139,7 @@ HEADER = """\
 // `eval_curl_in_tet` to the derivation, entrywise, at interior sample points.
 
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::interp::{eval_curl_in_tet, eval_field_in_tet};
 use rapidfem_fd::mesh::Mesh;
 
@@ -157,12 +157,12 @@ fn build_mesh() -> Mesh {
 /// curl at every sample point against the symbolic golden values.
 fn check_dof(local_dof: usize, pts: &[[f64; 3]], e_exp: &[[f64; 3]], curl_exp: &[[f64; 3]]) {
     let mesh = build_mesh();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     assert_eq!(basis.n_field, 20);
-    // Single-tet mesh: tet_to_field[0] is the identity, but route through it
+    // Single-tet mesh: tet_dofs(0) is the identity, but route through it
     // anyway so the test stays correct under any DOF-numbering change.
     let mut sol = vec![C64::new(0.0, 0.0); basis.n_field];
-    sol[basis.tet_to_field[0][local_dof]] = C64::new(1.0, 0.0);
+    sol[basis.tet_dofs(0)[local_dof]] = C64::new(1.0, 0.0);
 
     for (pi, p) in pts.iter().enumerate() {
         let (ex, ey, ez) = eval_field_in_tet(&mesh, &basis, &sol, 0, p[0], p[1], p[2]);

@@ -81,8 +81,8 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
-use crate::tet_assembly_r2::assemble_global_matrices;
+use crate::basis::NedelecBasis;
+use crate::tet_assembly::assemble_global_matrices;
 use crate::constants::*;
 use std::collections::HashSet;
 
@@ -148,7 +148,7 @@ fn norm2(x: &[C64]) -> f64 {
 
 pub fn solve_eigenmode(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     pec_tri_indices: &[usize],
     materials: Option<&[crate::materials::Material]>,
     target_freq: f64,

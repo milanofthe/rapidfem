@@ -1,6 +1,6 @@
 """The R2 surface element is the tangential trace of the R2 volume element.
 
-`crates/rapidfem-fd/src/tri_assembly_r2.rs` assembles the Robin / port boundary
+`crates/rapidfem-fd/src/tri_assembly.rs` assembles the Robin / port boundary
 term on a boundary triangle with 8 DOFs, and hands them to the global system under
 the SAME global indices the volume element uses on that face (3 edges x 2 modes,
 and the face itself x 2 modes). That is only legitimate if the surface functions
@@ -116,7 +116,7 @@ for k in range(3):
 
 
 # ---------------------------------------------------------------------------
-# The R2 functions, exactly as `tet_assembly_r2::r2_edge_fns` / `r2_face_fns`
+# The R2 functions, exactly as `tet_assembly::edge_fns` / `face_fns`
 # emit them. A function is a list of (coeff, exponent multi-index, grad index)
 # with an overall scale.
 # ---------------------------------------------------------------------------

@@ -19,9 +19,9 @@
 
 use faer::Mat;
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly_r2::assemble_global_matrices;
+use rapidfem_fd::tet_assembly::assemble_global_matrices;
 use std::collections::HashSet;
 
 pub const C0: f64 = 299_792_458.0;
@@ -89,7 +89,7 @@ pub fn boundary_tris(mesh: &Mesh) -> Vec<usize> {
 }
 
 /// The DOFs a PEC condition on `pec_tris` removes.
-pub fn pec_dofs(basis: &Nedelec2Basis, mesh: &Mesh, pec_tris: &[usize]) -> HashSet<usize> {
+pub fn pec_dofs(basis: &NedelecBasis, mesh: &Mesh, pec_tris: &[usize]) -> HashSet<usize> {
     let mut pec = HashSet::new();
     for &t in pec_tris {
         for &e in &mesh.tri_to_edge[t] {
@@ -110,7 +110,7 @@ pub fn air(n_tets: usize) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
 /// The generalised eigenvalues of E·x = λ·B·x on the free DOFs, ascending.
 ///
 /// Real materials only: with air, E and B come out real symmetric.
-pub fn dense_spectrum(basis: &Nedelec2Basis, mesh: &Mesh, pec_tris: &[usize]) -> Vec<f64> {
+pub fn dense_spectrum(basis: &NedelecBasis, mesh: &Mesh, pec_tris: &[usize]) -> Vec<f64> {
     let pec = pec_dofs(basis, mesh, pec_tris);
     let free: Vec<usize> = (0..basis.n_field).filter(|d| !pec.contains(d)).collect();
     let mut to_free = vec![usize::MAX; basis.n_field];
@@ -179,7 +179,7 @@ pub fn dense_spectrum(basis: &Nedelec2Basis, mesh: &Mesh, pec_tris: &[usize]) ->
 }
 
 /// The nonzero part of a spectrum, and the dimension of the kernel it sat on.
-pub fn resonances(basis: &Nedelec2Basis, mesh: &Mesh, pec: &[usize]) -> (Vec<f64>, usize) {
+pub fn resonances(basis: &NedelecBasis, mesh: &Mesh, pec: &[usize]) -> (Vec<f64>, usize) {
     let s = dense_spectrum(basis, mesh, pec);
     let scale = s.last().copied().unwrap();
     let k = s.iter().filter(|&&l| l.abs() < 1e-9 * scale).count();

@@ -11,7 +11,7 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::interp;
 
 /// Export E-field solution to a legacy VTK file (.vtk).
@@ -23,7 +23,7 @@ use crate::interp;
 pub fn write_vtk(
     path: &str,
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     label: &str,
 ) -> std::io::Result<()> {

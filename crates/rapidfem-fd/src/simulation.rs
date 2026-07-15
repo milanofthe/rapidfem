@@ -14,7 +14,7 @@
 
 use num_complex::Complex64 as C64;
 
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::config::{Config, PortConfig};
 use crate::constants::{EPS0, MU0};
 use crate::eigenmode::Eigenmode;
@@ -60,7 +60,7 @@ struct SParamCtx {
 /// Simulation context: a mesh + parsed config + pre-built BC objects.
 pub struct Simulation {
     pub mesh: Mesh,
-    pub basis: Nedelec2Basis,
+    pub basis: NedelecBasis,
     pub config: Config,
     pub ports: Vec<Box<dyn Port>>,
     pub port_tris: Vec<Vec<usize>>,
@@ -133,7 +133,7 @@ impl Simulation {
 
         let uniform = crate::order::OrderMap::uniform(&mesh, 2);
         let full_dofs = uniform.n_dofs();
-        let basis = Nedelec2Basis::with_orders(&mesh, kind, orders);
+        let basis = NedelecBasis::with_orders(&mesh, kind, orders);
         eprintln!(
             "RapidFEM - {} tets, {} DOFs, {:?} basis{}",
             mesh.n_tets(),

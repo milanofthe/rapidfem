@@ -354,7 +354,7 @@ pub struct NumericalMode {
     /// The **vector**-path profile (`from_vector`): the full Nédélec
     /// first-kind order-2 edge + face coefficient set plus the per-triangle edge
     /// data, so `e_profile` evaluates the degree-2 vector field *directly*
-    /// at each query point. This matches the basis the 3-D `Nedelec2Basis`
+    /// at each query point. This matches the basis the 3-D `NedelecBasis`
     /// carries on a port face, so the mode projection in `sparam_waveport`
     /// is exact (modulo Galerkin error) rather than the `O(h)` lossy
     /// projection a Nédélec-1 / P1 hybrid would produce. `None` for scalar.
@@ -466,7 +466,7 @@ impl NumericalMode {
     /// order-2 edge + face coefficients and evaluates the
     /// degree-2 vector field **directly** at query points (no nodal
     /// averaging), so the mode projection in the FD `sparam_waveport`
-    /// matches the 3-D `Nedelec2Basis` representation exactly. Zero
+    /// matches the 3-D `NedelecBasis` representation exactly. Zero
     /// cutoff, flat impedance `1/n_eff`.
     pub fn from_vector(mesh: PortMesh2D, mode: &VectorMode) -> NumericalMode {
         let z = if mode.n_eff > 0.0 { 1.0 / mode.n_eff } else { 1.0 };
@@ -681,7 +681,7 @@ struct TriEdges {
 //   face mode 0/1: the two interior bubbles (see `ned2_face_basis`)
 // Mode 0 is the Whitney function itself, mode 1 the order-2 increment: the
 // basis is hierarchical, so the lowest-order subspace is spanned by a subset
-// of the DOFs. The 3-D volume element (`rapidfem-fd::tet_assembly_r2`) spans
+// of the DOFs. The 3-D volume element (`rapidfem-fd::tet_assembly`) spans
 // the same space with the non-hierarchical pair {l[a]·W_e, l[b]·W_e}.
 //
 // The curl in 2D is the scalar z-component, ∇×φ_z = ∂φ_y/∂x − ∂φ_x/∂y:

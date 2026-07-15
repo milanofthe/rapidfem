@@ -20,7 +20,7 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::interp;
 use crate::error_estimator::eval_curl_in_tet;
 use crate::quadrature::gaus_quad_tri;
@@ -66,7 +66,7 @@ pub struct RadiationPattern {
 /// `gq_order`: Gauss quadrature order for surface integration
 pub fn compute_farfield(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     nfft_tri_ids: &[usize],
     frequency: f64,
@@ -87,7 +87,7 @@ pub fn compute_farfield(
 /// Directivity is unit-invariant; gain requires an externally known efficiency.
 pub fn compute_farfield_with_input(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     nfft_tri_ids: &[usize],
     frequency: f64,
@@ -112,7 +112,7 @@ pub fn compute_farfield_with_input(
 /// `pec_tri_ids`: PEC closing surfaces (ground, side walls); empty = no closure.
 pub fn compute_farfield_full(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     nfft_tri_ids: &[usize],
     pec_tri_ids: &[usize],

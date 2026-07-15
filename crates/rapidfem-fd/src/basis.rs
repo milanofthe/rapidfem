@@ -13,11 +13,11 @@
 //! [`crate::dofmap::DofMap`] turns the per-entity DOF counts into global indices, by
 //! a prefix sum, so it assumes nothing about those counts being equal. This module
 //! is the join: [`tet_dof_owners`] and [`tri_dof_owners`] enumerate an element's
-//! local DOFs from its entities' orders, and `Nedelec2Basis` resolves that against
+//! local DOFs from its entities' orders, and `NedelecBasis` resolves that against
 //! the mesh once and caches the local-to-global lists in flat, offset-indexed
 //! arrays.
 //!
-//! **The owner list is the element definition.** `tet_assembly_r2::build_basis`
+//! **The owner list is the element definition.** `tet_assembly::build_basis`
 //! builds one basis function per entry of it and enumerates nothing itself. So
 //! there is no second enumeration that could disagree with the DOF map about how
 //! many DOFs an element has, which they are, or what order they come in. At a
@@ -36,11 +36,11 @@
 use crate::dofmap::{DofMap, DofOwner};
 use crate::mesh::Mesh;
 use crate::order::{self, OrderMap};
-use crate::tet_assembly_r2::BasisKind;
+use crate::tet_assembly::BasisKind;
 
 /// The local DOFs of a tetrahedral element, as the entities they belong to.
 ///
-/// **This list IS the element definition.** `tet_assembly_r2::build_basis` builds
+/// **This list IS the element definition.** `tet_assembly::build_basis` builds
 /// one basis function per entry, by asking the entity's generator for its `k`-th
 /// function — it does not enumerate anything itself. So the basis and the DOF map
 /// cannot disagree about how many DOFs there are, which ones they are, or what
@@ -101,7 +101,7 @@ impl Ragged {
     }
 }
 
-pub struct Nedelec2Basis {
+pub struct NedelecBasis {
     /// Which basis of the R2 space the elements are built from.
     pub kind: BasisKind,
     /// The order of every cell and, by the minimum rule, of every entity.
@@ -138,15 +138,15 @@ fn square_offsets(counts: impl Iterator<Item = usize>) -> Vec<usize> {
     off
 }
 
-impl Nedelec2Basis {
+impl NedelecBasis {
     /// The default element: the interpolatory R2 basis, uniform order 2.
     pub fn new(mesh: &Mesh) -> Self {
-        Nedelec2Basis::with_kind(mesh, BasisKind::Interpolatory)
+        NedelecBasis::with_kind(mesh, BasisKind::Interpolatory)
     }
 
     /// A uniform order-2 space in the given basis.
     pub fn with_kind(mesh: &Mesh, kind: BasisKind) -> Self {
-        Nedelec2Basis::with_orders(mesh, kind, OrderMap::uniform(mesh, 2))
+        NedelecBasis::with_orders(mesh, kind, OrderMap::uniform(mesh, 2))
     }
 
     /// A space of arbitrary per-cell order.
@@ -240,7 +240,7 @@ impl Nedelec2Basis {
             }
         }
 
-        Nedelec2Basis {
+        NedelecBasis {
             kind,
             orders,
             n_field: dofs.n_field,

@@ -26,9 +26,9 @@
 
 use num_complex::Complex64 as C64;
 use rapidfem_core::mesh::Mesh;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::solver::SparseSolver;
-use rapidfem_fd::tet_assembly_r2::assemble_global_matrices;
+use rapidfem_fd::tet_assembly::assemble_global_matrices;
 use std::time::Instant;
 
 /// Structured box mesh: nx×ny×nz cells, each split into 6 tets (Kuhn).
@@ -129,7 +129,7 @@ fn bench_backend(
 fn main() {
     let nx: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8);
     let mesh = structured_box(nx, nx, nx, 0.02, 0.02, 0.02);
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     let n = basis.n_field;
     println!(
         "mesh: {} tets, {} edges, {} tris → n_field = {}",

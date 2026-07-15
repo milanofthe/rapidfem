@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Emit the Rust golden test for tet_assembly_r2.rs from the sympy element.
+"""Emit the Rust golden test for tet_assembly.rs from the sympy element.
 
 Generates full 20×20 D and F matrices for several tets and material tensors
 (symbolic, exact integration) and writes a cargo test that asserts the
@@ -93,7 +93,7 @@ HEADER = """\
 
 use num_complex::Complex64 as C64;
 use rapidfem_fd::basis::tet_dof_owners;
-use rapidfem_fd::tet_assembly_r2::{r2_tet_stiff_mass, BasisKind};
+use rapidfem_fd::tet_assembly::{tet_stiff_mass, BasisKind};
 
 const EDGE_MAP: [[usize; 2]; 6] = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
 const TRI_MAP: [[usize; 3]; 4] = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
@@ -132,7 +132,7 @@ def emit_case(name, verts, eps, mu_inv):
 #[test]
 fn r2_element_matches_derivation_{name}() {{
     let owners = tet_dof_owners(&[2; 6], &[2; 4]);
-    let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory, &owners, &XS_{name}, &YS_{name}, &ZS_{name}, &EL_{name},
+    let (d, f) = tet_stiff_mass(BasisKind::Interpolatory, &owners, &XS_{name}, &YS_{name}, &ZS_{name}, &EL_{name},
         &EDGE_MAP, &TRI_MAP, &MUINV_{name}, &EPS_{name});
     let derr = maxdiff(&d, &D_{name});
     let ferr = maxdiff(&f, &F_{name});
@@ -147,7 +147,7 @@ fn r2_element_matches_derivation_{name}() {{
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, "..", ".."))
-    out_path = os.path.join(repo, "crates", "rapidfem-fd", "tests", "r2_element_golden_test.rs")
+    out_path = os.path.join(repo, "crates", "rapidfem-fd", "tests", "element_golden_test.rs")
     body = HEADER
     for name, verts, eps, mu in CASES:
         body += emit_case(name, verts, eps, mu)

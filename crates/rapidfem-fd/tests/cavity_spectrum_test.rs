@@ -30,15 +30,15 @@ mod common;
 
 use common::*;
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::order::{cell_diameter, cell_wavenumbers, wavelength_policy, OrderMap};
-use rapidfem_fd::tet_assembly_r2::BasisKind;
+use rapidfem_fd::tet_assembly::BasisKind;
 use std::collections::HashSet;
 
 /// The dense spectrum, for a basis chosen by kind at uniform order 2.
 fn spectrum_by_kind(kind: BasisKind, mesh: &Mesh, pec: &[usize]) -> Vec<f64> {
-    dense_spectrum(&Nedelec2Basis::with_kind(mesh, kind), mesh, pec)
+    dense_spectrum(&NedelecBasis::with_kind(mesh, kind), mesh, pec)
 }
 
 #[test]
@@ -159,7 +159,7 @@ fn the_kernel_dimension_is_the_number_of_discrete_gradients() {
 
     for (p, want) in [(1u8, interior_nodes), (2u8, interior_nodes + interior_edges)] {
         let basis =
-            Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, p));
+            NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, p));
         let (_, kernel) = resonances(&basis, &mesh, &pec);
         eprintln!(
             "  p = {p}: {} DOFs, kernel dim {kernel} (discrete gradients: {want})",
@@ -189,7 +189,7 @@ fn order_1_converges_at_the_whitney_rate() {
         let mesh = box_mesh(a, b, d, 2 * m, m, 3 * m);
         let pec = boundary_tris(&mesh);
         let basis =
-            Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
+            NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
         let (res, _) = resonances(&basis, &mesh, &pec);
         let err = (res[0] - lambda).abs() / lambda;
         eprintln!(
@@ -258,14 +258,14 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
     );
 
     let b1 =
-        Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
-    let bm = Nedelec2Basis::with_orders(
+        NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
+    let bm = NedelecBasis::with_orders(
         &mesh,
         BasisKind::Hierarchical,
         OrderMap::from_cells(&mesh, cells),
     );
     let b2 =
-        Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
+        NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
 
     eprintln!(
         "  {} of {} cells reduced to p=1; DOFs: p1 {}, mixed {}, p2 {}",
@@ -377,7 +377,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     let kh_max = khs.iter().cloned().fold(0.0_f64, f64::max);
     eprintln!("  {} tets, k*h from {kh_min:.3} to {kh_max:.3}", mesh.n_tets());
 
-    let full = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
+    let full = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 2));
     let (r_full, _) = resonances(&full, &mesh, &pec);
     let e_full = (r_full[0] - lambda).abs() / lambda;
     eprintln!("  uniform p=2: {} DOFs, error {e_full:.3e}", full.n_field);
@@ -392,7 +392,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
             continue;
         }
         any = true;
-        let basis = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, orders);
+        let basis = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, orders);
         let (r, _) = resonances(&basis, &mesh, &pec);
         let err = (r[0] - lambda).abs() / lambda;
         let saved = 1.0 - basis.n_field as f64 / full.n_field as f64;
@@ -426,7 +426,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     // only good to ~2%. That is what makes the comparison meaningful — the fine
     // corner cells contribute nothing either way, which is exactly the situation the
     // policy is supposed to detect and exploit.)
-    let all_p1 = Nedelec2Basis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
+    let all_p1 = NedelecBasis::with_orders(&mesh, BasisKind::Hierarchical, OrderMap::uniform(&mesh, 1));
     let (r1, _) = resonances(&all_p1, &mesh, &pec);
     let e1 = (r1[0] - lambda).abs() / lambda;
     eprintln!(

@@ -31,7 +31,7 @@
 //! coordinate subspace of the order-2 space. It is, for `BasisKind::Hierarchical`
 //! (mode 0 of an edge is exactly the Whitney function), and it is *not* for
 //! `BasisKind::Interpolatory`, whose mode-0 block is disjoint from the Whitney
-//! space. `Nedelec2Basis` enforces that.
+//! space. `NedelecBasis` enforces that.
 
 use crate::mesh::Mesh;
 

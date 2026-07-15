@@ -10,7 +10,7 @@
 //! The solution vector holds DOF coefficients of the canonical R2 basis. The
 //! field inside a tet is the weighted sum of its 20 basis functions evaluated
 //! at the point; the curl follows from ∇×(s·∇L_g) = ∇s × ∇L_g. Both reuse the
-//! *same* basis definition as the assembly (`tet_assembly_r2::build_basis`),
+//! *same* basis definition as the assembly (`tet_assembly::build_basis`),
 //! so reconstruction and assembly cannot drift apart.
 //!
 //! Sign convention: the reconstructed field carries a global minus relative to
@@ -21,8 +21,8 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
-use crate::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn};
+use crate::basis::NedelecBasis;
+use crate::tet_assembly::{barycentric_grads, build_basis, BasisFn};
 
 type V3 = [f64; 3];
 
@@ -47,7 +47,7 @@ fn lambdas_at(grads: &[V3; 4], v0: &V3, p: &V3) -> [f64; 4] {
 
 /// Per-tet geometry shared by field and curl evaluation: the four ∇L_i, the
 /// 20 canonical basis functions (in DOF order), and node 0 as the affine base.
-fn tet_basis(mesh: &Mesh, tet_idx: usize, basis: &Nedelec2Basis) -> ([V3; 4], Vec<BasisFn>, V3) {
+fn tet_basis(mesh: &Mesh, tet_idx: usize, basis: &NedelecBasis) -> ([V3; 4], Vec<BasisFn>, V3) {
     let tet = &mesh.tets[tet_idx];
     let xs: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][0]);
     let ys: [f64; 4] = std::array::from_fn(|i| mesh.nodes[tet[i]][1]);
@@ -79,7 +79,7 @@ fn tet_basis(mesh: &Mesh, tet_idx: usize, basis: &Nedelec2Basis) -> ([V3; 4], Ve
 /// `scale·Σ coeff·L_p·L_q·∇L_g`, so the field is a simple polynomial sum.
 pub fn eval_field_in_tet(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     tet_idx: usize,
     x: f64, y: f64, z: f64,
@@ -227,7 +227,7 @@ pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize>
 /// the error estimator, far-field integration, and H = ∇×E / (jωμ).
 pub fn eval_curl_in_tet(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     tet_idx: usize,
     x: f64, y: f64, z: f64,
@@ -263,7 +263,7 @@ pub fn eval_curl_in_tet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::Nedelec2Basis;
+    use crate::basis::NedelecBasis;
     use crate::mesh::Mesh;
 
     /// Build a single-tet mesh with non-degenerate vertices.
@@ -284,7 +284,7 @@ mod tests {
     /// central differences are EXACT (to FP rounding) for linear functions.
     fn numerical_curl(
         mesh: &Mesh,
-        basis: &Nedelec2Basis,
+        basis: &NedelecBasis,
         solution: &[C64],
         tet_idx: usize,
         x: f64, y: f64, z: f64,
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn analytic_curl_matches_numerical() {
         let mesh = single_tet_mesh();
-        let basis = Nedelec2Basis::new(&mesh);
+        let basis = NedelecBasis::new(&mesh);
         assert_eq!(basis.n_field, 20);
 
         // Deterministic seed, every DOF gets a distinct, non-trivial complex value.

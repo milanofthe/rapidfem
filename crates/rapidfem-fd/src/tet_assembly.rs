@@ -39,7 +39,7 @@
 use num_complex::Complex64 as C64;
 use crate::coefficients::volume_coeff_exps;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::dofmap::DofOwner;
 
 type V3 = [f64; 3];
@@ -240,11 +240,11 @@ pub enum BasisKind {
 /// `a` and `b` are node indices in whatever local numbering the caller uses, so
 /// this serves the tetrahedron and the triangle alike.
 ///
-/// This, and `r2_face_fns`, are the ONLY places the R2 functions are written
+/// This, and `face_fns`, are the ONLY places the R2 functions are written
 /// down. The surface element is the tangential trace of this one and is built by
 /// calling the same two functions, so the two cannot drift apart in sign — which
 /// they previously could, being written out twice.
-pub fn r2_edge_fns(kind: BasisKind, a: usize, b: usize, len: f64) -> [BasisFn; 2] {
+pub fn edge_fns(kind: BasisKind, a: usize, b: usize, len: f64) -> [BasisFn; 2] {
     match kind {
         BasisKind::Interpolatory => [
             BasisFn::new(len, vec![Term::quad(1.0, a, a, b), Term::quad(-1.0, a, b, a)]),
@@ -265,7 +265,7 @@ pub fn r2_edge_fns(kind: BasisKind, a: usize, b: usize, len: f64) -> [BasisFn; 2
 /// `d02` and `d01` are the distances |n0 n2| and |n0 n1|. Both functions have a
 /// vanishing tangential trace on the tetrahedron's other three faces (proved in
 /// `derivations/nedelec2/`), which is what makes them face-interior DOFs.
-pub fn r2_face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [BasisFn; 2] {
+pub fn face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [BasisFn; 2] {
     [
         BasisFn::new(d02, vec![Term::quad(-1.0, n1, n0, n2), Term::quad(1.0, n1, n2, n0)]),
         BasisFn::new(d01, vec![Term::quad(1.0, n2, n0, n1), Term::quad(-1.0, n2, n1, n0)]),
@@ -289,12 +289,12 @@ pub fn build_basis(
     node_dist: &dyn Fn(usize, usize) -> f64,
 ) -> Vec<BasisFn> {
     let edges: Vec<[BasisFn; 2]> = (0..6)
-        .map(|e| r2_edge_fns(kind, edge_map[e][0], edge_map[e][1], edge_len[e]))
+        .map(|e| edge_fns(kind, edge_map[e][0], edge_map[e][1], edge_len[e]))
         .collect();
     let faces: Vec<[BasisFn; 2]> = (0..4)
         .map(|f| {
             let (n0, n1, n2) = (tri_map[f][0], tri_map[f][1], tri_map[f][2]);
-            r2_face_fns(n0, n1, n2, node_dist(n0, n2), node_dist(n0, n1))
+            face_fns(n0, n1, n2, node_dist(n0, n2), node_dist(n0, n1))
         })
         .collect();
 
@@ -449,7 +449,7 @@ pub fn cross_mass(a: &[BasisFn], b: &[BasisFn], grads: &[V3; 4], six_v: f64) -> 
 
 /// Per-tet stiffness and mass for the R2 element: build the basis, then hand it
 /// to the basis-agnostic `element_stiff_mass`. Returns row-major `20×20`.
-pub fn r2_tet_stiff_mass(
+pub fn tet_stiff_mass(
     kind: BasisKind,
     owners: &[DofOwner],
     xs: &[f64; 4],
@@ -493,7 +493,7 @@ fn ragged_chunks_mut<'a, T>(s: &'a mut [T], off: &[usize]) -> Vec<&'a mut [T]> {
 /// space that is 400 for every element; for a mixed-order space it is not.
 pub fn assemble_global_matrices(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     er: &[[[C64; 3]; 3]],
     ur: &[[[C64; 3]; 3]],
 ) -> (Vec<usize>, Vec<usize>, Vec<C64>, Vec<C64>) {
@@ -545,7 +545,7 @@ pub fn assemble_global_matrices(
             &basis.orders.tet_edge_orders(mesh, itet),
             &basis.orders.tet_face_orders(mesh, itet),
         );
-        let (esub, bsub) = r2_tet_stiff_mass(
+        let (esub, bsub) = tet_stiff_mass(
             basis.kind, &owners, &xs, &ys, &zs, &edge_lengths, &local_edge_map, &local_tri_map,
             &ms, mm,
         );
@@ -605,7 +605,7 @@ mod tests {
         let em = [[0,1],[0,2],[0,3],[1,2],[3,1],[2,3]];
         let tm = [[0,1,2],[0,2,3],[0,3,1],[1,2,3]];
         let owners = crate::basis::tet_dof_owners(&[2;6], &[2;4]);
-        let (d, f) = r2_tet_stiff_mass(BasisKind::Interpolatory,&owners,&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
+        let (d, f) = tet_stiff_mass(BasisKind::Interpolatory,&owners,&xs,&ys,&zs,&el,&em,&tm,&ident(),&ident());
         assert_eq!(d.len(), 400);
         for (dv, fv) in d.iter().zip(f.iter()) {
             assert!(dv.re.is_finite() && dv.im.is_finite(), "D finite");

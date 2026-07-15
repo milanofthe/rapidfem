@@ -22,9 +22,9 @@
 // is not a refactor.
 
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly_r2::assemble_global_matrices;
+use rapidfem_fd::tet_assembly::assemble_global_matrices;
 
 /// A unit cube cut into six tetrahedra (the standard Kuhn triangulation). Small
 /// enough to reason about, big enough that every entity kind is shared: it has
@@ -108,7 +108,7 @@ fn close(got: f64, want: f64, what: &str) {
 #[test]
 fn global_dof_map_is_pinned() {
     let mesh = cube_6tet();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
 
     assert_eq!(mesh.n_tets(), 6, "tets");
     assert_eq!(mesh.n_edges(), 19, "edges");
@@ -137,11 +137,11 @@ fn global_dof_map_is_pinned() {
 /// The previous layout, in closed form:
 ///   edge e, mode m -> e + m·(n_edges + n_tris)
 ///   face f, mode m -> f + n_edges + m·(n_edges + n_tris)
-/// which is exactly what `Nedelec2Basis::new` used to compute.
+/// which is exactly what `NedelecBasis::new` used to compute.
 #[test]
 fn numbering_is_a_relabelling_of_the_mode_major_layout() {
     let mesh = cube_6tet();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     let (ne, nt) = (mesh.n_edges(), mesh.n_tris());
     let stride = ne + nt;
 
@@ -183,7 +183,7 @@ fn numbering_is_a_relabelling_of_the_mode_major_layout() {
 #[test]
 fn global_assembly_is_pinned_identity_material() {
     let mesh = cube_6tet();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     let er = vec![identity(); mesh.n_tets()];
     let ur = vec![identity(); mesh.n_tets()];
 
@@ -208,7 +208,7 @@ fn global_assembly_is_pinned_identity_material() {
 #[test]
 fn global_assembly_is_pinned_anisotropic_material() {
     let mesh = cube_6tet();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     // A different tensor on each tet, so the per-element material path is
     // exercised rather than a single global constant.
     let er: Vec<_> = (0..mesh.n_tets())

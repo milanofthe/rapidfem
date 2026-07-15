@@ -14,7 +14,7 @@
 //!
 //!   cargo run --release -p rapidfem-fd --example eigen_bench [N] [MODES]
 
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::eigenmode::solve_eigenmode;
 use rapidfem_fd::mesh::Mesh;
 
@@ -70,7 +70,7 @@ fn main() {
     let pec: Vec<usize> = (0..mesh.n_tris())
         .filter(|&t| mesh.tri_to_tet[t][1] == usize::MAX)
         .collect();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     let f101 = 0.5 * C0 * ((1.0 / a).powi(2) + (1.0 / d).powi(2)).sqrt();
     let target = f_ghz.map(|g| g * 1e9).unwrap_or(f101);
 

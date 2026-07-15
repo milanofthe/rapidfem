@@ -13,7 +13,7 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::interp;
 use crate::quadrature::{gaus_quad_tet, gaus_quad_tri};
 
@@ -92,7 +92,7 @@ pub use crate::interp::eval_curl_in_tet;
 /// Compute the full residual error estimate for each element.
 pub fn estimate_error(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     solution: &[C64],
     k0: f64,
     er: &[[[C64; 3]; 3]],

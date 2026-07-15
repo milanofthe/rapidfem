@@ -20,17 +20,17 @@
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
-use crate::basis::Nedelec2Basis;
+use crate::basis::NedelecBasis;
 use crate::port::Port;
-use crate::tet_assembly_r2::assemble_global_matrices;
-use crate::tri_assembly_r2::{ned2_tri_stiff, ned2_tri_force};
+use crate::tet_assembly::assemble_global_matrices;
+use crate::tri_assembly::{tri_stiff, tri_force};
 use crate::quadrature::gaus_quad_tri;
 use std::collections::HashSet;
 
 /// The surface element's DOF owners for triangle `ti`, from the entity orders the
 /// minimum rule produced. The element and the DOF map read the same list, so they
 /// agree on the size by construction.
-fn tri_owners(basis: &Nedelec2Basis, mesh: &Mesh, ti: usize) -> Vec<crate::dofmap::DofOwner> {
+fn tri_owners(basis: &NedelecBasis, mesh: &Mesh, ti: usize) -> Vec<crate::dofmap::DofOwner> {
     crate::basis::tri_dof_owners(&basis.orders.tri_edge_orders(mesh, ti), basis.orders.face[ti])
 }
 
@@ -71,7 +71,7 @@ fn apply_equilibration(rows: &[usize], cols: &[usize], vals: &mut [C64], s: &[f6
 /// Port type via trait objects.
 pub fn assemble_and_solve(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     ports: &[&dyn Port],
     port_tri_indices: &[&[usize]],
     pec_tri_indices: &[usize],
@@ -83,7 +83,7 @@ pub fn assemble_and_solve(
 
 pub fn assemble_and_solve_with_pml(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     ports: &[&dyn Port],
     port_tri_indices: &[&[usize]],
     pec_tri_indices: &[usize],
@@ -154,7 +154,7 @@ pub fn assemble_and_solve_with_pml(
             let tri = &mesh.tris[ti];
             let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
             let owners = tri_owners(basis, mesh, ti);
-            let bsub = ned2_tri_stiff(basis.kind, &owners, &verts, gamma);
+            let bsub = tri_stiff(basis.kind, &owners, &verts, gamma);
             // The block reserved for this triangle is n×n, with n from the DOF
             // map, and the element produced exactly n functions from the same
             // owner list. Under the minimum rule n need not be 8.
@@ -199,7 +199,7 @@ pub fn assemble_and_solve_with_pml(
 
             if u_inc_at_qp.len() == gauss_points.len() {
                 let owners = tri_owners(basis, mesh, ti);
-                let b_tri = ned2_tri_force(basis.kind, &owners, &verts, &u_inc_at_qp, &gauss_points);
+                let b_tri = tri_force(basis.kind, &owners, &verts, &u_inc_at_qp, &gauss_points);
                 let dofs = basis.tri_dofs(ti);
                 for (i, &d) in dofs.iter().enumerate() {
                     bvec[d] += b_tri[i];
@@ -293,7 +293,7 @@ pub fn assemble_and_solve_with_pml(
 /// Returns solutions per frequency: Vec<SolveResult>.
 pub fn frequency_sweep(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     ports: &[&dyn Port],
     port_tri_indices: &[&[usize]],
     pec_tri_indices: &[usize],
@@ -305,7 +305,7 @@ pub fn frequency_sweep(
 
 pub fn frequency_sweep_with_pml(
     mesh: &Mesh,
-    basis: &Nedelec2Basis,
+    basis: &NedelecBasis,
     ports: &[&dyn Port],
     port_tri_indices: &[&[usize]],
     pec_tri_indices: &[usize],
@@ -438,7 +438,7 @@ pub fn frequency_sweep_with_pml(
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
                 let owners = tri_owners(basis, mesh, ti);
-                let bsub = ned2_tri_stiff(basis.kind, &owners, &verts, gamma);
+                let bsub = tri_stiff(basis.kind, &owners, &verts, gamma);
                 let n = basis.tri_dofs(ti).len();
                 let p = basis.tri_block(ti);
                 for ii in 0..n { for jj in 0..n { bempty[p + ii*n + jj] += bsub[ii*n + jj]; } }
@@ -463,7 +463,7 @@ pub fn frequency_sweep_with_pml(
                     }).collect();
                 if u_at_qp.len() == gauss_points.len() {
                     let owners = tri_owners(basis, mesh, ti);
-                    let b_tri = ned2_tri_force(basis.kind, &owners, &verts, &u_at_qp, &gauss_points);
+                    let b_tri = tri_force(basis.kind, &owners, &verts, &u_at_qp, &gauss_points);
                     let dofs = basis.tri_dofs(ti);
                     for (i, &d) in dofs.iter().enumerate() { bvec[d] += b_tri[i]; }
                 }

@@ -10,7 +10,7 @@
 // `eval_curl_in_tet` to the derivation, entrywise, at interior sample points.
 
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::interp::{eval_curl_in_tet, eval_field_in_tet};
 use rapidfem_fd::mesh::Mesh;
 
@@ -31,9 +31,9 @@ fn build_mesh() -> Mesh {
 /// curl at every sample point against the symbolic golden values.
 fn check_dof(local_dof: usize, pts: &[[f64; 3]], e_exp: &[[f64; 3]], curl_exp: &[[f64; 3]]) {
     let mesh = build_mesh();
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     assert_eq!(basis.n_field, 20);
-    // Single-tet mesh: the local-to-global map is a permutation, but route through it
+    // Single-tet mesh: tet_dofs(0) is the identity, but route through it
     // anyway so the test stays correct under any DOF-numbering change.
     let mut sol = vec![C64::new(0.0, 0.0); basis.n_field];
     sol[basis.tet_dofs(0)[local_dof]] = C64::new(1.0, 0.0);

@@ -7,7 +7,7 @@
 //
 // The surface element IS the tangential trace of the volume element.
 //
-// The Robin/port boundary term is assembled with `ned2_tri_stiff` on a boundary
+// The Robin/port boundary term is assembled with `tri_stiff` on a boundary
 // triangle, and its 8 DOFs are the same global DOFs the volume element carries on
 // that face. That only makes sense if the surface functions are literally the
 // traces of the volume functions. Until this test, that was an assertion in a
@@ -18,7 +18,7 @@
 //   1. exactly 8 of the 20 volume DOFs have a nonzero tangential trace on a face,
 //      and they are exactly the 8 the DOF map shares with the surface triangle;
 //   2. the other 12 trace to zero, so the surface element loses nothing;
-//   3. integrating the surviving traces over the face reproduces `ned2_tri_stiff`
+//   3. integrating the surviving traces over the face reproduces `tri_stiff`
 //      entrywise, in the DOF order the assembler uses.
 //
 // (3) is the operative statement: it says the Robin matrix the solver adds to K is
@@ -26,10 +26,10 @@
 // symbolic counterpart is `derivations/nedelec2/face_trace.py`.
 
 use rapidfem_core::quadrature::gaus_quad_tri;
-use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners, tri_dof_owners, Nedelec2Basis};
+use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners, tri_dof_owners, NedelecBasis};
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly_r2::{barycentric_grads, build_basis, BasisFn, BasisKind};
-use rapidfem_fd::tri_assembly_r2::ned2_tri_stiff;
+use rapidfem_fd::tet_assembly::{barycentric_grads, build_basis, BasisFn, BasisKind};
+use rapidfem_fd::tri_assembly::tri_stiff;
 
 type V3 = [f64; 3];
 
@@ -113,7 +113,7 @@ fn volume_basis(mesh: &Mesh, kind: BasisKind) -> (Vec<BasisFn>, [V3; 4]) {
 /// the local volume index whose GLOBAL DOF is the surface element's local DOF `s`.
 /// This is the correspondence the assembler relies on — a shared global index —
 /// not one re-derived here.
-fn trace_dofs(basis: &Nedelec2Basis, tri: usize) -> [usize; 8] {
+fn trace_dofs(basis: &NedelecBasis, tri: usize) -> [usize; 8] {
     let tet_dofs = basis.tet_dofs(0);
     let tri_dofs = basis.tri_dofs(tri);
     std::array::from_fn(|s| {
@@ -135,7 +135,7 @@ fn only_the_shared_dofs_have_a_tangential_trace() {
     for kind in KINDS {
     for (ti, verts) in test_tets().iter().enumerate() {
         let mesh = Mesh::from_tets(verts.to_vec(), vec![[0, 1, 2, 3]]);
-        let basis = Nedelec2Basis::with_kind(&mesh, kind);
+        let basis = NedelecBasis::with_kind(&mesh, kind);
         let (fns, grads) = volume_basis(&mesh, kind);
         let tet = &mesh.tets[0];
 
@@ -193,7 +193,7 @@ fn the_traced_robin_matrix_is_the_surface_element() {
     for kind in KINDS {
     for (ti, verts) in test_tets().iter().enumerate() {
         let mesh = Mesh::from_tets(verts.to_vec(), vec![[0, 1, 2, 3]]);
-        let basis = Nedelec2Basis::with_kind(&mesh, kind);
+        let basis = NedelecBasis::with_kind(&mesh, kind);
         let (fns, grads) = volume_basis(&mesh, kind);
         let tet = &mesh.tets[0];
 
@@ -228,7 +228,7 @@ fn the_traced_robin_matrix_is_the_surface_element() {
 
             // The surface element, on the same triangle, with γ = 1.
             let tri_owners = tri_dof_owners(&[2; 3], 2);
-            let want = ned2_tri_stiff(kind, &tri_owners, &tv, gamma);
+            let want = tri_stiff(kind, &tri_owners, &tv, gamma);
 
             let mut peak = 0.0_f64;
             let mut scale = 1e-300_f64;
@@ -244,7 +244,7 @@ fn the_traced_robin_matrix_is_the_surface_element() {
             }
             assert!(
                 peak / scale < 1e-12,
-                "tet {ti} face {f}: the traced Robin matrix differs from ned2_tri_stiff, \
+                "tet {ti} face {f}: the traced Robin matrix differs from tri_stiff, \
                  rel {:.3e}",
                 peak / scale
             );

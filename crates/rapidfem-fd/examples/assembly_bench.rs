@@ -22,9 +22,9 @@
 //! saturate the machine.
 
 use num_complex::Complex64 as C64;
-use rapidfem_fd::basis::Nedelec2Basis;
+use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly_r2::assemble_global_matrices;
+use rapidfem_fd::tet_assembly::assemble_global_matrices;
 
 /// A structured box of NX³ cubes, each cut into six tetrahedra.
 fn box_mesh(nx: usize) -> Mesh {
@@ -76,7 +76,7 @@ fn main() {
     let reps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     let mesh = box_mesh(nx);
-    let basis = Nedelec2Basis::new(&mesh);
+    let basis = NedelecBasis::new(&mesh);
     println!(
         "mesh: {} tets, {} edges, {} faces -> {} DOFs",
         mesh.n_tets(),

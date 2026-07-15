@@ -28,8 +28,8 @@
 
 use rapidfem_fd::basis::{local_mapping, local_mapping_tri, tet_dof_owners};
 use rapidfem_fd::mesh::Mesh;
-use rapidfem_fd::tet_assembly_r2::{
-    barycentric_grads, build_basis, cross_mass, r2_tet_stiff_mass, BasisFn, BasisKind,
+use rapidfem_fd::tet_assembly::{
+    barycentric_grads, build_basis, cross_mass, tet_stiff_mass, BasisFn, BasisKind,
 };
 
 type V3 = [f64; 3];
@@ -166,14 +166,14 @@ fn the_gradient_dofs_are_curl_free() {
     for (ti, verts) in test_tets().iter().enumerate() {
         let (xs, ys, zs, el, em, tm) = tet_setup(verts);
         let owners = tet_dof_owners(&[2; 6], &[2; 4]);
-        let (d, f) = r2_tet_stiff_mass(BasisKind::Hierarchical, &owners, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
+        let (d, f) = tet_stiff_mass(BasisKind::Hierarchical, &owners, &xs, &ys, &zs, &el, &em, &tm, &ident, &ident);
 
         // Scale by the biggest stiffness entry, so "zero" means zero relative to
         // the matrix and not to an absolute constant that depends on the mesh size.
         let scale = d.iter().map(|v| v.norm()).fold(0.0_f64, f64::max);
         assert!(scale > 0.0);
 
-        // Local DOFs 10..16 are the edge mode-1 functions (basis::R2_TET_OWNERS).
+        // Local DOFs 10..16 are the edge mode-1 functions (basis::tet_dof_owners).
         for i in 10..16 {
             for j in 0..20 {
                 let v = d[i * 20 + j].norm() / scale;
@@ -197,7 +197,7 @@ fn the_gradient_dofs_are_curl_free() {
 /// Mode 0 of every edge is the Whitney function times the edge length, exactly.
 /// This is what makes order 1 a coordinate subspace: dropping mode 1 leaves the
 /// lowest-order Nédélec element and nothing else. A sign or scale slip in
-/// `r2_edge_fns` would break the nesting silently, so pin the functions themselves.
+/// `edge_fns` would break the nesting silently, so pin the functions themselves.
 #[test]
 fn hierarchical_mode0_is_the_whitney_function() {
     for (ti, verts) in test_tets().iter().enumerate() {

@@ -84,13 +84,13 @@ pub enum OrderPolicy {
 }
 
 impl ElementConfig {
-    pub fn kind(&self) -> Result<crate::tet_assembly_r2::BasisKind, String> {
+    pub fn kind(&self) -> Result<crate::tet_assembly::BasisKind, String> {
         // An adaptive order needs a nesting basis, whether or not the user asked for
         // one. Silently running the interpolatory basis at mixed order would
         // discretise a space that is neither order 1 nor order 2; refuse instead.
         let requested = match self.basis.as_str() {
-            "interpolatory" => crate::tet_assembly_r2::BasisKind::Interpolatory,
-            "hierarchical" => crate::tet_assembly_r2::BasisKind::Hierarchical,
+            "interpolatory" => crate::tet_assembly::BasisKind::Interpolatory,
+            "hierarchical" => crate::tet_assembly::BasisKind::Hierarchical,
             other => {
                 return Err(format!(
                     "unknown element basis '{other}': expected 'interpolatory' or 'hierarchical'"
@@ -98,7 +98,7 @@ impl ElementConfig {
             }
         };
         if self.policy()? == OrderPolicy::Adaptive
-            && requested != crate::tet_assembly_r2::BasisKind::Hierarchical
+            && requested != crate::tet_assembly::BasisKind::Hierarchical
         {
             return Err(
                 "order_policy = 'adaptive' requires basis = 'hierarchical': only the                  hierarchical basis nests, so only there does reducing a cell to order 1 mean                  dropping DOFs rather than changing the space"
@@ -511,7 +511,7 @@ mod element_config_tests {
 
         assert_eq!(cfg.element.basis, "interpolatory");
         assert_eq!(cfg.element.order_policy, "uniform");
-        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly_r2::BasisKind::Interpolatory);
+        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly::BasisKind::Interpolatory);
         assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
     }
 
@@ -532,7 +532,7 @@ mod element_config_tests {
         )
         .expect("a partial [element] section must parse");
 
-        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly_r2::BasisKind::Hierarchical);
+        assert_eq!(cfg.element.kind().unwrap(), crate::tet_assembly::BasisKind::Hierarchical);
         assert_eq!(cfg.element.policy().unwrap(), OrderPolicy::Uniform);
         assert_eq!(cfg.element.theta, crate::order::DEFAULT_THETA);
     }

@@ -58,6 +58,59 @@ class MeshSpec:
         base = self.slabs.get(name, self.slab_default or self.global_h)
         return self.scale * base
 
+    @staticmethod
+    def derive(stack: Stack, layer_names, preset: str = "balanced") -> "MeshSpec":
+        """Mesh policy derived from the stack, no hand-tuned numbers.
+
+        ``layer_names`` are the layers actually drawn in the layout — the
+        full stack carries thin auxiliary layers (MIM, single vias) that are
+        usually absent from an RF layout and would drag the conductor size
+        down by an order of magnitude for nothing.
+
+        The rules, and why:
+
+        - ``conductor`` = 4x the thinnest drawn metal. Thinner buys nothing:
+          on the 2 nH octagon, halving it doubles the DOFs and leaves mesh
+          quality unchanged, because the worst elements come from the
+          sub-micron passivation shell, not from the conductor sizing.
+        - ``port`` = half the conductor size; the plate is the excitation and
+          wants a couple of elements across the gap.
+        - ``global_h`` = 8x the conductor size, the far-field filler.
+        - background slabs default to ``global_h``. Slab sizing is nearly
+          free here — sweeping the passivation slab from 37.5 um down to
+          1.5 um moved minSICN by less than 0.001 while costing 6x the DOFs.
+        - the substrate is graded: the top third at ``global_h`` (that is
+          where the fields still are), the rest at twice that.
+
+        ``preset`` scales everything: "fast" 2.0, "balanced" 1.5,
+        "accurate" 1.0. The presets are a coarsening factor, not a different
+        policy, so a mesh study is one keyword away.
+        """
+        try:
+            scale = {"fast": 2.0, "balanced": 1.5, "accurate": 1.0}[preset]
+        except KeyError:
+            raise ValueError(
+                f"preset must be fast|balanced|accurate, got {preset!r}")
+
+        drawn = [l for l in stack.layers
+                 if l.name in set(layer_names) and l.thickness > 0]
+        if not drawn:
+            raise ValueError("no drawn layers to derive a mesh policy from")
+        t_min = min(l.thickness for l in drawn)
+        conductor = 4.0 * t_min
+        global_h = 8.0 * conductor
+
+        graded = {}
+        for d in stack.dielectrics:
+            mat = stack.materials.get(d.material, StackMaterial(d.material))
+            if mat.kind == "semiconductor" and d.thickness > 1.5 * global_h:
+                graded[d.name] = [(d.thickness / 3.0, global_h),
+                                  (d.thickness, 2.0 * global_h)]
+
+        return MeshSpec(scale=scale, conductor=conductor,
+                        port=conductor / 2.0, global_h=global_h,
+                        graded=graded)
+
 
 @dataclass
 class ViaPort:
@@ -186,7 +239,7 @@ def build(
     air_top: float | None = None,
     pec_floor: bool = False,
     conductor_model: dict[str, str] | None = None,
-    mesh: MeshSpec | None = None,
+    mesh: "MeshSpec | str | None" = None,
     passivation: str = "planar",
     pass_t_side: float = 0.6e-6,
     pass_t_top: float | None = None,
@@ -220,8 +273,11 @@ def build(
         Per-layer override of the conductor treatment: layer name ->
         ``"sibc" | "pec" | "volume" | "volume_iso"``. Defaults: metals ->
         sibc, vias -> volume (anisotropic), LOWLOSS -> pec.
-    mesh : MeshSpec, optional
-        Mesh sizing policy; defaults to ``MeshSpec()``.
+    mesh : MeshSpec or {"fast", "balanced", "accurate"}, optional
+        Mesh sizing policy. A preset name (or the default ``None``, which
+        means ``"balanced"``) derives every size from the stack and the
+        layers actually drawn in the GDS — see :meth:`MeshSpec.derive`.
+        Pass a `MeshSpec` to take full control instead.
     passivation : {"planar", "conformal", "none"}
         "planar" keeps the stackup-XML sheet (the gds2palace / Momentum
         approximation). "conformal" models the real deposition: the oxide
@@ -262,7 +318,11 @@ def build(
         raise ValueError(f"boundary must be abc|pml, got {boundary!r}")
     if boundary == "pml" and pec_floor:
         raise ValueError("pec_floor is an ABC-mode option")
-    mesh = mesh or MeshSpec()
+    # A string (or None) means "derive from the stack"; resolved once the
+    # GDS tells us which layers are actually drawn.
+    mesh_preset = mesh if isinstance(mesh, str) else None
+    if mesh is None:
+        mesh_preset = "balanced"
     conductor_model = conductor_model or {}
 
     # The passivation sheet of the stack: topmost non-air dielectric slab.
@@ -299,6 +359,10 @@ def build(
             conductors.setdefault(o.name, []).append(o)
     if not conductors:
         raise ValueError(f"no stack layers found in {gds!r}")
+
+    # Now that the drawn layers are known, a preset can size itself.
+    if mesh_preset is not None:
+        mesh = MeshSpec.derive(stack, conductors.keys(), preset=mesh_preset)
 
     # Layout bbox from the extruded conductors (gmsh coords are scaled;
     # entity bboxes are tracked in scaled space, dilate back via g._scale).

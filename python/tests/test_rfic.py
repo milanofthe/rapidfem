@@ -187,6 +187,59 @@ def test_build_requires_dielectrics(mini_gds):
         rfic.build(mini_gds, stack)
 
 
+# ── derived mesh presets ───────────────────────────────────────────────────
+
+def test_meshspec_derive_sizes_from_drawn_layers():
+    um = 1e-6
+    stack = rfic.Stack.sg13g2()
+    drawn = ["SUBGND", "TopMetal1", "TopVia2", "TopMetal2"]
+    spec = rfic.MeshSpec.derive(stack, drawn, preset="accurate")
+
+    # thinnest DRAWN layer is TopMetal1 (2 um); the stack's thin auxiliary
+    # layers (MIM, single vias) must not drag the size down
+    t_min = min(stack.by_name(n).thickness for n in drawn)
+    assert t_min == pytest.approx(2 * um)
+    assert spec.conductor == pytest.approx(4 * t_min)
+    assert spec.port == pytest.approx(2 * t_min)
+    assert spec.global_h == pytest.approx(32 * t_min)
+
+    # the substrate is thick and field-poor -> graded, coarser towards the
+    # backside; without this the accurate preset blows up the DOF count
+    assert "Substrate" in spec.graded
+    zones = spec.graded["Substrate"]
+    assert len(zones) == 2 and zones[1][1] > zones[0][1]
+
+
+def test_meshspec_derive_presets_are_monotone():
+    stack = rfic.Stack.sg13g2()
+    drawn = ["SUBGND", "TopMetal1", "TopMetal2"]
+    scales = [rfic.MeshSpec.derive(stack, drawn, preset=p).scale
+              for p in ("fast", "balanced", "accurate")]
+    assert scales == sorted(scales, reverse=True)
+
+    with pytest.raises(ValueError, match="fast|balanced|accurate"):
+        rfic.MeshSpec.derive(stack, drawn, preset="nonsense")
+
+    with pytest.raises(ValueError, match="no drawn layers"):
+        rfic.MeshSpec.derive(stack, [], preset="fast")
+
+
+def test_build_accepts_preset_name(mini_gds):
+    um = 1e-6
+    stack = rfic.Stack.sg13g2()
+    model = rfic.build(
+        mini_gds, stack,
+        ports=[rfic.ViaPort(z=("SUBGND", "TopMetal1"), marker=201)],
+        margin=60 * um, air=40 * um, air_top=80 * um, mesh="fast",
+    )
+    g = model.geometry
+    try:
+        g.mesh()
+        assert g.mesh_stats.n_tets > 0
+    finally:
+        g.close()
+
+
 @pytest.mark.parametrize("passv,boundary", [
     ("conformal", "abc"), ("none", "abc"), ("planar", "pml")])
 def test_build_passivation_and_boundary_modes(mini_gds, passv, boundary):

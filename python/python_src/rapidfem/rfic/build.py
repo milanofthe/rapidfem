@@ -393,15 +393,20 @@ def build(
             for mp in metal_holes:
                 shell.append(_prism(mp, [], zm_hi, pass_t_top,
                                     _material_for(pass_mat), h_pass))
-        # air prisms: over the field sheet and over the draped metal
+        # Air above the shell. Only the step between the field sheet
+        # (zm_lo + t_top) and the shell top (zm_hi + t_top) has to follow the
+        # metal outline; everything above it is one plain box. Running the
+        # polygon prisms all the way to z_top instead would stamp the metal
+        # outline through the full air region — vertical interfaces between
+        # air and air, metres of aspect ratio, and gmsh resolving the trace
+        # width over the whole height (minSICN ~0.004 on the 2 nH octagon).
+        z_shell_top = zm_hi + pass_t_top
         air_boxes_low = [
             _prism(foot, expanded, zm_lo + pass_t_top,
-                   z_top - (zm_lo + pass_t_top), Air(), h_air),
+                   z_shell_top - (zm_lo + pass_t_top), Air(), h_air),
+            g.box(wx, wy, z_top - z_shell_top,
+                  position=(x0, y0, z_shell_top), material=Air(), maxh=h_air),
         ]
-        for ep, _ in rings:
-            air_boxes_low.append(_prism(ep, [], zm_hi + pass_t_top,
-                                        z_top - (zm_hi + pass_t_top),
-                                        Air(), h_air))
         slabs[pass_slab.name] = shell
         slabs[air_slab.name] = air_boxes_low
 

@@ -56,12 +56,25 @@ function physDim(m: SceneMesh, tag: number): number {
 
 export type Kind = 'dielectric' | 'conductor' | 'port' | 'gnd';
 
+// Physical groups arrive under two naming schemes and both have to be
+// understood here. `Geometry.mesh()` names a group after the material class
+// plus a counter — "dielectric_1", "air_2", "abc_1" — while hand-built and
+// older models use bare names like "substrate" / "oxide" / "gnd". Matching
+// only the bare names (as this did) drops every generated group through to
+// the `conductor` fallback: dielectrics render in conductor colour and the
+// absorbing boundary, which should never be drawn at all, gets painted over
+// the model.
 export function classify(name: string): Kind | null {
-	if (name === 'abc' || name.startsWith('_mat_')) return null;
-	if (name === 'substrate' || name === 'oxide' || name === 'air') return 'dielectric';
-	if (name.endsWith('_gnd') || name === 'gnd' || name === 'ground') return 'gnd';
+	const base = name.replace(/_\d+$/, '');
+	if (base === 'abc' || name.startsWith('_mat_')) return null;
 	if (
-		name === 'p1' || name === 'p2' || /^p\d+$/.test(name) ||
+		base === 'substrate' || base === 'oxide' || base === 'air' ||
+		base === 'dielectric' || base === 'anisotropic' || base === 'pml' ||
+		base === 'debye' || base === 'drude'
+	) return 'dielectric';
+	if (base === 'gnd' || base === 'ground' || name.endsWith('_gnd')) return 'gnd';
+	if (
+		/^p\d+$/.test(name) || base === 'port' ||
 		name.startsWith('port') || name.endsWith('_port')
 	) return 'port';
 	return 'conductor';
@@ -84,8 +97,11 @@ const FIXED_CONDUCTOR_COLORS: Record<string, string> = {
 
 export function colorFor(kind: Kind, name: string): [number, number, number] {
 	if (kind === 'dielectric') {
-		if (name === 'substrate') return hex('#4a9ec2');
-		if (name === 'oxide') return hex('#7b5e8a');
+		// Same two naming schemes as classify(); strip the counter suffix.
+		const base = name.replace(/_\d+$/, '');
+		if (base === 'substrate') return hex('#4a9ec2');
+		if (base === 'oxide') return hex('#7b5e8a');
+		if (base === 'air') return hex('#3f4855');       // dimmer than solids
 		return hex('#5a6470');
 	}
 	if (kind === 'gnd') return hex('#5aad78');
@@ -103,6 +119,7 @@ function pushGroup(
 	tag: number,
 	depthOffset: [number, number] | undefined,
 	fieldNorm: Float32Array | null,
+	cull = false,
 ): void {
 	const ntri = idx.length / 3;
 	const { positions, normals } = buildTriSoupF64(mesh.nodes, idx);
@@ -115,7 +132,7 @@ function pushGroup(
 			}
 		}
 	}
-	addMesh(state, positions, normals, color, tag, depthOffset, scalars);
+	addMesh(state, positions, normals, color, tag, depthOffset, scalars, cull);
 }
 
 // ── Wireframe edges of every named surface tri ───────────────────────
@@ -190,6 +207,19 @@ export function buildScene(
 			if (!arr) { arr = []; bySurf.set(tag, arr); }
 			arr.push(mesh.tris[i * 3], mesh.tris[i * 3 + 1], mesh.tris[i * 3 + 2]);
 		}
+		// Named surfaces get a one-unit nudge TOWARDS the camera, so that a
+		// conductor sitting exactly ON a volume boundary (ground plane on a
+		// substrate face, port plate on a slab face) wins the depth test.
+		// The nudge lives here, on the coplanar special case, rather than on
+		// the hulls: offsetting every hull backwards also pushed back the
+		// dielectrics that genuinely sit IN FRONT of a conductor, so the
+		// conformal passivation lost against the surface-impedance shell it
+		// encloses and flickered through it. With CULL_FACE off (sheets need
+		// both sides) the cap's underside is exactly coplanar with the shell,
+		// which is what made it fight in the first place.
+		// Sheets: no offset, no culling. These groups come straight from the
+		// mesh's triangle list and have no reliable winding, so both sides
+		// have to draw; they sit at their true depth.
 		for (const [tag, idx] of bySurf.entries()) {
 			const name = physName(mesh, tag);
 			const kind = classify(name);
@@ -197,16 +227,24 @@ export function buildScene(
 			pushGroup(state, mesh, idx, colorFor(kind, name), tag, undefined, fieldNorm);
 			faceTags.push(tag);
 		}
-		// 2) Implicit volume hulls — substrate / air / PML shells. Push
-		//    behind via polygon offset so coplanar conductors win the
-		//    depth test cleanly. (In field-mode the colormap renders all
-		//    surfaces by |E| anyway so the offset doesn't matter.)
+		// 2) Implicit volume hulls — substrate / air / passivation / PML.
+		//    buildVolumeBoundaries orients every face outward, so these can
+		//    be backface culled: only the side turned towards the camera
+		//    draws, and a shell's far side stops competing with whatever it
+		//    encloses.
+		//
+		//    They still take a small constant push backwards so a conductor
+		//    lying exactly ON a hull face (ground plane on a substrate
+		//    surface) wins that tie. factor stays 0: glPolygonOffset scales
+		//    it by the polygon's depth slope, so a non-zero factor grows
+		//    with the viewing angle and would overrun genuine separations
+		//    at grazing angles.
 		const volBoundaries = buildVolumeBoundaries(mesh);
+		const hullOffset: [number, number] | undefined = fieldNorm ? undefined : [0, 2];
 		for (const [vtag, idx] of volBoundaries.entries()) {
 			const name = physName(mesh, vtag);
 			if (!name || name.startsWith('_mat_')) continue;
-			const offset: [number, number] | undefined = fieldNorm ? undefined : [2, 2];
-			pushGroup(state, mesh, idx, colorFor('dielectric', name), vtag, offset, fieldNorm);
+			pushGroup(state, mesh, idx, colorFor('dielectric', name), vtag, hullOffset, fieldNorm, true);
 			faceTags.push(vtag);
 		}
 	}

@@ -31,6 +31,10 @@ interface Mesh {
 	tag: number;
 	visible: boolean;
 	depth_offset?: [number, number];
+	/** Closed volume hull with outward-oriented faces — safe to backface
+	 *  cull. Sheets (port plates, ABC walls, any named surface group) have
+	 *  no reliable winding and must stay two-sided. */
+	cull?: boolean;
 	/** Has a per-vertex scalar buffer attached (location=2). When true, the
 	 *  shader uses Viridis colormap on it instead of the flat color. */
 	has_scalar?: boolean;
@@ -481,7 +485,8 @@ export function addMesh(
 	color: [number, number, number],
 	tag = 0,
 	depth_offset?: [number, number],
-	scalars?: Float32Array          // one scalar per vertex (range [0,1] for viridis)
+	scalars?: Float32Array,         // one scalar per vertex (range [0,1] for viridis)
+	cull = false                    // closed hull with outward faces?
 ): void {
 	const { gl } = state;
 	const vao = gl.createVertexArray()!;
@@ -516,7 +521,7 @@ export function addMesh(
 	}
 
 	gl.bindVertexArray(null);
-	state.meshes.push({ vao, buffers, count: positions.length / 3, color, tag, visible: true, depth_offset, has_scalar });
+	state.meshes.push({ vao, buffers, count: positions.length / 3, color, tag, visible: true, depth_offset, has_scalar, cull });
 }
 
 /** Line segments. positions: 3 components per vertex, every two vertices = one segment. */
@@ -565,13 +570,36 @@ export function render3D(
 	gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
 	const aspect = w / h || 1;
-	// Near/far based on bbox extent so the substrate doesn't get clipped.
-	const dx = state.bbox.max[0] - state.bbox.min[0];
-	const dy = state.bbox.max[1] - state.bbox.min[1];
-	const dz = state.bbox.max[2] - state.bbox.min[2];
-	const sceneR = 0.5 * Math.sqrt(dx * dx + dy * dy + dz * dz);
-	const near = Math.max(camera.distance * 1e-3, sceneR * 1e-3, 1e-9);
-	const far = (camera.distance + sceneR) * 8;
+	// Near/far are fitted to the scene as seen from the current camera, so
+	// the depth buffer spends its precision on the geometry instead of on
+	// empty space in front of it.
+	//
+	// R is the distance from the camera target to the farthest bbox corner
+	// (not the bbox half-diagonal — the target moves when panning, and an
+	// under-estimated R would clip the scene away).
+	//
+	// Two regimes. With the camera outside the scene the near plane sits
+	// just in front of the closest possible geometry, so far/near stays
+	// close to unity and depth resolves sub-micron layers at any zoom. Once
+	// the camera is inside the bounding sphere there is no such bound and
+	// it falls back to a fraction of the camera distance.
+	//
+	// The previous floor tied to the scene size (sceneR * 1e-3) did not
+	// follow the zoom at all: on a 500 um model it parked the near plane at
+	// ~0.5 um regardless of where the camera was, which sliced the front off
+	// hulls and sheets as soon as you moved in on them.
+	const { min, max } = state.bbox;
+	let R = 0;
+	for (const cx of [min[0], max[0]])
+		for (const cy of [min[1], max[1]])
+			for (const cz of [min[2], max[2]]) {
+				const ex = cx - camera.target[0];
+				const ey = cy - camera.target[1];
+				const ez = cz - camera.target[2];
+				R = Math.max(R, Math.sqrt(ex * ex + ey * ey + ez * ez));
+			}
+	const far = camera.distance + R * 1.05;
+	const near = Math.max(0.9 * (camera.distance - R), camera.distance * 1e-3, 1e-12);
 	const proj = mat4Perspective(Math.PI / 6, aspect, near, far);
 
 	const eye = cameraEye(camera);
@@ -596,6 +624,7 @@ export function render3D(
 	gl.uniform4f(state.uClipPlane, state.clip_plane[0], state.clip_plane[1], state.clip_plane[2], state.clip_plane[3]);
 	gl.uniform1f(state.uClipEnable, state.clip_enable ? 1.0 : 0.0);
 	let offset_on = false;
+	let cull_on = false;
 	for (const m of state.meshes) {
 		if (!m.visible) continue;
 		if (m.depth_offset) {
@@ -605,12 +634,21 @@ export function render3D(
 			gl.disable(gl.POLYGON_OFFSET_FILL);
 			offset_on = false;
 		}
+		// Closed hulls drop their back faces: the far side of a shell is
+		// never what the viewer should see, and drawing it puts a surface
+		// exactly on top of whatever the shell encloses. Sheets have no
+		// reliable winding and stay two-sided.
+		if (m.cull !== cull_on) {
+			if (m.cull) gl.enable(gl.CULL_FACE); else gl.disable(gl.CULL_FACE);
+			cull_on = !!m.cull;
+		}
 		gl.uniform3f(state.uColor, m.color[0], m.color[1], m.color[2]);
 		gl.uniform1f(state.uColormap, m.has_scalar ? 1.0 : 0.0);
 		gl.bindVertexArray(m.vao);
 		gl.drawArrays(gl.TRIANGLES, 0, m.count);
 	}
 	if (offset_on) gl.disable(gl.POLYGON_OFFSET_FILL);
+	if (cull_on) gl.disable(gl.CULL_FACE);
 
 	// Line pass (wireframe / axes / grid)
 	if (state.lineMeshes.length > 0) {

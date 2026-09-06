@@ -1,4 +1,4 @@
-# VENDORED into rapidfem from https://github.com/milanofthe/rslab commit 82afa5f (v0.33.0 plus MC64 matching and the panel-form factors, PRs #51 to #53)
+# VENDORED into rapidfem from https://github.com/milanofthe/rslab commit eccacce (v0.33.0 plus MC64 matching and the panel-arena factors, PRs #51 to #54)
 # (git archive, dev/tooling dirs pruned, workspace members trimmed to the crates
 # that ship). Upstream fixes go to the rslab repo first, then re-vendor.
 [workspace]

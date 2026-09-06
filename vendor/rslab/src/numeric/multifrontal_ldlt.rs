@@ -38,7 +38,7 @@
 use crate::dense::ldlt_generic::{bk_alpha, swap_sym_lower, swap_sym_lower_bounded, LdltFactors};
 use crate::error::RslabError;
 use crate::inertia::Inertia;
-use crate::numeric::panel_factor::{assemble_panels, finish_panel, PanelFactor, PanelOut};
+use crate::numeric::panel_factor::{finish_panel, PanelArena, PanelFactor, PanelOut};
 use crate::scalar::Scalar;
 
 /// Scale-invariant singularity floor for a 2x2 Bunch-Kaufman pivot: a block
@@ -2096,14 +2096,21 @@ pub fn factor_numeric<T: Scalar>(
         .iter()
         .map(|n| n.as_ref().map_or(0, |nd| nd.front.nelim))
         .collect();
-    let mut emit_panel = |s: usize| -> Result<PanelOut<T>, RslabError> {
+    let arena = PanelArena::<T>::new(
+        node_results
+            .iter()
+            .map(|n| n.as_ref().map_or(0, |nd| nd.front.nrow * nd.front.nelim)),
+    );
+    let mut emit_panel = |s: usize| -> Result<PanelOut, RslabError> {
         let node = node_results[s].as_mut().ok_or_else(|| {
             RslabError::InvalidInput("internal: unfactored supernode".to_string())
         })?;
         let ff = &mut node.front;
         let (nrow, w) = (ff.nrow, ff.nelim);
-        let mut panel = std::mem::take(&mut ff.l);
-        panel.truncate(nrow * w);
+        // SAFETY: the sequential emit owns every slot.
+        let panel = unsafe { arena.slot_mut(s) };
+        panel.copy_from_slice(&ff.l[..nrow * w]);
+        ff.l = Vec::new();
         let e_rows: Vec<u32> = (w..nrow)
             .map(|i| e_of_g[node.row_indices[ff.perm[i]]] as u32)
             .collect();
@@ -2118,7 +2125,7 @@ pub fn factor_numeric<T: Scalar>(
             opts.drop_tol,
         ))
     };
-    let mut outs: Vec<PanelOut<T>> = Vec::with_capacity(ncols.len());
+    let mut outs: Vec<PanelOut> = Vec::with_capacity(ncols.len());
     for (s, &w) in ncols.iter().enumerate() {
         outs.push(if w > 0 {
             emit_panel(s)?
@@ -2127,7 +2134,7 @@ pub fn factor_numeric<T: Scalar>(
         });
     }
     let (factor, n_zeros) =
-        assemble_panels(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s]));
+        arena.finish(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s]));
 
     Ok(LdltNumeric {
         factor,
@@ -2146,7 +2153,6 @@ pub fn factor_numeric<T: Scalar>(
 /// Bunch-Kaufman D (diagonal + sub-diagonal + 2x2 flags, pivoted order), and
 /// the within-panel pivot permutation (identity on the off-diagonal rows).
 struct LdltSlot<T> {
-    panel: Vec<T>,
     d: Vec<T>,
     dsub: Vec<T>,
     two: Vec<bool>,
@@ -2155,7 +2161,6 @@ struct LdltSlot<T> {
 impl<T> Default for LdltSlot<T> {
     fn default() -> Self {
         LdltSlot {
-            panel: Vec::new(),
             d: Vec::new(),
             dsub: Vec::new(),
             two: Vec::new(),
@@ -2171,7 +2176,9 @@ type LlStore<T> = crate::numeric::ll_common::SlotStore<LdltSlot<T>>;
 struct LlEmitLdlt<T> {
     refcount: Vec<AtomicUsize>,
     e_offset: Vec<usize>,
-    panels: Cells<PanelOut<T>>,
+    /// The factor's buffer: every supernode factors into its own slot.
+    arena: PanelArena<T>,
+    panels: Cells<PanelOut>,
     e_of_g: Cells<usize>,
     perm: Cells<usize>,
     d_diag: Cells<T>,
@@ -2188,9 +2195,12 @@ impl<T: Scalar> LlEmitLdlt<T> {
         let nsuper = sym.supernodes.len();
         let n = sym.n;
         let (refcount, e_offset) = emit_refcount_offsets(sym, sched);
+        let arena =
+            PanelArena::new((0..nsuper).map(|s| sched.rows(s).len() * sym.supernodes[s].ncol));
         LlEmitLdlt {
             refcount,
             e_offset,
+            arena,
             panels: Cells::new_default(nsuper),
             e_of_g: Cells::new(n, usize::MAX),
             perm: Cells::new(n, 0),
@@ -2222,9 +2232,10 @@ fn ldlt_emit_and_free<T: Scalar>(
     let ncol = sym.supernodes[k].ncol;
     let nrow = sched.rows(k).len();
     // SAFETY: the owner of supernode `k` emits it exactly once, after its last
-    // updater has read the panel (refcount zero); nobody reads it afterwards.
+    // updater has read the slot (refcount zero); nobody reads it afterwards.
     let slot = unsafe { store.take(k) };
-    let (panel, lperm, t2) = (slot.panel, &slot.lperm, &slot.two);
+    let panel = unsafe { emit.arena.slot_mut(k) };
+    let (lperm, t2) = (&slot.lperm, &slot.two);
     debug_assert_eq!(panel.len(), nrow * ncol);
     debug_assert!(
         (0..ncol)
@@ -2278,7 +2289,10 @@ fn ll_factor_node<T: Scalar>(
     let (first, ncol) = (snode.first_col, snode.ncol);
     let nrow = sched.rows(s).len();
     let n = sym.n;
-    let mut panel = vec![T::zero(); nrow * ncol];
+    // SAFETY: this task owns supernode `s`; nobody reads the slot before it
+    // is published by `store.set` at the end of the cdiv.
+    let panel: &mut [T] = unsafe { emit.arena.slot_mut(s) };
+    debug_assert_eq!(panel.len(), nrow * ncol);
 
     // Thread-local global->local scratch (held at all-`Li::MAX`; narrow
     // entries halve the table's random-access footprint).
@@ -2372,7 +2386,8 @@ fn ll_factor_node<T: Scalar>(
                     // SAFETY: `kk` is a factored descendant of `s`, its cells
                     // are written and never mutated again.
                     let slot = unsafe { store.get(kk) };
-                    let (pk, dk, dsub_k, two_k) = (&slot.panel, &slot.d, &slot.dsub, &slot.two);
+                    let pk: &[T] = unsafe { emit.arena.slot(kk) };
+                    let (dk, dsub_k, two_k) = (&slot.d, &slot.dsub, &slot.two);
                     // G = (kk's block rows q0..q1) * D, column-major npk x nck.
                     vd_buf.clear();
                     vd_buf.resize(npk * nck, T::zero());
@@ -2439,7 +2454,8 @@ fn ll_factor_node<T: Scalar>(
         // SAFETY: `kk` is a factored descendant of `s` (its update reaches `s`),
         // so its panel/dval cells are written and never mutated again.
         let slot = unsafe { store.get(kk) };
-        let (pk, dk) = (&slot.panel, &slot.d);
+        let pk: &[T] = unsafe { emit.arena.slot(kk) };
+        let dk = &slot.d;
         // Bunch-Kaufman block structure of `kk`'s D (pivoted column order). The
         // cmod `L*D*L^T` is invariant under `kk`'s internal column permutation, so
         // only the block-diagonal `D`-apply has to honor the 2x2 blocks.
@@ -2824,7 +2840,7 @@ fn ll_cdiv_emit<T: Scalar>(
     n_perturbed: &AtomicUsize,
     ll_active: &AtomicUsize,
     kt: KernelTuning,
-    mut panel: Vec<T>,
+    panel: &mut [T],
     mut gloc: Vec<Li>,
 ) -> Result<(), RslabError> {
     let snode = &sym.supernodes[s];
@@ -2909,7 +2925,7 @@ fn ll_cdiv_emit<T: Scalar>(
         let ke = (kb + nb).min(ncol);
         if kb >= done_through {
             let r = ll_bk_panel_step(
-                &mut panel,
+                panel,
                 nrow,
                 kb,
                 ke,
@@ -3190,7 +3206,6 @@ fn ll_cdiv_emit<T: Scalar>(
         store.set(
             s,
             LdltSlot {
-                panel,
                 d,
                 dsub: d_subdiag,
                 two: two_by_two,
@@ -3273,18 +3288,29 @@ fn factor_left_looking<T: Scalar>(
     let n_perturbed = n_perturbed_atomic.load(Ordering::Relaxed);
     let kept: Vec<bool> = sym.supernodes.iter().map(|sn| sn.ncol > 0).collect();
     let supernode_parent = crate::symbolic::supernode_parents(&sym.supernodes, &kept);
-    let (factor, n_zeros) =
-        assemble_panels(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
-            std::mem::take(emit.panels.get_mut(s))
-        });
-    let perm: Vec<usize> = (0..n).map(|e| unsafe { *emit.perm.get(e) }).collect();
-    let d_diag: Vec<T> = (0..n).map(|e| unsafe { *emit.d_diag.get(e) }).collect();
-    let d_subdiag: Vec<T> = (0..n).map(|e| unsafe { *emit.d_subdiag.get(e) }).collect();
-    let two_by_two: Vec<bool> = (0..n).map(|e| unsafe { *emit.two_by_two.get(e) }).collect();
+    let LlEmitLdlt {
+        arena,
+        panels,
+        perm,
+        d_diag,
+        d_subdiag,
+        two_by_two,
+        inertia_pos,
+        inertia_neg,
+        inertia_zero,
+        ..
+    } = emit;
+    let (factor, n_zeros) = arena.finish(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
+        std::mem::take(panels.get_mut(s))
+    });
+    let perm: Vec<usize> = (0..n).map(|e| unsafe { *perm.get(e) }).collect();
+    let d_diag: Vec<T> = (0..n).map(|e| unsafe { *d_diag.get(e) }).collect();
+    let d_subdiag: Vec<T> = (0..n).map(|e| unsafe { *d_subdiag.get(e) }).collect();
+    let two_by_two: Vec<bool> = (0..n).map(|e| unsafe { *two_by_two.get(e) }).collect();
     let inertia = Inertia::new(
-        emit.inertia_pos.load(Ordering::Relaxed),
-        emit.inertia_neg.load(Ordering::Relaxed),
-        emit.inertia_zero.load(Ordering::Relaxed),
+        inertia_pos.load(Ordering::Relaxed),
+        inertia_neg.load(Ordering::Relaxed),
+        inertia_zero.load(Ordering::Relaxed),
     );
 
     Ok(LdltNumeric {

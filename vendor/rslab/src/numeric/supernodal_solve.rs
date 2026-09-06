@@ -78,7 +78,8 @@ pub(crate) struct SolvePlan<T> {
     /// The panels, one `(w + m) x w` column-major block per supernode with
     /// leading dimension `w + m` (the factor's own storage, see
     /// [`PanelFactor`]).
-    panels: Vec<Vec<T>>,
+    val_ptr: Vec<usize>,
+    vals: Vec<T>,
     /// Reciprocal diagonal per column for a non-unit triangular factor (the
     /// `U^T` of an LU); empty for a unit-diagonal factor.
     diag_inv: Vec<T>,
@@ -167,12 +168,12 @@ impl<T: Scalar> SolvePlan<T> {
                 let (_, w, m) = factor.shape(s);
                 let ld = w + m;
                 for k in 0..w {
-                    d.push(factor.panels[s][k * ld + k].recip());
+                    d.push(factor.panel(s)[k * ld + k].recip());
                 }
             }
             d
         };
-        let panels = factor.panels;
+        let PanelFactor { val_ptr, vals, .. } = factor;
         let known = supernode_parent.len() == ns;
 
         let mut parent = vec![NONE; ns];
@@ -375,7 +376,8 @@ impl<T: Scalar> SolvePlan<T> {
             row_ptr,
             rows,
             ext_slot,
-            panels,
+            val_ptr,
+            vals,
             diag_inv,
             subtrees,
             top_levels,
@@ -386,8 +388,7 @@ impl<T: Scalar> SolvePlan<T> {
 
     /// Bytes of the panel storage (values plus row indices).
     pub fn bytes(&self) -> usize {
-        self.panels.iter().map(|p| p.len()).sum::<usize>() * std::mem::size_of::<T>()
-            + self.rows.len() * 4
+        self.vals.len() * std::mem::size_of::<T>() + self.rows.len() * 4
     }
 
     #[inline]
@@ -397,7 +398,7 @@ impl<T: Scalar> SolvePlan<T> {
         let w = self.sn_col[s + 1] as usize - c0;
         let r0 = self.row_ptr[s];
         let m = self.row_ptr[s + 1] - r0;
-        let panel = self.panels[s].as_slice();
+        let panel = &self.vals[self.val_ptr[s]..self.val_ptr[s + 1]];
         (c0, w, r0, m, w + m, panel)
     }
 

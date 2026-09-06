@@ -34,7 +34,7 @@ use crate::numeric::gemm_tuning::KernelTuning;
 use crate::numeric::multifrontal_ldlt::{
     analyze_with, perturb_pivot, BlrMode, FactorMethod, SolverSettings, ZeroPivotAction,
 };
-use crate::numeric::panel_factor::{assemble_panels, finish_panel, PanelFactor, PanelOut};
+use crate::numeric::panel_factor::{finish_panel, PanelArena, PanelFactor, PanelOut};
 use crate::scalar::{fmadd, Scalar};
 use crate::sparse::general::GeneralCsc;
 use crate::symbolic::SymbolicFactorization;
@@ -1321,14 +1321,12 @@ pub fn factor_general_lu<T: Scalar>(
 /// (`rperm[i]` is the row-structure index physically at panel position `i`;
 /// identity on the trailing rows, only read by the emit).
 struct LuSlot<T> {
-    l: Vec<T>,
     u: Vec<T>,
     rperm: Vec<usize>,
 }
 impl<T> Default for LuSlot<T> {
     fn default() -> Self {
         LuSlot {
-            l: Vec::new(),
             u: Vec::new(),
             rperm: Vec::new(),
         }
@@ -1386,7 +1384,11 @@ struct LlEmit<T> {
     refcount: Vec<AtomicUsize>,
     /// First elimination position of each supernode (symbolic prefix sum of ncol).
     e_offset: Vec<usize>,
-    panels: Cells<(PanelOut<T>, PanelOut<T>)>,
+    /// The factors' buffers: every supernode factors `L` straight into its
+    /// slot of `l_arena`; `U^T` is gathered into `u_arena` at the emit.
+    l_arena: PanelArena<T>,
+    u_arena: PanelArena<T>,
+    panels: Cells<(PanelOut, PanelOut)>,
     /// `e_of_g[g]` = elimination position of COLUMN g; `row_pos_of_g[g]` =
     /// position whose PIVOT ROW is g. Written in-node (disjoint g), read after the
     /// join barrier (and in `emit_and_free`, where the join chain makes consumer
@@ -1401,9 +1403,13 @@ impl<T: Scalar> LlEmit<T> {
     fn new(sym: &SymbolicFactorization, sched: &LlSchedule) -> Self {
         let n = sym.n;
         let (refcount, e_offset) = emit_refcount_offsets(sym, sched);
+        let sizes =
+            || (0..sym.supernodes.len()).map(|s| sched.rows(s).len() * sym.supernodes[s].ncol);
         LlEmit {
             refcount,
             e_offset,
+            l_arena: PanelArena::new(sizes()),
+            u_arena: PanelArena::new(sizes()),
             panels: Cells::new_default(sym.supernodes.len()),
             e_of_g: Cells::new(n, usize::MAX),
             row_pos_of_g: Cells::new(n, usize::MAX),
@@ -1439,10 +1445,9 @@ fn emit_and_free<T: Scalar>(
     let nrow = sched.rows(k).len();
     let cnrow = nrow - ncol;
     // SAFETY: the owner of supernode `k` emits it exactly once, after its last
-    // updater has read the panel (refcount zero); nobody reads it afterwards.
+    // updater has read the slots (refcount zero); nobody reads them afterwards.
     let slot = unsafe { store.take(k) };
-    let (lbuf, ubuf, rperm) = (slot.l, &slot.u, &slot.rperm);
-    debug_assert_eq!(lbuf.len(), nrow * ncol);
+    let (ubuf, rperm) = (&slot.u, &slot.rperm);
     debug_assert_eq!(ubuf.len(), ncol * cnrow);
     let eoff = emit.e_offset[k];
     debug_assert!(
@@ -1450,24 +1455,42 @@ fn emit_and_free<T: Scalar>(
             && (0..ncol).all(|i| unsafe { emit.rg(sched.rows(k)[rperm[i]] as usize) } == eoff + i),
         "the diagonal block is in elimination order"
     );
+    // `U^T`'s panel from the upper triangle of the `L` slot and `ubuf`
+    // (`U`'s `ncol x cnrow` block, column-major), then `L`'s slot in place.
+    {
+        let lbuf: &[T] = unsafe { emit.l_arena.slot(k) };
+        let ut = unsafe { emit.u_arena.slot_mut(k) };
+        debug_assert_eq!(ut.len(), nrow * ncol);
+        for p in 0..ncol {
+            let col = &mut ut[p * nrow..(p + 1) * nrow];
+            for (i, v) in col.iter_mut().enumerate().take(ncol).skip(p) {
+                *v = lbuf[i * nrow + p];
+            }
+            for (t, v) in col[ncol..].iter_mut().enumerate() {
+                *v = ubuf[p + t * ncol];
+            }
+        }
+    }
     let l_rows: Vec<u32> = (ncol..nrow)
         .map(|i| unsafe { emit.rg(sched.rows(k)[rperm[i]] as usize) } as u32)
         .collect();
-    let mut ut = vec![T::zero(); nrow * ncol];
-    for p in 0..ncol {
-        let col = &mut ut[p * nrow..(p + 1) * nrow];
-        for (i, v) in col.iter_mut().enumerate().take(ncol).skip(p) {
-            *v = lbuf[i * nrow + p];
-        }
-        for (t, v) in col[ncol..].iter_mut().enumerate() {
-            *v = ubuf[p + t * ncol];
-        }
-    }
     let u_rows: Vec<u32> = (0..cnrow)
         .map(|t| unsafe { emit.eg(sched.rows(k)[ncol + t] as usize) } as u32)
         .collect();
-    let l_out = finish_panel(lbuf, ncol, l_rows, None, drop_tol);
-    let u_out = finish_panel(ut, ncol, u_rows, None, drop_tol);
+    let l_out = finish_panel(
+        unsafe { emit.l_arena.slot_mut(k) },
+        ncol,
+        l_rows,
+        None,
+        drop_tol,
+    );
+    let u_out = finish_panel(
+        unsafe { emit.u_arena.slot_mut(k) },
+        ncol,
+        u_rows,
+        None,
+        drop_tol,
+    );
     unsafe { emit.panels.set(k, (l_out, u_out)) };
 }
 
@@ -1496,7 +1519,10 @@ fn lu_ll_factor_node<T: Scalar>(
     let cnrow = nrow - ncol;
     let n = sym.n;
     // `lbuf`: nrowxncol (columns of s, full height). `ubuf`: ncolxcnrow (U12).
-    let mut lbuf = vec![T::zero(); nrow * ncol];
+    // SAFETY: this task owns supernode `s`; nobody reads the slot before it
+    // is published by `store.set` at the end of the node.
+    let lbuf: &mut [T] = unsafe { emit.l_arena.slot_mut(s) };
+    debug_assert_eq!(lbuf.len(), nrow * ncol);
     let mut ubuf = vec![T::zero(); ncol * cnrow];
 
     let mut gloc = GLOC_SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
@@ -1581,7 +1607,8 @@ fn lu_ll_factor_node<T: Scalar>(
                     }
                     // SAFETY: `kk` is a factored descendant of `s`.
                     let slot = unsafe { store.get(kk) };
-                    let (lk, uk) = (&slot.l, &slot.u);
+                    let lk: &[T] = unsafe { emit.l_arena.slot(kk) };
+                    let uk = &slot.u;
                     let mrows = nok - p0;
                     lupd.clear();
                     lupd.resize(mrows * npk, T::zero());
@@ -1647,7 +1674,8 @@ fn lu_ll_factor_node<T: Scalar>(
                         }
                         // SAFETY: `kk` is a factored descendant of `s`.
                         let slot = unsafe { store.get(kk) };
-                        let (lk, uk) = (&slot.l, &slot.u);
+                        let lk: &[T] = unsafe { emit.l_arena.slot(kk) };
+                        let uk = &slot.u;
                         uupd.clear();
                         uupd.resize(npk * ntr, T::zero());
                         // SAFETY: lhs/rhs/dst pairwise disjoint; strides in bounds.
@@ -1698,7 +1726,8 @@ fn lu_ll_factor_node<T: Scalar>(
         let nok = ok.len();
         // SAFETY: `kk` is a factored descendant of `s`.
         let slot = unsafe { store.get(kk) };
-        let (lk, uk) = (&slot.l, &slot.u);
+        let lk: &[T] = unsafe { emit.l_arena.slot(kk) };
+        let uk = &slot.u;
         let npk = p1 - p0;
         let mrows = nok - p0; // rows used by the L update (Ok subset sched.rows(s) from here)
         let ntrail = nok - p1;
@@ -1984,11 +2013,11 @@ fn lu_ll_factor_node<T: Scalar>(
             }
         };
         if cnrow * pw * pw >= ll_cdiv_par {
-            let lref: &[T] = &lbuf;
+            let lref: &[T] = lbuf;
             ubuf.par_chunks_mut(ncol).for_each(|col| trsm_u(col, lref));
         } else {
             for t in 0..cnrow {
-                trsm_u(&mut ubuf[t * ncol..t * ncol + ncol], &lbuf);
+                trsm_u(&mut ubuf[t * ncol..t * ncol + ncol], lbuf);
             }
         }
         // GEMM: lbuf[ke.., ke..ncol] -= L21[ke.., kb..ke] * U[kb..ke, ke..ncol].
@@ -2086,16 +2115,7 @@ fn lu_ll_factor_node<T: Scalar>(
         }
     }
     // SAFETY: this thread owns `s`, writes its cells exactly once.
-    unsafe {
-        store.set(
-            s,
-            LuSlot {
-                l: lbuf,
-                u: ubuf,
-                rperm,
-            },
-        )
-    };
+    unsafe { store.set(s, LuSlot { u: ubuf, rperm }) };
     Ok(())
 }
 
@@ -2154,11 +2174,17 @@ fn factor_lu_left_looking<T: Scalar>(
     let n_perturbed = n_perturbed_atomic.load(Ordering::Relaxed);
     let kept: Vec<bool> = sym.supernodes.iter().map(|sn| sn.ncol > 0).collect();
     let supernode_parent = crate::symbolic::supernode_parents(&sym.supernodes, &kept);
-    let (l, zeros_l) = assemble_panels(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
-        std::mem::take(&mut emit.panels.get_mut(s).0)
+    let LlEmit {
+        l_arena,
+        u_arena,
+        panels,
+        ..
+    } = emit;
+    let (l, zeros_l) = l_arena.finish(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
+        std::mem::take(&mut panels.get_mut(s).0)
     });
-    let (ut, zeros_u) = assemble_panels(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
-        std::mem::take(&mut emit.panels.get_mut(s).1)
+    let (ut, zeros_u) = u_arena.finish(n, sym.supernodes.iter().map(|sn| sn.ncol), |s| unsafe {
+        std::mem::take(&mut panels.get_mut(s).1)
     });
     let perm: Vec<usize> = (0..n).map(|e| unsafe { *emit.perm.get(e) }).collect();
     let perm_row: Vec<usize> = (0..n).map(|e| unsafe { *emit.perm_row.get(e) }).collect();
@@ -2443,7 +2469,14 @@ pub fn factor_general_lu_numeric<T: Scalar>(
         .iter()
         .map(|n| n.as_ref().map_or(0, |nd| nd.front.nelim))
         .collect();
-    let mut emit_panels = |s: usize| -> Result<(PanelOut<T>, PanelOut<T>), RslabError> {
+    let sizes = || {
+        node_results
+            .iter()
+            .map(|n| n.as_ref().map_or(0, |nd| nd.front.nrow * nd.front.nelim))
+    };
+    let l_arena = PanelArena::<T>::new(sizes());
+    let u_arena = PanelArena::<T>::new(sizes());
+    let mut emit_panels = |s: usize| -> Result<(PanelOut, PanelOut), RslabError> {
         let node = node_results[s].as_mut().ok_or_else(|| {
             RslabError::InvalidInput("internal: unfactored supernode".to_string())
         })?;
@@ -2455,13 +2488,16 @@ pub fn factor_general_lu_numeric<T: Scalar>(
                 && (0..w).all(|i| row_pos_of_g[node.row_indices[ff.rperm[i]]] == diag_e + i),
             "the diagonal block is in elimination order"
         );
-        let mut l = std::mem::take(&mut ff.l);
-        l.truncate(nr * w);
+        // SAFETY: the sequential emit owns every slot.
+        let l = unsafe { l_arena.slot_mut(s) };
+        l.copy_from_slice(&ff.l[..nr * w]);
+        ff.l = Vec::new();
         let l_rows: Vec<u32> = (w..nr)
             .map(|i| row_pos_of_g[node.row_indices[ff.rperm[i]]] as u32)
             .collect();
-        let mut ut = std::mem::take(&mut ff.u);
-        ut.truncate(nr * w);
+        let ut = unsafe { u_arena.slot_mut(s) };
+        ut.copy_from_slice(&ff.u[..nr * w]);
+        ff.u = Vec::new();
         let u_rows: Vec<u32> = (w..nr)
             .map(|i| col_pos_of_g[node.row_indices[i]] as u32)
             .collect();
@@ -2470,7 +2506,7 @@ pub fn factor_general_lu_numeric<T: Scalar>(
             finish_panel(ut, w, u_rows, None, opts.drop_tol),
         ))
     };
-    let mut outs: Vec<(PanelOut<T>, PanelOut<T>)> = Vec::with_capacity(ncols.len());
+    let mut outs: Vec<(PanelOut, PanelOut)> = Vec::with_capacity(ncols.len());
     for (s, &w) in ncols.iter().enumerate() {
         outs.push(if w > 0 {
             emit_panels(s)?
@@ -2478,10 +2514,9 @@ pub fn factor_general_lu_numeric<T: Scalar>(
             Default::default()
         });
     }
-    let (l, zeros_l) =
-        assemble_panels(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s].0));
+    let (l, zeros_l) = l_arena.finish(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s].0));
     let (ut, zeros_u) =
-        assemble_panels(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s].1));
+        u_arena.finish(n, ncols.iter().copied(), |s| std::mem::take(&mut outs[s].1));
 
     let mut fac = LuNumeric {
         l,

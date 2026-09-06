@@ -121,6 +121,7 @@ impl SparseSolver for RslabSolver {
         vals: &[C64],
     ) -> Result<(), String> {
         let a = self.build_matrix(n, rows, cols, vals)?;
+        dump_matrix(&a);
         let (mut sym, mut settings) = LdltSolver::<C64>::tuned(&a)
             .map_err(|e| format!("rslab analyze/tune: {e:?}"))?;
         // Escape hatches over the heuristic pick (rslab >= 0.19: deterministic
@@ -322,5 +323,33 @@ mod tests {
                 .map(|(a, c)| (a - c).norm_sqr()).sum::<f64>().sqrt();
             assert!(diff < 1e-12, "batched ≠ sequential, diff {diff}");
         }
+    }
+}
+
+/// `RAPIDFEM_DUMP_MATRIX=<dir>`: write the first assembled system matrix of
+/// the process as Matrix Market (`<dir>/rapidfem_<n>.mtx`, complex symmetric
+/// coordinate, lower triangle) for solver benchmarks on real FEM matrices.
+fn dump_matrix(a: &CscMatrix<C64>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let Ok(dir) = std::env::var("RAPIDFEM_DUMP_MATRIX") else {
+        return;
+    };
+    if DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let path = std::path::Path::new(&dir).join(format!("rapidfem_{}.mtx", a.n));
+    let mut out = String::new();
+    out.push_str("%%MatrixMarket matrix coordinate complex symmetric\n");
+    out.push_str(&format!("{} {} {}\n", a.n, a.n, a.row_idx.len()));
+    for j in 0..a.n {
+        for k in a.col_ptr[j]..a.col_ptr[j + 1] {
+            let v = a.values[k];
+            out.push_str(&format!("{} {} {:e} {:e}\n", a.row_idx[k] + 1, j + 1, v.re, v.im));
+        }
+    }
+    match std::fs::write(&path, out) {
+        Ok(()) => eprintln!("RAPIDFEM_DUMP_MATRIX: wrote {}", path.display()),
+        Err(e) => eprintln!("RAPIDFEM_DUMP_MATRIX: cannot write {}: {e}", path.display()),
     }
 }

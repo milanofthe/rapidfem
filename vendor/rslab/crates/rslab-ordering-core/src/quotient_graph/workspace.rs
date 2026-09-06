@@ -30,7 +30,7 @@ use crate::{CscPattern, OrderingError};
 pub const NONE: i32 = -1;
 
 /// Sentinel encoding used by the quotient graph: `flip(x) = -2 - x`.
-/// Used to mark absorbed elements (`pe[e] < 0` ⇒ `flip(parent)`) and
+/// Used to mark absorbed elements (`pe[e] < 0` => `flip(parent)`) and
 /// as a tag on `elen` for freshly eliminated zero-degree variables.
 #[inline(always)]
 pub fn flip(x: i32) -> i32 {
@@ -88,7 +88,7 @@ pub struct Workspace {
     ///
     /// `i64` (not `i32`): the un-quantized surface contribution has
     /// both factors `O(n)`, so it reaches ~`n^2` and overflows `i32`
-    /// for `n` ≳ 46k before being consumed as `f64` in the RMF score
+    /// for `n` >~ 46k before being consumed as `f64` in the RMF score
     /// (O1, `dev/research/repo-review-2026-06-09.md`). HAMF4 computes
     /// the RMF in DBLE for the same reason. The post-quantization RMF
     /// score stored here later is bounded by `i32::MAX - 1`.
@@ -144,14 +144,14 @@ impl Workspace {
     /// makes this byte-equivalent to [`Workspace::new`].
     ///
     /// `n_buckets` must be at least `n` so the init insertion at
-    /// `head[deg]` (with `deg ≤ dense ≤ n`) is in range.
+    /// `head[deg]` (with `deg <= dense <= n`) is in range.
     pub fn new_with_n_buckets(
         pattern: &CscPattern<'_>,
         opts: &WorkspaceOptions,
         n_buckets: usize,
     ) -> Result<Workspace, OrderingError> {
         let n = pattern.n;
-        debug_assert!(n_buckets >= n, "n_buckets must cover deg ∈ [0, n)");
+        debug_assert!(n_buckets >= n, "n_buckets must cover deg in [0, n)");
 
         // i32 addressing requires n < i32::MAX. The algorithm also
         // stores `pfree` as i32 via `pe[i]`, so iwlen must fit.
@@ -250,7 +250,7 @@ impl Workspace {
                 nel += 1;
             } else {
                 // LIFO head-insert at head[deg]. The AMF metric's
-                // `bucket(deg, n)` is identity for `deg ≤ n`, so the
+                // `bucket(deg, n)` is identity for `deg <= n`, so the
                 // index `deg` is the right slot for both AMD and AMF
                 // at init time. Seed the AMF fill score so the AMF
                 // path can compute `bucket(wf[i], n)` consistently.

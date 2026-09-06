@@ -1,5 +1,5 @@
 //! Banded and arrow/KKT generators - direct control over fill (bandwidth) and the
-//! symmetric-indefinite saddle-point structure that exercises Bunch-Kaufman 2×2
+//! symmetric-indefinite saddle-point structure that exercises Bunch-Kaufman 2x2
 //! pivoting.
 // Diagonal/triplet loops use the index as a value (push `k`, read `absum[k]`).
 #![allow(clippy::needless_range_loop)]
@@ -11,7 +11,7 @@ use super::Rng;
 
 /// Symmetric **banded** SPD matrix: random off-diagonals within `bandwidth`, with
 /// each diagonal set to its row's absolute off-diagonal sum plus `alpha`. Strict
-/// diagonal dominance ⇒ SPD; `alpha` is the conditioning knob (small ⇒ ill).
+/// diagonal dominance => SPD; `alpha` is the conditioning knob (small => ill).
 pub fn banded<T: Scalar>(n: usize, bandwidth: usize, alpha: f64, seed: u64) -> CscMatrix<T> {
     let mut rng = Rng::new(seed);
     let bw = bandwidth.max(1);
@@ -40,9 +40,9 @@ pub fn banded<T: Scalar>(n: usize, bandwidth: usize, alpha: f64, seed: u64) -> C
 }
 
 /// **Arrow / bordered KKT** saddle-point matrix (symmetric **indefinite**):
-/// `[[A11, Bᵀ], [B, −C]]` with a tridiagonal SPD interior `A11` of size
-/// `n − border`, a dense coupling `B` (the `border` arrow rows), and a small
-/// negative `(2,2)` block - so the system is genuinely indefinite and drives 2×2
+/// `[[A11, B^T], [B, -C]]` with a tridiagonal SPD interior `A11` of size
+/// `n - border`, a dense coupling `B` (the `border` arrow rows), and a small
+/// negative `(2,2)` block - so the system is genuinely indefinite and drives 2x2
 /// pivots. `border` sets the (dense) border width; `gamma` the `(2,2)` regulariser.
 pub fn arrow<T: Scalar>(n: usize, border: usize, gamma: f64, seed: u64) -> CscMatrix<T> {
     let mut rng = Rng::new(seed);
@@ -51,7 +51,7 @@ pub fn arrow<T: Scalar>(n: usize, border: usize, gamma: f64, seed: u64) -> CscMa
     let mut rows = Vec::new();
     let mut cols = Vec::new();
     let mut vals = Vec::new();
-    // A11: tridiagonal SPD (diag 2, sub −1) on indices [0, m).
+    // A11: tridiagonal SPD (diag 2, sub -1) on indices [0, m).
     for j in 0..m {
         rows.push(j);
         cols.push(j);
@@ -62,8 +62,8 @@ pub fn arrow<T: Scalar>(n: usize, border: usize, gamma: f64, seed: u64) -> CscMa
             vals.push(T::from_real(-1.0));
         }
     }
-    // B: dense coupling, border rows [m, n) × interior cols [0, m) (lower triangle,
-    // since row ≥ m > col).
+    // B: dense coupling, border rows [m, n) x interior cols [0, m) (lower triangle,
+    // since row >= m > col).
     for j in 0..m {
         for r in m..n {
             rows.push(r);
@@ -71,7 +71,7 @@ pub fn arrow<T: Scalar>(n: usize, border: usize, gamma: f64, seed: u64) -> CscMa
             vals.push(T::from_real(rng.range(-1.0, 1.0)));
         }
     }
-    // −C: negative diagonal on the border block ⇒ indefinite saddle.
+    // -C: negative diagonal on the border block => indefinite saddle.
     for r in m..n {
         rows.push(r);
         cols.push(r);
@@ -89,7 +89,7 @@ mod tests {
     fn banded_is_diagonally_dominant_spd() {
         let a = banded::<f64>(50, 3, 0.5, 1);
         assert_eq!(a.n, 50);
-        // Each diagonal ≥ its row's off-diagonal abs-sum (strict dominance).
+        // Each diagonal >= its row's off-diagonal abs-sum (strict dominance).
         for j in 0..a.n {
             let diag = a.values[a.col_ptr[j]..a.col_ptr[j + 1]]
                 .iter()
@@ -105,7 +105,7 @@ mod tests {
     fn arrow_has_negative_border_and_is_indefinite_shaped() {
         let a = arrow::<f64>(20, 4, 0.01, 1);
         assert_eq!(a.n, 20);
-        // The last `border` diagonals are negative (the −C block).
+        // The last `border` diagonals are negative (the -C block).
         for r in 16..20 {
             let diag = a.values[a.col_ptr[r]..a.col_ptr[r + 1]]
                 .iter()
@@ -113,7 +113,7 @@ mod tests {
                 .find(|(_, &rr)| rr == r)
                 .map(|(&v, _)| v)
                 .unwrap();
-            assert!(diag < 0.0, "border (2,2) block is negative ⇒ indefinite");
+            assert!(diag < 0.0, "border (2,2) block is negative => indefinite");
         }
     }
 }

@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_negative_col_ptr_tail() {
-        // col_ptr.last() is negative → nnz would be invalid.
+        // col_ptr.last() is negative -> nnz would be invalid.
         let cp = [0i32, -1];
         let ri: [i32; 0] = [];
         assert!(CscPattern::new(1, &cp, &ri).is_none());

@@ -1,6 +1,13 @@
 /// Errors returned by RSLAB's public API.
 #[derive(Debug)]
 pub enum RslabError {
+    /// The caller's interrupt flag was observed set during the numeric
+    /// factorization, which stopped at the next supernode or dense-panel
+    /// boundary. The factors are invalid exactly as after any failed factor;
+    /// clearing the flag and factoring again re-runs cleanly. No partial result
+    /// is promised, and the symbolic analysis is not interruptible.
+    Interrupted,
+
     /// The matrix is numerically rank-deficient: a pivot was exactly or
     /// near-zero and `ZeroPivotAction::Fail` was specified. The factorization
     /// is incomplete.
@@ -45,6 +52,9 @@ pub enum RslabError {
 impl std::fmt::Display for RslabError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RslabError::Interrupted => {
+                write!(f, "factorization interrupted by the caller's flag")
+            }
             RslabError::NumericallyRankDeficient => {
                 write!(f, "matrix is numerically rank-deficient")
             }

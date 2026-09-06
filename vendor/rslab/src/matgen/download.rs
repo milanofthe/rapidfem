@@ -7,7 +7,7 @@
 //! `ureq` + `rustls` (no OpenSSL), `flate2`/`miniz_oxide`, `tar`.
 //!
 //! Parse the returned file with the crate's Matrix Market readers
-//! ([`crate::read_mtx`], [`crate::read_mtx_complex`], …).
+//! ([`crate::read_mtx`], [`crate::read_mtx_complex`], ...).
 
 use std::path::PathBuf;
 
@@ -83,7 +83,7 @@ mod tests {
 /// "real matrices" sweep. `(group, name, note)`.
 pub fn suggested() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
-        ("HB", "bcsstk14", "SPD structural, small, moderate κ"),
+        ("HB", "bcsstk14", "SPD structural, small, moderate kappa"),
         ("HB", "bcsstk18", "SPD structural, medium, ill-conditioned"),
         ("Boeing", "bcsstk39", "SPD structural, larger"),
         ("FIDAP", "ex11", "unsymmetric CFD, medium"),

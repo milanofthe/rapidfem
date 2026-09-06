@@ -3,7 +3,7 @@
 //!
 //! Given a sparse symmetric matrix (lower triangle only in the
 //! input CSC), this module produces a symmetric scaling vector
-//! `s` such that `D · A · D` (with `D = diag(s)`) has
+//! `s` such that `D * A * D` (with `D = diag(s)`) has
 //! magnitude-bounded off-diagonals and unit-scale diagonals.
 //!
 //! Algorithm (mirrors `ref/spral/src/scaling.f90::hungarian_wrapper`,
@@ -11,7 +11,7 @@
 //!
 //!   1. Expand the lower-triangle CSC to a full symmetric pattern,
 //!      carrying the original values with the transpose entries.
-//!   2. Drop explicit zero entries (log of zero is -∞).
+//!   2. Drop explicit zero entries (log of zero is -inf).
 //!   3. Compute `c[k] = log |a[k]|` on the remaining entries.
 //!   4. For each column j, compute `cmax[j] = max_k c[k]` and replace
 //!      each `c[k]` by `cmax[j] - c[k]`. The cost graph is now
@@ -32,7 +32,7 @@
 //! The partial-singular path deviates from SPRAL, which runs a
 //! second Hungarian pass on the full-rank submatrix and then
 //! applies a Duff-Pralet correction (scaling.f90:688-800). The
-//! research note `dev/research/mc64-scaling.md` §"Structurally
+//! research note `dev/research/mc64-scaling.md` section "Structurally
 //! singular matrices" specifies identity fallback for unmatched
 //! rows/columns as the correct behavior for rslab, because KKT
 //! matrices from IPOPT are occasionally structurally rank-deficient
@@ -45,7 +45,7 @@ use crate::error::RslabError;
 use crate::sparse::csc::CscMatrix;
 
 /// Upper bound on the argument to `exp` before overflow.
-/// `ln(f64::MAX) ≈ 709.78`. We use 709.0 as a safe ceiling.
+/// `ln(f64::MAX) ~ 709.78`. We use 709.0 as a safe ceiling.
 const LOG_HUGE: f64 = 709.0;
 
 /// Cached MC64 output: the full Hungarian matching plus the
@@ -96,6 +96,95 @@ pub(crate) fn compute_matching(matrix: &CscMatrix) -> Result<Mc64Cache, RslabErr
         cmax,
         n_matched,
     })
+}
+
+/// MC64 on a general (unsymmetric) matrix: the maximum-product matching of
+/// rows to columns plus the row and column duals, for the LU path's
+/// row permutation and two-sided scaling (SPRAL `hungarian_scale_unsym`).
+pub(crate) fn compute_matching_general<T: crate::scalar::Scalar>(
+    a: &crate::sparse::general::GeneralCsc<T>,
+) -> Result<Mc64Cache, RslabError> {
+    let n = a.n;
+    if n == 0 {
+        return Ok(Mc64Cache {
+            perm: Vec::new(),
+            u: Vec::new(),
+            v: Vec::new(),
+            cmax: Vec::new(),
+            n_matched: 0,
+        });
+    }
+    // Cost graph in the column's own structure: `cmax[j] - log|a_ij|`
+    // over the nonzero entries, so every column has a zero-cost minimum.
+    let mut col_ptr = vec![0usize; n + 1];
+    let mut row_idx = Vec::with_capacity(a.row_idx.len());
+    let mut cost = Vec::with_capacity(a.row_idx.len());
+    let mut cmax = vec![f64::NEG_INFINITY; n];
+    for j in 0..n {
+        for k in a.col_ptr[j]..a.col_ptr[j + 1] {
+            let m = a.values[k].magnitude();
+            if m == 0.0 || !m.is_finite() {
+                continue;
+            }
+            let l = m.ln();
+            row_idx.push(a.row_idx[k]);
+            cost.push(l);
+            if l > cmax[j] {
+                cmax[j] = l;
+            }
+        }
+        col_ptr[j + 1] = row_idx.len();
+    }
+    for j in 0..n {
+        if !cmax[j].is_finite() {
+            cmax[j] = 0.0;
+        }
+        for c in &mut cost[col_ptr[j]..col_ptr[j + 1]] {
+            *c = cmax[j] - *c;
+        }
+    }
+    let graph = CostGraph {
+        n,
+        col_ptr,
+        row_idx,
+        cost,
+    };
+    let Matching {
+        perm,
+        u,
+        v,
+        n_matched,
+    } = hungarian_match(&graph);
+    Ok(Mc64Cache {
+        perm,
+        u,
+        v,
+        cmax,
+        n_matched,
+    })
+}
+
+/// Row and column scalings of a general matching: `r[i] = exp(u[i])`,
+/// `c[j] = exp(v[j] - cmax[j])`, so `|r_i a_ij c_j| <= 1` with equality on
+/// the matched entries (SPRAL scaling.f90 unsymmetric unwind). Guarded
+/// against overflow; a non-finite factor is reset to `1.0`.
+pub(crate) fn unsymmetric_scaling(cache: &Mc64Cache) -> (Vec<f64>, Vec<f64>) {
+    let guard = |x: f64| {
+        let s = x.clamp(-LOG_HUGE, LOG_HUGE).exp();
+        if s == 0.0 || !s.is_finite() {
+            1.0
+        } else {
+            s
+        }
+    };
+    let r: Vec<f64> = cache.u.iter().map(|&u| guard(u)).collect();
+    let c: Vec<f64> = cache
+        .v
+        .iter()
+        .zip(&cache.cmax)
+        .map(|(&v, &cm)| guard(v - cm))
+        .collect();
+    (r, c)
 }
 
 pub(crate) fn compute_symmetric(matrix: &CscMatrix) -> Result<(Vec<f64>, ScalingInfo), RslabError> {
@@ -168,11 +257,11 @@ pub(crate) fn scaling_from_cache(cache: &Mc64Cache) -> (Vec<f64>, ScalingInfo) {
         let mut arg = (u[i] + v[i] - cmax[i]) / 2.0;
 
         // Clamp to avoid overflow on `exp`. A dual variable can
-        // grow to ±∞-ish magnitudes on pathological inputs; mature
+        // grow to +/-inf-ish magnitudes on pathological inputs; mature
         // MC64-style implementations (MUMPS, SSIDS) guard against
         // this too. The clamp is symmetric so that a clamped row
         // exponentiates to a very large or very small but finite
-        // value rather than `+∞` or `0`.
+        // value rather than `+inf` or `0`.
         if !arg.is_finite() {
             scaling[i] = 1.0;
             continue;
@@ -379,7 +468,7 @@ mod tests {
     /// `cmax`). The contract requires `s[0] = 1.0` (row 0 unmatched) and
     /// `s[1] = 1.0` (column 1 unmatched). Pre-fix the code only skipped on an
     /// unmatched COLUMN, so index 0 took `exp((0 + v[0] - cmax[0]) / 2)
-    /// = exp((0 + 2 - 1) / 2) = exp(0.5) ≈ 1.6487` - the witness.
+    /// = exp((0 + 2 - 1) / 2) = exp(0.5) ~ 1.6487` - the witness.
     #[test]
     fn unmatched_row_with_matched_column_falls_back_to_identity() {
         let cache = Mc64Cache {
@@ -409,7 +498,7 @@ mod tests {
         );
     }
 
-    /// Empty 0×0 matrix returns an empty scaling vector.
+    /// Empty 0x0 matrix returns an empty scaling vector.
     #[test]
     fn empty_matrix_returns_empty_scaling() {
         let csc = CscMatrix {

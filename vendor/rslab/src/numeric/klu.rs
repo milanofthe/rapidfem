@@ -1,6 +1,6 @@
 //! KLU-style sparse LU: BTF + per-block left-looking Gilbert-Peierls.
 //!
-//! The third direct path next to the multifrontal LDLáµ€ and LU, built for
+//! The third direct path next to the multifrontal LDL^T and LU, built for
 //! circuit-shaped matrices: extremely sparse, unsymmetric, near-triangularizable,
 //! with diagonal blocks far too small for supernodal/BLAS-3 kernels to pay off.
 //! Algorithmic reference: SuiteSparse KLU (Davis & Palamadai Natarajan); this is
@@ -74,13 +74,29 @@ pub struct KluSettings {
     /// does not depend on scheduling or thread count. The default `Auto`
     /// enables it through a deterministic structural gate (no implicit
     /// measuring): at least 4 diagonal blocks, 8000 input nonzeros, and no
-    /// dominant block (largest block at most half of `n`) — real circuits
+    /// dominant block (largest block at most half of `n`) - real circuits
     /// are often one giant irreducible block plus thousands of singletons,
     /// where distributing blocks cannot help.
     /// Cap the pool with [`with_threads`](crate::with_threads) scoping for
     /// solver-in-the-loop use, or force `Off` for strictly sequential
     /// execution.
     pub parallel: KluParallel,
+    /// Maximum-product row matching (MC64) as the transversal of the block
+    /// triangular form: the matched, largest-product entries become the
+    /// diagonal, so the diagonal-preference pivoting rarely has to leave
+    /// it. The structural transversal only guarantees a zero-free
+    /// diagonal; on the ibmpg1 power grid it leaves 14k of 45k columns to
+    /// off-diagonal pivots and the fill at seven times the symbolic
+    /// estimate. Analysis-time (value dependent); a `refactor` keeps the
+    /// matching. Default `true`; needs `btf`.
+    pub matching: bool,
+
+    /// Caller-owned cancellation flag for the numeric phase, read and never
+    /// written, polled at block boundaries and inside the pipelined refactor at
+    /// column boundaries. The flag armed for a factorization is carried into
+    /// the factors, so a later [`refactor`](KluSolver::refactor) on them
+    /// observes the same flag. **Default `None`**.
+    pub interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Parallel per-block execution policy for the KLU path
@@ -105,11 +121,25 @@ impl Default for KluSettings {
             row_scaling: true,
             btf: true,
             parallel: KluParallel::Auto,
+            matching: true,
+            interrupt: None,
         }
     }
 }
 
 impl KluSettings {
+    /// Builder: arm the numeric phase with a caller-owned cancellation flag.
+    pub fn with_interrupt(mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.interrupt = Some(flag);
+        self
+    }
+
+    /// Poll the caller's flag; `Ok(())` when unarmed or clear.
+    #[inline]
+    pub(crate) fn interrupted(&self) -> Result<(), RslabError> {
+        interrupt_check(self.interrupt.as_deref())
+    }
+
     /// Composable override of the diagonal-preference threshold
     /// (see [`pivot_tol`](Self::pivot_tol)). `1.0` is plain partial pivoting.
     pub fn with_pivot_tol(mut self, tol: f64) -> Self {
@@ -125,6 +155,13 @@ impl KluSettings {
     }
 
     /// Composable toggle for the BTF permutation (see [`btf`](Self::btf)).
+    /// Enable or disable the MC64 row matching (see
+    /// [`KluSettings::matching`]).
+    pub fn with_matching(mut self, on: bool) -> Self {
+        self.matching = on;
+        self
+    }
+
     pub fn with_btf(mut self, on: bool) -> Self {
         self.btf = on;
         self
@@ -156,7 +193,7 @@ impl KluSettings {
 pub struct KluSymbolic {
     n: usize,
     nnz: usize,
-    /// Pre-pivot row permutation (new-to-old): BTF matching âˆ˜ SCC order âˆ˜
+    /// Pre-pivot row permutation (new-to-old): BTF matching then SCC order then
     /// per-block AMD. Partial pivoting at factor time refines this within
     /// each block.
     pre_row_perm: Vec<usize>,
@@ -220,10 +257,22 @@ impl KluSymbolic {
         // lnz (Gilbert-Ng-Peyton column counts on the ordered symmetrized
         // pattern) and the cheapest matching wins. Different maximum
         // matchings differ by several-x fill on the harmonic-balance class
-        // (onetone/twotone), in matrix-dependent directions — measuring
+        // (onetone/twotone), in matrix-dependent directions - measuring
         // beats guessing. The common MNA case (complete structural
         // diagonal) short-circuits to a single candidate and pays nothing.
-        let (pre_row_perm, col_perm, block_ptr) = if settings.btf {
+        let weighted = if settings.btf && settings.matching {
+            let cache = crate::scaling::mc64::compute_matching_general(a)?;
+            (cache.n_matched == n).then_some(cache.perm)
+        } else {
+            None
+        };
+        let (pre_row_perm, col_perm, block_ptr) = if let Some(m) = weighted {
+            // The weighted matching decides the transversal; the blocks are
+            // its strongly connected components.
+            let form = btf::btf_from_matching(n, &a.col_ptr, &a.row_idx, m);
+            let of = order_blocks(a, form, false)?;
+            (of.pre_row_perm, of.col_perm, of.block_ptr)
+        } else if settings.btf {
             let cands = btf::matching_candidates(n, &a.col_ptr, &a.row_idx)
                 .ok_or(RslabError::StructurallySingular)?;
             let score_it = cands.len() > 1;
@@ -389,7 +438,7 @@ impl KluSymbolic {
     ///
     /// KLU specifics: the fill is exact under diagonal pivoting (threshold
     /// pivoting can shift it slightly); `factor_flops` is the Gilbert-Peierls
-    /// flop count (not the supernodal `nrowÂ²Â·ncol` proxy); the path is
+    /// flop count (not the supernodal `nrow^2*ncol` proxy); the path is
     /// strictly sequential, so `critical_path_flops == factor_flops` and
     /// `max_tree_width == 1`; there are no dense panels.
     pub fn estimate_memory<T: Scalar>(&self) -> crate::diagnostics::MemoryEstimate {
@@ -462,8 +511,22 @@ impl KluSymbolic {
         let entry = (std::mem::size_of::<T>() + std::mem::size_of::<Ki>()) as u64;
         let mut diagnostics = crate::diagnostics::Diagnostics {
             threads: 1,
+            n: a.n,
+            nnz_a: a.row_idx.len() as u64,
             factor_nnz: nnz,
             estimate,
+            decisions: crate::diagnostics::Decisions {
+                ordering_requested: "Amd".to_string(),
+                ordering_used: "Amd".to_string(),
+                scaling: if settings.row_scaling {
+                    "RowMaxAbs".to_string()
+                } else {
+                    "Identity".to_string()
+                },
+                method: "Klu".to_string(),
+                btf_blocks: if settings.btf { self.n_blocks() } else { 0 },
+                ..Default::default()
+            },
             ..Default::default()
         };
         diagnostics.push(
@@ -472,9 +535,13 @@ impl KluSymbolic {
             diagnostics_flops(&diagnostics),
             nnz * entry,
         );
+        if crate::logging::enabled(crate::logging::LogLevel::Info) {
+            crate::logging::info(&format!("klu factor: {}", diagnostics.summary()));
+        }
         Ok(KluSolver {
             factors,
             diagnostics,
+            solves: Default::default(),
         })
     }
 }
@@ -493,7 +560,7 @@ fn diagnostics_flops(d: &crate::diagnostics::Diagnostics) -> u64 {
 ///    gains 2.7x). The floor is overhead physics; no setting bypasses it.
 /// 2. **Concurrency ratio** ([`KLU_PAR_MIN_RATIO`]): parallelism engages only
 ///    where the structure offers at least this much simultaneous work.
-///    Across BTF blocks that is the exact Amdahl bound `Σ work / max block
+///    Across BTF blocks that is the exact Amdahl bound `sum work / max block
 ///    work`; inside a block it is the mean level width of the frozen
 ///    elimination DAG - the average number of simultaneously replayable
 ///    columns. (A chain-work critical-path bound would be the "exact" ratio
@@ -503,7 +570,7 @@ const KLU_PAR_MIN_WORK: u64 = 50_000_000;
 const KLU_PAR_MIN_RATIO: f64 = 2.0;
 
 /// The replay-parallelism plan, computed once at factor time from the
-/// pivot-final pattern: per-block replay work `W_b = Σ_j Σ_{p in U(:,j)}
+/// pivot-final pattern: per-block replay work `W_b = sum_j sum_{p in U(:,j)}
 /// |L(:,p)|` and elimination-DAG level structure.
 ///
 /// A block is **pipelined** (NICSLU pipeline mode, Chen/Wang/Yang TCAD 2013)
@@ -555,6 +622,8 @@ fn compute_replay_plan(
 /// off-block entries, with row scaling folded in.
 #[derive(Debug, Clone)]
 struct KluFactors<T> {
+    /// The flag armed for the factorization, carried so `refactor` polls it too.
+    interrupt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     n: usize,
     nnz_a: usize,
     block_ptr: Vec<usize>,
@@ -609,6 +678,8 @@ struct KluFactors<T> {
 pub struct KluSolver<T> {
     factors: KluFactors<T>,
     diagnostics: crate::diagnostics::Diagnostics,
+    /// Solve-phase accumulators (every `solve*` call records into them).
+    solves: crate::diagnostics::SolveCounter,
 }
 
 fn pattern_mismatch() -> RslabError {
@@ -616,6 +687,17 @@ fn pattern_mismatch() -> RslabError {
         "klu: matrix pattern does not match the symbolic analysis / stored factorization"
             .to_string(),
     )
+}
+
+/// Poll a caller-owned cancellation flag. One `Option` branch when unarmed.
+#[inline]
+pub(crate) fn interrupt_check(
+    flag: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), RslabError> {
+    match flag {
+        Some(f) if f.load(std::sync::atomic::Ordering::Relaxed) => Err(RslabError::Interrupted),
+        _ => Ok(()),
+    }
 }
 
 /// Row-max scaling reciprocals (1 for empty rows / scaling off).
@@ -650,12 +732,12 @@ struct OrderedForm {
     score: u64,
 }
 
-/// Per-block AMD on the symmetrized block pattern (B + Bᵀ, with diagonal,
+/// Per-block AMD on the symmetrized block pattern (B + B^T, with diagonal,
 /// matching what the multifrontal paths feed rslab-amd), applied
 /// symmetrically to the form's permutations. Blocks of size <= 2 have
 /// nothing to reorder. With `score_it`, additionally accumulates the exact
 /// Cholesky lnz of each AMD-ordered block pattern (Gilbert-Ng-Peyton column
-/// counts, near-linear) as the bakeoff score — the trivial blocks are
+/// counts, near-linear) as the bakeoff score - the trivial blocks are
 /// identical across candidates and are skipped consistently.
 fn order_blocks<T: Scalar>(
     a: &GeneralCsc<T>,
@@ -683,18 +765,18 @@ fn order_blocks<T: Scalar>(
         if bn <= 2 {
             continue;
         }
-        // Symmetrized block adjacency (B + Bᵀ + diagonal), canonical form
+        // Symmetrized block adjacency (B + B^T + diagonal), canonical form
         // (sorted, deduplicated columns). Built as: the off-diagonal
         // in-block entries B column by column (sequential writes, one random
         // `pinv0` read per entry), a per-column sort of B's short columns,
-        // Bᵀ by counting transpose (whose columns come out sorted for
+        // B^T by counting transpose (whose columns come out sorted for
         // free), then a linear three-way sorted merge per column. One
         // random counting/scatter pass over the entries instead of the two
-        // of the old both-directions scatter — the random writes, not the
+        // of the old both-directions scatter - the random writes, not the
         // short-column sorts, dominate this stage.
         // 1) B: off-diagonal in-block entries, block-local coordinates.
         // Single pass over the matrix (the random `pinv0` reads are this
-        // stage's bottleneck — no separate counting pass), sequential
+        // stage's bottleneck - no separate counting pass), sequential
         // pushes, then a short per-column sort.
         let cap: usize = (bs..be)
             .map(|j| {
@@ -718,7 +800,7 @@ fn order_blocks<T: Scalar>(
             bcol.push(bri.len());
         }
         let m = bcol[bn];
-        // 2) Bᵀ via counting transpose; columns arrive sorted because the
+        // 2) B^T via counting transpose; columns arrive sorted because the
         // source columns are visited in ascending order.
         let mut tcol = vec![0usize; bn + 1];
         for &li in &bri {
@@ -737,7 +819,7 @@ fn order_blocks<T: Scalar>(
                 }
             }
         }
-        // 3) Per-column sorted merge of B, Bᵀ, and the diagonal, deduped.
+        // 3) Per-column sorted merge of B, B^T, and the diagonal, deduped.
         let mut colptr_i32 = Vec::with_capacity(bn + 1);
         let mut rowidx_i32 = Vec::with_capacity(2 * m + bn);
         colptr_i32.push(0i32);
@@ -1322,7 +1404,7 @@ fn factor_impl<T: Scalar>(
 
     // Numeric output buffers, filled either incrementally block-by-block
     // (sequential: one reused scratch + one reused block buffer, no
-    // per-block allocations and no separate splice pass — the allocator and
+    // per-block allocations and no separate splice pass - the allocator and
     // the extra copy dominated on the tens-of-thousands-of-tiny-blocks
     // circuit class) or by the two-phase parallel splice below.
     let mut l_colptr: Vec<usize> = Vec::with_capacity(n + 1);
@@ -1356,6 +1438,7 @@ fn factor_impl<T: Scalar>(
         let mut scratch = KluScratch::<T>::new(max_bn);
         let mut out = BlockOut::<T>::default();
         for b in 0..nblocks {
+            settings.interrupted()?;
             let bs = sym.block_ptr[b];
             let be = sym.block_ptr[b + 1];
             factor_block(
@@ -1399,6 +1482,7 @@ fn factor_impl<T: Scalar>(
             .map_init(
                 || KluScratch::<T>::new(max_bn),
                 |scratch, b| {
+                    settings.interrupted()?;
                     let mut out = BlockOut::<T>::default();
                     factor_block(
                         sym,
@@ -1542,6 +1626,7 @@ fn factor_impl<T: Scalar>(
     };
 
     Ok(KluFactors {
+        interrupt: settings.interrupt.clone(),
         n,
         nnz_a: sym.nnz,
         block_ptr: sym.block_ptr.clone(),
@@ -1574,20 +1659,34 @@ impl<T: Scalar> KluSolver<T> {
     /// like [`LuSolver::factor`](crate::LuSolver::factor); use the phased
     /// [`KluSymbolic::factor`] for populated diagnostics.
     pub fn factor(a: &GeneralCsc<T>, settings: &KluSettings) -> Result<Self, RslabError> {
-        let sym = KluSymbolic::analyze_with(a, settings)?;
-        let factors = factor_impl(&sym, a, settings)?;
-        Ok(Self {
-            factors,
-            diagnostics: crate::diagnostics::Diagnostics::default(),
-        })
+        // Through the symbolic object, so the diagnostics are filled the same
+        // way as on the analyze-once path (the former direct call returned
+        // an empty `Diagnostics`).
+        KluSymbolic::analyze_with(a, settings)?.factor(a, settings)
     }
 
     /// Per-call diagnostics: measured factor/refactor stages, fill, and the
     /// a-priori [`MemoryEstimate`](crate::diagnostics::MemoryEstimate).
     /// Populated by the phased [`KluSymbolic::factor`]; empty for the
     /// one-shot [`factor`](Self::factor).
-    pub fn diagnostics(&self) -> &crate::diagnostics::Diagnostics {
-        &self.diagnostics
+    /// Everything this factorization can tell about itself (see
+    /// [`Diagnostics`](crate::Diagnostics)), the solve-phase accumulators
+    /// included. A snapshot.
+    pub fn diagnostics(&self) -> crate::diagnostics::Diagnostics {
+        let mut d = self.diagnostics.clone();
+        d.solves = self.solves.snapshot();
+        d
+    }
+
+    fn record_solve(&self, rhs: usize, t: crate::clock::Instant, refine_steps: usize) {
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        self.solves.record(rhs, ms, refine_steps);
+        if crate::logging::enabled(crate::logging::LogLevel::Debug) {
+            crate::logging::debug(&format!(
+                "klu solve: n={} rhs={rhs} refine_steps={refine_steps} {ms:.3} ms",
+                self.factors.n
+            ));
+        }
     }
 
     /// Thread policy the solve phase should honour: the KLU path is strictly
@@ -1624,6 +1723,13 @@ impl<T: Scalar> KluSolver<T> {
 
     /// Solve `A x = b`.
     pub fn solve(&self, b: &[T]) -> Result<Vec<T>, RslabError> {
+        let t = crate::clock::Instant::now();
+        let x = self.solve_inner(b)?;
+        self.record_solve(1, t, 0);
+        Ok(x)
+    }
+
+    fn solve_inner(&self, b: &[T]) -> Result<Vec<T>, RslabError> {
         let f = &self.factors;
         if b.len() != f.n {
             return Err(RslabError::DimensionMismatch {
@@ -1643,18 +1749,18 @@ impl<T: Scalar> KluSolver<T> {
         Ok(xout)
     }
 
-    /// Solve the transposed system `Aáµ€ x = b` with the **same** factorization.
+    /// Solve the transposed system `A^T x = b` with the **same** factorization.
     ///
     /// This is the plain transpose, NOT the conjugate transpose: for a complex
-    /// adjoint solve `Aá´´ x = b`, conjugate `b` before and `x` after. (This
+    /// adjoint solve `A^H x = b`, conjugate `b` before and `x` after. (This
     /// matches the convention of the usual sparse-LU transpose solves, and is
     /// what implicit-function adjoints over holomorphic residuals need.)
     ///
-    /// The stored form is `A = Rs Â· P_ráµ€ Â· M Â· C` with `M` the block-upper
+    /// The stored form is `A = Rs * P_r^T * M * C` with `M` the block-upper
     /// (BTF) permuted, row-scaled matrix and `M_bb = L_b U_b` per diagonal
-    /// block, so `Aáµ€ x = b` is `Máµ€ (P_r Rs x) = C b`: gather `b` through the
+    /// block, so `A^T x = b` is `M^T (P_r Rs x) = C b`: gather `b` through the
     /// column permutation, run the transposed block substitution (blocks
-    /// forward, per block `Uáµ€` forward then `Láµ€` backward, off-block `Fáµ€`
+    /// forward, per block `U^T` forward then `L^T` backward, off-block `F^T`
     /// contributions from the already-solved earlier blocks), then scatter
     /// through the row permutation and undo the row scaling. Sequential and
     /// bit-deterministic, like [`solve`](Self::solve).
@@ -1666,13 +1772,13 @@ impl<T: Scalar> KluSolver<T> {
                 got: b.len(),
             });
         }
-        // w = CÂ·b: position k of the permuted system reads b at its column.
+        // w = C*b: position k of the permuted system reads b at its column.
         let mut w = vec![T::zero(); f.n];
         for (k, &c) in f.col_perm.iter().enumerate() {
             w[k] = b[c];
         }
         self.solve_permuted_transpose(&mut w);
-        // x = Rsâ»Â¹ Â· P_ráµ€ Â· w: scatter through the row permutation, then undo
+        // x = Rs^-1 * P_r^T * w: scatter through the row permutation, then undo
         // the row scaling (Rs is diagonal, so it transposes onto the solution).
         let mut xout = vec![T::zero(); f.n];
         for (k, &orig) in f.row_perm.iter().enumerate() {
@@ -1681,10 +1787,10 @@ impl<T: Scalar> KluSolver<T> {
         Ok(xout)
     }
 
-    /// The transposed block substitution on the permuted vector: `Máµ€` is block
+    /// The transposed block substitution on the permuted vector: `M^T` is block
     /// **lower** triangular (the transpose of the BTF block-upper `M`), so the
-    /// blocks run forward, and within a block `M_bbáµ€ = U_báµ€ L_báµ€` solves as
-    /// `Uáµ€` (lower, diagonal `udiag`) forward then `Láµ€` (unit upper) backward.
+    /// blocks run forward, and within a block `M_bb^T = U_b^T L_b^T` solves as
+    /// `U^T` (lower, diagonal `udiag`) forward then `L^T` (unit upper) backward.
     /// Column `j` of the stored `U`/`L`/`F` is row `j` of the transpose, so
     /// every inner loop is a gather over the existing column storage.
     fn solve_permuted_transpose(&self, w: &mut [T]) {
@@ -1696,7 +1802,7 @@ impl<T: Scalar> KluSolver<T> {
         let f = &self.factors;
         for b in 0..f.block_ptr.len() - 1 {
             let (bs, be) = (f.block_ptr[b], f.block_ptr[b + 1]);
-            // Fáµ€: this block's rows read the already-solved earlier blocks.
+            // F^T: this block's rows read the already-solved earlier blocks.
             for j in bs..be {
                 let mut acc = w[j];
                 for k in f.f_colptr[j]..f.f_colptr[j + 1] {
@@ -1704,7 +1810,7 @@ impl<T: Scalar> KluSolver<T> {
                 }
                 w[j] = acc;
             }
-            // Uáµ€ (lower triangular, diagonal `udiag`) forward within the block.
+            // U^T (lower triangular, diagonal `udiag`) forward within the block.
             for j in bs..be {
                 let mut acc = w[j];
                 for k in f.u_colptr[j]..f.u_colptr[j + 1] {
@@ -1712,7 +1818,7 @@ impl<T: Scalar> KluSolver<T> {
                 }
                 w[j] = acc / f.udiag[j];
             }
-            // Láµ€ (unit upper) backward within the block.
+            // L^T (unit upper) backward within the block.
             for j in (bs..be).rev() {
                 let mut acc = w[j];
                 for k in f.l_colptr[j]..f.l_colptr[j + 1] {
@@ -1734,6 +1840,13 @@ impl<T: Scalar> KluSolver<T> {
     /// [`solve`](Self::solve), so the result is bit-identical to `nrhs`
     /// single solves.
     pub fn solve_many(&self, b: &[T], nrhs: usize) -> Result<Vec<T>, RslabError> {
+        let t = crate::clock::Instant::now();
+        let x = self.solve_many_inner(b, nrhs)?;
+        self.record_solve(nrhs, t, 0);
+        Ok(x)
+    }
+
+    fn solve_many_inner(&self, b: &[T], nrhs: usize) -> Result<Vec<T>, RslabError> {
         let f = &self.factors;
         if nrhs == 0 || b.len() != f.n * nrhs {
             return Err(RslabError::DimensionMismatch {
@@ -1758,7 +1871,7 @@ impl<T: Scalar> KluSolver<T> {
             // L (unit lower) forward within the block. Negating the factor
             // value (loop-invariant here) instead of `xj` keeps each column's
             // FMA product bitwise equal to `solve_permuted`'s
-            // (`(-a)Â·b == aÂ·(-b)` exactly per real FMA).
+            // (`(-a)*b == a*(-b)` exactly per real FMA).
             for j in bs..be {
                 xj.copy_from_slice(&w[j * nrhs..j * nrhs + nrhs]);
                 for k in f.l_colptr[j]..f.l_colptr[j + 1] {
@@ -1817,43 +1930,61 @@ impl<T: Scalar> KluSolver<T> {
         b: &[T],
         max_iter: usize,
     ) -> Result<Vec<T>, RslabError> {
+        Ok(self
+            .solve_refined_with(a, b, &crate::refine::RefinePolicy::steps(max_iter))?
+            .0)
+    }
+
+    /// Iterative refinement under an explicit
+    /// [`RefinePolicy`](crate::refine::RefinePolicy), reporting the achieved
+    /// backward error.
+    pub fn solve_refined_with(
+        &self,
+        a: &GeneralCsc<T>,
+        b: &[T],
+        policy: &crate::refine::RefinePolicy,
+    ) -> Result<(Vec<T>, crate::refine::RefineOutcome), RslabError> {
+        let mut x = self.solve(b)?;
+        let outcome = self.refine_into(a, b, &mut x, policy)?;
+        Ok((x, outcome))
+    }
+
+    /// Refine an existing iterate in place, allocating nothing for the
+    /// solution.
+    pub fn refine_into(
+        &self,
+        a: &GeneralCsc<T>,
+        b: &[T],
+        x: &mut [T],
+        policy: &crate::refine::RefinePolicy,
+    ) -> Result<crate::refine::RefineOutcome, RslabError> {
+        let t = crate::clock::Instant::now();
+        let outcome = self.refine_into_inner(a, b, x, policy)?;
+        self.record_solve(0, t, outcome.steps);
+        Ok(outcome)
+    }
+
+    fn refine_into_inner(
+        &self,
+        a: &GeneralCsc<T>,
+        b: &[T],
+        x: &mut [T],
+        policy: &crate::refine::RefinePolicy,
+    ) -> Result<crate::refine::RefineOutcome, RslabError> {
         let n = self.factors.n;
-        if a.n != n || b.len() != n {
+        if a.n != n || b.len() != n || x.len() != n {
             return Err(RslabError::DimensionMismatch {
                 expected: n,
-                got: b.len(),
+                got: a.n,
             });
         }
-        let mut x = self.solve(b)?;
-        let mut ax = vec![T::zero(); n];
-        let mut best_x = x.clone();
-        let mut best_res = f64::INFINITY;
-        // Every computed correction is evaluated: the final pass only
-        // measures, so no solve is spent on an iterate that could never be
-        // returned.
-        for it in 0..=max_iter {
-            a.matvec(&x, &mut ax);
-            let r: Vec<T> = b.iter().zip(&ax).map(|(&bi, &axi)| bi - axi).collect();
-            let res = r.iter().map(|v| v.magnitude()).fold(0.0, f64::max);
-            if res < best_res {
-                best_res = res;
-                best_x.clone_from(&x);
-            }
-            if res == 0.0 || it == max_iter {
-                break;
-            }
-            let dx = self.solve(&r)?;
-            for (xi, &d) in x.iter_mut().zip(&dx) {
-                *xi = *xi + d;
-            }
-        }
-        Ok(best_x)
+        crate::refine::refine_in_place(a, b, x, policy, |r| self.solve(r))
     }
 
     /// The block forward/backward substitution on the permuted/scaled vector.
     /// The axpys run through `fmadd` with the loop-invariant operand negated
     /// once per column, `solve_many` negates the per-entry factor value
-    /// instead, which is bitwise the same product (`(-a)Â·b == aÂ·(-b)` holds
+    /// instead, which is bitwise the same product (`(-a)*b == a*(-b)` holds
     /// exactly per real FMA), so the two stay bit-identical per column.
     fn solve_permuted(&self, w: &mut [T]) {
         let f = &self.factors;
@@ -1920,6 +2051,10 @@ impl<T: Scalar> KluSolver<T> {
     pub fn refactor(&mut self, a: &GeneralCsc<T>) -> Result<(), RslabError> {
         a.validate()?;
         let t = crate::clock::Instant::now();
+        // Cloned out of the factors so the borrow below stays exclusive; the
+        // flag is read-only for us either way.
+        let int_flag = self.factors.interrupt.clone();
+        let int_flag = int_flag.as_deref();
         let f = &mut self.factors;
         if a.n != f.n {
             return Err(RslabError::DimensionMismatch {
@@ -1963,6 +2098,7 @@ impl<T: Scalar> KluSolver<T> {
             let (mut lv, mut uv) = (f.l_val.as_mut_slice(), f.u_val.as_mut_slice());
             let (mut ud, mut fv) = (f.udiag.as_mut_slice(), f.f_val.as_mut_slice());
             for b in 0..nblocks {
+                interrupt_check(int_flag)?;
                 let (bs, be) = (f.block_ptr[b], f.block_ptr[b + 1]);
                 let (a1, r1) =
                     std::mem::take(&mut lv).split_at_mut(f.l_colptr[be] - f.l_colptr[bs]);
@@ -2121,6 +2257,7 @@ impl<T: Scalar> KluSolver<T> {
                                 let mut x = vec![T::zero(); bn];
                                 let mut jj = bs + w;
                                 while jj < be {
+                                    interrupt_check(int_flag)?;
                                     // SAFETY: worker-owned column; deps are
                                     // fenced by the ready Acquire loads inside
                                     // `replay_col`.
@@ -2222,6 +2359,80 @@ impl<T: Scalar> KluSolver<T> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The MC64 transversal keeps the diagonal-preference pivoting on the
+    /// diagonal: on a row-scrambled, badly scaled grid the numeric fill
+    /// equals the symbolic estimate, while the structural transversal
+    /// pivots off the diagonal and fills.
+    #[test]
+    fn klu_matching_keeps_fill_at_the_symbolic_estimate() {
+        let m = 40usize;
+        let n = m * m;
+        let mut cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for j in 0..n {
+            let (x, y) = (j % m, j / m);
+            let rs = |i: usize| 10f64.powi(((i * 7919) % 13) as i32 - 6);
+            let mut push = |i: usize, v: f64| cols[j].push(((i + 17) % n, v * rs(i)));
+            push(j, 4.0);
+            if x > 0 {
+                push(j - 1, -1.4);
+            }
+            if x + 1 < m {
+                push(j + 1, -0.6);
+            }
+            if y > 0 {
+                push(j - m, -1.0);
+            }
+            if y + 1 < m {
+                push(j + m, -1.0);
+            }
+        }
+        let (mut col_ptr, mut row_idx, mut values) = (vec![0usize], Vec::new(), Vec::new());
+        for c in &mut cols {
+            c.sort_by_key(|e| e.0);
+            for &(r, v) in c.iter() {
+                row_idx.push(r);
+                values.push(v);
+            }
+            col_ptr.push(row_idx.len());
+        }
+        let a = GeneralCsc {
+            n,
+            col_ptr,
+            row_idx,
+            values,
+        };
+        let b: Vec<f64> = (0..n).map(|i| ((i * 31) % 17) as f64 - 8.0).collect();
+        let with = KluSettings::default();
+        let sym = KluSymbolic::analyze_with(&a, &with).unwrap();
+        let s = sym.factor(&a, &with).unwrap();
+        assert_eq!(
+            s.factor_nnz(),
+            sym.symbolic_factor_nnz(),
+            "no pivot-induced fill"
+        );
+        let x = s.solve(&b).unwrap();
+        let mut r = b.clone();
+        let mut d: Vec<f64> = b.iter().map(|v| v.abs()).collect();
+        for j in 0..n {
+            for k in a.col_ptr[j]..a.col_ptr[j + 1] {
+                r[a.row_idx[k]] -= a.values[k] * x[j];
+                d[a.row_idx[k]] += a.values[k].abs() * x[j].abs();
+            }
+        }
+        let omega = r
+            .iter()
+            .zip(&d)
+            .map(|(ri, di)| ri.abs() / di)
+            .fold(0.0, f64::max);
+        assert!(omega < 1e-13, "backward error {omega}");
+        let without = KluSettings::default().with_matching(false);
+        let s0 = KluSolver::factor(&a, &without).unwrap();
+        assert!(
+            s0.factor_nnz() > s.factor_nnz(),
+            "structural transversal fills more"
+        );
+    }
     use super::*;
     use crate::numeric::multifrontal_ldlt::SolverSettings;
     use crate::numeric::multifrontal_lu::{factor_general_lu, solve_lu};
@@ -2630,7 +2841,7 @@ mod tests {
         assert!(s.refactor(&a2).is_err(), "changed pattern must be rejected");
     }
 
-    /// Max-norm relative residual of the *transposed* system `Aáµ€ x = b`.
+    /// Max-norm relative residual of the *transposed* system `A^T x = b`.
     fn resid_t<T: Scalar>(a: &GeneralCsc<T>, x: &[T], b: &[T]) -> f64 {
         resid(&a.transpose(), x, b)
     }
@@ -2638,7 +2849,7 @@ mod tests {
     #[test]
     fn klu_solve_transpose_matches_factored_transpose() {
         // Reducible circuit-shaped matrix: solve_transpose on A's factors must
-        // agree with a fresh factorization of Aáµ€, and satisfy Aáµ€ x = b.
+        // agree with a fresh factorization of A^T, and satisfy A^T x = b.
         let a = circuit_like(200, 42);
         let b: Vec<f64> = (0..200).map(|i| ((i * 3) % 13) as f64 - 6.0).collect();
         let s = KluSolver::factor(&a, &KluSettings::default()).unwrap();
@@ -2664,8 +2875,8 @@ mod tests {
 
     #[test]
     fn klu_solve_transpose_complex_plain_not_conjugate() {
-        // Complex: solve_transpose must solve the PLAIN transpose Aáµ€ x = b
-        // (adjoint convention: the caller conjugates for Aá´´). Off-diagonal
+        // Complex: solve_transpose must solve the PLAIN transpose A^T x = b
+        // (adjoint convention: the caller conjugates for A^H). Off-diagonal
         // pivoting pressure included (small diagonal), as in the solve test.
         let c = |re, im| Complex::new(re, im);
         let m = 6;
@@ -2709,7 +2920,7 @@ mod tests {
             "residual {}",
             resid_t(&a, &x, &b)
         );
-        // Aá´´ x = b via the documented conjugation recipe.
+        // A^H x = b via the documented conjugation recipe.
         let bc: Vec<Complex<f64>> = b.iter().map(|v| v.conj()).collect();
         let xh: Vec<Complex<f64>> = s
             .solve_transpose(&bc)
@@ -2891,7 +3102,8 @@ mod tests {
         assert_eq!(d.stages[0].name, "klu-factor");
 
         let mut s2 = KluSolver::factor(&a, &KluSettings::default()).unwrap();
-        assert!(s2.diagnostics().stages.is_empty());
+        // the one-shot factor fills its diagnostics like the phased path
+        assert_eq!(s2.diagnostics().stages.last().unwrap().name, "klu-factor");
         s2.refactor(&a).unwrap();
         assert_eq!(s2.diagnostics().stages.last().unwrap().name, "klu-refactor");
     }

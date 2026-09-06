@@ -14,8 +14,8 @@ quotient-graph algorithm of Amestoy, Davis and Duff (1996, 2004).
 ## What AMD does
 
 Given the sparsity pattern of a symmetric matrix `A`, AMD computes a
-permutation `P` such that the Cholesky factorization `P A Pᵀ = L Lᵀ`
-(or symmetric indefinite `P A Pᵀ = L D Lᵀ`) introduces far fewer
+permutation `P` such that the Cholesky factorization `P A P^T = L L^T`
+(or symmetric indefinite `P A P^T = L D L^T`) introduces far fewer
 non-zeros than the natural ordering. "Fill" is the set of zero
 entries in `A` that become non-zero in `L`; minimising fill is NP-hard
 in general, so AMD is a greedy heuristic that in practice rivals
@@ -34,7 +34,7 @@ algorithm.
   Approximate Minimum Degree Ordering Algorithm.* SIAM Journal on
   Matrix Analysis and Applications, 17(4), 886-905. Introduces the
   approximate external degree bound that makes the algorithm O(|A|)
-  per pivot instead of O(|A|·n).
+  per pivot instead of O(|A|*n).
 - **Amestoy, P. R., Davis, T. A., and Duff, I. S. (2004).**
   *Algorithm 837: AMD, an Approximate Minimum Degree Ordering
   Algorithm.* ACM Transactions on Mathematical Software, 30(3),
@@ -82,11 +82,11 @@ of supervariables eliminated so far. At each step it:
 
 ### Dense-row handling
 
-Variables whose initial degree exceeds `max(16, min(n, α·√n))` with
-`α = 10` by default are classified as "dense" and deferred to the end
+Variables whose initial degree exceeds `max(16, min(n, alpha*sqrt(n)))` with
+`alpha = 10` by default are classified as "dense" and deferred to the end
 of the permutation. This is a structural device - it keeps a few hub
 vertices (e.g. an arrow-matrix's central row) from dominating the
-degree computation for every other variable. A negative `α` disables
+degree computation for every other variable. A negative `alpha` disables
 the heuristic.
 
 ### Garbage collection
@@ -135,7 +135,7 @@ let _ = rslab_amd::amd_order_opts(&pattern, &opts);
 
 The input must be the full symmetric pattern - both the upper and
 lower triangles. If your matrix is stored as upper-triangular only,
-symmetrise with `A + Aᵀ - diag(A)` before handing it to `rslab-amd`.
+symmetrise with `A + A^T - diag(A)` before handing it to `rslab-amd`.
 
 ### CLI
 
@@ -184,13 +184,13 @@ the permutation, but on `ncmpa`, `ndiv`, `nms_ldl`, `nms_lu`, and
 
 | fixture       | n   | description                          | perm + stats match? |
 |---------------|-----|--------------------------------------|---------------------|
-| `diag_4`      | 4   | pure diagonal                        | ✓                   |
-| `tridiag_10`  | 10  | tridiagonal                          | ✓                   |
-| `arrow_5`     | 5   | hub at 0 + diagonal                  | ✓                   |
-| `arrow_200`   | 200 | hub at 0 + diagonal (tests dense)    | ✓                   |
-| `band_20_3`   | 20  | banded, bandwidth 3 (tests GC)       | ✓                   |
-| `grid_7x7`    | 49  | 2D 5-point stencil                   | ✓                   |
-| `amd_demo_24` | 24  | 6×4 grid (canonical demo substitute) | ✓                   |
+| `diag_4`      | 4   | pure diagonal                        | yes                   |
+| `tridiag_10`  | 10  | tridiagonal                          | yes                   |
+| `arrow_5`     | 5   | hub at 0 + diagonal                  | yes                   |
+| `arrow_200`   | 200 | hub at 0 + diagonal (tests dense)    | yes                   |
+| `band_20_3`   | 20  | banded, bandwidth 3 (tests GC)       | yes                   |
+| `grid_7x7`    | 49  | 2D 5-point stencil                   | yes                   |
+| `amd_demo_24` | 24  | 6x4 grid (canonical demo substitute) | yes                   |
 
 Two additional tests assert `n_mass_elim > 0` on patterns where
 mass elimination must fire (tridiag_10, band_20_3, grid_7x7), and
@@ -246,23 +246,23 @@ $ grep -r 'amd = "' crates/rslab-amd/Cargo.toml | grep -v harness
 
 ```
 src/
-├── lib.rs         Public surface: amd_order, amd_order_with_stats,
-│                  amd_order_opts, AmdOptions.
-├── pattern.rs     CscPattern - borrowed CSC sparsity pattern with
-│                  validation.
-├── error.rs       AmdError (IndexOverflow, NonSymmetric,
-│                  MalformedInput).
-├── stats.rs       AmdStats (ncmpa, n_mass_elim, n_supervar_merge,
-│                  n_dense_deferred, ndiv, nms_ldl, nms_lu).
-├── workspace.rs   AmdWorkspace::new - owns pe/iw/len/nv/elen/degree
-│                  scratch arrays and runs initialization (dense-row
-│                  classification, zero-degree fast path, degree-bucket
-│                  construction).
-├── algo.rs        run_elimination + finalize_permutation - the main
-│                  loop and the post-order expansion.
-└── bin/
-    ├── rslab-amd.rs       Triplet-file CLI.
-    └── rslab-amd-bench.rs Small in-crate bench skeleton.
++-- lib.rs         Public surface: amd_order, amd_order_with_stats,
+|                  amd_order_opts, AmdOptions.
++-- pattern.rs     CscPattern - borrowed CSC sparsity pattern with
+|                  validation.
++-- error.rs       AmdError (IndexOverflow, NonSymmetric,
+|                  MalformedInput).
++-- stats.rs       AmdStats (ncmpa, n_mass_elim, n_supervar_merge,
+|                  n_dense_deferred, ndiv, nms_ldl, nms_lu).
++-- workspace.rs   AmdWorkspace::new - owns pe/iw/len/nv/elen/degree
+|                  scratch arrays and runs initialization (dense-row
+|                  classification, zero-degree fast path, degree-bucket
+|                  construction).
++-- algo.rs        run_elimination + finalize_permutation - the main
+|                  loop and the post-order expansion.
+\-- bin/
+    +-- rslab-amd.rs       Triplet-file CLI.
+    \-- rslab-amd-bench.rs Small in-crate bench skeleton.
 ```
 
 Every function that ports a block of faer's `amd.rs` cites the faer
@@ -277,7 +277,7 @@ line range in its doc comment so the translation is auditable.
   `dev/plans/ordering-integration.md` once the sibling ordering
   crates (METIS, SCOTCH, KaHIP) also exist.
 - **Matrices must be structurally symmetric.** AMD operates on
-  `A + Aᵀ`; handing it an unsymmetric pattern produces meaningless
+  `A + A^T`; handing it an unsymmetric pattern produces meaningless
   orderings. Debug builds assert symmetry; release builds trust the
   caller for the sake of speed.
 - **`i32` index space.** The scratch arrays use `i32` with a

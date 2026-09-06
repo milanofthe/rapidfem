@@ -38,10 +38,10 @@ pub fn postorder(etree: &EliminationTree) -> (Vec<usize>, Vec<usize>) {
     // The previous version stored only `(node, child_idx)` and re-cloned and
     // re-sorted `children[node]` on every `stack.last_mut()` iteration. A node
     // with `c` children sits on top of the stack `c+1` times (once per child
-    // push + once for the final pop), so it paid `O(c²·log c)`. On a star
+    // push + once for the final pop), so it paid `O(c^2*log c)`. On a star
     // etree (one root with `n-1` children - the arrow/bordered-KKT shape AMD
     // produces for a dense trailing border) that made the default symbolic
-    // pipeline `O(n²·log n)`. See S1, dev/research/repo-review-2026-06-09.md,
+    // pipeline `O(n^2*log n)`. See S1, dev/research/repo-review-2026-06-09.md,
     // and the matching cursor layout in `biased_postorder` /
     // `EliminationTree::postorder`.
     let mut stack: Vec<(usize, Vec<usize>, usize)> = Vec::new();
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_postorder_tridiagonal() {
-        // Chain: 0→1→2→3. Postorder should be [0, 1, 2, 3].
+        // Chain: 0->1->2->3. Postorder should be [0, 1, 2, 3].
         let m =
             CscMatrix::from_triplets(4, &[0, 1, 1, 2, 2, 3, 3], &[0, 0, 1, 1, 2, 2, 3], &[1.0; 7])
                 .unwrap();
@@ -296,14 +296,14 @@ mod tests {
     /// S1 (dev/research/repo-review-2026-06-09.md): the previous `postorder`
     /// re-cloned and re-sorted `children[node]` on every stack visit, so a
     /// node with `c` children (on top of the stack `c+1` times) paid
-    /// O(c²·log c). On a star etree (one root with `n-1` children) that is
-    /// O(n²·log n) - quadratic - in the default symbolic pipeline.
+    /// O(c^2*log c). On a star etree (one root with `n-1` children) that is
+    /// O(n^2*log n) - quadratic - in the default symbolic pipeline.
     ///
     /// Reproduction is deterministic via the `SORT_WORK` counter (total
     /// child-list elements materialized across all per-node sorts), so no
     /// flaky wall-clock timing is needed. Pre-fix the root's `(n-1)`-element
-    /// child list is materialized `n` times → `~n²` elements. Post-fix it is
-    /// materialized exactly once → `~n` elements. The assertion `work ≤ 4·n`
+    /// child list is materialized `n` times -> `~n^2` elements. Post-fix it is
+    /// materialized exactly once -> `~n` elements. The assertion `work <= 4*n`
     /// fails on the quadratic version and passes on the linear fix.
     #[test]
     fn test_postorder_star_sort_work_is_linear() {
@@ -327,11 +327,11 @@ mod tests {
         }
 
         // The fix: child-sorting work is linear, not quadratic. The old
-        // sort-on-every-visit code materializes ~n² elements here.
+        // sort-on-every-visit code materializes ~n^2 elements here.
         assert!(
             work <= 4 * n,
             "postorder sort work {work} exceeds the linear bound {} (n={n}); \
-             the O(n²·log n) sort-on-every-stack-visit regression is back",
+             the O(n^2*log n) sort-on-every-stack-visit regression is back",
             4 * n
         );
     }

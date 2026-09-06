@@ -13,7 +13,7 @@
 //!
 //! Inline garbage collection (faer `amd.rs:289-338`) fires inside
 //! the out-of-place branch when `pfree >= iwlen`. See
-//! [`create_element`] for the full save → mark → compact → restore
+//! [`create_element`] for the full save -> mark -> compact -> restore
 //! dance.
 //!
 //! Pass-1 `w[e]` seeding (`amd.rs:366-385`), Pass-2 approximate
@@ -294,7 +294,7 @@ pub fn create_element(
 
 /// Finish the elimination step whose create-element phase produced
 /// `(pme1, pme2_excl, nvpiv, degme)` and left `nv[me] = -nvpiv` and
-/// `nv[i] = -nv[i]` for every variable `i ∈ iw[pme1..pme2_excl]`.
+/// `nv[i] = -nv[i]` for every variable `i in iw[pme1..pme2_excl]`.
 ///
 /// Does, in order:
 /// 1. **Pass-1 w-seeding** (faer `amd.rs:366-385`). For each
@@ -654,7 +654,7 @@ fn amf_bucket_of(score: i64, n: usize) -> usize {
 /// variant of the formula).
 ///
 /// Computed in `i64`: both factors are `O(n)`, so the product reaches
-/// ~`n^2` and overflows `i32` for `n` ≳ 46k (`i32::MAX` is
+/// ~`n^2` and overflows `i32` for `n` >~ 46k (`i32::MAX` is
 /// 2_147_483_647 and `46342 * 46341 = 2_147_534_622` already exceeds
 /// it). In release the old `i32` form wrapped silently, feeding garbage
 /// into the RMF pivot score; in debug it panicked. The value is later
@@ -1205,9 +1205,8 @@ pub fn finalize_step_amf(
             ws.nv[i] = nvi;
             let degme_i = degme_i32;
             let nvi_i = nvi;
-            let rmf: f64;
             let deg_i = ws.degree[i];
-            if (deg_i as usize) + (degme_i as usize) > nleft {
+            let rmf = if (deg_i as usize) + (degme_i as usize) > nleft {
                 // Saturated branch. RMF1 uses original DEG.
                 let deg_f = deg_i as f64;
                 let rmf1 = deg_f * (deg_f - 1.0 + 2.0 * degme_i as f64) - ws.wf[i] as f64;
@@ -1216,12 +1215,12 @@ pub fn finalize_step_amf(
                 let nd = new_deg as f64;
                 let rmf_new =
                     nd * (nd - 1.0) - (degme_i - nvi_i) as f64 * (degme_i - nvi_i - 1) as f64;
-                rmf = rmf_new.min(rmf1);
+                rmf_new.min(rmf1)
             } else {
                 let deg_f = deg_i as f64;
                 ws.degree[i] = deg_i + degme_i - nvi_i;
-                rmf = deg_f * (deg_f - 1.0 + 2.0 * degme_i as f64) - ws.wf[i] as f64;
-            }
+                deg_f * (deg_f - 1.0 + 2.0 * degme_i as f64) - ws.wf[i] as f64
+            };
             let rmf = rmf / (nvi_i as f64 + 1.0);
             let qscore: i32 = if rmf < dummy_f {
                 rmf.round() as i32
@@ -1573,7 +1572,7 @@ mod tests {
     }
 
     /// O1 (repo-review-2026-06-09.md): the AMF working-fill kernels must
-    /// be computed in `i64`. Both factors are `O(n)`, so for `n` ≳ 46k
+    /// be computed in `i64`. Both factors are `O(n)`, so for `n` >~ 46k
     /// the products exceed `i32::MAX` (2_147_483_647) and wrap silently
     /// in release / panic in debug, feeding garbage into the RMF pivot
     /// score. Oracle: the exact hand-computed `i64` value of the
@@ -1715,7 +1714,7 @@ mod tests {
         let mut ws = ws_for(5, &cp, &ri);
         run_elimination(&mut ws, true).unwrap();
         assert_eq!(ws.nel, 5);
-        // Every var was pivoted exactly once ⇒ nv[i] > 0 everywhere
+        // Every var was pivoted exactly once => nv[i] > 0 everywhere
         // (the pivot restores nv to +nvpiv).
         for i in 0..5 {
             assert!(ws.nv[i] >= 0, "nv[{}] = {}", i, ws.nv[i]);

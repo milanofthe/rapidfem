@@ -62,7 +62,7 @@ pub fn read_mtx(path: &Path) -> Result<MtxMatrix<f64>, RslabError> {
 /// Read a **complex** symmetric Matrix Market file (`mtype 6`).
 ///
 /// Accepts `%%MatrixMarket matrix coordinate complex symmetric`. Each data line
-/// is `i j re im`. Indices 1-based → 0-based; upper triangle → lower triangle.
+/// is `i j re im`. Indices 1-based -> 0-based; upper triangle -> lower triangle.
 pub fn read_mtx_complex(path: &Path) -> Result<MtxMatrix<Complex<f64>>, RslabError> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| RslabError::IoError(format!("{}: {}", path.display(), e)))?;
@@ -74,13 +74,13 @@ pub fn read_mtx_complex(path: &Path) -> Result<MtxMatrix<Complex<f64>>, RslabErr
 /// [`read_mtx_any`] so a heterogeneous corpus (SuiteSparse) routes each matrix to
 /// the right solver path.
 pub enum MtxLoaded {
-    /// `symmetric` file: lower triangle, for the LDLᵀ path.
+    /// `symmetric` file: lower triangle, for the LDL^T path.
     Symmetric(CscMatrix<Complex<f64>>),
     /// `general` file: full pattern, for the LU path.
     General(crate::sparse::general::GeneralCsc<Complex<f64>>),
 }
 
-/// Read any `real`/`complex`/`integer` × `symmetric`/`general` Matrix Market
+/// Read any `real`/`complex`/`integer` x `symmetric`/`general` Matrix Market
 /// coordinate file, widening values to `Complex<f64>`. The header is auto-detected;
 /// `pattern`, `hermitian`, and `skew-symmetric` are rejected (not the
 /// complex-symmetric / general forms the solvers take).
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(dense.get(0, 0), Complex::new(2.0, 1.0));
         assert_eq!(dense.get(1, 0), Complex::new(-1.0, 0.3));
         assert_eq!(dense.get(0, 1), Complex::new(-1.0, 0.3)); // symmetric (no conj)
-                                                              // (1,3) → normalized to lower (2,0).
+                                                              // (1,3) -> normalized to lower (2,0).
         assert_eq!(dense.get(2, 0), Complex::new(0.5, 0.2));
     }
 

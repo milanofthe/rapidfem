@@ -1,6 +1,6 @@
 //! Recursive nested-dissection driver.
 //!
-//! Top-level algorithm (Karypis & Kumar 1998, §4, George 1973):
+//! Top-level algorithm (Karypis & Kumar 1998, section 4, George 1973):
 //!
 //! 1. Split graph into connected components. Each component is
 //!    ordered independently and its numbering is concatenated.
@@ -11,7 +11,7 @@
 //!    - Otherwise, run a multilevel node bisection, number the
 //!      separator last, and recurse on the two sides.
 //!
-//! The numbering convention is "permutation" = new-position → old-id.
+//! The numbering convention is "permutation" = new-position -> old-id.
 //! Internally we populate `iperm[original_vertex] = new_position` and
 //! invert at the end.
 
@@ -24,9 +24,65 @@ use crate::sep_refine::{balance_node_separator, refine_node_separator};
 use crate::separator::construct_separator;
 use crate::{MetisOptions, MetisStats};
 use rslab_ordering_core::{CscPattern, OrderingError};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 /// Entry point. Produces a permutation `perm` where `perm[i]` is the
 /// old vertex id placed at new position `i` (new-to-old).
+/// The inverse permutation under construction, written concurrently by
+/// the independent subproblems of the recursion. Every original vertex is
+/// assigned exactly once (the subproblems partition the vertex set), so
+/// relaxed atomic stores suffice.
+struct IpermWriter(Vec<AtomicI32>);
+
+impl IpermWriter {
+    fn new(n: usize) -> Self {
+        Self((0..n).map(|_| AtomicI32::new(-1)).collect())
+    }
+
+    #[inline]
+    fn set(&self, orig: usize, pos: i32) {
+        self.0[orig].store(pos, Ordering::Relaxed);
+    }
+
+    fn into_vec(self) -> Vec<i32> {
+        self.0.into_iter().map(|a| a.into_inner()).collect()
+    }
+}
+
+/// Counters accumulated across the parallel recursion.
+#[derive(Default)]
+struct AtomicStats {
+    n_levels: AtomicU32,
+    n_separator_vertices: AtomicU32,
+    n_fm_passes: AtomicU32,
+    n_two_hop_fallbacks: AtomicU32,
+    n_amd_leaf_calls: AtomicU32,
+}
+
+impl AtomicStats {
+    fn add(&self, s: &MetisStats) {
+        self.n_levels.fetch_add(s.n_levels, Ordering::Relaxed);
+        self.n_separator_vertices
+            .fetch_add(s.n_separator_vertices, Ordering::Relaxed);
+        self.n_fm_passes.fetch_add(s.n_fm_passes, Ordering::Relaxed);
+        self.n_two_hop_fallbacks
+            .fetch_add(s.n_two_hop_fallbacks, Ordering::Relaxed);
+        self.n_amd_leaf_calls
+            .fetch_add(s.n_amd_leaf_calls, Ordering::Relaxed);
+    }
+}
+
+/// Subproblems at least this large fork their two sides onto the rayon
+/// pool; smaller ones recurse sequentially (the fork cost would show).
+const PARALLEL_MIN_VERTICES: usize = 4096;
+
+/// A child's seed: derived from the parent's seed and the child's place, so
+/// the ordering is a function of the seed alone, however the subproblems
+/// are scheduled.
+fn child_seed(seed: u64, which: u64) -> u64 {
+    SplitMix::new(seed ^ which.wrapping_mul(0x9E37_79B9_7F4A_7C15)).next_u64()
+}
+
 pub(crate) fn nd_order(
     pattern: &CscPattern<'_>,
     opts: &MetisOptions,
@@ -34,116 +90,152 @@ pub(crate) fn nd_order(
 ) -> Result<Vec<i32>, OrderingError> {
     let graph = Graph::from_csc_pattern(pattern)?;
     let n = graph.nvtxs as usize;
-    let mut iperm: Vec<i32> = vec![-1; n];
-    let mut rng = SplitMix::new(opts.seed);
+    let writer = IpermWriter::new(n);
+    let acc = AtomicStats::default();
 
-    // Iterative dissection over an explicit work stack of `(subgraph, vtx_map,
-    // offset)` items - **not** native recursion, so the depth of the dissection
-    // tree (O(log n) for good separators, but O(n) for graphs without them, e.g.
-    // dense/random patterns) never overflows the call stack. Each item owns a
-    // disjoint output range `[offset, offset + nvtxs)`, so siblings are order
-    // independent.
-    let mut work: Vec<(Graph, Vec<i32>, usize)> = Vec::new();
     let (cc_label, ncc) = connected_components(&graph);
     stats.n_components = ncc as u32;
+    let mut work: Vec<(Graph, Vec<i32>, usize, u64)> = Vec::new();
     let mut offset: usize = 0;
     for c in 0..ncc {
         let (sub, vtx_map) = extract_by_label(&graph, &cc_label, c as i32);
         let count = sub.nvtxs as usize;
         if count > 0 {
-            work.push((sub, vtx_map, offset));
+            work.push((sub, vtx_map, offset, child_seed(opts.seed, c as u64)));
         }
         offset += count;
     }
+    drop(graph);
+    // Components are independent as well.
+    let results: Vec<Result<(), OrderingError>> = {
+        use rayon::prelude::*;
+        work.into_par_iter()
+            .map(|(sub, vtx_map, offset, seed)| {
+                nd_subproblem(sub, vtx_map, offset, seed, opts, &writer, &acc)
+            })
+            .collect()
+    };
+    for r in results {
+        r?;
+    }
+    stats.n_levels += acc.n_levels.load(Ordering::Relaxed);
+    stats.n_separator_vertices += acc.n_separator_vertices.load(Ordering::Relaxed);
+    stats.n_fm_passes += acc.n_fm_passes.load(Ordering::Relaxed);
+    stats.n_two_hop_fallbacks += acc.n_two_hop_fallbacks.load(Ordering::Relaxed);
+    stats.n_amd_leaf_calls += acc.n_amd_leaf_calls.load(Ordering::Relaxed);
+    invert_iperm(&writer.into_vec(), n)
+}
 
-    while let Some((subgraph, vtx_map, offset)) = work.pop() {
-        let n = subgraph.nvtxs as usize;
-        if n == 0 {
-            continue;
-        }
-        if n == 1 {
-            iperm[vtx_map[0] as usize] = offset as i32;
-            continue;
-        }
+/// Order one connected subgraph: AMD below the switch, else a multilevel
+/// node bisection with the separator numbered last and the two sides
+/// ordered recursively, in parallel when they are large.
+fn nd_subproblem(
+    subgraph: Graph,
+    vtx_map: Vec<i32>,
+    offset: usize,
+    seed: u64,
+    opts: &MetisOptions,
+    writer: &IpermWriter,
+    acc: &AtomicStats,
+) -> Result<(), OrderingError> {
+    let n = subgraph.nvtxs as usize;
+    if n == 0 {
+        return Ok(());
+    }
+    if n == 1 {
+        writer.set(vtx_map[0] as usize, offset as i32);
+        return Ok(());
+    }
+    let mut local = MetisStats::default();
 
-        // Connected-component split (sub-problem may be disconnected).
-        let (cc_label, ncc) = connected_components(&subgraph);
-        if ncc > 1 {
-            let mut off = offset;
-            for c in 0..ncc {
-                let (sub, map) = extract_by_label(&subgraph, &cc_label, c as i32);
-                let map_to_orig: Vec<i32> =
-                    map.iter().map(|&local| vtx_map[local as usize]).collect();
-                let count = sub.nvtxs as usize;
-                if count > 0 {
-                    work.push((sub, map_to_orig, off));
-                }
-                off += count;
+    let (cc_label, ncc) = connected_components(&subgraph);
+    if ncc > 1 {
+        let mut off = offset;
+        for c in 0..ncc {
+            let (sub, map) = extract_by_label(&subgraph, &cc_label, c as i32);
+            let map_to_orig: Vec<i32> = map.iter().map(|&local| vtx_map[local as usize]).collect();
+            let count = sub.nvtxs as usize;
+            if count > 0 {
+                nd_subproblem(
+                    sub,
+                    map_to_orig,
+                    off,
+                    child_seed(seed, 7 + c as u64),
+                    opts,
+                    writer,
+                    acc,
+                )?;
             }
-            continue;
+            off += count;
         }
-
-        // AMD leaf.
-        if n <= opts.nd_to_amd_switch as usize {
-            amd_leaf(&subgraph, &vtx_map, offset, &mut iperm, stats)?;
-            continue;
-        }
-
-        // Multilevel node bisection.
-        let labels = multilevel_node_bisection(&subgraph, opts, &mut rng, stats);
-        let mut a_verts: Vec<i32> = Vec::new();
-        let mut b_verts: Vec<i32> = Vec::new();
-        let mut s_verts: Vec<i32> = Vec::new();
-        for (v, &l) in labels.iter().enumerate() {
-            match l {
-                PART_A => a_verts.push(v as i32),
-                PART_B => b_verts.push(v as i32),
-                _ => s_verts.push(v as i32),
-            }
-        }
-
-        // Safety: a degenerate split - one side empty, or so unbalanced that the
-        // larger side is >=90% of the subgraph - dissects ~O(n) deep for no gain
-        // (each level barely shrinks) on graphs without good separators. Order the
-        // whole subgraph with the (non-recursive) AMD leaf instead; this also keeps
-        // the work-stack shallow.
-        let big = a_verts.len().max(b_verts.len());
-        if a_verts.is_empty() || b_verts.is_empty() || big as f64 >= 0.9 * n as f64 {
-            amd_leaf(&subgraph, &vtx_map, offset, &mut iperm, stats)?;
-            continue;
-        }
-
-        stats.n_separator_vertices += s_verts.len() as u32;
-        let na = a_verts.len();
-        let nb = b_verts.len();
-
-        // Number separator last: positions [offset + na + nb, offset + n).
-        for (i, &v) in s_verts.iter().enumerate() {
-            let orig = vtx_map[v as usize];
-            iperm[orig as usize] = (offset + na + nb + i) as i32;
-        }
-
-        let (sub_a, map_a_local) = extract_by_list(&subgraph, &a_verts);
-        let map_a: Vec<i32> = map_a_local
-            .iter()
-            .map(|&local| vtx_map[local as usize])
-            .collect();
-        let (sub_b, map_b_local) = extract_by_list(&subgraph, &b_verts);
-        let map_b: Vec<i32> = map_b_local
-            .iter()
-            .map(|&local| vtx_map[local as usize])
-            .collect();
-        work.push((sub_a, map_a, offset));
-        work.push((sub_b, map_b, offset + na));
+        return Ok(());
     }
 
-    invert_iperm(&iperm, n)
+    if n <= opts.nd_to_amd_switch as usize {
+        amd_leaf(&subgraph, &vtx_map, offset, writer, &mut local)?;
+        acc.add(&local);
+        return Ok(());
+    }
+
+    let mut rng = SplitMix::new(seed);
+    let labels = multilevel_node_bisection(&subgraph, opts, &mut rng, &mut local);
+    let mut a_verts: Vec<i32> = Vec::new();
+    let mut b_verts: Vec<i32> = Vec::new();
+    let mut s_verts: Vec<i32> = Vec::new();
+    for (v, &l) in labels.iter().enumerate() {
+        match l {
+            PART_A => a_verts.push(v as i32),
+            PART_B => b_verts.push(v as i32),
+            _ => s_verts.push(v as i32),
+        }
+    }
+
+    let big = a_verts.len().max(b_verts.len());
+    if a_verts.is_empty() || b_verts.is_empty() || big as f64 >= 0.9 * n as f64 {
+        amd_leaf(&subgraph, &vtx_map, offset, writer, &mut local)?;
+        acc.add(&local);
+        return Ok(());
+    }
+
+    local.n_separator_vertices += s_verts.len() as u32;
+    let na = a_verts.len();
+    let nb = b_verts.len();
+    for (i, &v) in s_verts.iter().enumerate() {
+        writer.set(vtx_map[v as usize] as usize, (offset + na + nb + i) as i32);
+    }
+
+    let (sub_a, map_a_local) = extract_by_list(&subgraph, &a_verts);
+    let map_a: Vec<i32> = map_a_local
+        .iter()
+        .map(|&local| vtx_map[local as usize])
+        .collect();
+    let (sub_b, map_b_local) = extract_by_list(&subgraph, &b_verts);
+    let map_b: Vec<i32> = map_b_local
+        .iter()
+        .map(|&local| vtx_map[local as usize])
+        .collect();
+    drop(subgraph);
+    drop(vtx_map);
+    acc.add(&local);
+
+    let (seed_a, seed_b) = (child_seed(seed, 1), child_seed(seed, 2));
+    if n >= PARALLEL_MIN_VERTICES && rayon::current_num_threads() > 1 {
+        let (ra, rb) = rayon::join(
+            || nd_subproblem(sub_a, map_a, offset, seed_a, opts, writer, acc),
+            || nd_subproblem(sub_b, map_b, offset + na, seed_b, opts, writer, acc),
+        );
+        ra?;
+        rb
+    } else {
+        nd_subproblem(sub_a, map_a, offset, seed_a, opts, writer, acc)?;
+        nd_subproblem(sub_b, map_b, offset + na, seed_b, opts, writer, acc)
+    }
 }
 
 /// Multilevel node bisection, METIS `MlevelNodeBisectionL1` structure:
-/// coarsen → initial *edge* bisection with niparts trials (best
-/// post-FM cut) → convert to a node separator once, at the coarsest
-/// level (König min vertex cover) → refine the **node separator**
+/// coarsen -> initial *edge* bisection with niparts trials (best
+/// post-FM cut) -> convert to a node separator once, at the coarsest
+/// level (König min vertex cover) -> refine the **node separator**
 /// itself at the coarsest level and at every uncoarsening step
 /// (balance + one-sided node FM). Returns labels in {PART_A, PART_B,
 /// PART_SEP}.
@@ -243,7 +335,7 @@ fn amd_leaf(
     subgraph: &Graph,
     vtx_map: &[i32],
     offset: usize,
-    iperm: &mut [i32],
+    iperm: &IpermWriter,
     stats: &mut MetisStats,
 ) -> Result<(), OrderingError> {
     stats.n_amd_leaf_calls += 1;
@@ -257,7 +349,7 @@ fn amd_leaf(
     debug_assert_eq!(perm_local.len(), n);
     for (new_pos, &local_id) in perm_local.iter().enumerate() {
         let orig = vtx_map[local_id as usize];
-        iperm[orig as usize] = (offset + new_pos) as i32;
+        iperm.set(orig as usize, (offset + new_pos) as i32);
     }
     Ok(())
 }
@@ -293,8 +385,8 @@ fn graph_to_csc_pattern(graph: &Graph) -> (Vec<i32>, Vec<i32>) {
     (col_ptr, row_idx)
 }
 
-/// Invert the new→old position map `iperm` (where `iperm[old] = new_pos`)
-/// into the old→new permutation `perm` (where `perm[new_pos] = old`).
+/// Invert the new->old position map `iperm` (where `iperm[old] = new_pos`)
+/// into the old->new permutation `perm` (where `perm[new_pos] = old`).
 ///
 /// Rejects an out-of-range or duplicated target position rather than
 /// silently emitting a non-bijection - parity with the scotch/kahip
@@ -319,7 +411,7 @@ fn invert_iperm(iperm: &[i32], n: usize) -> Result<Vec<i32>, OrderingError> {
 }
 
 /// Connected-component labeling via BFS. Returns `(cc_label, ncc)`
-/// where `cc_label[v] ∈ 0..ncc`.
+/// where `cc_label[v] in 0..ncc`.
 fn connected_components(graph: &Graph) -> (Vec<i32>, usize) {
     let n = graph.nvtxs as usize;
     let mut cc: Vec<i32> = vec![-1; n];
@@ -350,7 +442,7 @@ fn connected_components(graph: &Graph) -> (Vec<i32>, usize) {
 }
 
 /// Extract the induced subgraph on the vertex set `{v : label[v] == c}`.
-/// Returns the subgraph and the mapping `local_id → original_id`.
+/// Returns the subgraph and the mapping `local_id -> original_id`.
 fn extract_by_label(graph: &Graph, label: &[i32], c: i32) -> (Graph, Vec<i32>) {
     let n = graph.nvtxs as usize;
     let mut vtx_map: Vec<i32> = Vec::new();
@@ -467,8 +559,8 @@ mod tests {
 
     #[test]
     fn invert_iperm_rejects_duplicate_positions() {
-        // A valid new→old inversion of a bijection.
-        // iperm[old] = new_pos: old0→2, old1→0, old2→1 ⇒ perm = [1, 2, 0].
+        // A valid new->old inversion of a bijection.
+        // iperm[old] = new_pos: old0->2, old1->0, old2->1 => perm = [1, 2, 0].
         assert_eq!(invert_iperm(&[2, 0, 1], 3).unwrap(), vec![1, 2, 0]);
         // Two olds claiming the same position must be rejected, not
         // silently overwritten into a non-bijection (parity with the
@@ -696,7 +788,7 @@ mod tests {
         let (sub, map) = extract_by_list(&g, &[0, 1, 2]);
         assert_eq!(sub.nvtxs, 3);
         assert_eq!(map, vec![0, 1, 2]);
-        // Top row: 0-1, 1-2 → 2 edges, each stored twice.
+        // Top row: 0-1, 1-2 -> 2 edges, each stored twice.
         assert_eq!(sub.adjncy.len(), 4);
     }
 }

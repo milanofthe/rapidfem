@@ -17,7 +17,7 @@
 //! Both passes are iterative (explicit stacks, no recursion, safe on
 //! arbitrarily deep graphs) and allocation-linear in `n + nnz`.
 
-/// Result of the BTF permutation of an `n×n` pattern.
+/// Result of the BTF permutation of an `nxn` pattern.
 #[derive(Debug, Clone)]
 pub(crate) struct BtfForm {
     /// Row permutation, new-to-old: permuted row `k` is original row
@@ -51,8 +51,8 @@ pub(crate) fn max_transversal(
 /// layering over alternating paths from all free columns, then one sweep of
 /// vertex-disjoint shortest augmenting DFS, `O(sqrt(n) * nnz)` worst case.
 /// (The classic MC21 one-column-at-a-time DFS degenerates on the
-/// harmonic-balance circuit class — seconds instead of tens of milliseconds
-/// on `twotone` — because late columns re-walk ever longer alternating
+/// harmonic-balance circuit class - seconds instead of tens of milliseconds
+/// on `twotone` - because late columns re-walk ever longer alternating
 /// paths; phases amortize that.) Fully deterministic: columns are processed
 /// in natural order and adjacency in stored order.
 pub(crate) fn hk_transversal(
@@ -68,8 +68,8 @@ pub(crate) fn hk_transversal(
 
     // Seed pass 1: match every column to its structural diagonal entry when
     // present. On circuit matrices the diagonal is the physically meaningful
-    // pairing (MNA conductances) — it is what the KLU pivoting prefers later
-    // — and seeding it keeps the final matching (and thus the per-block
+    // pairing (MNA conductances) - it is what the KLU pivoting prefers later
+    // - and seeding it keeps the final matching (and thus the per-block
     // symmetrized pattern AMD orders) from drifting on augmenting-path
     // accidents.
     if diag_seed {
@@ -208,7 +208,7 @@ pub(crate) fn hk_transversal(
 /// augmenting DFS) with a deterministic work budget in adjacency steps.
 ///
 /// MC21 walks different alternating paths than Hopcroft-Karp and therefore
-/// lands on a different (equally maximum) matching — on some circuit
+/// lands on a different (equally maximum) matching - on some circuit
 /// families (`onetone2`) a markedly better one for the downstream per-block
 /// AMD. It is kept as a *candidate* for [`matching_candidates`]; the budget
 /// bounds its known degeneration (`twotone`-class), where it returns `None`
@@ -340,8 +340,8 @@ fn mc21_augment(
 /// distinct maximum matchings: diagonal-seeded HK, free-seeded HK, and
 /// budgeted MC21 (dropped when its budget runs out). Different maximum
 /// matchings hand the downstream per-block AMD different symmetrized
-/// patterns — with several-x fill differences on the harmonic-balance
-/// class — so the caller scores the candidates and keeps the cheapest.
+/// patterns - with several-x fill differences on the harmonic-balance
+/// class - so the caller scores the candidates and keeps the cheapest.
 pub(crate) fn matching_candidates(
     n: usize,
     col_ptr: &[usize],

@@ -13,8 +13,9 @@ pub use column_counts::{column_counts_gnp, total_factor_nnz};
 pub use ldlt_compress::{build_supermap, compress_pattern, expand_permutation, SuperMap};
 pub use small_leaf::{find_small_leaf_groups, SmallLeafGroup, SmallLeafParams};
 pub use supernode::{
-    find_supernodes, pick_amalgamation_strategy, AmalgamationStrategy, OrderingPreprocess,
-    RelaxAmalgamation, Supernode, SupernodeParams, AUTO_MULTI_CHILD_FRAC_THRESHOLD,
+    find_supernodes, pick_amalgamation_strategy, supernode_parents, AmalgamationStrategy,
+    OrderingPreprocess, RelaxAmalgamation, Supernode, SupernodeParams,
+    AUTO_MULTI_CHILD_FRAC_THRESHOLD,
 };
 
 /// Which fill-reducing ordering to use in [`symbolic_factorize_with_method`].
@@ -35,12 +36,12 @@ pub enum OrderingMethod {
     /// symbolic pipeline. See
     /// `dev/journal/2026-04-18-03.org` for the retirement evidence
     /// (34-matrix bakeoff: geomean fill tied on parity, crate
-    /// 17-23% better and 18-88× faster on large).
+    /// 17-23% better and 18-88x faster on large).
     #[default]
     Amd,
     /// Approximate Minimum Fill (`rslab-amf` crate: HAMF4 variant
     /// of Amestoy 1999 - quotient-graph elimination scored by
-    /// approximate fill `RMF(i) = (deg(i)·(deg(i)-1+2·degme) -
+    /// approximate fill `RMF(i) = (deg(i)*(deg(i)-1+2*degme) -
     /// WF(i)) / (nv(i)+1)` rather than approximate degree).
     /// Same downstream pipeline as `Amd`.
     ///
@@ -48,10 +49,16 @@ pub enum OrderingMethod {
     /// matching MUMPS's `ana_set_ordering.F` rule for SYM=2 small
     /// matrices. Validated against MUMPS HAMF4 on the 183_293-
     /// sidecar corpus by `tests/amf_corpus_oracle.rs`: rslab nnz_L
-    /// is within 1.10× MUMPS HAMF4 nnz_L on 183_277 matrices, with
+    /// is within 1.10x MUMPS HAMF4 nnz_L on 183_277 matrices, with
     /// CHARDIS1_0000 the lone documented metric-divergence skip.
     Amf,
-    /// rslab-metis multilevel nested dissection.
+    /// rslab-metis multilevel nested dissection: one run with the default
+    /// seed (METIS semantics), the two sides of every bisection ordered in
+    /// parallel on the rayon pool (the result depends on the seed only, not
+    /// on the thread count). The ordering race (`Auto` on large systems,
+    /// `AutoRace`) additionally runs a small seed ensemble and keeps the
+    /// lowest-fill result when the predicted factorization work is large
+    /// enough to pay for the extra runs (`ND_SEED_RACE_MIN_FLOPS`).
     MetisND,
     /// Reverse Cuthill-McKee band/profile-reducing ordering
     /// (`rslab-ordering-core`: George-Liu degree-sorted BFS from a
@@ -68,15 +75,15 @@ pub enum OrderingMethod {
     /// Issue #50 plus its F11 follow-up (2026-05-23) collapsed the
     /// per-shape branches to one very-large-and-sparse catch on top
     /// of `pick_default_method`:
-    ///   - very-large-and-sparse (n > 100_000, full nnz/n < 5) → `Amd`
+    ///   - very-large-and-sparse (n > 100_000, full nnz/n < 5) -> `Amd`
     ///   - everything else delegates to `pick_default_method`
-    ///     (`n <= 10_000 → Amf`, `n > 10_000 → MetisND`).
+    ///     (`n <= 10_000 -> Amf`, `n > 10_000 -> MetisND`).
     ///
     /// **Opt-in only.** The 154k-matrix IPM bench (2026-04-18) showed
     /// `Auto` regresses sparse factor/MUMPS geomean from 0.44 (AMD)
     /// to 0.58 because the (pre-F11) small-and-sparse branch routed
     /// thousands of n<500 IPM iteration dumps to KaHIP, where K1 +
-    /// multilevel setup cost 2-3× per call vs AMD. That branch is
+    /// multilevel setup cost 2-3x per call vs AMD. That branch is
     /// gone - `Auto`'s small-and-sparse path is now AMF via the
     /// default - but the original `Auto` warning is preserved here
     /// since the historical-bench regression evidence remains a
@@ -98,14 +105,14 @@ pub enum OrderingMethod {
     ///
     /// Unlike [`Auto`](OrderingMethod::Auto), which guesses the winner from cheap pattern
     /// features, `AutoRace` measures the actual symbolic outcome. Cost
-    /// is N× the prefix plus ONE pipeline tail (the previous
+    /// is Nx the prefix plus ONE pipeline tail (the previous
     /// full-pipeline race paid the tail for every candidate), paid
     /// once per problem because symbolic factorization is reused across
     /// numeric refactorizations with the same sparsity pattern.
     ///
     /// Motivated by issue #8: on `pinene_3200_0009` the
     /// `pick_default_method` heuristic picks `MetisND` (88 s numeric
-    /// factor), but `Amd` factors in 19.5 s on the same matrix - a 4.5×
+    /// factor), but `Amd` factors in 19.5 s on the same matrix - a 4.5x
     /// win that the cheap predicate misses. Racing eliminates the
     /// guess: whichever candidate wins on this matrix is the one we
     /// use, no calibration required.
@@ -122,18 +129,18 @@ pub enum OrderingMethod {
 ///
 /// The rule set adds shape-bakeoff branches on top of
 /// [`pick_default_method`]:
-///   - very-large-and-sparse (`n > 100_000`, full avg_deg < 5.0) → `Amd`
+///   - very-large-and-sparse (`n > 100_000`, full avg_deg < 5.0) -> `Amd`
 ///   - arrow/bordered (issue #64): whenever the size rule would pick
 ///     `MetisND` (`n > 10_000`) but [`is_arrow_bordered`] detects a
 ///     dense border concentrating the nonzeros, override to `Amf`.
 ///   - thin-large (issues #67 + #73): whenever the size rule would still
-///     pick `MetisND` (after the avg_deg<5 → AMD and arrow → AMF catches),
+///     pick `MetisND` (after the avg_deg<5 -> AMD and arrow -> AMF catches),
 ///     override to `Amf` at every `n`. Corpus A/Bs on real factor+solve
 ///     wall-time found AMF wins or ties MetisND across the whole population:
 ///     36/36 in the `(10_000, 100_000]` band (#67) and every measured
 ///     `n > 100_000 && avg_deg >= 5` non-arrow family (#73), including the
 ///     one matrix (nql180) where MetisND has smaller fill but AMF is still
-///     2× faster on the real factor+solve.
+///     2x faster on the real factor+solve.
 ///
 /// Anything else delegates to `pick_default_method`. `symbolic_factorize`
 /// routes through `Auto`, so the no-arg default and `Auto` resolve to the
@@ -143,7 +150,7 @@ pub enum OrderingMethod {
 ///
 /// The large-and-sparse branch swap from `ScotchND` to `Amd` is the
 /// issue #50 fix (2026-05-23). On `powerflow22` (n=2.8 M,
-/// full_avg_deg ≈ 3.7) the prior ScotchND route took 113.8 s
+/// full_avg_deg ~ 3.7) the prior ScotchND route took 113.8 s
 /// symbolic (15.8 M nnz_L); MetisND was 117.4 s (20.5 M nnz_L); AMD
 /// was 55 s (10.4 M nnz_L). The ScotchND advantage at very large n
 /// was load-bearing against the same BK pivoting cascade that
@@ -154,18 +161,18 @@ pub enum OrderingMethod {
 /// inventory: `dev/research/issue-50-numeric-inventory.csv` shows
 /// the IPM corpus's [100k, 200k) bucket has AMD/MetisND num_nnz_l
 /// ratio 1.00 on both representatives. See
-/// `dev/research/issue-50-metisnd-symbolic-cost.md` §F7-F8.
+/// `dev/research/issue-50-metisnd-symbolic-cost.md` section F7-F8.
 ///
-/// The small-and-sparse branch (`n < 10_000 && avg_deg < 15 →
+/// The small-and-sparse branch (`n < 10_000 && avg_deg < 15 ->
 /// KahipND`) was deleted by the F11 side finding from issue #50
 /// (2026-05-23). The corpus inventory in
 /// `dev/research/small-sparse-inventory.csv` (838 IPM-corpus
 /// matrices factored under AMD/AMF/MetisND/KahipND) shows AMF
 /// dominates this population: AMF wins 169/838 per-matrix
-/// (vs KahipND's 16), aggregate AMF fill is 0.87× AMD vs KahipND's
-/// 0.98×, aggregate AMF time is 0.83× AMD vs KahipND's 0.99×. After
+/// (vs KahipND's 16), aggregate AMF fill is 0.87x AMD vs KahipND's
+/// 0.98x, aggregate AMF time is 0.83x AMD vs KahipND's 0.99x. After
 /// deletion these matrices fall through to `pick_default_method`'s
-/// `n ≤ 10_000 → Amf` rule. (KahipND itself was removed in the 2026-08
+/// `n <= 10_000 -> Amf` rule. (KahipND itself was removed in the 2026-08
 /// consolidation; the bakeoff evidence stays in dev/research.)
 ///
 /// `pattern` is expected to be the matrix's full-symmetric pattern (the
@@ -194,10 +201,10 @@ fn choose_adaptive(pattern: &CscPattern, method: OrderingMethod) -> OrderingMeth
     // Issue #64 arrow/bordered-KKT catch. The size-only
     // `pick_default_method` routes every `n > 10_000` matrix to MetisND,
     // but nested dissection cannot isolate a dense border (a handful of
-    // very-high-degree columns concentrating the nonzeros) and the LDLᵀ
-    // factor blows up ~7-9× vs AMF/AMD. Override MetisND → AMF on the
+    // very-high-degree columns concentrating the nonzeros) and the LDL^T
+    // factor blows up ~7-9x vs AMF/AMD. Override MetisND -> AMF on the
     // arrow signature. Only the would-be-MetisND decision is touched;
-    // the `n <= 10_000 → AMF` and `n > 100_000 && avg_deg < 5 → AMD`
+    // the `n <= 10_000 -> AMF` and `n > 100_000 && avg_deg < 5 -> AMD`
     // (returned above) paths are untouched. See
     // `dev/research/issue-64-arrow-bordered-ordering.md`.
     if base == OrderingMethod::MetisND && is_arrow_bordered(pattern) {
@@ -207,23 +214,23 @@ fn choose_adaptive(pattern: &CscPattern, method: OrderingMethod) -> OrderingMeth
     // routes every `n > 10_000` matrix to MetisND, but corpus A/Bs on real
     // factor+solve wall-time (not nnz_L alone) show AMF wins or ties MetisND
     // across the whole would-be-MetisND population:
-    //   - #67: 36/36 in-scope `(10_000, 100_000]` families, worst case 0.99×
-    //     (noise), median ~1.5×, up to 4.5×.
+    //   - #67: 36/36 in-scope `(10_000, 100_000]` families, worst case 0.99x
+    //     (noise), median ~1.5x, up to 4.5x.
     //   - #73: the `n > 100_000 && avg_deg >= 5` non-arrow families - dtoc2
-    //     2.49×, pinene 1.18×, cont5_1_l 2.75×, nql180 2.05×, YATP1NE 2.13× -
+    //     2.49x, pinene 1.18x, cont5_1_l 2.75x, nql180 2.05x, YATP1NE 2.13x -
     //     AMF wins factor+solve on every measured matrix. Critically nql180 is
-    //     the lone case where MetisND has *smaller* symbolic fill (nnz_L 0.98×)
-    //     yet AMF is still 2.05× faster on real factor+solve, so fill (nnz_L /
+    //     the lone case where MetisND has *smaller* symbolic fill (nnz_L 0.98x)
+    //     yet AMF is still 2.05x faster on real factor+solve, so fill (nnz_L /
     //     flop_proxy) is NOT a reliable speed predictor and a fill-guarded race
     //     would wrongly demote nql180. The simple unconditional reroute is the
     //     one the evidence supports - see `dev/research/issue-73-n100k-thin-
     //     regime.md` and `dev/research/issue-67-thin-large-ordering.md`.
     //
     // MetisND's separators do not pay off on these uniformly-thin discretization
-    // patterns, and its symbolic ordering is 2-5× more expensive than AMF's, so
+    // patterns, and its symbolic ordering is 2-5x more expensive than AMF's, so
     // racing the two is a net loss. Route every would-be-MetisND decision to AMF
     // outright. Only the would-be-MetisND decision is touched; the earlier
-    // `n > 100_000 && avg_deg < 5 → Amd` (#50 powerflow) and arrow → AMF (#64)
+    // `n > 100_000 && avg_deg < 5 -> Amd` (#50 powerflow) and arrow -> AMF (#64)
     // catches fire first and are untouched.
     if base == OrderingMethod::MetisND {
         return OrderingMethod::Amf;
@@ -358,7 +365,7 @@ pub struct SymbolicFactorization {
     pub snode_group: Vec<Option<usize>>,
 
     /// Concrete ordering method actually dispatched. Records the
-    /// `OrderingMethod::Auto → AMD/AMF/MetisND`
+    /// `OrderingMethod::Auto -> AMD/AMF/MetisND`
     /// resolution made by `choose_adaptive`. For non-`Auto` callers
     /// this is identical to the requested method.
     pub resolved_method: OrderingMethod,
@@ -378,25 +385,25 @@ pub struct SymbolicFactorization {
 /// walk). Narrow on purpose - see comment on `Auto` for why a broad
 /// dispatcher regressed the IPM bench. `choose_adaptive` calls this for
 /// the bulk of patterns, then layers the pattern-aware catches on top
-/// (very-large-and-sparse → AMD; arrow/bordered → AMF, issue #64).
+/// (very-large-and-sparse -> AMD; arrow/bordered -> AMF, issue #64).
 ///
 /// Current rule (mirrors MUMPS's `ana_set_ordering.F` AMF-vs-METIS
 /// heuristic):
-///   - `n == 0`                                        → `Amd`
+///   - `n == 0`                                        -> `Amd`
 ///     (avoids /0 and external-crate weirdness on the empty pattern)
-///   - `n <= 10_000`                                   → `Amf`
+///   - `n <= 10_000`                                   -> `Amf`
 ///     (MUMPS-style "small symmetric" rule: HAMF4 fill metric is
-///     within 1.10× of MUMPS HAMF4 on 183_277 of 183_293 sidecar'd
+///     within 1.10x of MUMPS HAMF4 on 183_277 of 183_293 sidecar'd
 ///     matrices in `tests/amf_corpus_oracle.rs`, and the in-tree
 ///     audit (`diag_amf_vs_amd`) shows AMF strictly better than AMD
 ///     on 83/782 matrices, tied on 589, AMD better on 110, geomean
 ///     ratio 1.003. ORBIT2_0000 alone goes from AMD's 1.4M nnz_L
 ///     down to AMF's 32_105.)
-///   - everything else (`n > 10_000`)                  → `MetisND`,
+///   - everything else (`n > 10_000`)                  -> `MetisND`,
 ///     but note this base decision is **always rerouted to AMF** by the
 ///     issue #67/#73 catches in `choose_adaptive` (measured: AMF wins or
 ///     ties MetisND on real factor+solve across the whole would-be-MetisND
-///     population, and MetisND's symbolic is 2-5× more expensive). It is
+///     population, and MetisND's symbolic is 2-5x more expensive). It is
 ///     kept here so the reroute stays a visible, separately-documented
 ///     decision rather than being silently folded in.
 ///
@@ -404,23 +411,23 @@ pub struct SymbolicFactorization {
 /// symmetric matrices), not the symmetric pattern's.
 ///
 /// Issue #50 (2026-05-23) deleted two prior escape hatches:
-///   - `n >= 5000 && nnz/n < 6 → MetisND` (bordered-KKT catch, CRESC132);
-///   - `n >= 2000 && nnz/n < 4 → MetisND` (chain-pattern catch,
+///   - `n >= 5000 && nnz/n < 6 -> MetisND` (bordered-KKT catch, CRESC132);
+///   - `n >= 2000 && nnz/n < 4 -> MetisND` (chain-pattern catch,
 ///     CHAINWOO/HYDROELL/DIXMAANH/VESUVIO).
 ///
 /// Both were calibrated on 2026-04-27 against a Bunch-Kaufman
 /// pivoting cascade that fattened the AMD-ordered factor by up to
-/// 7.5× on CHAINWOO_0000 and produced a near-dense root frontal on
+/// 7.5x on CHAINWOO_0000 and produced a near-dense root frontal on
 /// CRESC132_0000. Issue #46's fixes (`42434a5` fine-grained delayed
-/// pivoting, `070840b` two-tier 2×2 partner selection) eliminated
+/// pivoting, `070840b` two-tier 2x2 partner selection) eliminated
 /// the amplifier in May 2026: CHAINWOO_0000 now produces 22.9k
 /// num_nnz_l with AMD vs the 2.10M it produced before, and the
 /// numeric inventory in `dev/research/issue-50-numeric-inventory.csv`
 /// shows zero of 250 chain-catch-class corpus matrices have
-/// AMD/MetisND num_nnz_l ratio ≥ 1.5×. The catches now route 113-s
+/// AMD/MetisND num_nnz_l ratio >= 1.5x. The catches now route 113-s
 /// nested-dissection symbolic on `powerflow22` (n=2.8 M, stored
-/// avg_deg ≈ 2.4) where AMD does the same job in 55 s with smaller
-/// fill. See `dev/research/issue-50-metisnd-symbolic-cost.md` §F7-F8.
+/// avg_deg ~ 2.4) where AMD does the same job in 55 s with smaller
+/// fill. See `dev/research/issue-50-metisnd-symbolic-cost.md` section F7-F8.
 fn pick_default_method(n: usize, _stored_nnz: usize) -> OrderingMethod {
     if n == 0 {
         return OrderingMethod::Amd;
@@ -438,15 +445,15 @@ fn pick_default_method(n: usize, _stored_nnz: usize) -> OrderingMethod {
 /// Returns [`OrderingPreprocess::LdltCompress`] when two conditions hold:
 ///
 /// 1. `n >= MIN_N_FOR_COMPRESSION` (size floor). Below this, numeric
-///    factor time is in the sub-ms range and the ~100-400μs compression
+///    factor time is in the sub-ms range and the ~100-400 us compression
 ///    symbolic overhead dominates. Calibrated from the 154 588-matrix
-///    bench: geomean regressed 0.36 → 0.48 with unconditional
+///    bench: geomean regressed 0.36 -> 0.48 with unconditional
 ///    compression, driven by small-matrix symbolic overhead.
 ///
 /// 2. `low_degree_cols / n >= LOW_DEGREE_THRESHOLD` (arrow-KKT
-///    signature). Columns with stored degree ≤ 2 (the diagonal plus at
+///    signature). Columns with stored degree <= 2 (the diagonal plus at
 ///    most one off-diagonal) are the structural fingerprint of IPM KKT
-///    slack blocks (`IpStdAugSystemSolver.cpp:250-305`: `Σ_s + δ_s I`
+///    slack blocks (`IpStdAugSystemSolver.cpp:250-305`: `sum_s + delta_s I`
 ///    coupled to the d-row by a single identity off-diagonal). Many
 ///    such columns means the MC64 matching has abundant 2-cycle
 ///    structure for compression to exploit. This broadens the
@@ -536,6 +543,7 @@ fn to_contract_pattern_bufs(pattern: &CscPattern) -> Result<(Vec<i32>, Vec<i32>)
 fn run_external_ordering(
     pattern: &CscPattern,
     method: OrderingMethod,
+    nd_seeds: &[u64],
 ) -> Result<(Vec<usize>, OrderingMethod), RslabError> {
     let (col_buf, row_buf) = to_contract_pattern_bufs(pattern)?;
     let pat = rslab_ordering_core::CscPattern::new(pattern.n, &col_buf, &row_buf)
@@ -548,7 +556,7 @@ fn run_external_ordering(
     let perm_i32 = match method {
         OrderingMethod::Amd => rslab_amd::amd_order(&pat),
         OrderingMethod::Amf => rslab_amf::amf_order(&pat),
-        OrderingMethod::MetisND => metis_seed_race(pattern, &pat),
+        OrderingMethod::MetisND => metis_seed_race(pattern, &pat, nd_seeds),
         OrderingMethod::Rcm => rslab_ordering_core::rcm_order(&pat),
         OrderingMethod::Auto => {
             unreachable!("Auto is resolved by symbolic_factorize_with_method")
@@ -594,13 +602,33 @@ fn run_external_ordering(
 /// ensemble strictly sequentially.
 const ND_SEED_CANDIDATES: &[u64] = &[1, 2, 3];
 
+/// One nested-dissection run: what an explicit `MetisND` request gets
+/// (METIS semantics), and what the ordering race uses below
+/// [`ND_SEED_RACE_MIN_FLOPS`].
+const ND_SINGLE_SEED: &[u64] = &[1];
+
+/// Predicted factorization flops (sum of squared column counts of the cheap
+/// champion) from which the ordering race runs the full seed ensemble. Each
+/// extra seed costs one nested dissection; the ensemble buys a few percent
+/// of fill (up to 15 percent on 3D meshes), which only pays when the numeric
+/// factorization is the dominant cost.
+const ND_SEED_RACE_MIN_FLOPS: u64 = 50_000_000_000;
+
 /// Best-of-seeds nested dissection (see [`ND_SEED_CANDIDATES`]).
 fn metis_seed_race(
     pattern: &CscPattern,
     pat: &rslab_ordering_core::CscPattern<'_>,
+    seeds: &[u64],
 ) -> Result<Vec<i32>, rslab_ordering_core::OrderingError> {
     use rayon::prelude::*;
-    let scored: Vec<(usize, u64, Vec<i32>)> = ND_SEED_CANDIDATES
+    if let [seed] = seeds {
+        let opts = rslab_metis::MetisOptions {
+            seed: *seed,
+            ..Default::default()
+        };
+        return rslab_metis::metis_order_full(pat, &opts).map(|(perm, _, _)| perm);
+    }
+    let scored: Vec<(usize, u64, Vec<i32>)> = seeds
         .par_iter()
         .filter_map(|&seed| {
             let opts = rslab_metis::MetisOptions {
@@ -682,7 +710,7 @@ fn symbolic_factorize_race(
     // breaking ties - regardless of completion order.
     let results: Vec<Result<SymbolicPrefix, RslabError>> = RACE_CHEAP
         .par_iter()
-        .map(|&cand| symbolic_prefix(matrix, snode_params, cand))
+        .map(|&cand| symbolic_prefix(matrix, snode_params, cand, ND_SINGLE_SEED))
         .collect();
     let mut best: Option<SymbolicPrefix> = None;
     let mut last_err: Option<RslabError> = None;
@@ -705,8 +733,14 @@ fn symbolic_factorize_race(
     // Stage 2: the expensive ND candidate, only where its cost can amortize
     // (see [`ND_RACE_MIN_FLOPS`]).
     if let Some(champ) = &best {
-        if matrix.n > 10_000 && prefix_flops(champ) >= ND_RACE_MIN_FLOPS {
-            if let Ok(nd) = symbolic_prefix(matrix, snode_params, OrderingMethod::MetisND) {
+        let flops = prefix_flops(champ);
+        if matrix.n > 10_000 && flops >= ND_RACE_MIN_FLOPS {
+            let seeds = if flops >= ND_SEED_RACE_MIN_FLOPS {
+                ND_SEED_CANDIDATES
+            } else {
+                ND_SINGLE_SEED
+            };
+            if let Ok(nd) = symbolic_prefix(matrix, snode_params, OrderingMethod::MetisND, seeds) {
                 if nd.factor_nnz < champ.factor_nnz {
                     best = Some(nd);
                 }
@@ -738,7 +772,12 @@ pub fn symbolic_factorize_with_method(
     if method == OrderingMethod::AutoRace {
         return symbolic_factorize_race(matrix, snode_params);
     }
-    symbolic_finish(symbolic_prefix(matrix, snode_params, method)?)
+    symbolic_finish(symbolic_prefix(
+        matrix,
+        snode_params,
+        method,
+        ND_SINGLE_SEED,
+    )?)
 }
 
 /// Everything the cheap pipeline *prefix* produces: ordering (incl.
@@ -787,6 +826,7 @@ fn symbolic_prefix(
     matrix: &CscMatrix,
     snode_params: &SupernodeParams,
     method: OrderingMethod,
+    nd_seeds: &[u64],
 ) -> Result<SymbolicPrefix, RslabError> {
     let resolved_preprocess = match snode_params.preprocess {
         OrderingPreprocess::Auto => pick_ordering_preprocess(matrix),
@@ -795,7 +835,7 @@ fn symbolic_prefix(
     let verify = matches!(snode_params.preprocess, OrderingPreprocess::Auto)
         && matches!(resolved_preprocess, OrderingPreprocess::LdltCompress);
     if !verify {
-        return symbolic_prefix_with(matrix, snode_params, method, resolved_preprocess);
+        return symbolic_prefix_with(matrix, snode_params, method, resolved_preprocess, nd_seeds);
     }
     // Verify the predicate's LdltCompress pick against the `None` baseline.
     let variant_params = |pre: OrderingPreprocess| SupernodeParams {
@@ -803,9 +843,15 @@ fn symbolic_prefix(
         ..snode_params.clone()
     };
     let p_none = variant_params(OrderingPreprocess::None);
-    let none = symbolic_prefix_with(matrix, &p_none, method, OrderingPreprocess::None);
+    let none = symbolic_prefix_with(matrix, &p_none, method, OrderingPreprocess::None, nd_seeds);
     let p_comp = variant_params(OrderingPreprocess::LdltCompress);
-    let comp = symbolic_prefix_with(matrix, &p_comp, method, OrderingPreprocess::LdltCompress);
+    let comp = symbolic_prefix_with(
+        matrix,
+        &p_comp,
+        method,
+        OrderingPreprocess::LdltCompress,
+        nd_seeds,
+    );
     let winner = match (none, comp) {
         (Ok(none), Ok(comp)) => {
             let limit = (none.factor_nnz as f64) * PREPROCESS_FILL_INFLATION_LIMIT;
@@ -830,10 +876,11 @@ fn symbolic_prefix_with(
     snode_params: &SupernodeParams,
     method: OrderingMethod,
     resolved_preprocess: OrderingPreprocess,
+    nd_seeds: &[u64],
 ) -> Result<SymbolicPrefix, RslabError> {
     let n = matrix.n;
 
-    // β refactor: scaling is no longer computed here. It moved to
+    // beta refactor: scaling is no longer computed here. It moved to
     // `factorize_multifrontal` so that `SymbolicFactorization`
     // depends only on the matrix pattern (not its values) and can
     // be reused across multiple numeric factorizations of
@@ -873,7 +920,7 @@ fn symbolic_prefix_with(
     // actual `run_external_ordering` call so every path records exactly one
     // `ordering` stage.
     let record_ordering = |pat: &CscPattern| -> Result<(Vec<usize>, OrderingMethod), RslabError> {
-        let r = run_external_ordering(pat, method)?;
+        let r = run_external_ordering(pat, method, nd_seeds)?;
         Ok(r)
     };
     let (amd_perm, resolved_method): (Vec<usize>, OrderingMethod) = match resolved_preprocess {
@@ -937,11 +984,11 @@ fn symbolic_prefix_with(
 
     // Step 5b: Build the final elimination tree by renumbering `amd_etree`
     // through the postorder. Postorder is a topological relabeling of the
-    // elimination tree nodes, so `etree(P·A·Pᵀ) = post-renumbering of
+    // elimination tree nodes, so `etree(P*A*P^T) = post-renumbering of
     // etree(A)` when P is a postorder of etree(A) - the tree structure is
     // preserved and only the node labels change. This lets us produce the
     // final etree in O(n) instead of re-running `from_pattern` at
-    // O(nnz · α(n)). A 3-run bench shows ~3% small-frontal p90 improvement
+    // O(nnz * alpha(n)). A 3-run bench shows ~3% small-frontal p90 improvement
     // over the old two-from_pattern approach.
     let final_parent: Vec<Option<usize>> = (0..n)
         .map(|new| {
@@ -955,9 +1002,9 @@ fn symbolic_prefix_with(
     };
 
     // Step 6: Column counts on the final pattern + etree.
-    // Phase 2.5.1 switched this from the O(n²) elimination simulation
+    // Phase 2.5.1 switched this from the O(n^2) elimination simulation
     // (still available as `column_counts`) to Gilbert-Ng-Peyton at
-    // O(nnz(A) + n·α(n)). Bit-exact equivalence verified on 169585
+    // O(nnz(A) + n*alpha(n)). Bit-exact equivalence verified on 169585
     // KKT matrices - see `dev/validation/phase-2.5.1-*`.
     let mut col_counts = column_counts_gnp(&permuted_pattern, &etree);
 
@@ -972,7 +1019,7 @@ fn symbolic_prefix_with(
     // re-permute the matrix, rebuild etree and col_counts. The
     // structural properties are invariant under within-subtree
     // relabeling (CHOLMOD/SSIDS observation, see
-    // `dev/research/phase-2.12-column-renumbering.md` §5.1).
+    // `dev/research/phase-2.12-column-renumbering.md` section 5.1).
     //
     // Fast-path: when no bias is requested (no desired merges, OR
     // the strategy is `Adjacency`), the second pass is skipped and
@@ -1001,8 +1048,8 @@ fn symbolic_prefix_with(
         let bias = supernode::predict_merges(&etree, &col_counts, snode_params);
         if bias.iter().any(|&b| b) {
             let (post2, _post2_inv) = biased_postorder(&etree, &bias);
-            // Compose: perm₂[k] = perm[post2[k]]; the existing
-            // `perm` already encodes AMD ∘ post1.
+            // Compose: perm_2[k] = perm[post2[k]]; the existing
+            // `perm` already encodes AMD o post1.
             let new_perm: Vec<usize> = post2.iter().map(|&p| perm[p]).collect();
             let mut new_perm_inv = vec![0usize; n];
             for (new, &old) in new_perm.iter().enumerate() {
@@ -1016,7 +1063,7 @@ fn symbolic_prefix_with(
             // postorder of `etree`, the relabeled tree is equivalent
             // by construction. Re-derive from scratch as a defense
             // against the etree-invariance claim being subtly wrong;
-            // O(nnz · α(n)) is small for the matrices we target.
+            // O(nnz * alpha(n)) is small for the matrices we target.
             let new_etree = EliminationTree::from_pattern(&new_permuted_pattern);
             let new_col_counts = column_counts_gnp(&new_permuted_pattern, &new_etree);
 
@@ -1145,6 +1192,62 @@ fn compute_peak_contrib(supernodes: &[Supernode], contrib_sizes: &[usize]) -> us
 
 #[cfg(test)]
 mod tests {
+
+    /// The frontal height reported by the symbolic phase must equal the row set
+    /// the numeric phase actually builds. They come from different code: the
+    /// symbolic tracks the union cardinality through amalgamation, the schedule
+    /// materializes the rows from the permuted pattern. A merged supernode is
+    /// where the two used to disagree, so the amalgamation is swept.
+    #[test]
+    fn supernode_nrow_matches_the_built_row_sets() {
+        use crate::numeric::ll_common::LlSchedule;
+        // 2D 5-point Laplacian, lower triangle.
+        let k = 20usize;
+        let n = k * k;
+        let (mut rows, mut cols, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+        let push = |i: usize,
+                    j: usize,
+                    v: f64,
+                    rows: &mut Vec<usize>,
+                    cols: &mut Vec<usize>,
+                    vals: &mut Vec<f64>| {
+            rows.push(i.max(j));
+            cols.push(i.min(j));
+            vals.push(v);
+        };
+        for y in 0..k {
+            for x in 0..k {
+                let idx = y * k + x;
+                push(idx, idx, 4.0, &mut rows, &mut cols, &mut vals);
+                if x + 1 < k {
+                    push(idx + 1, idx, -1.0, &mut rows, &mut cols, &mut vals);
+                }
+                if y + 1 < k {
+                    push(idx + k, idx, -1.0, &mut rows, &mut cols, &mut vals);
+                }
+            }
+        }
+        let a = CscMatrix::<f64>::from_triplets(n, &rows, &cols, &vals).unwrap();
+
+        for nemin in [1usize, 16, 32] {
+            let params = SupernodeParams {
+                nemin,
+                ..Default::default()
+            };
+            let sym = symbolic_factorize(&a, &params).unwrap();
+            let sched = LlSchedule::build(&sym);
+            let merged = sym.supernodes.iter().filter(|sn| sn.ncol > 1).count();
+            assert!(merged > 0, "nemin={nemin}: nothing merged, test is vacuous");
+            for (s, snode) in sym.supernodes.iter().enumerate() {
+                assert_eq!(
+                    snode.nrow,
+                    sched.rows(s).len(),
+                    "nemin={nemin}, supernode {s} (ncol={})",
+                    snode.ncol
+                );
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -1360,7 +1463,7 @@ mod tests {
             col_ptr.push(row_idx.len());
             (col_ptr, row_idx)
         }
-        // Very-large-and-sparse (n > 100_000, avg_deg < 5.0) → AMD.
+        // Very-large-and-sparse (n > 100_000, avg_deg < 5.0) -> AMD.
         // Issue #50 swap (2026-05-23): pre-fix this was the ScotchND
         // branch; see choose_adaptive's doc comment.
         let (cp, ri) = pat_bufs(200_000, 3);
@@ -1373,15 +1476,15 @@ mod tests {
             choose_adaptive(&p, OrderingMethod::Auto),
             OrderingMethod::Amd
         );
-        // Small-and-sparse (n<10_000, avg_deg<15) → delegates to
-        // pick_default_method, which routes n≤10_000 to AMF. The F11
+        // Small-and-sparse (n<10_000, avg_deg<15) -> delegates to
+        // pick_default_method, which routes n<=10_000 to AMF. The F11
         // follow-up to issue #50 (2026-05-23) deleted the previous
         // small-and-sparse KahipND branch after the 838-matrix
-        // inventory showed AMF aggregate fill 0.870× AMD vs KahipND
-        // 0.984× and AMF aggregate time 0.832× AMD vs KahipND 0.990×
+        // inventory showed AMF aggregate fill 0.870x AMD vs KahipND
+        // 0.984x and AMF aggregate time 0.832x AMD vs KahipND 0.990x
         // on that population; KahipND won only 16/838 matrices (1.9%)
         // vs AMF's 169/838 (20.2%). See choose_adaptive's doc comment
-        // and dev/research/issue-50-metisnd-symbolic-cost.md §F12.
+        // and dev/research/issue-50-metisnd-symbolic-cost.md section F12.
         let (cp, ri) = pat_bufs(500, 6);
         let p = CscPattern {
             n: 500,
@@ -1396,7 +1499,7 @@ mod tests {
         // size rule would send to MetisND is overridden to AMF. The corpus
         // A/B (dev/research/issue-67-thin-large-ordering.md) found AMF wins
         // or ties MetisND on factor+solve across this whole band. Here
-        // (n=50_000, avg_deg=20, uniform → not arrow) → AMF.
+        // (n=50_000, avg_deg=20, uniform -> not arrow) -> AMF.
         let (cp, ri) = pat_bufs(50_000, 20);
         let p = CscPattern {
             n: 50_000,
@@ -1410,9 +1513,9 @@ mod tests {
         // Large-dense (n > 100_000, avg_deg >= 5, non-arrow) now also routes
         // to AMF (issue #73): the real factor+solve A/B found AMF wins on
         // every measured matrix in this regime, so the would-be-MetisND
-        // decision is overridden to AMF at every n. The #50 avg_deg < 5 → AMD
+        // decision is overridden to AMF at every n. The #50 avg_deg < 5 -> AMD
         // catch fires first and is unaffected. (n=150_000, avg_deg=10, uniform
-        // → not arrow.)
+        // -> not arrow.)
         let (cp, ri) = pat_bufs(150_000, 10);
         let p = CscPattern {
             n: 150_000,
@@ -1463,9 +1566,9 @@ mod tests {
         // Issue #64: a small set of very-high-degree border columns
         // carrying a large nnz share = arrow. 11_900 body columns of
         // degree 6 (71_400 nnz) + 100 border columns of degree 600
-        // (60_000 nnz). avg_deg≈10.95, heavy_thr=max(64,88)=88; border
+        // (60_000 nnz). avg_deg~10.95, heavy_thr=max(64,88)=88; border
         // exceeds it. heavy_count=100 (0.83% of n < 5%); heavy_nnz share
-        // 60_000/131_400 = 45.7% >= 20% → arrow.
+        // 60_000/131_400 = 45.7% >= 20% -> arrow.
         let mut degrees = vec![6usize; 11_900];
         degrees.extend(std::iter::repeat_n(600usize, 100));
         let pat = pattern_with_degrees(&degrees);
@@ -1475,7 +1578,7 @@ mod tests {
     #[test]
     fn is_arrow_bordered_rejects_uniform_sparse() {
         // Uniformly thin (PoissonControl / powerflow22 / bratu3d shape):
-        // no column exceeds heavy_thr → not an arrow.
+        // no column exceeds heavy_thr -> not an arrow.
         let pat = pattern_with_degrees(&vec![8usize; 12_000]);
         assert!(
             !is_arrow_bordered(&pat),
@@ -1555,7 +1658,7 @@ mod tests {
     fn symbolic_factorize_default_uses_amf_for_small_matrices() {
         // Per Phase D of dev/plans/amf-clean-room.md: small matrices
         // (n <= 10_000) default to AMF, mirroring MUMPS's
-        // ana_set_ordering.F rule for SYM=2 N≤10000.
+        // ana_set_ordering.F rule for SYM=2 N<=10000.
         let m = small_grid_5x5();
         let params = SupernodeParams::default();
         let a = symbolic_factorize(&m, &params).unwrap();
@@ -1578,16 +1681,16 @@ mod tests {
         // issue #46's fixes (42434a5, 070840b). The numeric
         // inventory in dev/research/issue-50-numeric-inventory.csv
         // shows zero of 250 chain-catch-class matrices now have
-        // AMD/MetisND num_nnz_l ratio ≥ 1.5×.
+        // AMD/MetisND num_nnz_l ratio >= 1.5x.
         //
         // The remaining rule is the MUMPS-style "small symmetric"
-        // dispatch: n <= 10_000 → AMF, n > 10_000 → MetisND, with
+        // dispatch: n <= 10_000 -> AMF, n > 10_000 -> MetisND, with
         // the n == 0 sentinel returning AMD.
 
         // Empty matrix: AMD (avoids /0 and external-crate weirdness).
         assert_eq!(pick_default_method(0, 0), OrderingMethod::Amd);
 
-        // Small matrices (n <= 10_000) → AMF regardless of avg_deg.
+        // Small matrices (n <= 10_000) -> AMF regardless of avg_deg.
         assert_eq!(pick_default_method(715, 2839), OrderingMethod::Amf); // HAHN1
         assert_eq!(pick_default_method(3000, 8999), OrderingMethod::Amf); // DIXMAANH
         assert_eq!(pick_default_method(3000, 13_000), OrderingMethod::Amf);
@@ -1597,13 +1700,13 @@ mod tests {
         assert_eq!(pick_default_method(5314, 22566), OrderingMethod::Amf); // CRESC132
         assert_eq!(pick_default_method(10_000, 100_000), OrderingMethod::Amf);
 
-        // Large matrices (n > 10_000) → MetisND.
+        // Large matrices (n > 10_000) -> MetisND.
         assert_eq!(
             pick_default_method(20_000, 200_000),
             OrderingMethod::MetisND
         );
         // n=2_813_976, stored_nnz=6_622_463 (powerflow22 from #50):
-        // → MetisND now (was → ScotchND via choose_adaptive's deleted
+        // -> MetisND now (was -> ScotchND via choose_adaptive's deleted
         // n>100k branch before #50). Issue #50's IPM-loop validation
         // is what justifies the deletion at this size.
         assert_eq!(
@@ -1613,7 +1716,7 @@ mod tests {
     }
 
     /// PoissonControl KKT lower-triangle CSC, mirrors
-    /// `src/bin/diag_poisson_kkt.rs`. n_kkt = 3K². K=20 → n=1200,
+    /// `src/bin/diag_poisson_kkt.rs`. n_kkt = 3K^2. K=20 -> n=1200,
     /// large enough to exceed amd_switch=120 (so SCOTCH actually
     /// runs the multilevel pipeline) but small enough to be cheap.
     fn poisson_kkt_csc(k: usize) -> CscMatrix {
@@ -1676,7 +1779,7 @@ mod tests {
         // Issue #3 invariant: the `Auto` path and the no-arg
         // `symbolic_factorize` default must resolve to the *same* concrete
         // ordering on every matrix. PoissonControl K=58 (n=10092, stored
-        // avg_deg≈2.67) is a uniformly-thin KKT just inside the #67
+        // avg_deg~2.67) is a uniformly-thin KKT just inside the #67
         // thin-large AMF band ((10_000, 100_000], non-arrow), so both paths
         // now resolve to AMF. (Before #67 this matrix resolved to MetisND
         // via pick_default_method's n>10_000 rule; the MetisND delegation is

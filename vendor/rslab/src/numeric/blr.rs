@@ -12,14 +12,14 @@
 //! Compression uses **fully-pivoted Adaptive Cross Approximation (ACA)** - the
 //! integral-equation-community standard: a truncated, rank-revealing
 //! Gaussian-elimination cross approximation that needs no SVD (which has no
-//! pure-Rust complex implementation here). For a dense `m×n` block it is
-//! `O(rank·m·n)`, robust, and stops adaptively at a relative Frobenius
+//! pure-Rust complex implementation here). For a dense `mxn` block it is
+//! `O(rank*m*n)`, robust, and stops adaptively at a relative Frobenius
 //! tolerance.
 
 use crate::scalar::Scalar;
 
-/// A low-rank factorization `B ≈ U · Vᵀ` of a dense `m × n` block, with `U`
-/// (`m × rank`) and `V` (`n × rank`) stored column-major. `Vᵀ` (not `Vᴴ`): no
+/// A low-rank factorization `B ~ U * V^T` of a dense `m x n` block, with `U`
+/// (`m x rank`) and `V` (`n x rank`) stored column-major. `V^T` (not `V^H`): no
 /// conjugation, matching the unconjugated (complex-symmetric / general) algebra
 /// the fronts use.
 #[derive(Debug, Clone)]
@@ -29,32 +29,32 @@ pub struct LowRank<T: Scalar> {
     /// Total rank: full-precision crosses `[0, rank)` in `u`/`v` plus the
     /// low-precision tail `[rank, rank + rank_lo)` in `u_lo`/`v_lo`.
     pub rank: usize,
-    /// `m × rank`, column-major.
+    /// `m x rank`, column-major.
     pub u: Vec<T>,
-    /// `n × rank`, column-major.
+    /// `n x rank`, column-major.
     pub v: Vec<T>,
     /// Adaptive-precision tail (issue #19): trailing crosses whose
     /// contribution is small enough that storing them at the `T::Lo`
     /// roundoff stays below the compression tolerance - half the bytes
     /// per entry when `T::LO_SHRINKS`. Empty for plain compression.
     pub rank_lo: usize,
-    /// `m × rank_lo`, column-major, low precision.
+    /// `m x rank_lo`, column-major, low precision.
     pub u_lo: Vec<T::Lo>,
-    /// `n × rank_lo`, column-major, low precision.
+    /// `n x rank_lo`, column-major, low precision.
     pub v_lo: Vec<T::Lo>,
 }
 
 impl<T: Scalar> LowRank<T> {
     /// Stored size in full-precision-entry equivalents: full crosses count
     /// 1 each, low-precision tail entries count 1/2 (when `T::Lo` shrinks).
-    /// Comparable against the dense `m·n`.
+    /// Comparable against the dense `m*n`.
     pub fn storage(&self) -> usize {
         let lo = self.rank_lo * (self.m + self.n);
         let lo_eq = if T::LO_SHRINKS { lo.div_ceil(2) } else { lo };
         self.rank * (self.m + self.n) + lo_eq
     }
 
-    /// Reconstruct the dense approximation `U·Vᵀ` (column-major `m × n`). For
+    /// Reconstruct the dense approximation `U*V^T` (column-major `m x n`). For
     /// tests / diagnostics; the factorization never densifies a compressed block.
     pub fn to_dense(&self) -> Vec<T> {
         let mut d = vec![T::zero(); self.m * self.n];
@@ -93,7 +93,7 @@ fn frob<T: Scalar>(a: &[T]) -> f64 {
     a.iter().map(|x| x.magnitude_sq()).sum::<f64>().sqrt()
 }
 
-/// Fully-pivoted ACA compression of a dense `m × n` block `b` (column-major) to
+/// Fully-pivoted ACA compression of a dense `m x n` block `b` (column-major) to
 /// relative Frobenius tolerance `eps`. Caps the rank at `max_rank`.
 ///
 /// Returns the low-rank factors and the achieved rank. If the block does not
@@ -101,9 +101,9 @@ fn frob<T: Scalar>(a: &[T]) -> f64 {
 /// (`min(m, n)` cap) and the caller should treat it as not worth compressing.
 ///
 /// Algorithm: repeatedly pick the largest-magnitude residual entry `(i*, j*)`,
-/// peel off the rank-1 cross `R[:,j*] · R[i*,:] / R[i*,j*]` (Schur step of
+/// peel off the rank-1 cross `R[:,j*] * R[i*,:] / R[i*,j*]` (Schur step of
 /// Gaussian elimination with full pivoting), and stop when the residual
-/// Frobenius norm falls to `eps · ‖B‖_F`.
+/// Frobenius norm falls to `eps * ||B||_F`.
 #[cfg(test)]
 pub fn compress_aca<T: Scalar>(
     b: &[T],
@@ -117,9 +117,9 @@ pub fn compress_aca<T: Scalar>(
 
 /// [`compress_aca`] with the **adaptive-precision tail** (issue #19,
 /// Amestoy/Buttari/Higham/Mary adapted to ACA crosses): after compression,
-/// the trailing crosses whose weight `w_k = ‖u_k‖₂·‖v_k‖₂` satisfies
-/// `w_k · eps_lo ≤ eps · ‖B‖_F / rank` are stored in `T::Lo` - their
-/// storage-rounding noise (`w_k · eps_lo` each, `rank` of them at most)
+/// the trailing crosses whose weight `w_k = ||u_k||_2*||v_k||_2` satisfies
+/// `w_k * eps_lo <= eps * ||B||_F / rank` are stored in `T::Lo` - their
+/// storage-rounding noise (`w_k * eps_lo` each, `rank` of them at most)
 /// stays below the compression tolerance already accepted, so the overall
 /// approximation quality class is unchanged at half the bytes per tail
 /// entry. The split is a prefix rule (all crosses from the first qualifying
@@ -145,7 +145,7 @@ fn compress_aca_impl<T: Scalar>(
 ) -> LowRank<T> {
     let cap = max_rank.min(m).min(n);
     let bnorm = frob(b);
-    let mut r = b.to_vec(); // residual, column-major m×n
+    let mut r = b.to_vec(); // residual, column-major mxn
     let mut u: Vec<T> = Vec::with_capacity(m * cap);
     let mut v: Vec<T> = Vec::with_capacity(n * cap);
     let mut rank = 0usize;
@@ -185,10 +185,10 @@ fn compress_aca_impl<T: Scalar>(
             break; // residual exactly zero - exact low-rank
         }
         let pinv = r[bj * m + bi].recip();
-        // Cross factors: u = R[:, bj], v = R[bi, :]·(1/pivot).
+        // Cross factors: u = R[:, bj], v = R[bi, :]*(1/pivot).
         let uk: Vec<T> = (0..m).map(|i| r[bj * m + i]).collect();
         let vk: Vec<T> = (0..n).map(|j| r[j * m + bi] * pinv).collect();
-        // Schur update R -= u ⊗ v.
+        // Schur update R -= u kron v.
         for j in 0..n {
             let vj = vk[j];
             if vj != T::zero() {
@@ -247,15 +247,15 @@ fn compress_aca_impl<T: Scalar>(
 }
 
 /// One tile of a block-partitioned matrix: stored either dense (column-major,
-/// `rows × cols`) or in compressed low-rank form `U·Vᵀ`. Diagonal tiles and
+/// `rows x cols`) or in compressed low-rank form `U*V^T`. Diagonal tiles and
 /// off-diagonal tiles that do not compress below the break-even rank stay
 /// `Dense`; admissible (geometrically separated, smooth-kernel) off-diagonal
 /// tiles become `LowRank`. The BLR factorization dispatches on this enum: dense
 /// tiles take the ordinary kernels, low-rank tiles take the cheap
-/// `U(VᵀU)Vᵀ`-style block arithmetic.
+/// `U(V^TU)V^T`-style block arithmetic.
 #[derive(Debug, Clone)]
 pub enum Block<T: Scalar> {
-    /// Column-major `rows × cols` dense tile. The shape fields are read only
+    /// Column-major `rows x cols` dense tile. The shape fields are read only
     /// by the test-only `storage` accounting; production consumes `data` with
     /// the extent coming from the partition.
     Dense {
@@ -265,12 +265,12 @@ pub enum Block<T: Scalar> {
         cols: usize,
         data: Vec<T>,
     },
-    /// Compressed tile `U·Vᵀ`.
+    /// Compressed tile `U*V^T`.
     LowRank(LowRank<T>),
 }
 
 impl<T: Scalar> Block<T> {
-    /// Stored scalar count - `rows·cols` dense, `rank·(rows+cols)` low-rank.
+    /// Stored scalar count - `rows*cols` dense, `rank*(rows+cols)` low-rank.
     // Test-only: the compression tests assert BLR beats dense storage.
     #[cfg(test)]
     pub fn storage(&self) -> usize {
@@ -288,7 +288,7 @@ impl<T: Scalar> Block<T> {
         matches!(self, Block::LowRank(_))
     }
 
-    /// Dense `rows × cols` column-major reconstruction of the tile.
+    /// Dense `rows x cols` column-major reconstruction of the tile.
     pub fn to_dense(&self) -> Vec<T> {
         match self {
             Block::Dense { data, .. } => data.clone(),
@@ -305,9 +305,9 @@ fn block_extent(full: usize, b: usize, k: usize) -> (usize, usize) {
 }
 
 /// A block-partitioned (Block Low-Rank) representation of a dense column-major
-/// `nrow × ncol` matrix: a `nbr × nbc` grid of [`Block`]s over a fixed block
+/// `nrow x ncol` matrix: a `nbr x nbc` grid of [`Block`]s over a fixed block
 /// size `b` (the trailing row/column tile may be smaller). The grid is stored
-/// row-major (`blocks[ib·nbc + jb]`).
+/// row-major (`blocks[ib*nbc + jb]`).
 ///
 /// This is the data structure the BLR-aware front factorization operates on:
 /// Stage 1 builds and reconstructs it; later stages factor it block-by-block
@@ -348,7 +348,7 @@ impl<T: Scalar> BlrMatrix<T> {
         self.blocks.iter().map(Block::storage).sum()
     }
 
-    /// Footprint of the equivalent dense matrix, `nrow·ncol`.
+    /// Footprint of the equivalent dense matrix, `nrow*ncol`.
     // Test-only: the compression tests assert BLR beats dense storage. Off the
     // production path, so `cfg(test)` keeps it out of release builds.
     #[cfg(test)]
@@ -363,15 +363,15 @@ impl<T: Scalar> BlrMatrix<T> {
         self.blocks.iter().filter(|b| b.is_low_rank()).count()
     }
 
-    /// Build a BLR partition of the dense column-major `nrow × ncol` matrix `a`
+    /// Build a BLR partition of the dense column-major `nrow x ncol` matrix `a`
     /// at block size `b` and per-tile relative Frobenius tolerance `eps`.
     ///
     /// Diagonal tiles (`ib == jb`) are always dense. Each off-diagonal tile is
     /// compressed by ACA, capped at the **break-even rank**
-    /// `⌊rows·cols/(rows+cols)⌋` (the rank above which `U·Vᵀ` stores no less than
+    /// `floor(rows*cols/(rows+cols))` (the rank above which `U*V^T` stores no less than
     /// the dense tile): a tile that reaches that cap without converging is kept
     /// dense, which also bounds the ACA cost on incompressible near-diagonal
-    /// tiles to `O(breakeven · rows·cols)`.
+    /// tiles to `O(breakeven * rows*cols)`.
     #[allow(dead_code)] // stable convenience wrapper; production enters via from_dense_with
     pub fn from_dense(a: &[T], nrow: usize, ncol: usize, b: usize, eps: f64) -> BlrMatrix<T> {
         Self::from_dense_with(a, nrow, ncol, b, eps, false)
@@ -434,7 +434,7 @@ impl<T: Scalar> BlrMatrix<T> {
         }
     }
 
-    /// Reconstruct the dense column-major `nrow × ncol` approximation by writing
+    /// Reconstruct the dense column-major `nrow x ncol` approximation by writing
     /// every tile into place. Test-only reconstruction check for the compression
     /// path; production never densifies the whole matrix (it consumes tiles via
     /// [`Block::to_dense`]). `cfg(test)` keeps it out of release builds.
@@ -470,8 +470,8 @@ mod tests {
 
     #[test]
     fn aca_recovers_exact_low_rank() {
-        // Build a rank-3 block U0·V0ᵀ (m=40, n=30) and check ACA recovers it at a
-        // tiny tolerance with rank ≤ 3.
+        // Build a rank-3 block U0*V0^T (m=40, n=30) and check ACA recovers it at a
+        // tiny tolerance with rank <= 3.
         let (m, n, r0) = (40usize, 30usize, 3usize);
         let u0: Vec<f64> = (0..m * r0).map(|t| (t * 7 % 11) as f64 - 5.0).collect();
         let v0: Vec<f64> = (0..n * r0).map(|t| (t * 5 % 13) as f64 - 6.0).collect();
@@ -484,14 +484,14 @@ mod tests {
             }
         }
         let lr = compress_aca(&b, m, n, 1e-12, m.min(n));
-        assert!(lr.rank <= r0, "rank {} should be ≤ {r0}", lr.rank);
+        assert!(lr.rank <= r0, "rank {} should be <= {r0}", lr.rank);
         assert!(max_abs_diff(&b, &lr.to_dense()) < 1e-9 * frob(&b));
         assert!(lr.storage() < m * n, "must actually compress");
     }
 
     #[test]
     fn aca_compresses_smooth_kernel_block() {
-        // A smooth-kernel off-diagonal block (1/(2 + |i−j|) type, separated
+        // A smooth-kernel off-diagonal block (1/(2 + |i-j|) type, separated
         // clusters) - the EM near-field analogue - must compress to low rank at a
         // loose preconditioner tolerance.
         let (m, n) = (64usize, 64usize);
@@ -546,7 +546,7 @@ mod tests {
         // Loose bound: per-tile relative eps accumulates mildly across the grid.
         assert!(
             err <= 1e-2 * frob(&a),
-            "reconstruction error {err} vs ‖A‖={}",
+            "reconstruction error {err} vs ||A||={}",
             frob(&a)
         );
         assert!(
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn blr_ragged_partition_reconstructs() {
-        // Block size that does not divide the dimension → trailing short tiles.
+        // Block size that does not divide the dimension -> trailing short tiles.
         let (m, n, b) = (100usize, 70usize, 32usize);
         let mut a = vec![0.0f64; m * n];
         for j in 0..n {

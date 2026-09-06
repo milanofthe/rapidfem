@@ -1,7 +1,7 @@
 use crate::error::RslabError;
 use crate::scalar::Scalar;
 
-/// Symmetric matrix stored as full n×n column-major. Only the lower triangle
+/// Symmetric matrix stored as full nxn column-major. Only the lower triangle
 /// is meaningful; the strict upper triangle is ignored on input.
 /// Entry (i, j) is at index j*n + i. Size: n*n `T` values.
 ///
@@ -13,7 +13,7 @@ pub struct SymmetricMatrix<T = f64> {
 }
 
 impl<T: Scalar> SymmetricMatrix<T> {
-    /// Create a new n×n symmetric matrix initialized to zero.
+    /// Create a new nxn symmetric matrix initialized to zero.
     pub fn zeros(n: usize) -> Self {
         Self {
             n,

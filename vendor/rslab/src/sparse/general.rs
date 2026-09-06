@@ -3,7 +3,7 @@
 //! [`CscMatrix`](crate::sparse::csc::CscMatrix) stores only the lower triangle
 //! of a *symmetric* matrix. The unsymmetric LU path
 //! ([`crate::numeric::multifrontal_lu`]) needs the **full** matrix with both
-//! triangles and genuinely distinct `A_ij ≠ A_ji`; this type provides that.
+//! triangles and genuinely distinct `A_ij != A_ji`; this type provides that.
 
 use crate::error::RslabError;
 use crate::scalar::Scalar;
@@ -37,7 +37,7 @@ impl<T: Scalar> GeneralCsc<T> {
         for (&r, &c) in rows.iter().zip(cols) {
             if r >= n || c >= n {
                 return Err(RslabError::InvalidInput(format!(
-                    "GeneralCsc::from_triplets: index ({r}, {c}) out of bounds for {n}×{n}"
+                    "GeneralCsc::from_triplets: index ({r}, {c}) out of bounds for {n}x{n}"
                 )));
             }
         }
@@ -115,7 +115,7 @@ impl<T: Scalar> GeneralCsc<T> {
         }
     }
 
-    /// The transpose `Aᵀ` (also general CSC). Column `i` of `Aᵀ` is row `i` of
+    /// The transpose `A^T` (also general CSC). Column `i` of `A^T` is row `i` of
     /// `A`.
     pub fn transpose(&self) -> Self {
         let n = self.n;
@@ -133,7 +133,7 @@ impl<T: Scalar> GeneralCsc<T> {
         let mut next = col_ptr[..n].to_vec();
         for j in 0..n {
             for k in self.col_ptr[j]..self.col_ptr[j + 1] {
-                let i = self.row_idx[k]; // entry (i, j) → transpose column i, row j
+                let i = self.row_idx[k]; // entry (i, j) -> transpose column i, row j
                 let pos = next[i];
                 next[i] += 1;
                 row_idx[pos] = j;
@@ -148,7 +148,7 @@ impl<T: Scalar> GeneralCsc<T> {
         }
     }
 
-    /// One-norm `‖A‖₁ = maxⱼ Σᵢ |aᵢⱼ|` (max absolute column sum) - the
+    /// One-norm `||A||_1 = max_j sum_i |a_ij|` (max absolute column sum) - the
     /// norm side of the Hager-Higham condition estimate (feral #94 port).
     pub fn one_norm(&self) -> f64 {
         let mut worst = 0.0f64;

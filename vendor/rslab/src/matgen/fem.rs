@@ -2,11 +2,11 @@
 //! stencil Laplacian misses: the **curl-curl** time-harmonic Maxwell operator
 //! (complex symmetric indefinite, with a large gradient near-null-space -- the
 //! FEM edge-element / EM workload) and the **saddle-point** Stokes/KKT operator
-//! (symmetric indefinite, `[A Bᵀ; B -βC]`). Both are assembled directly on a
+//! (symmetric indefinite, `[A B^T; B -betaC]`). Both are assembled directly on a
 //! structured grid with finite differences, no external FEM library, following
-//! the standard discretizations (curl-curl `∇×∇×E - (ω²ε - iωσ)E`, Nédélec/Yee;
-//! Stokes MAC / mixed-FEM `[A Bᵀ; B 0]` with Brezzi-Pitkäranta pressure
-//! stabilization `-βC`). References: Jin, *The FEM in Electromagnetics*;
+//! the standard discretizations (curl-curl `curl curl E - (omega^2 eps - i omega sigma) E`, Nédélec/Yee;
+//! Stokes MAC / mixed-FEM `[A B^T; B 0]` with Brezzi-Pitkäranta pressure
+//! stabilization `-betaC`). References: Jin, *The FEM in Electromagnetics*;
 //! Elman-Silvester-Wathen, *Finite Elements and Fast Iterative Solvers* (IFISS);
 //! Benzi-Golub-Liesen, *Numerical solution of saddle point problems*.
 #![allow(clippy::needless_range_loop)]
@@ -29,7 +29,7 @@ fn strides(dims: &[usize]) -> Vec<usize> {
 }
 
 /// The discrete divergence row for grid node `k`: central differences over each
-/// dimension, `(Du)_k = Σ_a (u[k+e_a,a] - u[k-e_a,a]) / 2`. Returns `(dof, coeff)`
+/// dimension, `(Du)_k = sum_a (u[k+e_a,a] - u[k-e_a,a]) / 2`. Returns `(dof, coeff)`
 /// entries into a component-major velocity vector (`dof(a,i) = a*n + i`). Missing
 /// (boundary) neighbours are dropped.
 fn divergence_row(k: usize, dims: &[usize], stride: &[usize], n: usize) -> Vec<(usize, f64)> {
@@ -81,11 +81,11 @@ fn vector_laplacian(
 }
 
 /// Time-harmonic **curl-curl** Maxwell operator on a structured grid:
-/// `A = (∇×∇×) - ω²M + iωσM`, discretized via the identity `∇×∇× = L - grad·div`
-/// (`L` the component-wise vector Laplacian, `grad·div = DᵀD` from the discrete
-/// divergence `D`). `M` is the lumped mass (identity). The `-ω²M` shift makes the
-/// operator **indefinite**; the `iωσM` conductivity term makes it **complex
-/// symmetric** (`A = Aᵀ`, not Hermitian); the curl-curl part is singular on
+/// `A = (curl curl) - omega^2 M + i omega sigma M`, discretized via the identity `curl curl = L - grad div`
+/// (`L` the component-wise vector Laplacian, `grad div = D^TD` from the discrete
+/// divergence `D`). `M` is the lumped mass (identity). The `-omega^2 M` shift makes the
+/// operator **indefinite**; the `i omega sigma M` conductivity term makes it **complex
+/// symmetric** (`A = A^T`, not Hermitian); the curl-curl part is singular on
 /// discrete gradients, so the system has the gradient near-null-space that makes
 /// edge-element EM problems hard for iterative solvers and a stress test for a
 /// direct one. `dims` is `[nx, ny]` (2 components) or `[nx, ny, nz]` (3).
@@ -107,7 +107,7 @@ pub fn curl_curl(dims: &[usize], omega: f64, sigma: f64) -> CscMatrix<Complex<f6
     for (r, c, w) in l_tri {
         *off.entry((r, c)).or_insert(0.0) += w;
     }
-    // - DᵀD (grad-div): accumulate the outer product of each divergence row.
+    // - D^TD (grad-div): accumulate the outer product of each divergence row.
     for k in 0..n {
         let e = divergence_row(k, dims, &stride, n);
         for a in 0..e.len() {
@@ -121,7 +121,7 @@ pub fn curl_curl(dims: &[usize], omega: f64, sigma: f64) -> CscMatrix<Complex<f6
         }
     }
 
-    // Complex mass shift on the diagonal: -ω²M + iωσM (M = I).
+    // Complex mass shift on the diagonal: -omega^2 M + i omega sigma M (M = I).
     let shift = Complex::new(-omega * omega, omega * sigma);
     let mut rows = Vec::with_capacity(ndof + off.len());
     let mut cols = Vec::with_capacity(ndof + off.len());
@@ -141,11 +141,11 @@ pub fn curl_curl(dims: &[usize], omega: f64, sigma: f64) -> CscMatrix<Complex<f6
     super::build_sym(ndof, &rows, &cols, &vals)
 }
 
-/// **Saddle-point** Stokes/KKT operator `[A Bᵀ; B -βC]` on a structured grid
+/// **Saddle-point** Stokes/KKT operator `[A B^T; B -betaC]` on a structured grid
 /// (symmetric indefinite), generic over the scalar type. `A` is the velocity
 /// vector Laplacian (SPD), `B` the discrete divergence coupling velocity to
-/// pressure, and `-βC` a Brezzi-Pitkäranta pressure-Laplacian stabilization
-/// (`β>0`) that regularizes the otherwise-singular zero `(2,2)` block on a
+/// pressure, and `-betaC` a Brezzi-Pitkäranta pressure-Laplacian stabilization
+/// (`beta>0`) that regularizes the otherwise-singular zero `(2,2)` block on a
 /// collocated grid. DOF layout: velocity `a*n+i` (`a<ndim`), then pressure
 /// `ndim*n + i`. The zero/negative pressure block makes the system indefinite --
 /// the KKT/constrained-optimization class distinct from an SPD or a shifted
@@ -168,15 +168,15 @@ pub fn saddle_point<T: Scalar>(dims: &[usize], beta: f64) -> CscMatrix<T> {
     }
     tri.extend(l_tri);
 
-    // B / Bᵀ: divergence coupling. Row = pressure dof (always > velocity dofs), so
-    // (pdof(k), vel_dof) is lower-triangle; symmetry supplies Bᵀ.
+    // B / B^T: divergence coupling. Row = pressure dof (always > velocity dofs), so
+    // (pdof(k), vel_dof) is lower-triangle; symmetry supplies B^T.
     for k in 0..n {
         for (v, coeff) in divergence_row(k, dims, &stride, n) {
             tri.push((pdof(k), v, coeff));
         }
     }
 
-    // -βC: pressure Laplacian stabilization (bottom-right, negative definite).
+    // -betaC: pressure Laplacian stabilization (bottom-right, negative definite).
     let (c_diag, c_tri) = vector_laplacian(dims, &stride, n); // ndim blocks; use block 0 (scalar)
     for i in 0..n {
         diag[pdof(i)] -= beta * c_diag[i];
@@ -210,21 +210,21 @@ pub enum Flow {
     /// Constant unit velocity along the grid diagonal (equal on every axis) --- a
     /// uniform wind, unsymmetric but spatially constant.
     Diagonal,
-    /// Recirculating vortex in the first two axes, `b = (-(y-½), (x-½))`, zero on
+    /// Recirculating vortex in the first two axes, `b = (-(y-1/2), (x-1/2))`, zero on
     /// any third axis. The classic double-glazing / recirculating-flow benchmark:
     /// the velocity reverses across the domain, so up-/down-wind coupling flips
     /// sign, a richer unsymmetric structure than a constant wind.
     Rotating,
 }
 
-/// Convection--diffusion operator `-ε∇²u + b·∇u = f` on a structured `dims` grid
+/// Convection--diffusion operator `-epsgrad^2u + b*gradu = f` on a structured `dims` grid
 /// with interior unknowns and homogeneous Dirichlet boundaries, finite-differenced
 /// --- the canonical source of **unsymmetric** sparse matrices (the LU path's
-/// workload). The first-derivative advection term `b·∇u` breaks symmetry; the
+/// workload). The first-derivative advection term `b*gradu` breaks symmetry; the
 /// diffusion term is the usual 5/7-point Laplacian scaled by `eps`.
 ///
 /// * `upwind=false` (central differences) is the sharp, oscillation-prone form
-///   that stresses pivoting at small `eps` (high grid-Péclet `|b|h/ε`);
+///   that stresses pivoting at small `eps` (high grid-Péclet `|b|h/eps`);
 /// * `upwind=true` is the first-order upwind form, a diagonally dominant M-matrix.
 ///
 /// Sweeping `eps` moves the operator from diffusion-dominated (nearly symmetric,

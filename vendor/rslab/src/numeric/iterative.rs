@@ -1,13 +1,13 @@
 //! Krylov iteration for complex-symmetric systems, preconditioned by an RLA
 //! factorization.
 //!
-//! The target use is **3D EM FEM / MOM**: large complex-symmetric `A = Aᵀ`
+//! The target use is **3D EM FEM / MOM**: large complex-symmetric `A = A^T`
 //! (PARDISO `mtype 6`) systems solved iteratively, with a robust, memory-light
 //! RLA factorization (static-pivoted, optionally `f32` / incomplete) as the
-//! preconditioner. The iterative method of choice for `A = Aᵀ` is **COCG**
+//! preconditioner. The iterative method of choice for `A = A^T` is **COCG**
 //! (Conjugate Orthogonal Conjugate Gradient, van der Vorst & Melissen 1990):
 //! structurally CG, but every inner product is the *unconjugated* bilinear
-//! form `xᵀy = Σ xᵢyᵢ` - the correct geometry for a complex-symmetric (not
+//! form `x^T y = sum x_i y_i` - the correct geometry for a complex-symmetric (not
 //! Hermitian) operator. For `T = f64` it reduces exactly to preconditioned CG.
 //!
 //! The [`Preconditioner`] trait decouples the iteration from the factorization
@@ -22,14 +22,14 @@
 //!
 //! - **Single-RHS [`gmres`]:** *modified* Gram-Schmidt (each projection updates
 //!   `w` before the next is taken) with a conditional DGKS second pass, triggered
-//!   when one MGS sweep cancels more than `1/√2` of `‖w‖`.
+//!   when one MGS sweep cancels more than `1/sqrt2` of `||w||`.
 //! - **Block [`gmres_block`]:** *classical* Gram-Schmidt with a conditional second
 //!   pass = **CGS2**, batched over the whole panel for BLAS-3 arithmetic
 //!   intensity; the DGKS second pass is decided and applied **per column**.
 //!
 //! Consequently a **block solve with `s = 1` is *not* bit-identical to the single-
 //! RHS [`gmres`]**: MGS and CGS accumulate the projections in a different order, so
-//! the two can differ by a rounding ULP per step and hence by up to ±1 iteration
+//! the two can differ by a rounding ULP per step and hence by up to +/-1 iteration
 //! at a residual that straddles `tol`. Both converge to the same solution within
 //! the requested tolerance. This is a deliberate design point (CGS2's panel-wide
 //! reductions are what make the multi-RHS path fast and thread-count deterministic),
@@ -52,10 +52,10 @@ use rayon::prelude::*;
 pub trait LinearOperator<T: Scalar> {
     /// The system dimension.
     fn n(&self) -> usize;
-    /// Write `y ← A x`. `x` and `y` have length `n`.
+    /// Write `y <- A x`. `x` and `y` have length `n`.
     fn apply(&self, x: &[T], y: &mut [T]);
-    /// Block apply: `Y[:,c] ← A X[:,c]` for `c in 0..s`, with `X`,`Y` **column-
-    /// major** `n×s` (RHS `c` is the contiguous slice `[c·n, (c+1)·n)`). The
+    /// Block apply: `Y[:,c] <- A X[:,c]` for `c in 0..s`, with `X`,`Y` **column-
+    /// major** `nxs` (RHS `c` is the contiguous slice `[c*n, (c+1)*n)`). The
     /// default loops the single-vector [`apply`](Self::apply); explicit-matrix
     /// operators override it with an amortized block matvec (each matrix entry
     /// loaded once for all `s` columns - the BLAS-3 arithmetic intensity that
@@ -76,8 +76,8 @@ impl<T: Scalar> LinearOperator<T> for CscMatrix<T> {
         self.symv(x, y);
     }
     /// Amortized block symv: each lower-triangle entry `(i,j,v)` is loaded once
-    /// and scattered to all `s` columns (`y[:,c] += v·x[j,c]`, and symmetrically
-    /// `y[j,c] += v·x[i,c]` off the diagonal) - the BLAS-3 reuse a multi-RHS
+    /// and scattered to all `s` columns (`y[:,c] += v*x[j,c]`, and symmetrically
+    /// `y[j,c] += v*x[i,c]` off the diagonal) - the BLAS-3 reuse a multi-RHS
     /// solve buys over `s` separate `symv`s.
     fn apply_block(&self, x: &[T], y: &mut [T], s: usize) {
         let n = self.n;
@@ -113,7 +113,7 @@ impl<T: Scalar> LinearOperator<T> for GeneralCsc<T> {
         self.matvec(x, y);
     }
     /// Amortized block matvec: each entry `(i,j,v)` is loaded once and applied to
-    /// all `s` columns (`y[i,c] += v·x[j,c]`).
+    /// all `s` columns (`y[i,c] += v*x[j,c]`).
     fn apply_block(&self, x: &[T], y: &mut [T], s: usize) {
         let n = self.n;
         for v in y.iter_mut() {
@@ -132,14 +132,14 @@ impl<T: Scalar> LinearOperator<T> for GeneralCsc<T> {
     }
 }
 
-/// A preconditioner `M ≈ A`: applies `z = M⁻¹ r`. Implemented by a factored
+/// A preconditioner `M ~ A`: applies `z = M^-1 r`. Implemented by a factored
 /// [`LdltSolver`](crate::numeric::sparse_solver::LdltSolver)
 /// and by [`NoPreconditioner`] (the unpreconditioned baseline).
 pub trait Preconditioner<T: Scalar> {
-    /// Write `z ← M⁻¹ r`. `r` and `z` have length `n`.
+    /// Write `z <- M^-1 r`. `r` and `z` have length `n`.
     fn apply(&self, r: &[T], z: &mut [T]) -> Result<(), RslabError>;
-    /// Block apply: `Z[:,c] ← M⁻¹ R[:,c]` for `c in 0..s`, with `R`,`Z` **column-
-    /// major** `n×s`. The default loops [`apply`](Self::apply); a factored solver
+    /// Block apply: `Z[:,c] <- M^-1 R[:,c]` for `c in 0..s`, with `R`,`Z` **column-
+    /// major** `nxs`. The default loops [`apply`](Self::apply); a factored solver
     /// overrides it with a block triangular solve (`solve_many`) that loads each
     /// `L`/`D`/`U` value once for all `s` columns.
     fn apply_block(&self, r: &[T], z: &mut [T], s: usize, n: usize) -> Result<(), RslabError> {
@@ -173,8 +173,8 @@ impl<T: Scalar> Preconditioner<T> for NoPreconditioner {
     }
 }
 
-/// A factored RLA solver is a preconditioner: `M⁻¹ r` is one forward/back
-/// substitution against the stored `LDLᵀ` factor.
+/// A factored RLA solver is a preconditioner: `M^-1 r` is one forward/back
+/// substitution against the stored `LDL^T` factor.
 impl<T: Scalar> Preconditioner<T> for LdltSolver<T> {
     fn apply(&self, r: &[T], z: &mut [T]) -> Result<(), RslabError> {
         let x = self.solve(r)?;
@@ -299,8 +299,8 @@ impl Preconditioner<Complex<f64>> for LowPrecisionLu {
     }
 }
 
-/// Unconjugated bilinear inner product `xᵀy = Σ xᵢyᵢ` (no complex conjugation -
-/// the defining choice of the COCG geometry for `A = Aᵀ`).
+/// Unconjugated bilinear inner product `x^T y = sum x_i y_i` (no complex conjugation -
+/// the defining choice of the COCG geometry for `A = A^T`).
 #[inline]
 fn dotu<T: Scalar>(x: &[T], y: &[T]) -> T {
     let mut s = T::zero();
@@ -310,7 +310,7 @@ fn dotu<T: Scalar>(x: &[T], y: &[T]) -> T {
     s
 }
 
-/// Euclidean norm `‖x‖₂ = √Σ|xᵢ|²` (genuine modulus - used only for the stopping
+/// Euclidean norm `||x||_2 = sqrt(sum |x_i|^2)` (genuine modulus - used only for the stopping
 /// test, never inside the Krylov recurrences).
 #[inline]
 fn norm2<T: Scalar>(x: &[T]) -> f64 {
@@ -323,7 +323,7 @@ fn norm2<T: Scalar>(x: &[T]) -> f64 {
 /// from an algebraic breakdown of the short-recurrence denominator (`Breakdown`).
 ///
 /// Only the states the solvers genuinely distinguish are represented:
-/// * COCG / COCR report all three - a zero bilinear denominator (`pᵀAp` or `rᵀz`
+/// * COCG / COCR report all three - a zero bilinear denominator (`p^TAp` or `r^Tz`
 ///   in COCG, the residual-norm form in COCR), reachable on an indefinite
 ///   complex-symmetric operator, is a real `Breakdown` before convergence.
 /// * GMRES / FGMRES / GCRO-DR / block-GMRES never report `Breakdown`: a
@@ -381,22 +381,22 @@ pub struct KrylovResult<T> {
     pub x: Vec<T>,
     /// Number of iterations actually performed.
     pub iters: usize,
-    /// `true` if `‖b − Ax‖ / ‖b‖ ≤ tol` was reached within `max_iter`.
+    /// `true` if `||b - Ax|| / ||b|| <= tol` was reached within `max_iter`.
     pub converged: bool,
-    /// Final relative residual `‖b − Ax‖ / ‖b‖`.
+    /// Final relative residual `||b - Ax|| / ||b||`.
     pub final_res: f64,
     /// Why the iteration stopped (`converged` is `stop == Converged`).
     pub stop: StopReason,
 }
 
-/// Preconditioned COCG for a complex-symmetric `A = Aᵀ` stored as a lower-
+/// Preconditioned COCG for a complex-symmetric `A = A^T` stored as a lower-
 /// triangle [`CscMatrix`] (multiplied via [`CscMatrix::symv`]).
 ///
 /// Solves `A x = b` to relative residual `tol` (or `max_iter` iterations).
-/// `precond` supplies `M⁻¹`; pass [`NoPreconditioner`] for the unpreconditioned
-/// baseline. Starts from `x₀ = 0`.
+/// `precond` supplies `M^-1`; pass [`NoPreconditioner`] for the unpreconditioned
+/// baseline. Starts from `x_0 = 0`.
 ///
-/// Breakdown (a zero bilinear denominator `pᵀAp` or `rᵀz`, possible for an
+/// Breakdown (a zero bilinear denominator `p^TAp` or `r^Tz`, possible for an
 /// indefinite complex-symmetric operator) stops the iteration and returns the
 /// best iterate with `converged = false`.
 pub fn cocg<T, A, M>(
@@ -420,7 +420,7 @@ where
     }
 
     let mut x = vec![T::zero(); n];
-    // r₀ = b − A x₀ = b (x₀ = 0).
+    // r_0 = b - A x_0 = b (x_0 = 0).
     let mut r = b.to_vec();
     let bnorm = norm2(b);
     if bnorm == 0.0 {
@@ -436,7 +436,7 @@ where
     let mut z = vec![T::zero(); n];
     precond.apply(&r, &mut z)?;
     let mut p = z.clone();
-    let mut rho = dotu(&r, &z); // rᵀz, unconjugated
+    let mut rho = dotu(&r, &z); // r^Tz, unconjugated
     let mut q = vec![T::zero(); n];
 
     let mut final_res = norm2(&r) / bnorm;
@@ -471,7 +471,7 @@ where
         rho = rho_new;
     }
 
-    // Not converged with iterations left ⇒ the loop broke on a zero `pᵀAp`/`rᵀz`
+    // Not converged with iterations left => the loop broke on a zero `p^TAp`/`r^Tz`
     // denominator (breakdown); otherwise the budget was exhausted.
     let stop = stop_reason(converged, iters, max_iter);
     Ok(KrylovResult {
@@ -484,7 +484,7 @@ where
 }
 
 /// Preconditioned COCR (Conjugate Orthogonal Conjugate Residual, Sogabe &
-/// Zhang 2007) for complex-symmetric `A = Aᵀ`. The CR-family analogue of
+/// Zhang 2007) for complex-symmetric `A = A^T`. The CR-family analogue of
 /// [`cocg`]: it minimises a residual-like quantity and is typically **smoother
 /// and more robust on strongly indefinite** operators (high-frequency 3D
 /// Helmholtz) where COCG's residual can oscillate or break down.
@@ -513,7 +513,7 @@ where
     }
 
     let mut x = vec![T::zero(); n];
-    let mut r = b.to_vec(); // r₀ = b (x₀ = 0)
+    let mut r = b.to_vec(); // r_0 = b (x_0 = 0)
     let bnorm = norm2(b);
     if bnorm == 0.0 {
         return Ok(KrylovResult {
@@ -525,23 +525,23 @@ where
         });
     }
 
-    let mut z = vec![T::zero(); n]; // z = M⁻¹ r
+    let mut z = vec![T::zero(); n]; // z = M^-1 r
     precond.apply(&r, &mut z)?;
     let mut p = z.clone();
     let mut ap = vec![T::zero(); n];
     op.apply(&p, &mut ap); // A p
     let mut az = ap.clone(); // A z (= A p at init since p = z)
-    let mut gamma = dotu(&z, &az); // zᵀ A z
-    let mut w = vec![T::zero(); n]; // M⁻¹ A p
+    let mut gamma = dotu(&z, &az); // z^T A z
+    let mut w = vec![T::zero(); n]; // M^-1 A p
     let mut aw = vec![T::zero(); n]; // A w
 
     let mut final_res = norm2(&r) / bnorm;
     let mut converged = false;
     let mut iters = 0;
     while iters < max_iter {
-        precond.apply(&ap, &mut w)?; // w = M⁻¹ A p
+        precond.apply(&ap, &mut w)?; // w = M^-1 A p
         op.apply(&w, &mut aw); // A w
-        let denom = dotu(&ap, &w); // (A p)ᵀ M⁻¹ (A p)
+        let denom = dotu(&ap, &w); // (A p)^T M^-1 (A p)
         if denom == T::zero() {
             break;
         }
@@ -581,7 +581,7 @@ where
     })
 }
 
-/// Conjugated (Hermitian) inner product `⟨x, y⟩ = Σ conj(xᵢ)·yᵢ` - the geometry
+/// Conjugated (Hermitian) inner product `<x, y> = sum conj(x_i)*y_i` - the geometry
 /// GMRES orthogonalises in (distinct from COCG's unconjugated form).
 #[inline]
 fn dotc<T: Scalar>(x: &[T], y: &[T]) -> T {
@@ -593,8 +593,8 @@ fn dotc<T: Scalar>(x: &[T], y: &[T]) -> T {
 }
 
 /// Complex Givens rotation `(c, s)` that zeroes `g` against `f`: with the
-/// rotation `[[conj(c), conj(s)], [-s, c]]`, `conj(c)·f + conj(s)·g = r` (real)
-/// and `-s·f + c·g = 0`, `|c|²+|s|² = 1`.
+/// rotation `[[conj(c), conj(s)], [-s, c]]`, `conj(c)*f + conj(s)*g = r` (real)
+/// and `-s*f + c*g = 0`, `|c|^2+|s|^2 = 1`.
 #[inline]
 fn givens<T: Scalar>(f: T, g: T) -> (T, T) {
     if g == T::zero() {
@@ -608,10 +608,10 @@ fn givens<T: Scalar>(f: T, g: T) -> (T, T) {
     (f * inv, g * inv)
 }
 
-/// Largest leading dimension `d ≤ jdim` whose Hessenberg diagonals are all above a
-/// relative breakdown threshold `eps · max_i |h[i][i]|`. The upper-triangular
+/// Largest leading dimension `d <= jdim` whose Hessenberg diagonals are all above a
+/// relative breakdown threshold `eps * max_i |h[i][i]|`. The upper-triangular
 /// solve for `y` back-substitutes with `1/h[i][i]`; after Givens the diagonal is
-/// `√(|f|²+|g|²)` and normally nonzero, but under exact stagnation or a rank-
+/// `sqrt(|f|^2+|g|^2)` and normally nonzero, but under exact stagnation or a rank-
 /// deficient Hessenberg (hard / indefinite / singular operators) some `h[i][i]`
 /// can be `0`, so an unguarded `recip()` would emit `Inf`/`NaN` into `x` and the
 /// residual. Truncating the solve to this well-conditioned prefix instead yields a
@@ -639,7 +639,7 @@ fn well_conditioned_dim<T: Scalar>(h: &[Vec<T>], jdim: usize) -> usize {
 }
 
 /// [`well_conditioned_dim`] for a **flat** row-major Hessenberg buffer (issue #10):
-/// the single-RHS [`gmres`] stores `H` as one `(m+1)×m` `Vec<T>` (diagonal entry
+/// the single-RHS [`gmres`] stores `H` as one `(m+1)xm` `Vec<T>` (diagonal entry
 /// `i` at `h[i*stride + i]`) rather than a `Vec<Vec<T>>`, so this reads the same
 /// breakdown-guarded leading dimension off the flat layout. Identical logic.
 #[inline]
@@ -704,20 +704,20 @@ fn ortho_in_pool<R: Send>(pool: &Option<rayon::ThreadPool>, f: impl FnOnce() -> 
     }
 }
 
-/// Column-wise projection of a panel `W` (`n×sa`) onto each column's **own**
-/// Arnoldi basis: `proj[i*sa + ap] = ⟨V_i[:,ap], W[:,ap]⟩` for block `i` in
+/// Column-wise projection of a panel `W` (`nxsa`) onto each column's **own**
+/// Arnoldi basis: `proj[i*sa + ap] = <V_i[:,ap], W[:,ap]>` for block `i` in
 /// `0..blocks` and active column `ap` in `0..sa`. The basis is blocks-major -
 /// block `i` is the contiguous slice `vbas[i*sa*n .. (i+1)*sa*n]`, its column `ap`
 /// at offset `+ap*n`; `W` column `ap` is `w[ap*n .. ap*n+n]`.
 ///
 /// This is the classical (block) Gram-Schmidt projection: **all** projections are
-/// taken against the same `W`, so the `blocks·sa` inner products are independent
-/// and computed as one panel sweep instead of the `O(blocks·sa)` sequential,
+/// taken against the same `W`, so the `blocks*sa` inner products are independent
+/// and computed as one panel sweep instead of the `O(blocks*sa)` sequential,
 /// latency-bound BLAS-1 reductions of modified Gram-Schmidt. The reduction is a
-/// fixed row-chunk sum folded in chunk order → deterministic regardless of the
+/// fixed row-chunk sum folded in chunk order -> deterministic regardless of the
 /// thread count.
-/// `scratch` is a caller-owned reduction buffer of length `≥ nchunks · width`
-/// (`nchunks = ⌈n/ORTHO_CHUNK⌉`, `width = blocks·sa`), reused across steps so the
+/// `scratch` is a caller-owned reduction buffer of length `>= nchunks * width`
+/// (`nchunks = ceil(n/ORTHO_CHUNK)`, `width = blocks*sa`), reused across steps so the
 /// hot loop allocates nothing. Each chunk writes its `width` partial sums into its
 /// own slice; the slices are then folded in chunk order.
 #[inline]
@@ -767,9 +767,9 @@ fn block_project<T: Scalar>(
 }
 
 /// Subtract the projected components from the panel in place, per column:
-/// `W[:,ap] -= Σ_i proj[i*sa+ap] · V_i[:,ap]`, accumulated in block order (`i`
+/// `W[:,ap] -= sum_i proj[i*sa+ap] * V_i[:,ap]`, accumulated in block order (`i`
 /// ascending) at every element. Parallel over fixed row-chunks within each column
-/// → the element-wise order is fixed, so the update is deterministic.
+/// -> the element-wise order is fixed, so the update is deterministic.
 #[inline]
 fn block_subtract<T: Scalar>(
     vbas: &[T],
@@ -802,22 +802,22 @@ fn block_subtract<T: Scalar>(
 /// **Flexible** right-preconditioned restarted **GMRES(`restart`)** (FGMRES,
 /// Saad 1993) for a general (unsymmetric) operator - the natural Krylov method
 /// for unsymmetric MoM/FEM systems where COCG/COCR do not apply. `op` may be
-/// matrix-free; `precond` supplies `M⁻¹` (e.g. an RLA
+/// matrix-free; `precond` supplies `M^-1` (e.g. an RLA
 /// [`LuFactors`](crate::numeric::multifrontal_lu::LuFactors) near-field factor).
-/// Solves `A x = b` from the optional initial guess `x0` (default `x₀ = 0`).
+/// Solves `A x = b` from the optional initial guess `x0` (default `x_0 = 0`).
 ///
 /// **Warm start (issue #5):** pass `x0 = Some(prev)` to seed the iteration from a
 /// previous, related solution - on a sequence of slowly varying systems this
 /// often cuts the iteration count substantially. Convergence is still measured
-/// relative to ‖b‖.
+/// relative to ||b||.
 ///
 /// **Flexible variant (issue #7):** the preconditioned Arnoldi vectors
-/// `z_j = M⁻¹ v_j` (already formed to build `w = A z_j`) are *kept* as a second
-/// basis `Z = [z_0 … z_{m-1}]`, and the restart update is `x += Z y` directly.
-/// This (a) removes the one extra `M⁻¹` solve per cycle that plain right-
-/// preconditioned GMRES spends rebuilding `M⁻¹(V y)`, and (b) makes the method
+/// `z_j = M^-1 v_j` (already formed to build `w = A z_j`) are *kept* as a second
+/// basis `Z = [z_0 ... z_{m-1}]`, and the restart update is `x += Z y` directly.
+/// This (a) removes the one extra `M^-1` solve per cycle that plain right-
+/// preconditioned GMRES spends rebuilding `M^-1(V y)`, and (b) makes the method
 /// flexible: `M` may **vary** between steps (an inner Krylov solve, or a
-/// preconditioner strengthened across iterations). Cost: one extra `n·(m+1)`
+/// preconditioner strengthened across iterations). Cost: one extra `n*(m+1)`
 /// basis of storage.
 pub fn gmres<T, A, M>(
     op: &A,
@@ -846,8 +846,8 @@ where
     let m = restart.max(1);
     let bnorm = norm2(b);
     // Warm start (issue #5): seed `x` from the caller's initial guess `x0`; the
-    // per-cycle true residual `r = b − A x` then measures progress from that
-    // guess. Convergence is still relative to ‖b‖. Absent `x0`, `x₀ = 0`.
+    // per-cycle true residual `r = b - A x` then measures progress from that
+    // guess. Convergence is still relative to ||b||. Absent `x0`, `x_0 = 0`.
     let mut x = match x0 {
         Some(g) => {
             if g.len() != n {
@@ -874,16 +874,16 @@ where
     let mut total = 0usize;
     let mut w = vec![T::zero(); n];
     let mut ax = vec![T::zero(); n];
-    // Arnoldi basis as one **flat** `n × (m+1)` buffer (column `i` is
+    // Arnoldi basis as one **flat** `n x (m+1)` buffer (column `i` is
     // `v[i*n .. (i+1)*n]`) - contiguous, no per-iteration vector allocation, and
     // cache-friendly for the Gram-Schmidt sweeps.
     let mut v = vec![T::zero(); n * (m + 1)];
-    // FGMRES preconditioned basis `Z = [z_0 … z_{m-1}]`, `z_j = M⁻¹ v_j` (issue
+    // FGMRES preconditioned basis `Z = [z_0 ... z_{m-1}]`, `z_j = M^-1 v_j` (issue
     // #7): stored as it is computed so the restart update is `x += Z y` with no
     // second preconditioner solve, and so a *variable* `M` is honoured exactly.
     let mut zb = vec![T::zero(); n * m];
     // Per-restart Krylov scalars hoisted out of the outer loop and cleared/reused
-    // each cycle (issue #10): the Hessenberg `h` as one **flat** `(m+1)×m` buffer
+    // each cycle (issue #10): the Hessenberg `h` as one **flat** `(m+1)xm` buffer
     // (row `i`, col `j` at `h[i*m + j]` - cache-friendlier than a `Vec<Vec<T>>`),
     // the Givens `cs`/`sn`, the LS RHS `g`, and the back-substitution `y`. A
     // many-restart solve (the ill-conditioned regime) then does no per-cycle heap
@@ -895,7 +895,7 @@ where
     let mut g = vec![T::zero(); m + 1];
     let mut y = vec![T::zero(); m];
 
-    // Outer restart loop. Each pass first measures the TRUE residual ‖b−Ax‖ of the
+    // Outer restart loop. Each pass first measures the TRUE residual ||b-Ax|| of the
     // current iterate (the only reliable stop test on ill-conditioned MoM near-
     // field operators, where the Hessenberg LS estimate can dip below `tol` while
     // the true residual is orders larger) and records it as `final_res`. On
@@ -911,7 +911,7 @@ where
         if final_res <= tol || total >= max_iter {
             break;
         }
-        // Column 0 of the basis = r / ‖r‖. Reset the reused Hessenberg / Givens /
+        // Column 0 of the basis = r / ||r||. Reset the reused Hessenberg / Givens /
         // LS state to the fresh-zero semantics of the old per-cycle allocation.
         let inv_beta = T::from_real(1.0 / beta);
         for k in 0..n {
@@ -935,7 +935,7 @@ where
             if total >= max_iter {
                 break;
             }
-            // Flexible right preconditioning: z_j = M⁻¹ v[j] (stored into the Z
+            // Flexible right preconditioning: z_j = M^-1 v[j] (stored into the Z
             // basis for the restart update), then w = A z_j.
             precond.apply(&v[j * n..j * n + n], &mut zb[j * n..j * n + n])?;
             op.apply(&zb[j * n..j * n + n], &mut w);
@@ -944,7 +944,7 @@ where
             // ill-conditioned operators (MoM near-field) where a single MGS pass
             // loses orthogonality and the Hessenberg residual estimate drifts from
             // the true residual - runs only when the projection cancelled most of
-            // the vector (‖w‖ dropped below `η·‖w₀‖`, η = 1/√2). Well-conditioned
+            // the vector (||w|| dropped below `eta*||w_0||`, eta = 1/sqrt2). Well-conditioned
             // cycles skip it, halving the orthogonalization cost.
             let wnorm0 = norm2(&w);
             for i in 0..=j {
@@ -1003,8 +1003,8 @@ where
             }
         }
         // Back-substitute the upper-triangular H for y on the well-conditioned
-        // leading block (breakdown guard), then (FGMRES) x += Z·y directly from the
-        // stored preconditioned basis - no second `M⁻¹` solve.
+        // leading block (breakdown guard), then (FGMRES) x += Z*y directly from the
+        // stored preconditioned basis - no second `M^-1` solve.
         let jd = well_conditioned_dim_flat(&h, m, jdim);
         for i in (0..jd).rev() {
             let mut s = g[i];
@@ -1056,20 +1056,20 @@ where
 // compose cleanly with a shared recycle subspace, and warrants its own design pass.
 //
 // **The split (right-preconditioned / flexible).** The Krylov space is built on
-// the preconditioned operator `Ã = A M⁻¹` (FGMRES stores `Z = M⁻¹ V`, updates
+// the preconditioned operator `A_tilde = A M^-1` (FGMRES stores `Z = M^-1 V`, updates
 // `x += Z y`), so `U` lives in the *preconditioned* space (approximate smallest
-// eigenvectors of `Ã`). Each cycle recomputes `P = M⁻¹ U` (`k` preconditioner
-// solves) and `C = A P = Ã U` (`k` matvecs), orthonormalizes `C = Q R` (updating
-// `P, U ← ·R⁻¹` so `C = Ã U` and `P = M⁻¹ U` still hold), then runs the GCRO
+// eigenvectors of `A_tilde`). Each cycle recomputes `P = M^-1 U` (`k` preconditioner
+// solves) and `C = A P = A_tilde U` (`k` matvecs), orthonormalizes `C = Q R` (updating
+// `P, U <- *R^-1` so `C = A_tilde U` and `P = M^-1 U` still hold), then runs the GCRO
 // split: project the residual onto `range(C)` (`x += P C^H r`, `r -= C C^H r`)
 // and build the rest of the Krylov space **orthogonal to `C`** (each Arnoldi
 // vector has its `C` component removed, recorded in `B = C^H A Z`). The restart
 // least-squares problem then decouples: `y` is the ordinary GMRES solution of the
-// Hessenberg system and the recycle coordinate is `z₁ = −B y`, giving
-// `x += P z₁ + Z y`. Recomputing `C` each solve (the default) is `k` matvecs +
+// Hessenberg system and the recycle coordinate is `z_1 = -B y`, giving
+// `x += P z_1 + Z y`. Recomputing `C` each solve (the default) is `k` matvecs +
 // `k` M-solves and keeps the invariant exact when `A` / `M` change between solves.
 //
-// **Memory.** `U` and `C` are each `n·k` extra scalars (plus the same-size `P`),
+// **Memory.** `U` and `C` are each `n*k` extra scalars (plus the same-size `P`),
 // on top of the FGMRES `V`+`Z` bases. `k` defaults modest and is capped at
 // `restart/2` so the deflation never starves the Arnoldi space.
 //
@@ -1104,9 +1104,9 @@ pub trait RecycleScalar: Scalar + recycle_sealed::Sealed {
     #[doc(hidden)]
     fn to_c(self) -> Complex<f64>;
     /// Reconstruct up to `kmax` recycle vectors (column-major, length `n` each)
-    /// from the search-space columns `cols` (`n × d`) and the harmonic-Ritz
-    /// `(θ, g)` pairs (coefficient vectors of length `d`, sorted by ascending
-    /// `|θ|`). Real fields split each complex conjugate pair into `Re g`, `Im g`.
+    /// from the search-space columns `cols` (`n x d`) and the harmonic-Ritz
+    /// `(theta, g)` pairs (coefficient vectors of length `d`, sorted by ascending
+    /// `|theta|`). Real fields split each complex conjugate pair into `Re g`, `Im g`.
     #[doc(hidden)]
     fn combine_ritz(
         cols: &[Self],
@@ -1165,7 +1165,7 @@ fn combine_ritz_real<T: Scalar>(
 }
 
 /// Complex-field recycle reconstruction (`Complex<f64>` / `Complex<f32>`): the
-/// harmonic-Ritz vectors are genuinely complex, so `U ← [U, V] gᵢ` directly, one
+/// harmonic-Ritz vectors are genuinely complex, so `U <- [U, V] g_i` directly, one
 /// vector per pair. `mk` casts a `Complex<f64>` coefficient into the working field
 /// (identity for `Complex<f64>`, a narrowing cast for `Complex<f32>`).
 fn combine_ritz_complex<T: Scalar>(
@@ -1257,7 +1257,7 @@ impl RecycleScalar for Complex<f32> {
 
 /// An opaque **recycle subspace** carried across a sequence of related solves
 /// ([`gmres_recycled`], issue #5). Holds `k` harmonic-Ritz vectors `U` (in the
-/// preconditioned space, i.e. approximate smallest eigenvectors of `A M⁻¹`) that
+/// preconditioned space, i.e. approximate smallest eigenvectors of `A M^-1`) that
 /// dominate GMRES stagnation, so the next related solve deflates them from the
 /// start instead of re-discovering them.
 ///
@@ -1265,19 +1265,19 @@ impl RecycleScalar for Complex<f32> {
 /// `k`) and pass `&mut` to each solve; the handle is *updated in place* at the
 /// end of every solve with the freshest harmonic-Ritz vectors. It stays useful
 /// across solves with the **same or slowly varying** `A` and `M`: the invariant
-/// subspace it tracks drifts slowly, and `C = A M⁻¹ U` is recomputed from `U`
+/// subspace it tracks drifts slowly, and `C = A M^-1 U` is recomputed from `U`
 /// every solve (`k` matvecs + `k` M-solves), so a changed operator is handled
 /// exactly with no stale `C`. If the dimension `n` changes the handle resets
 /// itself. Reusing it on an *unrelated* system is safe (never wrong) but may not
 /// help. Call [`Recycle::clear`] to forget the accumulated subspace.
 ///
-/// **Memory:** `U` is `n·k` scalars; the transient `P = M⁻¹ U` and `C = A M⁻¹ U`
-/// (another `2·n·k`) live only for the duration of a solve.
+/// **Memory:** `U` is `n*k` scalars; the transient `P = M^-1 U` and `C = A M^-1 U`
+/// (another `2*n*k`) live only for the duration of a solve.
 #[derive(Debug, Clone)]
 pub struct Recycle<T> {
     /// Target subspace dimension (capped at `restart/2` per solve).
     k: usize,
-    /// Recycle vectors, column-major `n × kc` (`kc ≤ k`), in preconditioned space.
+    /// Recycle vectors, column-major `n x kc` (`kc <= k`), in preconditioned space.
     u: Vec<T>,
     /// Current number of stored recycle vectors.
     kc: usize,
@@ -1286,6 +1286,14 @@ pub struct Recycle<T> {
 }
 
 impl<T: Scalar> Recycle<T> {
+    /// The stored recycle vectors: column-major `n x kc` (`kc` columns of length `n`),
+    /// in the preconditioned space — the approximate smallest-magnitude eigenvectors of
+    /// `A M^-1` the last solve found. For inspection (which physical directions a solver
+    /// keeps re-discovering); empty before the first solve.
+    pub fn vectors(&self) -> (&[T], usize, usize) {
+        (&self.u, self.n, self.kc)
+    }
+
     /// A fresh, empty recycle handle targeting `k` harmonic-Ritz vectors. The
     /// first solve seeds `U` (there is nothing to deflate yet); subsequent solves
     /// deflate and refresh it. `k` is capped at `restart/2` inside the solve.
@@ -1303,7 +1311,7 @@ impl<T: Scalar> Recycle<T> {
         self.k
     }
 
-    /// The number of recycle vectors currently stored (`≤ k`, `0` until the first
+    /// The number of recycle vectors currently stored (`<= k`, `0` until the first
     /// solve populates it or after [`clear`](Self::clear)).
     pub fn active(&self) -> usize {
         self.kc
@@ -1319,9 +1327,9 @@ impl<T: Scalar> Recycle<T> {
 }
 
 /// Modified-Gram-Schmidt orthonormalization of the recycle triple `(C, P, U)`
-/// (each column-major `n × kc`), maintaining the invariants `C = A P` and
-/// `P = M⁻¹ U`: the same linear combination applied to `C`'s columns is applied
-/// to `P` and `U`, so after `C ← Q` (orthonormal) the scaled `P, U` still satisfy
+/// (each column-major `n x kc`), maintaining the invariants `C = A P` and
+/// `P = M^-1 U`: the same linear combination applied to `C`'s columns is applied
+/// to `P` and `U`, so after `C <- Q` (orthonormal) the scaled `P, U` still satisfy
 /// them. Rank-deficient columns (norm collapses under the projection) are
 /// **dropped** and the survivors compacted forward. Returns the surviving count.
 fn orthonormalize_recycle<T: Scalar>(
@@ -1394,11 +1402,11 @@ fn orthonormalize_columns<T: Scalar>(v: &mut [T], n: usize, nc: usize) -> usize 
 }
 
 /// Recompute the recycle subspace `U` from this cycle's search space by GCRO-DR
-/// harmonic-Ritz extraction. Forms the small `(d+1) × d` matrix
-/// `Ḡ = [[I_k, B], [0, H̄]]` and the orthonormal image basis `Ŵ = [C, V_{p+1}]`
+/// harmonic-Ritz extraction. Forms the small `(d+1) x d` matrix
+/// `G_bar = [[I_k, B], [0, H_bar]]` and the orthonormal image basis `W_hat = [C, V_{p+1}]`
 /// (`d = k + p`, `p = jdim` Arnoldi steps), solves the generalized eigenproblem
-/// `Ḡᴴ Ḡ g = θ Ḡᴴ (Ŵᴴ [U, V]) g` for the `k` smallest `|θ|`, and reconstructs
-/// `U ← [U, V] G_k` (orthonormalized, rank-guarded). Returns `(U, count)` or
+/// `G_bar^H G_bar g = theta G_bar^H (W_hat^H [U, V]) g` for the `k` smallest `|theta|`, and reconstructs
+/// `U <- [U, V] G_k` (orthonormalized, rank-guarded). Returns `(U, count)` or
 /// `None` (keep the previous subspace) on a singular projection / empty spectrum.
 #[allow(clippy::too_many_arguments)]
 fn recompute_recycle<T: RecycleScalar>(
@@ -1420,7 +1428,7 @@ fn recompute_recycle<T: RecycleScalar>(
     let rows = d + 1;
     let c0 = Complex::new(0.0, 0.0);
     let c1 = Complex::new(1.0, 0.0);
-    // Ḡ (rows × d), row-major, in Complex<f64>.
+    // G_bar (rows x d), row-major, in Complex<f64>.
     let mut ghat = vec![c0; rows * d];
     for i in 0..ncur {
         ghat[i * d + i] = c1; // I_k block
@@ -1432,10 +1440,10 @@ fn recompute_recycle<T: RecycleScalar>(
     }
     for r in 0..(jdim + 1) {
         for j in 0..jdim {
-            ghat[(ncur + r) * d + (ncur + j)] = hbar[r * p_arn + j].to_c(); // H̄ block
+            ghat[(ncur + r) * d + (ncur + j)] = hbar[r * p_arn + j].to_c(); // H_bar block
         }
     }
-    // Ŵᴴ [U, V]  (rows × d): [[Cᴴ U, 0], [Vᴴ U, [I_p; 0]]].
+    // W_hat^H [U, V]  (rows x d): [[C^H U, 0], [V^H U, [I_p; 0]]].
     let mut whatu = vec![c0; rows * d];
     for i in 0..ncur {
         for a in 0..ncur {
@@ -1450,7 +1458,7 @@ fn recompute_recycle<T: RecycleScalar>(
     for j in 0..jdim {
         whatu[(ncur + j) * d + (ncur + j)] = c1;
     }
-    // M1 = Ḡᴴ Ḡ,  M2 = Ḡᴴ (Ŵᴴ [U, V]).
+    // M1 = G_bar^H G_bar,  M2 = G_bar^H (W_hat^H [U, V]).
     let mut m1 = vec![c0; d * d];
     let mut m2 = vec![c0; d * d];
     for a in 0..d {
@@ -1470,7 +1478,7 @@ fn recompute_recycle<T: RecycleScalar>(
     if pairs.is_empty() {
         return None;
     }
-    // Search-space columns [U | V_p]  (n × d), column-major.
+    // Search-space columns [U | V_p]  (n x d), column-major.
     let mut space = vec![T::zero(); n * d];
     for a in 0..ncur {
         space[a * n..a * n + n].copy_from_slice(&u[a * n..a * n + n]);
@@ -1526,7 +1534,7 @@ where
     }
     const REORTH_ETA: f64 = std::f64::consts::FRAC_1_SQRT_2;
     let m = restart.max(1);
-    // Cap the recycle dimension at restart/2 so the Arnoldi space (m − k) is never
+    // Cap the recycle dimension at restart/2 so the Arnoldi space (m - k) is never
     // starved. `k = 0` (or an empty handle) degrades to plain FGMRES.
     let k = recycle.k.min(m / 2);
     let bnorm = norm2(b);
@@ -1580,7 +1588,7 @@ where
             break;
         }
 
-        // --- Recycle refresh: C = A M⁻¹ U, orthonormalize, GCRO project. ---
+        // --- Recycle refresh: C = A M^-1 U, orthonormalize, GCRO project. ---
         let mut cmat = vec![T::zero(); n * ncur];
         let mut pmat = vec![T::zero(); n * ncur];
         if ncur > 0 {
@@ -1589,7 +1597,7 @@ where
                 op.apply(&pmat[i * n..i * n + n], &mut cmat[i * n..i * n + n]);
             }
             ncur = orthonormalize_recycle(&mut cmat, &mut pmat, &mut u, n, ncur);
-            // Outer minimization over range(C): x += P (Cᴴ r), r -= C (Cᴴ r).
+            // Outer minimization over range(C): x += P (C^H r), r -= C (C^H r).
             for i in 0..ncur {
                 let di = dotc(&cmat[i * n..i * n + n], &r);
                 for kk in 0..n {
@@ -1628,7 +1636,7 @@ where
             precond.apply(&vb[j * n..j * n + n], &mut zb[j * n..j * n + n])?;
             op.apply(&zb[j * n..j * n + n], &mut w);
             let wnorm0 = norm2(&w);
-            // Project the new direction orthogonal to C (record B[:,j] = Cᴴ w).
+            // Project the new direction orthogonal to C (record B[:,j] = C^H w).
             for i in 0..ncur {
                 let bij = dotc(&cmat[i * n..i * n + n], &w);
                 bmat[i * p_arn + j] = bij;
@@ -1717,7 +1725,7 @@ where
                 x[kk] = x[kk] + zb[i * n + kk] * yi;
             }
         }
-        // x += P z₁ with z₁ = −B y   (the recycle-coordinate update).
+        // x += P z_1 with z_1 = -B y   (the recycle-coordinate update).
         for i in 0..ncur {
             let mut z1i = T::zero();
             for j in 0..jd {
@@ -1762,13 +1770,13 @@ where
 /// Outcome of a block (multi-RHS) Krylov solve.
 #[derive(Debug, Clone)]
 pub struct BlockKrylovResult<T> {
-    /// Solutions, column-major `n×s` (RHS `c` is the slice `[c·n, (c+1)·n)`).
+    /// Solutions, column-major `nxs` (RHS `c` is the slice `[c*n, (c+1)*n)`).
     pub x: Vec<T>,
     /// Block iterations performed (the RHS advance in lockstep).
     pub iters: usize,
     /// `true` iff **every** RHS reached `tol`.
     pub converged: bool,
-    /// Per-RHS final relative residual `‖b_c − A x_c‖ / ‖b_c‖`.
+    /// Per-RHS final relative residual `||b_c - A x_c|| / ||b_c||`.
     pub final_res: Vec<f64>,
     /// Why the block iteration stopped: `Converged` when every RHS met `tol`,
     /// else `MaxIter` (the block loop has no non-converged breakdown state).
@@ -1778,8 +1786,8 @@ pub struct BlockKrylovResult<T> {
 /// Form and add one converged column's solution contribution to the global `x`
 /// **mid-cycle**, so the column can be compacted out of the active panel: back-
 /// substitute `y` from that column's frozen Hessenberg/Givens state (`h`,`g`,`jd`
-/// rows), build `V_ap · y` from its Arnoldi basis at the *current* stride `sa`,
-/// apply the preconditioner once (`x_c += M⁻¹·(V_ap·y)`). This is the block
+/// rows), build `V_ap * y` from its Arnoldi basis at the *current* stride `sa`,
+/// apply the preconditioner once (`x_c += M^-1*(V_ap*y)`). This is the block
 /// analogue of the single-RHS restart update, issued for a single column the
 /// instant its Hessenberg estimate reaches `tol`, so the batched applies can then
 /// shrink to the still-active width.
@@ -1832,7 +1840,7 @@ where
 }
 
 /// Right-preconditioned restarted **block GMRES** for `s` right-hand sides `b`
-/// (column-major `n×s`). The `s` systems advance in lockstep so the two expensive
+/// (column-major `nxs`). The `s` systems advance in lockstep so the two expensive
 /// operations - the operator matvec and the preconditioner solve - are issued
 /// once per step as **block** applies ([`LinearOperator::apply_block`] /
 /// [`Preconditioner::apply_block`]), reaching BLAS-3 arithmetic intensity (each
@@ -1840,11 +1848,11 @@ where
 /// own Arnoldi basis / Hessenberg / Givens, so a column converges identically to
 /// the single-RHS [`gmres`]; the systems share only the batched operator and
 /// preconditioner calls. Solves `A X = B` from the optional initial guess `x0`
-/// (column-major `n×s`, default `X₀ = 0`).
+/// (column-major `nxs`, default `X_0 = 0`).
 ///
 /// **Warm start (issue #5):** `x0 = Some(prev)` seeds every column from a related
 /// previous solution; on a slowly varying sequence this cuts the block iteration
-/// count. Each column's convergence is still relative to its own `‖B[:,c]‖`.
+/// count. Each column's convergence is still relative to its own `||B[:,c]||`.
 ///
 /// **Deflation:** a RHS whose true residual reaches `tol` drops out of the block,
 /// so the batched applies shrink to the active width as columns converge - the
@@ -1854,9 +1862,9 @@ where
 /// drive all right-hand sides through one block iteration.
 ///
 /// **Memory (issue #12):** the Arnoldi basis is a single up-front allocation of
-/// `n·s·(restart+1)` scalars (plus a handful of `n·s` work panels), *independent*
-/// of how few iterations actually run - so a large `restart` on a big `n·s` can
-/// allocate many GB (`n=100k, s=10, Complex<f64>, restart=80` ≈ 13 GB). Size
+/// `n*s*(restart+1)` scalars (plus a handful of `n*s` work panels), *independent*
+/// of how few iterations actually run - so a large `restart` on a big `n*s` can
+/// allocate many GB (`n=100k, s=10, Complex<f64>, restart=80` ~ 13 GB). Size
 /// `restart` to the memory budget; the Python binding caps an unspecified
 /// `restart` automatically (an explicit value is honoured exactly).
 ///
@@ -1875,7 +1883,7 @@ where
 /// (classical Gram-Schmidt with a conditional, now *per-column*, second pass), not
 /// the MGS+DGKS of the single-RHS [`gmres`]. The two summation orders differ, so a
 /// block solve with `s = 1` is **not** bit-identical to [`gmres`] and may differ by
-/// up to ±1 iteration - both still converge to `tol`. See the module-level
+/// up to +/-1 iteration - both still converge to `tol`. See the module-level
 /// "Orthogonalization" note for the rationale.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn gmres_block<T, A, M>(
@@ -1898,7 +1906,7 @@ where
 
 /// [`gmres_block`] with an optional per-cycle progress MONITOR (rapidmom-local addition,
 /// upstream candidate): at the start of every restart cycle, right after the true
-/// residuals `‖b − A·x‖/‖b‖` of all live columns were recomputed, `mon` receives
+/// residuals `||b - A*x||/||b||` of all live columns were recomputed, `mon` receives
 /// `(iters_done, worst_live_residual, n_active_columns)` and returns whether the solve
 /// should CONTINUE. Long solves stop being a black box: the caller can stream residual
 /// trajectories to its log, and a `false` return cancels the solve early (a stagnation
@@ -1934,7 +1942,7 @@ where
     // width the preconditioner was factored with, so factor and solve share one
     // concurrency budget. `None` (Ambient / no factor) keeps the caller's pool.
     let ortho_pool = solve_thread_pool(precond.solve_threads());
-    // Warm start (issue #5): seed every column from `x0` (column-major `n×s`).
+    // Warm start (issue #5): seed every column from `x0` (column-major `nxs`).
     let mut x = match x0 {
         Some(g) => {
             if g.len() != n * s {
@@ -1954,11 +1962,11 @@ where
     // Scratch sized for the **full** width `s` and reused; each restart cycle uses
     // only the first `sa` columns, where `sa` is the count of still-active RHS.
     // The basis stride is therefore `sa` (recomputed per cycle): block `j`, active
-    // column `a` lives at `vbas[(j*sa + a)*n ..]`, so block `j` (the `n×sa` input
+    // column `a` lives at `vbas[(j*sa + a)*n ..]`, so block `j` (the `nxsa` input
     // to one block apply) is the contiguous prefix `vbas[j*sa*n .. (j+1)*sa*n]`.
     let mut vbas = vec![T::zero(); n * s * (m + 1)];
-    let mut zblk = vec![T::zero(); n * s]; // M⁻¹ · (block j)
-    let mut wblk = vec![T::zero(); n * s]; // A · zblk
+    let mut zblk = vec![T::zero(); n * s]; // M^-1 * (block j)
+    let mut wblk = vec![T::zero(); n * s]; // A * zblk
     let mut axblk = vec![T::zero(); n * s];
     let mut vyblk = vec![T::zero(); n * s];
     let mut xc = vec![T::zero(); n * s]; // compact live-RHS solutions for the residual matvec
@@ -1971,7 +1979,7 @@ where
     let mut proj2 = vec![T::zero(); m * s];
     let mut wnorm0 = vec![0.0f64; s]; // panel column norms before ortho (DGKS reorth test)
     let mut reorth_col = vec![false; s]; // per-column DGKS second-pass flags (issue #8)
-                                         // Reduction scratch for `block_project`: `nchunks · (m·s)`, reused every step
+                                         // Reduction scratch for `block_project`: `nchunks * (m*s)`, reused every step
                                          // so the orthogonalization allocates nothing in the hot loop.
     let mut proj_scratch = vec![T::zero(); n.div_ceil(ORTHO_CHUNK) * m * s];
 
@@ -2069,11 +2077,11 @@ where
             op.apply_block(&zblk[..sa * n], &mut wblk[..sa * n], sa);
             // **Block Gram-Schmidt** of the whole `sa`-column panel `W` against each
             // column's own basis `V_0..V_j`: one classical projection pass
-            // (project → subtract), then a **conditional** reorthogonalization pass
+            // (project -> subtract), then a **conditional** reorthogonalization pass
             // (block DGKS) taken only when a column's norm collapses - the
             // backward-stable, single-thread-cheap analogue of the old per-RHS
             // MGS+DGKS. Both passes are panel-wide, high-arithmetic-intensity sweeps
-            // parallelized over the vector dimension, replacing the `O(j·sa)`
+            // parallelized over the vector dimension, replacing the `O(j*sa)`
             // sequential BLAS-1 inner products. The reorth decision is taken from
             // serial column norms, so it is identical across thread counts (the
             // whole solve stays bit-identical regardless of parallelism). Converged
@@ -2224,7 +2232,7 @@ where
             }
         }
 
-        // x_c += M⁻¹ (V_a y_a): back-substitute each still-active RHS, build the
+        // x_c += M^-1 (V_a y_a): back-substitute each still-active RHS, build the
         // compact VY block, one batched preconditioner apply, then scatter to
         // global `x`. Columns that deflated mid-cycle were already finalized
         // individually above, so `sa == 0` here means the whole panel converged
@@ -2322,7 +2330,7 @@ where
     })
 }
 
-/// Adapter: a closure block-matvec `op(x, y, s)` (`Y ← A·X`, column-major `n×s`) as a
+/// Adapter: a closure block-matvec `op(x, y, s)` (`Y <- A*X`, column-major `nxs`) as a
 /// [`LinearOperator`] for the matrix-free call path. `FnMut` (the Arnoldi issues applies
 /// sequentially) so the operator's own scratch lives in the closure capture - no struct, no
 /// interior-mutability dance at the call site. The `RefCell` is borrowed for one apply at a time.
@@ -2342,7 +2350,7 @@ impl<T: Scalar, F: FnMut(&[T], &mut [T], usize)> LinearOperator<T> for FnOp<F> {
     }
 }
 
-/// Adapter: a closure block-preconditioner `pc(r, z, s)` (`Z ← M⁻¹·R`) as a [`Preconditioner`].
+/// Adapter: a closure block-preconditioner `pc(r, z, s)` (`Z <- M^-1*R`) as a [`Preconditioner`].
 struct FnPc<G> {
     f: std::cell::RefCell<G>,
 }
@@ -2388,9 +2396,9 @@ where
 }
 
 /// Closure entry point for [`gmres_block_mon`], [`gmres_block_fn`] plus the per-cycle
-/// progress monitor and an optional WARM START `x0` (column-major `n×s`, like `b`;
-/// `None` ⇒ `x₀ = 0`). Seeding with a nearby solution (e.g. the previous frequency
-/// of a sweep) starts from its residual; convergence stays relative to `‖b‖`.
+/// progress monitor and an optional WARM START `x0` (column-major `nxs`, like `b`;
+/// `None` => `x_0 = 0`). Seeding with a nearby solution (e.g. the previous frequency
+/// of a sweep) starts from its residual; convergence stays relative to `||b||`.
 #[allow(clippy::too_many_arguments)]
 pub fn gmres_block_fn_mon<T, F, G>(
     op: F,
@@ -2417,6 +2425,35 @@ where
         f: std::cell::RefCell::new(precond),
     };
     gmres_block_mon(&op, b, s, &pc, tol, max_iter, restart, x0, mon)
+}
+
+/// Closure entry point for [`gmres_recycled`] (single RHS, GCRO-DR): the operator and
+/// preconditioner as `FnMut` closures, the recycle handle updated in place - see [`gmres_fn`].
+#[allow(clippy::too_many_arguments)]
+pub fn gmres_recycled_fn<T, F, G>(
+    op: F,
+    precond: G,
+    b: &[T],
+    n: usize,
+    tol: f64,
+    max_iter: usize,
+    restart: usize,
+    x0: Option<&[T]>,
+    recycle: &mut Recycle<T>,
+) -> Result<KrylovResult<T>, RslabError>
+where
+    T: RecycleScalar,
+    F: FnMut(&[T], &mut [T], usize),
+    G: FnMut(&[T], &mut [T], usize) -> Result<(), RslabError>,
+{
+    let op = FnOp {
+        f: std::cell::RefCell::new(op),
+        n,
+    };
+    let pc = FnPc {
+        f: std::cell::RefCell::new(precond),
+    };
+    gmres_recycled(&op, b, &pc, tol, max_iter, restart, x0, recycle)
 }
 
 /// Closure entry point for [`gmres`] (single RHS) - see [`gmres_block_fn`].
@@ -2446,9 +2483,9 @@ where
 }
 
 /// Shared block-apply adapter for the factored preconditioners: the Krylov
-/// panel is column-major (`n × s`, RHS `c` contiguous) while every
-/// `solve_many` takes row-major (`b[i·s + c]`), so transpose in, run the
-/// batched solve, transpose out (`O(n·s)`, cheap against the solve). One
+/// panel is column-major (`n x s`, RHS `c` contiguous) while every
+/// `solve_many` takes row-major (`b[i*s + c]`), so transpose in, run the
+/// batched solve, transpose out (`O(n*s)`, cheap against the solve). One
 /// implementation instead of four copies across the `Preconditioner` impls.
 fn apply_block_via_rowmajor<T: Scalar>(
     r: &[T],
@@ -2559,7 +2596,7 @@ impl<T: Scalar> Factorization<T> for crate::numeric::multifrontal_lu::LuSolver<T
 }
 
 /// The KLU path composes with the iterative stack exactly like the
-/// multifrontal solvers: an exact (or sweep-refactored) `M⁻¹ = (LU)⁻¹` for
+/// multifrontal solvers: an exact (or sweep-refactored) `M^-1 = (LU)^-1` for
 /// [`gmres`]/[`gmres_block`]. Sequential by design, so [`solve_threads`]
 /// pins the orthogonalization pool to one worker.
 ///
@@ -2676,7 +2713,7 @@ mod tests {
     fn gmres_solves_unsymmetric_with_lu_preconditioner() {
         use crate::numeric::multifrontal_lu::factor_general_lu;
         use crate::sparse::general::GeneralCsc;
-        // Genuinely unsymmetric complex 2D grid (right ≠ left couplings).
+        // Genuinely unsymmetric complex 2D grid (right != left couplings).
         let c = |re, im| Complex::new(re, im);
         let m = 8;
         let n = m * m;
@@ -2715,7 +2752,7 @@ mod tests {
         let un = gmres(&a, &b, &NoPreconditioner, 1e-10, 2000, 40, None).unwrap();
         assert!(un.converged, "GMRES res={}", un.final_res);
 
-        // LU factor as preconditioner → 1-2 iterations.
+        // LU factor as preconditioner -> 1-2 iterations.
         let lu = factor_general_lu(&a, &SolverSettings::default()).unwrap();
         let pre = gmres(&a, &b, &lu, 1e-10, 200, 40, None).unwrap();
         assert!(pre.converged, "preconditioned GMRES res={}", pre.final_res);
@@ -2734,7 +2771,7 @@ mod tests {
     #[test]
     fn gmres_singular_operator_breaks_down_without_nan() {
         // Rank-deficient operator (issue #11): A = diag(1, 1, 0) is singular and
-        // `b = (1,1,1)` has a component in the null space (e₂), so GMRES cannot
+        // `b = (1,1,1)` has a component in the null space (e_2), so GMRES cannot
         // drive the residual to zero - it stagnates. The Krylov subspace is
         // A-invariant with a *singular* restriction (eigenvalue 0), so the upper-
         // triangular Hessenberg factor acquires a ~0 diagonal. The unguarded
@@ -2744,7 +2781,7 @@ mod tests {
         // a truthful non-convergence report.
         use crate::sparse::general::GeneralCsc;
         let c = |re: f64, im: f64| Complex::new(re, im);
-        // Only the (0,0) and (1,1) entries; row/col 2 is all-zero → A e₂ = 0.
+        // Only the (0,0) and (1,1) entries; row/col 2 is all-zero -> A e_2 = 0.
         let a = GeneralCsc::<C>::from_triplets(3, &[0, 1], &[0, 1], &[c(1.0, 0.0), c(1.0, 0.0)])
             .unwrap();
         let b = vec![c(1.0, 0.0), c(1.0, 0.0), c(1.0, 0.0)];
@@ -2761,7 +2798,7 @@ mod tests {
             res.final_res
         );
         // Deterministic breakdown: reported as non-converged with a sane residual
-        // (the singular direction pins the relative residual near 1/√3 ≈ 0.577 - it
+        // (the singular direction pins the relative residual near 1/sqrt3 ~ 0.577 - it
         // is bounded well below the blow-up an unguarded divide would produce).
         assert!(
             !res.converged,
@@ -2810,7 +2847,7 @@ mod tests {
         GeneralCsc::<C>::from_triplets(n, &rr, &cc, &vv).unwrap()
     }
 
-    /// Wraps a preconditioner and counts every scalar `apply` (the `M⁻¹` solves).
+    /// Wraps a preconditioner and counts every scalar `apply` (the `M^-1` solves).
     struct CountingPc<'a, M: ?Sized> {
         inner: &'a M,
         applies: std::sync::atomic::AtomicUsize,
@@ -2826,11 +2863,11 @@ mod tests {
     #[test]
     fn fgmres_saves_one_precond_apply_per_restart_cycle() {
         // FGMRES (issue #7): the preconditioned basis `Z` is kept, so the restart
-        // update `x += Z y` costs **no** extra `M⁻¹` solve. The loop applies `M⁻¹`
+        // update `x += Z y` costs **no** extra `M^-1` solve. The loop applies `M^-1`
         // exactly once per inner iteration and never at the restart, so over a
         // multi-cycle solve the total preconditioner-apply count equals the total
         // iteration count. Plain right-preconditioned GMRES would spend one extra
-        // `M⁻¹` per cycle (rebuilding `M⁻¹(V y)`), i.e. `iters + n_cycles`.
+        // `M^-1` per cycle (rebuilding `M^-1(V y)`), i.e. `iters + n_cycles`.
         use crate::numeric::multifrontal_lu::factor_general_lu;
         let c = |re, im| Complex::new(re, im);
         let a = unsym_grid(10); // n = 100
@@ -2930,7 +2967,7 @@ mod tests {
     fn gmres_block_single_rhs_matches_scalar_gmres() {
         // s = 1 block GMRES reduces to the single-RHS path (same Arnoldi, same
         // Givens, default block apply = one single apply): same solution to the
-        // requested tolerance, same iteration count up to a ±1 boundary effect.
+        // requested tolerance, same iteration count up to a +/-1 boundary effect.
         // The paths are NOT bit-identical - block uses CGS2, single uses MGS+DGKS,
         // so the projections sum in a different order and the true residual can
         // straddle `tol` by a rounding ULP. This is documented as a design point in
@@ -2965,7 +3002,7 @@ mod tests {
         let a = unsym_grid(10);
         let n = a.n;
         let s = 5;
-        // Column-major n×s block: RHS `k` is shifted/scaled so columns differ.
+        // Column-major nxs block: RHS `k` is shifted/scaled so columns differ.
         let mut bblk = vec![C::default(); n * s];
         for k in 0..s {
             for i in 0..n {
@@ -3034,7 +3071,7 @@ mod tests {
         let c = |re: f64, im: f64| Complex::new(re, im);
         let n = 8;
         let s = 4;
-        // Diagonal operator with distinct entries → the minimal polynomial degree
+        // Diagonal operator with distinct entries -> the minimal polynomial degree
         // of a RHS equals the number of distinct diagonal entries in its support.
         let (mut rr, mut cc, mut vv) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
@@ -3043,7 +3080,7 @@ mod tests {
             vv.push(c(2.0 + i as f64, 0.5 + 0.1 * i as f64));
         }
         let a = GeneralCsc::<C>::from_triplets(n, &rr, &cc, &vv).unwrap();
-        // RHS `k` = sum of the first `k+1` unit vectors → converges in `k+1` steps.
+        // RHS `k` = sum of the first `k+1` unit vectors -> converges in `k+1` steps.
         let mut bblk = vec![C::default(); n * s];
         for k in 0..s {
             for i in 0..=k {
@@ -3207,7 +3244,7 @@ mod tests {
                 bblk[k * n + i] = c(((i + k) % 7) as f64 - 3.0, ((i + 2 * k) % 5) as f64 - 2.0);
             }
         }
-        // Factor capped to exactly 2 workers → solve policy is Fixed(2).
+        // Factor capped to exactly 2 workers -> solve policy is Fixed(2).
         let lu = factor_general_lu(&a, &SolverSettings::default().with_threads(2)).unwrap();
         assert_eq!(
             Preconditioner::<C>::solve_threads(&lu),
@@ -3284,7 +3321,7 @@ mod tests {
                 let p = idx(a, b);
                 rr.push(p);
                 cc.push(p);
-                vv.push(c(20.0, 2.0)); // strongly diagonally dominant → f32 factor is accurate
+                vv.push(c(20.0, 2.0)); // strongly diagonally dominant -> f32 factor is accurate
                 if b + 1 < m {
                     rr.push(p);
                     cc.push(idx(a, b + 1));
@@ -3352,7 +3389,7 @@ mod tests {
     fn incomplete_factor_reduces_fill_and_still_preconditions() {
         // Threshold dropping shrinks the factor (less memory) at the cost of a
         // weaker preconditioner - but COCG must still converge to the true
-        // f64 solution. Demonstrates the memory ↔ iteration tradeoff.
+        // f64 solution. Demonstrates the memory <-> iteration tradeoff.
         let c = |re, im| Complex::new(re, im);
         let a = grid(16, c(4.0, 1.0), c(-1.0, 0.2));
         let n = a.n;
@@ -3378,7 +3415,7 @@ mod tests {
         assert!(ri.converged, "incomplete-preconditioned COCG must converge");
         assert!(
             ri.iters >= rf.iters,
-            "incomplete factor should need ≥ complete-factor iterations"
+            "incomplete factor should need >= complete-factor iterations"
         );
         let mut ax = vec![C::default(); n];
         a.symv(&ri.x, &mut ax);
@@ -3411,7 +3448,7 @@ mod tests {
 
     #[test]
     fn rla_preconditioner_collapses_iteration_count() {
-        // A complete RLA factorization is ≈ A⁻¹, so preconditioned COCG must
+        // A complete RLA factorization is ~ A^-1, so preconditioned COCG must
         // converge in a handful of iterations - vastly fewer than without.
         let c = |re, im| Complex::new(re, im);
         let a = grid(12, c(4.0, 1.0), c(-1.0, 0.2));
@@ -3425,7 +3462,7 @@ mod tests {
         assert!(pre.converged && unpre.converged);
         assert!(
             pre.iters <= 3,
-            "complete-factor preconditioner should need ≤3 iters, got {}",
+            "complete-factor preconditioner should need <=3 iters, got {}",
             pre.iters
         );
         assert!(
@@ -3437,8 +3474,8 @@ mod tests {
     }
 
     /// Strongly **non-normal** 1D convection-diffusion operator as a general
-    /// complex matrix: tridiagonal `diag = 2 (+ tiny damping)`, super `= -1+γ`,
-    /// sub `= -1-γ`. For `γ ≠ 0` it is far from normal - the classic GMRES-hard
+    /// complex matrix: tridiagonal `diag = 2 (+ tiny damping)`, super `= -1+gamma`,
+    /// sub `= -1-gamma`. For `gamma != 0` it is far from normal - the classic GMRES-hard
     /// regime where the residual stagnates for many steps before converging - yet
     /// remains (weakly) diagonally dominant, so unpreconditioned GMRES does
     /// converge, only after many iterations / restart cycles.
@@ -3517,7 +3554,7 @@ mod tests {
         // (issue #13c) A near-defective, strongly non-normal operator (bidiagonal
         // Jordan-like block: clustered diagonal, dominant super-diagonal) drives
         // the Arnoldi vectors toward linear dependence, so a single MGS sweep
-        // collapses the norm and the conditional DGKS second pass (`hn < η·‖w₀‖`)
+        // collapses the norm and the conditional DGKS second pass (`hn < eta*||w_0||`)
         // must fire to restore orthogonality. Asserting the trigger directly needs
         // an intrusive probe; instead we certify the *effect*: GMRES still drives
         // the true residual to `tol` and matches the exact (direct-LU) solution -
@@ -3530,7 +3567,7 @@ mod tests {
         for i in 0..n {
             rr.push(i);
             cc.push(i);
-            vv.push(c(2.0, 0.0)); // clustered diagonal → non-normal, near-defective
+            vv.push(c(2.0, 0.0)); // clustered diagonal -> non-normal, near-defective
             if i + 1 < n {
                 rr.push(i);
                 cc.push(i + 1);
@@ -3601,7 +3638,7 @@ mod tests {
         // **factor-based** (drop-tol) preconditioner. The operator is diagonal with
         // distinct entries `d_i`; the preconditioner is a `drop_tol` LU factor of a
         // *different* diagonal matrix `diag(p_i)` - a deliberately imperfect
-        // approximate inverse, so the preconditioned operator `M⁻¹A = diag(d_i/p_i)`
+        // approximate inverse, so the preconditioned operator `M^-1A = diag(d_i/p_i)`
         // still has distinct eigenvalues. Right-hand side `k` is supported on the
         // first `k+1` unit vectors, so its GMRES converges in **exactly** `k+1`
         // steps: the columns finish at staggered steps *within one cycle*. The
@@ -3622,7 +3659,7 @@ mod tests {
         }
         let a = GeneralCsc::<C>::from_triplets(n, &dr, &dc, &dv).unwrap();
         // Preconditioning matrix P = diag(p_i), p_i chosen so d_i/p_i stay distinct
-        // (p_i = 1+i ⇒ ratios 2, 1.5, 1.33, … all different): an imperfect factor.
+        // (p_i = 1+i => ratios 2, 1.5, 1.33, ... all different): an imperfect factor.
         let (mut pr, mut pc_, mut pv) = (Vec::new(), Vec::new(), Vec::new());
         for i in 0..n {
             pr.push(i);
@@ -3637,7 +3674,7 @@ mod tests {
         };
         let lu = factor_general_lu(&pmat, &opts).unwrap();
 
-        // RHS k = sum of the first k+1 unit vectors → converges in exactly k+1 steps.
+        // RHS k = sum of the first k+1 unit vectors -> converges in exactly k+1 steps.
         let mut bblk = vec![C::default(); n * s];
         for k in 0..s {
             for i in 0..=k {
@@ -3720,7 +3757,7 @@ mod tests {
     fn gmres_recycled_matches_plain_on_hard_matrix() {
         // Correctness: the recycled solve must reach the SAME solution as plain
         // FGMRES on a hard preconditioned system (weak incomplete LU factor, short
-        // restart → many cycles), to the same tolerance.
+        // restart -> many cycles), to the same tolerance.
         use crate::numeric::multifrontal_lu::factor_general_lu;
         let c = |re, im| Complex::new(re, im);
         let a = unsym_grid(12); // n = 144
@@ -3981,7 +4018,7 @@ mod tests {
                     vv.push(-1.0);
                     rr.push(q);
                     cc.push(p);
-                    vv.push(-1.8); // asymmetric ⇒ complex spectrum
+                    vv.push(-1.8); // asymmetric => complex spectrum
                 }
                 if a + 1 < m {
                     let q = idx(a + 1, b);

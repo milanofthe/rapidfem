@@ -24,7 +24,7 @@ impl EliminationTree {
     /// For each column j (in order 0..n), examine all rows i < j in column j
     /// (the upper triangle entries). Walk from i up the partially built tree
     /// using path compression until finding a root or reaching j. Make j the
-    /// parent of that root. This produces parent[j] = min { i > j : L(i,j) ≠ 0 }.
+    /// parent of that root. This produces parent[j] = min { i > j : L(i,j) != 0 }.
     pub fn from_pattern(pattern: &CscPattern) -> Self {
         Self::from_cols(pattern.n, |j| {
             pattern.row_idx[pattern.col_ptr[j]..pattern.col_ptr[j + 1]]
@@ -33,7 +33,7 @@ impl EliminationTree {
         })
     }
 
-    /// The elimination tree of the **permuted** pattern `Pᵀ A P` (with
+    /// The elimination tree of the **permuted** pattern `P^T A P` (with
     /// `perm[new] = old` and `perm_inv[old] = new`), computed without
     /// materializing the permuted pattern: column `new` reads the original
     /// column `perm[new]` and maps each row through `perm_inv` on the fly.
@@ -182,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_etree_tridiagonal() {
-        // Tridiagonal 5x5: elimination tree is a path 0→1→2→3→4
+        // Tridiagonal 5x5: elimination tree is a path 0->1->2->3->4
         let m = CscMatrix::from_triplets(
             5,
             &[0, 1, 1, 2, 2, 3, 3, 4, 4],
@@ -217,20 +217,20 @@ mod tests {
 
         // With natural ordering on arrow matrix:
         // All nodes 1-4 connect to 0, and eliminating 0 creates a clique
-        // among 1-4. So the etree should be 0→1→2→3→4 (chain from fill).
+        // among 1-4. So the etree should be 0->1->2->3->4 (chain from fill).
         // Actually: parent[j] = min { i > j : L(i,j) != 0 }
-        // For column 0: rows 1,2,3,4 all have entries → parent[0] = 1 (not a root!)
+        // For column 0: rows 1,2,3,4 all have entries -> parent[0] = 1 (not a root!)
         // Wait - arrow has column 0 connected to rows 1,2,3,4
-        // Column 0: entries at rows 1,2,3,4 → parent[0] = min(1,2,3,4) = 1
+        // Column 0: entries at rows 1,2,3,4 -> parent[0] = min(1,2,3,4) = 1
         // Column 1: entry at row 0 (but 0 < 1, skip). Fill from eliminating 0: rows 2,3,4
-        //   → parent[1] = 2
-        // etc. So etree is a chain 0→1→2→3→4, root = 4
+        //   -> parent[1] = 2
+        // etc. So etree is a chain 0->1->2->3->4, root = 4
         assert_eq!(etree.parent[4], None);
         assert_eq!(etree.roots(), vec![4]);
     }
 
     fn chain_etree(n: usize) -> EliminationTree {
-        // Build a chain 0→1→2→...→(n-1) directly.
+        // Build a chain 0->1->2->...->(n-1) directly.
         let mut parent = vec![None; n];
         for j in 0..n.saturating_sub(1) {
             parent[j] = Some(j + 1);
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_postorder_two_roots() {
-        // Two disjoint chains: 0→1 (root 1) and 2→3 (root 3).
+        // Two disjoint chains: 0->1 (root 1) and 2->3 (root 3).
         let parent = vec![Some(1), None, Some(3), None];
         let et = EliminationTree { parent, n: 4 };
         let post = et.postorder();
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn test_first_descendants_chain() {
-        // Chain 0→1→2→3→4. Postorder is [0,1,2,3,4].
+        // Chain 0->1->2->3->4. Postorder is [0,1,2,3,4].
         // Subtree of i is {0, 1, ..., i}. First descendant is 0 for all.
         let et = chain_etree(5);
         let post = et.postorder();
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_etree_diagonal() {
-        // Diagonal: no off-diagonal entries → forest of singletons
+        // Diagonal: no off-diagonal entries -> forest of singletons
         let m = CscMatrix::from_triplets(4, &[0, 1, 2, 3], &[0, 1, 2, 3], &[1.0; 4]).unwrap();
         let pat = m.symmetric_pattern();
         let etree = EliminationTree::from_pattern(&pat);
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_subtree_sizes() {
-        // Tridiagonal 4x4: chain 0→1→2→3
+        // Tridiagonal 4x4: chain 0->1->2->3
         let m =
             CscMatrix::from_triplets(4, &[0, 1, 1, 2, 2, 3, 3], &[0, 0, 1, 1, 2, 2, 3], &[1.0; 7])
                 .unwrap();

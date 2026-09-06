@@ -1,6 +1,6 @@
 use crate::sparse::csc::CscPattern;
 
-/// Apply a permutation to row/column indices: compute P·A·Pᵀ pattern.
+/// Apply a permutation to row/column indices: compute P*A*P^T pattern.
 ///
 /// Given a symmetric CscPattern (both triangles stored, the form produced
 /// by `CscMatrix::symmetric_pattern`) and a permutation `perm`
@@ -9,7 +9,7 @@ use crate::sparse::csc::CscPattern;
 ///
 /// Uses a two-pass counting-sort layout (O(nnz)) rather than a
 /// `Vec<Vec<usize>>` with per-column sort+dedup. On near-dense inputs
-/// like DMN15103 (n=99 fully full) this is ~7× faster because (a) each
+/// like DMN15103 (n=99 fully full) this is ~7x faster because (a) each
 /// entry is copied exactly once instead of being pushed once from each
 /// triangle and then deduped, and (b) the final per-column sort runs on
 /// pre-placed contiguous slices.

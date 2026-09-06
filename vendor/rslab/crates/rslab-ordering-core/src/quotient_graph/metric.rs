@@ -11,7 +11,7 @@
 //!    `select_pivot` scans `while deg < n`). AMF: `2 * n + 2` because
 //!    the quantized RMF can exceed `n`.
 //! 3. **Bucket index for a score.** AMD: identity. AMF: identity for
-//!    `s ≤ n`, then coarse stride `PAS = max(n / 8, 1)` above.
+//!    `s <= n`, then coarse stride `PAS = max(n / 8, 1)` above.
 //! 4. **Pivot selection within a bucket.** AMD: head only.
 //!    AMF: linear scan when the bucket is in the coarse region.
 //! 5. **Score on supervariable merge.** AMD: no-op (only `nv[i]`
@@ -58,7 +58,7 @@ pub trait Metric {
     fn init_score(len: i32) -> Self::Score;
 
     /// Bucket index for the given score. AMD: identity. AMF: identity
-    /// for `s ≤ n`, coarse-stride above.
+    /// for `s <= n`, coarse-stride above.
     fn bucket(score: Self::Score, n: usize) -> usize;
 
     /// Whether `idx` falls in the "coarse" bucket region - i.e.
@@ -129,7 +129,7 @@ impl Metric for MinDegree {
 ///
 /// AMF selects the next pivot to minimise the *fill* introduced by
 /// the elimination, rather than the candidate's degree. On bipartite-
-/// KKT graphs with a few "hub" rows AMF can be 47× better than AMD on
+/// KKT graphs with a few "hub" rows AMF can be 47x better than AMD on
 /// final `nnz_L` (see `dev/research/amf-clean-room.md` Section 1).
 ///
 /// Score is a quantized `RMF = DEG*(DEG-1+2*DEGME) - WF(i)` value
@@ -204,7 +204,7 @@ impl Metric for MinFill {
         idx > n
     }
 
-    /// On supervariable merge `j → i`, update the surviving anchor's
+    /// On supervariable merge `j -> i`, update the surviving anchor's
     /// score with `max(WF(i), WF(j))` (the HAMF4 merge rule).
     #[inline(always)]
     fn merge_supervariable(parent: &mut i32, child: i32) {
@@ -355,15 +355,15 @@ mod tests {
     fn min_fill_merge_takes_max() {
         let mut parent: i32 = 10;
         MinFill::merge_supervariable(&mut parent, 25);
-        assert_eq!(parent, 25, "child larger ⇒ adopt child");
+        assert_eq!(parent, 25, "child larger => adopt child");
 
         let mut parent: i32 = 100;
         MinFill::merge_supervariable(&mut parent, 7);
-        assert_eq!(parent, 100, "child smaller ⇒ keep parent");
+        assert_eq!(parent, 100, "child smaller => keep parent");
 
         let mut parent: i32 = 42;
         MinFill::merge_supervariable(&mut parent, 42);
-        assert_eq!(parent, 42, "equal ⇒ unchanged");
+        assert_eq!(parent, 42, "equal => unchanged");
     }
 
     /// MinFill's elimination now runs the real AMF inner loop on a

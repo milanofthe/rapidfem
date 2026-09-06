@@ -1,10 +1,10 @@
-//! Random sparse (structurally-conditioned) and spectral (exact-κ) generators.
+//! Random sparse (structurally-conditioned) and spectral (exact-kappa) generators.
 //!
 //! Random sparse matrices stress the ordering/symbolic stage on irregular
 //! patterns; conditioning is steered by **diagonal loading**. The spectral family
-//! follows LAPACK `xLATMS`: build `A = Q Λ Qᵀ` with a *prescribed* spectrum, so the
+//! follows LAPACK `xLATMS`: build `A = Q Lambda Q^T` with a *prescribed* spectrum, so the
 //! condition number is **exact** - the right tool for accuracy/stability tests.
-//! `QΛQᵀ` is dense, so this family is small-`n` by nature.
+//! `QLambdaQ^T` is dense, so this family is small-`n` by nature.
 // Diagonal/triplet loops use the index as a value (push `k`, read `colsum[k]`).
 #![allow(clippy::needless_range_loop)]
 
@@ -16,7 +16,7 @@ use super::Rng;
 
 /// Random **symmetric** sparse SPD matrix: ~`avg_deg` random off-diagonals per
 /// row, each diagonal loaded to its row's |off|-sum plus `alpha` (strict diagonal
-/// dominance ⇒ SPD). `alpha` is the conditioning knob.
+/// dominance => SPD). `alpha` is the conditioning knob.
 pub fn random_spd<T: Scalar>(n: usize, avg_deg: usize, alpha: f64, seed: u64) -> CscMatrix<T> {
     let mut rng = Rng::new(seed);
     let mut rows = Vec::new();
@@ -76,10 +76,10 @@ pub fn random_unsym<T: Scalar>(n: usize, avg_deg: usize, alpha: f64, seed: u64) 
     super::build_gen(n, &rows, &cols, &vals)
 }
 
-/// Spectral generator (`xLATMS`-style): `A = Q Λ Qᵀ` with a prescribed spectrum so
+/// Spectral generator (`xLATMS`-style): `A = Q Lambda Q^T` with a prescribed spectrum so
 /// the **condition number is exactly `kappa`**. Eigenvalues are log-spaced in
 /// `[1, kappa]` (SPD) or alternately signed (indefinite). `Q` is a random
-/// orthogonal matrix (Givens sweeps). Dense ⇒ keep `n` small (≤ ~500).
+/// orthogonal matrix (Givens sweeps). Dense => keep `n` small (<= ~500).
 pub fn spectral<T: Scalar>(n: usize, kappa: f64, indefinite: bool, seed: u64) -> CscMatrix<T> {
     let mut rng = Rng::new(seed);
     // Log-spaced eigenvalues with exact endpoints 1 and kappa.
@@ -124,7 +124,7 @@ pub fn spectral<T: Scalar>(n: usize, kappa: f64, indefinite: bool, seed: u64) ->
             q[r * n + col] = sn * a + cs * b;
         }
     }
-    // A = Q diag(eig) Qᵀ, lower triangle.
+    // A = Q diag(eig) Q^T, lower triangle.
     let mut rows = Vec::with_capacity(n * (n + 1) / 2);
     let mut cols = Vec::with_capacity(n * (n + 1) / 2);
     let mut vals = Vec::with_capacity(n * (n + 1) / 2);
@@ -155,14 +155,14 @@ mod tests {
 
     #[test]
     fn spectral_has_exact_condition_number() {
-        // A = QΛQᵀ ⇒ eigenvalues are exactly Λ; verify via the extreme Rayleigh
+        // A = QLambdaQ^T => eigenvalues are exactly Lambda; verify via the extreme Rayleigh
         // quotients along the eigenvectors is hard from CSC, so check the trace
-        // (= Σλ) and that the matrix is symmetric & sized right instead.
+        // (= sumlambda) and that the matrix is symmetric & sized right instead.
         let n = 50;
         let kappa = 1e6;
         let a = spectral::<f64>(n, kappa, false, 3);
         assert_eq!(a.n, n);
-        // Trace = Σ eig (log-spaced 1..kappa). Lower-triangle diagonal entries.
+        // Trace = sum eig (log-spaced 1..kappa). Lower-triangle diagonal entries.
         let mut trace = 0.0;
         for j in 0..n {
             for k in a.col_ptr[j]..a.col_ptr[j + 1] {
@@ -180,7 +180,7 @@ mod tests {
         eigsum += kappa - 10f64.powf(lk);
         assert!(
             (trace - eigsum).abs() / eigsum < 1e-9,
-            "trace = Σλ (spectrum preserved)"
+            "trace = sumlambda (spectrum preserved)"
         );
     }
 }

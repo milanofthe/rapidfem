@@ -24,10 +24,10 @@ pub const DEFAULT_PAR_CDIV: usize = 8_000_000;
 /// push more work into the deferred trailing GEMM but enlarge the serial
 /// within-panel factorization; narrower panels do the reverse at more GEMM calls.
 pub const DEFAULT_PANEL_NB: usize = 64;
-/// Default threshold partial-pivoting tolerance `u ∈ [0, 1]` for the left-looking
+/// Default threshold partial-pivoting tolerance `u in [0, 1]` for the left-looking
 /// LU path (UMFPACK's `THRESH`). The diagonal pivot is kept unless it falls below
-/// `u · |colmax|` in its fully-summed block. `u = 1` is full partial pivoting
-/// (always take the column max); `u → 0` keeps the diagonal unless it is exactly
+/// `u * |colmax|` in its fully-summed block. `u = 1` is full partial pivoting
+/// (always take the column max); `u -> 0` keeps the diagonal unless it is exactly
 /// zero (least fill, least stable). The historical value `0.1` is the default, so
 /// leaving it untouched reproduces the shipped factor.
 pub const DEFAULT_PIVOT_U: f64 = 0.1;
@@ -37,16 +37,34 @@ pub const DEFAULT_PIVOT_U: f64 = 0.1;
 /// (no process-wide state - per-call). `panel_nb` is pre-clamped to at least 8 by
 /// [`SolverSettings::kernel`](crate::SolverSettings::kernel).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct KernelTuning {
+pub(crate) struct KernelTuning<'a> {
     pub scalar_gate: usize,
     pub par_gemm: usize,
     pub par_cdiv: usize,
     pub panel_nb: usize,
     pub use_gemm_schur: bool,
-    /// Threshold partial-pivoting tolerance `u ∈ [0, 1]` for the left-looking LU
-    /// path (see [`DEFAULT_PIVOT_U`]). Ignored by the LDLᵀ kernels (Bunch-Kaufman
-    /// has its own fixed `α`) and by the multifrontal LU front (full pivoting).
+    /// Threshold partial-pivoting tolerance `u in [0, 1]` for the left-looking LU
+    /// path (see [`DEFAULT_PIVOT_U`]). Ignored by the LDL^T kernels (Bunch-Kaufman
+    /// has its own fixed `alpha`) and by the multifrontal LU front (full pivoting).
     pub pivot_u: f64,
+    /// The caller's cancellation flag, read and never written. `None` is the
+    /// unarmed default: the poll is one `Option` branch and touches no atomic.
+    pub interrupt: Option<&'a std::sync::atomic::AtomicBool>,
+}
+
+impl KernelTuning<'_> {
+    /// Poll the caller's flag. Called at supernode and dense-panel boundaries,
+    /// which is where a driver can stop without leaving a half-written panel
+    /// behind; there is no guarantee about when within a panel it fires.
+    #[inline]
+    pub fn interrupted(&self) -> Result<(), crate::error::RslabError> {
+        match self.interrupt {
+            Some(flag) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
+                Err(crate::error::RslabError::Interrupted)
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// The three GEMM scheduling thresholds (flop counts), the kernel-level

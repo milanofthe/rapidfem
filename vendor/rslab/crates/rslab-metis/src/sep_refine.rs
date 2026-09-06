@@ -1,82 +1,32 @@
-//! Node-separator refinement for the multilevel ND pipeline.
+//! Node-separator refinement (two-sided FM on the vertex separator).
 //!
-//! Independent implementation written from published descriptions of
-//! separator-local refinement; no third-party partitioning source code
-//! was consulted for this module. Sources:
-//!
-//! - Karypis & Kumar, "A Fast and High Quality Multilevel Scheme for
-//!   Partitioning Irregular Graphs" (SIAM J. Sci. Comput. 1998):
-//!   multilevel scheme, refinement applied at every uncoarsening step.
-//! - Hendrickson & Rothberg, "Improving the Run Time and Quality of
-//!   Nested Dissection Ordering" (SIAM J. Sci. Comput. 1998):
-//!   Fiduccia-Mattheyses-style refinement operating directly on a
-//!   vertex separator, with hill climbing past locally bad moves.
-//! - Ashcraft & Liu, "Applications of the Dulmage-Mendelsohn
-//!   Decomposition and Network Flow to Graph Bisection Improvement"
-//!   (SIAM J. Matrix Anal. 1998): separator-improvement framing.
-//! - `dev/research/metis-node-separator-2026-07.md`: RSLAB's own
-//!   evidence chain for why hierarchical node-separator refinement is
-//!   the fill lever, and the exact-fill evaluation harness
-//!   (`examples/grid_fill.rs`) this module's policies were tuned on.
-//!
-//! ## The move
-//!
-//! State is a tri-section `labels[v] ∈ {A, B, SEP}` where SEP blocks
-//! every A-B edge. The elementary refinement step takes a separator
-//! vertex `v` and assigns it to a chosen side `s`; every neighbor of
-//! `v` on the far side must then enter the separator to keep the
-//! tri-section valid. Writing `far(v, s)` for the total weight of
-//! those neighbors, the separator weight changes by
-//! `far(v, s) - w(v)`, so the move's gain is `w(v) - far(v, s)`.
-//!
-//! ## The pass
-//!
-//! One pass fixes a target side and repeatedly applies the best-gain
-//! move from a lazy max-heap, hill-climbing through negative-gain
-//! moves until the heap is exhausted (with a generous patience /
-//! overshoot brake purely as termination hygiene). Every label
-//! transition is appended to a journal; when the pass ends, the
-//! journal suffix past the best observed separator is unwound,
-//! restoring the best prefix. Rounds alternate the target side,
-//! lighter side first, and stop as soon as a full round yields no net
-//! improvement.
-//!
-//! ## Tie-breaking: newest first
-//!
-//! Equal-gain heap entries pop **newest first** (a per-pass push
-//! counter is the secondary key). Freshly pulled-in vertices and
-//! just-updated neighbors are therefore preferred over stale
-//! same-gain candidates, so the pass drills along the moving
-//! separator front instead of scattering across it; LIFO gain
-//! buckets are a known-good choice in the FM literature. Measured on
-//! the exact-fill harness (40^3 7-point grid, scalar nnz(L)): random
-//! static tie ranks 14.75 M, newest-first 11.06 M, against 20.6 M
-//! for AMD and 12.5 M for the best vendor ND ordering we measured
-//! (see the research note). Seeding order is shuffled per pass, so
-//! different seeds still explore genuinely different climbs.
-//!
-//! Determinism: given the same seed the result is bit-identical.
-
-use std::collections::BinaryHeap;
+//! A pass moves separator vertices into one side; every neighbor of the moved
+//! vertex that sat on the other side is pulled into the separator. The gain of
+//! moving `v` into side `s` is `w(v) - w(N(v) on the far side)`. Vertices are
+//! taken from an indexed max-heap keyed by gain (in-place key updates, one
+//! entry per vertex, most recently touched vertex first among equal gains),
+//! moves are journaled, and the pass rolls back to the best separator seen.
+//! A pass stops when the heap drains, after [`MOVE_LIMIT`] consecutive moves
+//! without improvement, or when the separator has grown past
+//! [`MAX_OVERSHOOT`] times the best one.
 
 use crate::fm_refine::PART_SEP;
 use crate::graph::Graph;
 use crate::initial_partition::{PART_A, PART_B};
 use crate::rng::SplitMix;
 
-/// Hill-climb patience: a pass ends after this many consecutive moves
-/// without a new best separator. Effectively unbounded on the graph
-/// sizes RSLAB targets; the exact-fill harness saturates two orders of
-/// magnitude below this. Exists purely so a pathological climb cannot
-/// run away.
-const PATIENCE: usize = 1 << 20;
+/// Consecutive non-improving moves after which a pass gives up. Effectively
+/// unbounded: the one-sided passes find their best separators at the end of
+/// long hill traversals (a METIS-style limit of 300 costs 10 to 35 percent
+/// fill on 2D and 3D grids for a 15 percent time saving), so a pass runs
+/// until the heap drains or the overshoot cap trips.
+const MOVE_LIMIT: usize = 1 << 20;
 
-/// Termination hygiene: give up on a climb that has wandered this far
-/// (as a multiple of the best weight) above the best separator seen.
-/// Verified on the harness to leave results untouched.
+/// A pass also stops when the separator has grown to this multiple of the
+/// best separator seen (a safety net for pathological hill climbs).
 const MAX_OVERSHOOT: f64 = 4.0;
 
-/// Weight of the neighbors of `v` lying on side `s` (0 or 1).
+/// Weight of `v`'s neighbors that carry label `s`.
 #[inline]
 fn far_weight(graph: &Graph, labels: &[u8], v: usize, s: usize) -> i64 {
     let mut w = 0i64;
@@ -89,7 +39,7 @@ fn far_weight(graph: &Graph, labels: &[u8], v: usize, s: usize) -> i64 {
     w
 }
 
-/// Total weight per label class `[A, B, SEP]`.
+/// Total vertex weight per label class `[A, B, SEP]`.
 fn class_weights(graph: &Graph, labels: &[u8]) -> [i64; 3] {
     let mut w = [0i64; 3];
     for v in 0..graph.nvtxs as usize {
@@ -98,108 +48,224 @@ fn class_weights(graph: &Graph, labels: &[u8]) -> [i64; 3] {
     w
 }
 
-/// Lazy max-heap entry: `(gain, push_seq, vertex, version)`. Entries
-/// are never removed eagerly; a popped entry is valid only if the
-/// vertex is still in the separator and its version matches the
-/// per-vertex counter (the `fm_refine` staleness pattern). The push
-/// sequence number makes equal-gain entries pop newest first.
-type HeapEntry = (i64, u64, u32, u32);
-
-/// Push the current key of separator vertex `v` for target side `into`.
+/// Gain of moving separator vertex `v` into side `into`.
 #[inline]
-fn push_key(
-    heap: &mut BinaryHeap<HeapEntry>,
-    graph: &Graph,
-    labels: &[u8],
-    version: &[u32],
-    seq: &mut u64,
-    v: usize,
-    into: usize,
-) {
-    let gain = graph.vwgt[v] as i64 - far_weight(graph, labels, v, 1 - into);
-    *seq += 1;
-    heap.push((gain, *seq, v as u32, version[v]));
+fn gain(graph: &Graph, labels: &[u8], v: usize, into: usize) -> i64 {
+    graph.vwgt[v] as i64 - far_weight(graph, labels, v, 1 - into)
 }
 
-/// One journal record: `vertex` previously carried `old_label`.
+const NONE: u32 = u32::MAX;
+
+/// Indexed binary max-heap over vertices: `key` orders, the most recently
+/// pushed or updated vertex wins ties (the `tie` stamp; a touched vertex is
+/// handled next, which keeps the moves contiguous along the separator), and
+/// `pos` maps a vertex to its slot so keys update in place.
+pub(crate) struct GainHeap {
+    heap: Vec<u32>,
+    pos: Vec<u32>,
+    key: Vec<i64>,
+    tie: Vec<u64>,
+    seq: u64,
+}
+
+impl GainHeap {
+    pub fn new(n: usize) -> Self {
+        Self {
+            heap: Vec::with_capacity(n),
+            pos: vec![NONE; n],
+            key: vec![0; n],
+            tie: vec![0; n],
+            seq: 0,
+        }
+    }
+
+    /// Empty the heap (`O(len)`), keeping the allocations.
+    pub fn clear(&mut self) {
+        for &v in &self.heap {
+            self.pos[v as usize] = NONE;
+        }
+        self.heap.clear();
+    }
+
+    #[inline]
+    pub fn contains(&self, v: usize) -> bool {
+        self.pos[v] != NONE
+    }
+
+    #[inline]
+    fn before(&self, a: u32, b: u32) -> bool {
+        let (ka, kb) = (self.key[a as usize], self.key[b as usize]);
+        ka > kb || (ka == kb && self.tie[a as usize] > self.tie[b as usize])
+    }
+
+    fn sift_up(&mut self, mut i: usize) {
+        while i > 0 {
+            let p = (i - 1) / 2;
+            if self.before(self.heap[i], self.heap[p]) {
+                self.heap.swap(i, p);
+                self.pos[self.heap[i] as usize] = i as u32;
+                self.pos[self.heap[p] as usize] = p as u32;
+                i = p;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sift_down(&mut self, mut i: usize) {
+        let n = self.heap.len();
+        loop {
+            let (l, r) = (2 * i + 1, 2 * i + 2);
+            let mut best = i;
+            if l < n && self.before(self.heap[l], self.heap[best]) {
+                best = l;
+            }
+            if r < n && self.before(self.heap[r], self.heap[best]) {
+                best = r;
+            }
+            if best == i {
+                break;
+            }
+            self.heap.swap(i, best);
+            self.pos[self.heap[i] as usize] = i as u32;
+            self.pos[self.heap[best] as usize] = best as u32;
+            i = best;
+        }
+    }
+
+    /// Insert `v` (not in the heap) with `key`.
+    pub fn push(&mut self, v: usize, key: i64) {
+        debug_assert!(!self.contains(v));
+        self.seq += 1;
+        self.key[v] = key;
+        self.tie[v] = self.seq;
+        self.pos[v] = self.heap.len() as u32;
+        self.heap.push(v as u32);
+        self.sift_up(self.heap.len() - 1);
+    }
+
+    /// Set the key of `v` (in the heap), stamp it as most recent, and restore
+    /// the heap order.
+    pub fn update(&mut self, v: usize, key: i64) {
+        let i = self.pos[v] as usize;
+        let old = self.key[v];
+        self.seq += 1;
+        self.key[v] = key;
+        self.tie[v] = self.seq;
+        if key >= old {
+            self.sift_up(i);
+        } else {
+            self.sift_down(i);
+        }
+    }
+
+    /// Remove and return the vertex with the largest key.
+    pub fn pop(&mut self) -> Option<usize> {
+        let top = *self.heap.first()?;
+        let last = self.heap.pop().expect("non-empty");
+        self.pos[top as usize] = NONE;
+        if !self.heap.is_empty() {
+            self.heap[0] = last;
+            self.pos[last as usize] = 0;
+            self.sift_down(0);
+        }
+        Some(top as usize)
+    }
+}
+
+/// One label change, for the rollback journal.
 #[derive(Clone, Copy)]
 struct Transition {
     vertex: u32,
     old_label: u8,
 }
 
-/// Assign separator vertex `v` to side `into`, pulling its far-side
-/// neighbors into the separator. Appends every label transition to the
-/// journal, bumps the version of every separator vertex whose key
-/// changed, and re-pushes their keys. Returns the separator-weight
-/// delta (negative = the separator shrank).
-#[allow(clippy::too_many_arguments)]
+/// Per-call scratch: the heap plus the move journal.
+pub(crate) struct Workspace {
+    heap: GainHeap,
+    journal: Vec<Transition>,
+    order: Vec<u32>,
+}
+
+impl Workspace {
+    pub fn new(n: usize) -> Self {
+        Self {
+            heap: GainHeap::new(n),
+            journal: Vec::new(),
+            order: Vec::new(),
+        }
+    }
+}
+
+/// Move separator vertex `v` into side `into`, pulling its far-side neighbors
+/// into the separator; keeps the heap keys of the affected separator vertices
+/// current. Returns the change of the separator weight.
 fn apply_move(
     graph: &Graph,
     labels: &mut [u8],
     class_w: &mut [i64; 3],
-    journal: &mut Vec<Transition>,
-    heap: &mut BinaryHeap<HeapEntry>,
-    version: &mut [u32],
-    seq: &mut u64,
+    ws: &mut Workspace,
     v: usize,
     into: usize,
 ) -> i64 {
     let from_side = 1 - into;
     let wv = graph.vwgt[v] as i64;
 
-    journal.push(Transition {
+    ws.journal.push(Transition {
         vertex: v as u32,
         old_label: PART_SEP,
     });
     labels[v] = into as u8;
     class_w[PART_SEP as usize] -= wv;
     class_w[into] += wv;
-    version[v] = version[v].wrapping_add(1);
     let mut delta = -wv;
 
-    // Far-side neighbors enter the separator; separator vertices
-    // adjacent to them get changed keys and are re-pushed lazily.
     for k in graph.xadj[v] as usize..graph.xadj[v + 1] as usize {
         let u = graph.adjncy[k] as usize;
-        let lu = labels[u];
-        if lu == from_side as u8 {
-            let wu = graph.vwgt[u] as i64;
-            journal.push(Transition {
-                vertex: u as u32,
-                old_label: lu,
-            });
-            labels[u] = PART_SEP;
-            class_w[from_side] -= wu;
-            class_w[PART_SEP as usize] += wu;
-            delta += wu;
-            version[u] = version[u].wrapping_add(1);
-            push_key(heap, graph, labels, version, seq, u, into);
-            // `u` leaving the far side changes the key of every
-            // separator vertex adjacent to it.
-            for kk in graph.xadj[u] as usize..graph.xadj[u + 1] as usize {
-                let t = graph.adjncy[kk] as usize;
-                if labels[t] == PART_SEP && t != u {
-                    version[t] = version[t].wrapping_add(1);
-                    push_key(heap, graph, labels, version, seq, t, into);
-                }
+        if labels[u] != from_side as u8 {
+            continue;
+        }
+        // `u` joins the separator.
+        let wu = graph.vwgt[u] as i64;
+        ws.journal.push(Transition {
+            vertex: u as u32,
+            old_label: from_side as u8,
+        });
+        labels[u] = PART_SEP;
+        class_w[from_side] -= wu;
+        class_w[PART_SEP as usize] += wu;
+        delta += wu;
+        ws.heap.push(u, gain(graph, labels, u, into));
+        // Every separator neighbor of `u` lost `u` from its far side: its
+        // gain for moving into `into` grows by `w(u)`.
+        for kk in graph.xadj[u] as usize..graph.xadj[u + 1] as usize {
+            let t = graph.adjncy[kk] as usize;
+            if t == u || labels[t] != PART_SEP {
+                continue;
+            }
+            if ws.heap.contains(t) {
+                let key = ws.heap.key[t] + wu;
+                ws.heap.update(t, key);
+            } else {
+                // Dropped earlier as too heavy for the side cap; a fresh gain
+                // makes it a candidate again.
+                ws.heap.push(t, gain(graph, labels, t, into));
             }
         }
     }
     delta
 }
 
-/// Undo journal entries beyond `keep`, restoring labels and class
-/// weights to the state after the first `keep` transitions.
+/// Roll the journal back to length `keep`, restoring labels and class weights.
 fn unwind(
     graph: &Graph,
     labels: &mut [u8],
     class_w: &mut [i64; 3],
-    journal: &mut Vec<Transition>,
+    ws: &mut Workspace,
     keep: usize,
 ) {
-    while journal.len() > keep {
-        let t = journal.pop().expect("journal non-empty");
+    while ws.journal.len() > keep {
+        let t = ws.journal.pop().expect("journal non-empty");
         let v = t.vertex as usize;
         let wv = graph.vwgt[v] as i64;
         class_w[labels[v] as usize] -= wv;
@@ -208,86 +274,67 @@ fn unwind(
     }
 }
 
-/// One refinement pass toward `into`. Returns the separator weight
-/// after the pass (the best state visited, journal-unwound).
+/// Seed the heap with every separator vertex's gain for moving into `into`,
+/// in a random order (the tie-break among equal gains, seed-deterministic).
+fn seed_heap(graph: &Graph, labels: &[u8], ws: &mut Workspace, rng: &mut SplitMix, into: usize) {
+    ws.heap.clear();
+    ws.order.clear();
+    ws.order
+        .extend((0..graph.nvtxs as u32).filter(|&v| labels[v as usize] == PART_SEP));
+    rng.shuffle(&mut ws.order);
+    for i in 0..ws.order.len() {
+        let v = ws.order[i] as usize;
+        ws.heap.push(v, gain(graph, labels, v, into));
+    }
+}
+
+/// One refinement pass moving separator vertices into side `into` while that
+/// side stays under `side_cap`. Returns the (best) separator weight reached.
 fn side_pass(
     graph: &Graph,
     labels: &mut [u8],
     into: usize,
     side_cap: i64,
     rng: &mut SplitMix,
+    ws: &mut Workspace,
 ) -> i64 {
-    let n = graph.nvtxs as usize;
-
     let mut class_w = class_weights(graph, labels);
-    let mut version: Vec<u32> = vec![0; n];
-    let mut seq: u64 = 0;
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    seed_heap(graph, labels, ws, rng, into);
+    ws.journal.clear();
 
-    // Shuffled seeding: with newest-first ties, the seeding order is
-    // the tie order among untouched vertices, so the shuffle is what
-    // lets different seeds explore different climbs.
-    let mut order: Vec<u32> = (0..n as u32)
-        .filter(|&v| labels[v as usize] == PART_SEP)
-        .collect();
-    rng.shuffle(&mut order);
-    for &v in &order {
-        push_key(
-            &mut heap, graph, labels, &version, &mut seq, v as usize, into,
-        );
-    }
-
-    let mut journal: Vec<Transition> = Vec::new();
     let mut sep_w = class_w[PART_SEP as usize];
     let mut best_w = sep_w;
     let mut best_len = 0usize;
     let mut since_best = 0usize;
 
-    while let Some((_, _, v32, ver)) = heap.pop() {
-        let v = v32 as usize;
-        if labels[v] != PART_SEP || version[v] != ver {
-            continue; // stale entry
-        }
+    while let Some(v) = ws.heap.pop() {
+        debug_assert_eq!(labels[v], PART_SEP);
         if class_w[into] + graph.vwgt[v] as i64 > side_cap {
             continue; // too heavy for the target side right now
         }
-
-        sep_w += apply_move(
-            graph,
-            labels,
-            &mut class_w,
-            &mut journal,
-            &mut heap,
-            &mut version,
-            &mut seq,
-            v,
-            into,
-        );
-
+        sep_w += apply_move(graph, labels, &mut class_w, ws, v, into);
         if sep_w < best_w {
             best_w = sep_w;
-            best_len = journal.len();
+            best_len = ws.journal.len();
             since_best = 0;
         } else {
             since_best += 1;
             let overshoot = sep_w - best_w;
-            if since_best > PATIENCE || overshoot as f64 > MAX_OVERSHOOT * best_w.max(1) as f64 {
+            if since_best > MOVE_LIMIT || overshoot as f64 > MAX_OVERSHOOT * best_w.max(1) as f64 {
                 break;
             }
         }
     }
 
-    unwind(graph, labels, &mut class_w, &mut journal, best_len);
+    unwind(graph, labels, &mut class_w, ws, best_len);
     debug_assert_eq!(class_w[PART_SEP as usize], best_w);
     best_w
 }
 
-/// Refine a node separator in place. Runs up to `max_rounds` rounds of
-/// two side-passes each (lighter side first); stops early once a full
-/// round brings no improvement. Returns the final separator weight.
-///
-/// `labels[v] ∈ {PART_A, PART_B, PART_SEP}` must form a valid
-/// tri-section on entry; it does on exit. Deterministic per seed.
+/// Refine a node separator (labels `PART_A` / `PART_B` / `PART_SEP`) for up
+/// to `max_rounds` rounds of two side passes each, keeping either side under
+/// `(1 + max_imbalance) / 2` of the total weight. Returns the separator
+/// weight.
 pub(crate) fn refine_node_separator(
     graph: &Graph,
     labels: &mut [u8],
@@ -300,12 +347,9 @@ pub(crate) fn refine_node_separator(
     if sep_w == 0 {
         return 0;
     }
-    // Cap on either side's weight: half the total graph weight plus
-    // the imbalance allowance. The base includes the separator, since
-    // its vertices eventually land on one of the sides; excluding it
-    // would freeze refinement whenever the separator is fat.
     let total = class_w[0] + class_w[1] + class_w[2];
     let side_cap = ((1.0 + max_imbalance) * total as f64 / 2.0).ceil() as i64;
+    let mut ws = Workspace::new(graph.nvtxs as usize);
 
     for _round in 0..max_rounds {
         let w = class_weights(graph, labels);
@@ -314,8 +358,8 @@ pub(crate) fn refine_node_separator(
         } else {
             PART_B as usize
         };
-        let after_first = side_pass(graph, labels, first, side_cap, rng);
-        let after_second = side_pass(graph, labels, 1 - first, side_cap, rng);
+        let after_first = side_pass(graph, labels, first, side_cap, rng, &mut ws);
+        let after_second = side_pass(graph, labels, 1 - first, side_cap, rng, &mut ws);
         let round_end = after_first.min(after_second);
         if round_end >= sep_w {
             sep_w = round_end;
@@ -326,17 +370,15 @@ pub(crate) fn refine_node_separator(
     sep_w
 }
 
-/// Rebalance a tri-section by shifting separator vertices into the
-/// lighter side. Accepts negative-gain moves; keeps every accepted
-/// move (no rollback); stops once the sides are within the imbalance
-/// tolerance or the lighter side would overtake the heavier one.
+/// Rebalance a projected separator whose sides differ by more than the
+/// tolerance: move separator vertices (best gain first) into the lighter
+/// side until the sides balance. Moves are kept, never rolled back.
 pub(crate) fn balance_node_separator(
     graph: &Graph,
     labels: &mut [u8],
     max_imbalance: f64,
     rng: &mut SplitMix,
 ) {
-    let n = graph.nvtxs as usize;
     let mut class_w = class_weights(graph, labels);
     let a = class_w[PART_A as usize];
     let b = class_w[PART_B as usize];
@@ -351,49 +393,19 @@ pub(crate) fn balance_node_separator(
     };
     let heavy = 1 - into;
 
-    let mut version: Vec<u32> = vec![0; n];
-    let mut seq: u64 = 0;
-    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
-    let mut order: Vec<u32> = (0..n as u32)
-        .filter(|&v| labels[v as usize] == PART_SEP)
-        .collect();
-    rng.shuffle(&mut order);
-    for &v in &order {
-        push_key(
-            &mut heap, graph, labels, &version, &mut seq, v as usize, into,
-        );
-    }
-
-    let mut journal: Vec<Transition> = Vec::new(); // kept, never unwound
-    while let Some((_, _, v32, ver)) = heap.pop() {
-        let v = v32 as usize;
-        if labels[v] != PART_SEP || version[v] != ver {
-            continue;
-        }
-        // Never overtake the heavy side; a lighter candidate may
-        // still fit, so skip rather than stop.
+    let mut ws = Workspace::new(graph.nvtxs as usize);
+    seed_heap(graph, labels, &mut ws, rng, into);
+    while let Some(v) = ws.heap.pop() {
         if class_w[into] + graph.vwgt[v] as i64 > class_w[heavy] {
             continue;
         }
-        apply_move(
-            graph,
-            labels,
-            &mut class_w,
-            &mut journal,
-            &mut heap,
-            &mut version,
-            &mut seq,
-            v,
-            into,
-        );
+        apply_move(graph, labels, &mut class_w, &mut ws, v, into);
         if (class_w[PART_A as usize] - class_w[PART_B as usize]).abs() <= tolerance.max(1) {
             break;
         }
     }
 }
 
-/// Debug validation: labels form a valid tri-section (every A-B edge
-/// is blocked by the separator).
 #[cfg(test)]
 pub(crate) fn is_valid_trisection(graph: &Graph, labels: &[u8]) -> bool {
     for v in 0..graph.nvtxs as usize {

@@ -99,7 +99,7 @@ pub enum AmalgamationStrategy {
     /// picks `Adjacency` for path / near-path elimination trees and
     /// `Renumber` for bushy ones, eliminating Renumber's
     /// over-merging regression on path-like trees (MUONSINE_0000:
-    /// 5.5× → 1.4× MUMPS) while keeping the IPM-KKT tail wins.
+    /// 5.5x -> 1.4x MUMPS) while keeping the IPM-KKT tail wins.
     /// Default since Phase 2.13a. See
     /// `dev/research/phase-2.13a-amalgamation-auto.md`.
     #[default]
@@ -192,7 +192,7 @@ impl Supernode {
 
 /// Phase 2.13a - shape predicate threshold.
 ///
-/// `multi_child_frac < THRESH` ⇒ path / near-path tree, dispatch to
+/// `multi_child_frac < THRESH` => path / near-path tree, dispatch to
 /// `Adjacency`. Otherwise dispatch to `Renumber`. Threshold chosen
 /// from the etree-shape probe (`src/bin/diag_etree_shape.rs`) on
 /// the 7 known-answer matrices. MUONSINE (the only Renumber-loses
@@ -286,12 +286,35 @@ pub fn find_supernodes(
     // Track the actual first column of each supernode (may change during merging)
     let mut snode_first_col: Vec<usize> = snode_starts;
 
+    // Frontal height per supernode, exact through amalgamation.
+    //
+    // For a *fundamental* supernode the columns' row structures are nested, so
+    // the first column's count is the frontal height. After a merge that is no
+    // longer true: the merged group's first column is the child's, whose
+    // pattern misses the rows only the parent contributes.
+    //
+    // The union is still exact in closed form. In an elimination tree a
+    // parent's row structure contains the child's minus the child's own
+    // eliminated columns (Liu, "The role of elimination trees in sparse
+    // factorization"), so the merged group's row set is the child's own column
+    // block - dense, and disjoint from the parent's rows - united with the
+    // parent group's row set:
+    //
+    //   merged_nrow = child_group_ncol + parent_group_nrow
+    //
+    // The rule composes along a chain under both iteration orders: a group that
+    // later merges upward carries its whole accumulated `ncol` into the next
+    // parent.
+    let mut snode_nrow: Vec<usize> = (0..n_snodes)
+        .map(|s| col_counts[snode_first_col[s]].max(snode_ncols[s]))
+        .collect();
+
     // Iteration order: forward (legacy / `Adjacency` strategy) is the
     // historical behavior - children processed in increasing postorder
     // index. On a multi-child parent only the highest-index child is
     // adjacent to the parent, so only one child merges per multi-child
     // parent (this is what `dev/research/phase-2.12-column-renumbering.md`
-    // §2 documents).
+    // section 2 documents).
     //
     // Reverse iteration (`Renumber` strategy) processes the parent
     // first, then descends to children in decreasing index order.
@@ -417,6 +440,9 @@ pub fn find_supernodes(
                 // so the merged range is [s_first, p_first+p_ncol).
                 snode_ncols[root_p] = merged_ncol;
                 snode_first_col[root_p] = s_first;
+                // The merged front gains exactly the child's own column block;
+                // every other child row already lies in the parent's row set.
+                snode_nrow[root_p] += child_ncol;
             }
         }
     }
@@ -424,7 +450,7 @@ pub fn find_supernodes(
     // Step 3: Build final supernode list
     // Collect non-merged supernodes
     let mut final_snodes: Vec<Supernode> = Vec::new();
-    let mut new_snode_id = vec![0usize; n_snodes]; // old → new supernode index
+    let mut new_snode_id = vec![0usize; n_snodes]; // old -> new supernode index
 
     for s in 0..n_snodes {
         if merged_into[s].is_some() {
@@ -433,9 +459,10 @@ pub fn find_supernodes(
 
         let first_col = snode_first_col[s];
         let ncol = snode_ncols[s];
-        // nrow = col_counts[first_col]: number of rows in L for the first
-        // column of this supernode, which gives the frontal matrix height
-        let nrow = col_counts[first_col].max(ncol);
+        // Frontal height, tracked exactly through amalgamation above.
+        // `col_counts[first_col]` alone is the fundamental-supernode case and
+        // understates every merged group.
+        let nrow = snode_nrow[s].max(ncol);
 
         // Row indices: the first_col..first_col+ncol are the eliminated columns,
         // plus the remaining rows from col_counts
@@ -521,7 +548,7 @@ pub const DELAY_CAPACITY_MIN_FLOOR: usize = 16;
 /// - The second term tightens that to a constant multiple of the
 ///   supernode's own width, which is the quantity that drives
 ///   frontal-matrix memory at numeric time (the frontal is sized
-///   as `(own_ncol + n_delayed_in) × nrow`).
+///   as `(own_ncol + n_delayed_in) x nrow`).
 ///
 /// The `min` of the two is the cap actually enforced. For leaves
 /// (no children, `subtree_ncol == own_ncol`) the first term is 0,
@@ -707,6 +734,44 @@ pub(crate) fn predict_merges(
     }
 
     bias
+}
+
+/// Parent of every supernode in the assembly tree (`usize::MAX` for a root),
+/// renumbered over the supernodes for which `kept` holds (an empty supernode
+/// contributes no factor columns; its children attach to the nearest kept
+/// ancestor). The result is indexed by the kept supernodes in order.
+pub fn supernode_parents(supernodes: &[Supernode], kept: &[bool]) -> Vec<usize> {
+    let ns = supernodes.len();
+    let mut parent = vec![usize::MAX; ns];
+    for (s, sn) in supernodes.iter().enumerate() {
+        for &c in &sn.children {
+            parent[c] = s;
+        }
+    }
+    let mut new_index = vec![usize::MAX; ns];
+    let mut next = 0;
+    for s in 0..ns {
+        if kept[s] {
+            new_index[s] = next;
+            next += 1;
+        }
+    }
+    let mut out = Vec::with_capacity(next);
+    for s in 0..ns {
+        if !kept[s] {
+            continue;
+        }
+        let mut p = parent[s];
+        while p != usize::MAX && !kept[p] {
+            p = parent[p];
+        }
+        out.push(if p == usize::MAX {
+            usize::MAX
+        } else {
+            new_index[p]
+        });
+    }
+    out
 }
 
 #[cfg(test)]

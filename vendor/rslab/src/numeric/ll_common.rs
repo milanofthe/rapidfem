@@ -1,5 +1,5 @@
 //! Shared scaffolding of the supernodal left-looking drivers - the pieces that
-//! are identical between the LDLᵀ and the LU twin: the per-supernode slot
+//! are identical between the LDL^T and the LU twin: the per-supernode slot
 //! store, the raw panel pointer used for disjoint-row parallel writes, and the
 //! heuristic `tuned` driver (ND bakeoff + calibrated worker count).
 
@@ -40,10 +40,10 @@ impl<P: Default> SlotStore<P> {
         *self.slots[s].get() = p;
     }
 
-    /// Release `k`'s payload once it has been compacted.
-    /// SAFETY: `k`'s last consumer is done - no other thread reads this slot.
-    pub unsafe fn free(&self, k: usize) {
-        *self.slots[k].get() = P::default();
+    /// Move the panel out, leaving the default in its place. SAFETY: the
+    /// owner of supernode `k`, after its last reader is done.
+    pub unsafe fn take(&self, k: usize) -> P {
+        std::mem::take(&mut *self.slots[k].get())
     }
 }
 
@@ -76,6 +76,7 @@ impl<T> PanelPtr<T> {
 /// calibrated cost-model worker count.
 pub(crate) fn tuned<A: ?Sized, S>(
     a: &A,
+    base: &SolverSettings,
     analyze_with: impl Fn(&A, &SolverSettings) -> Result<S, RslabError>,
     estimate: impl Fn(&S) -> MemoryEstimate,
 ) -> Result<(S, SolverSettings), RslabError> {
@@ -86,7 +87,7 @@ pub(crate) fn tuned<A: ?Sized, S>(
     // Amd-pinned default plus flops-gated ND bakeoff with one exact
     // measurement (the race is what the bakeoff approximated).
     #[allow(unused_mut)]
-    let mut s = SolverSettings::default().with_ordering(OrderingMethod::AutoRace);
+    let mut s = base.clone().with_ordering(OrderingMethod::AutoRace);
     let sym = analyze_with(a, &s)?;
     // Install-diagnosed worker count: only when a calibration cache exists
     // (written once by `tuning::install_diagnose`); never measures here.
@@ -187,9 +188,9 @@ pub(crate) struct PermScatter {
 }
 
 impl PermScatter {
-    /// Build for the symmetric lower-triangle fold `Pᵀ A P` (LDLᵀ path):
+    /// Build for the symmetric lower-triangle fold `P^T A P` (LDL^T path):
     /// original entry `(i, j)` lands at permuted `(max(gi, gj), min(gi, gj))`
-    /// with `g = perm_inv[·]`. Columns come out row-sorted.
+    /// with `g = perm_inv[*]`. Columns come out row-sorted.
     pub fn build_lower(
         n: usize,
         a_col_ptr: &[usize],
@@ -211,7 +212,7 @@ impl PermScatter {
         )
     }
 
-    /// Build for the full (unfolded) permutation `Pᵀ A P` (LU path).
+    /// Build for the full (unfolded) permutation `P^T A P` (LU path).
     pub fn build_full(
         n: usize,
         a_col_ptr: &[usize],
@@ -221,7 +222,7 @@ impl PermScatter {
         Self::build_with(n, a_col_ptr, a_row_idx, |gi, gj| (gi, gj), perm_inv)
     }
 
-    /// Build for the transpose of the full permutation, `(Pᵀ A P)ᵀ` (the LU
+    /// Build for the transpose of the full permutation, `(P^T A P)^T` (the LU
     /// path's `a_perm_t`): entry `(i, j)` lands at `(gj, gi)`.
     pub fn build_full_transposed(
         n: usize,
@@ -415,7 +416,7 @@ impl LlSchedule {
 
 /// The left-looking assembly-forest recursion shared by the LDLT/LU twins:
 /// factor every child subtree concurrently, then this node, then compact and
-/// free every descendant whose last consumer this node was (refcount→0), and
+/// free every descendant whose last consumer this node was (refcount->0), and
 /// the node itself if nothing above consumes it. `factor_node` and `emit_free`
 /// carry the path-specific kernels; everything else is the shared schedule.
 pub(crate) fn ll_subtree(

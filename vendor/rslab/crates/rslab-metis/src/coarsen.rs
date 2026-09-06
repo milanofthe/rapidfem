@@ -19,7 +19,7 @@
 //!
 //! References:
 //! - Karypis & Kumar, "A Fast and High Quality Multilevel Scheme",
-//!   §3.1 (matching) and §3.2 (graph contraction).
+//!   section 3.1 (matching) and section 3.2 (graph contraction).
 //! - METIS 5.2.0 `libmetis/coarsen.c` (`Match_SHEM`, `Match_2Hop`,
 //!   `CreateCoarseGraph`).
 

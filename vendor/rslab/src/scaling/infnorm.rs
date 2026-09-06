@@ -1,8 +1,8 @@
-//! Knight-Ruiz ∞-norm iterative equilibration for sparse symmetric
+//! Knight-Ruiz inf-norm iterative equilibration for sparse symmetric
 //! matrices.
 //!
 //! Given a symmetric CSC matrix `A`, compute a diagonal `d` such that
-//! each row of `D·A·D` has infinity-norm ≈ 1, where `D = diag(d)`.
+//! each row of `D*A*D` has infinity-norm ~ 1, where `D = diag(d)`.
 //! This is the same algorithm used by the dense path in
 //! `src/dense/equilibrate.rs`, adapted to iterate over lower-triangular
 //! CSC storage.
@@ -21,16 +21,16 @@
 //!
 //! 1. Initialize `d = 1`.
 //! 2. Repeat up to `max_iter` times:
-//!    a. For each row `i`, compute `max_i = max_j |d[i]·a[i,j]·d[j]|`.
+//!    a. For each row `i`, compute `max_i = max_j |d[i]*a[i,j]*d[j]|`.
 //!    b. Update `d[i] /= sqrt(max_i)` for every row whose `max_i > 0`.
-//!    c. Stop when `max_i |1 − max_i|` falls below `tol`.
+//!    c. Stop when `max_i |1 - max_i|` falls below `tol`.
 
 use crate::scaling::ScalingInfo;
 use crate::sparse::csc::CscMatrix;
 
-/// Compute the Knight-Ruiz ∞-norm symmetric scaling vector for a
+/// Compute the Knight-Ruiz inf-norm symmetric scaling vector for a
 /// lower-triangular symmetric CSC matrix. Returns the diagonal `d`
-/// such that `D·A·D` has unit-∞ rows, paired with `ScalingInfo::Applied`.
+/// such that `D*A*D` has unit-inf rows, paired with `ScalingInfo::Applied`.
 pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
     let n = matrix.n;
     if n == 0 {
@@ -43,7 +43,7 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
     let max_iter = 10;
     let tol = 1e-8;
 
-    // Work buffer for the row ∞-norms.
+    // Work buffer for the row inf-norms.
     let mut row_max = vec![0.0f64; n];
 
     for _ in 0..max_iter {
@@ -65,8 +65,8 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
         // contribution. Off-diagonal entries (i > j) update both
         // `row_max[i]` and `col_max`.
         //
-        // Bit-identical to the prior formulation: max(·,·) is
-        // associative on non-NaN inputs (every `v` is `|·|` of finite
+        // Bit-identical to the prior formulation: max(*,*) is
+        // associative on non-NaN inputs (every `v` is `|*|` of finite
         // products), so combining via a register accumulator then
         // folding into `row_max[j]` produces the same value as in-place
         // updates in any iteration order.
@@ -114,11 +114,11 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
     (d, ScalingInfo::Applied)
 }
 
-/// One-pass symmetric ∞-norm equilibration `sᵢ = 1/√maxⱼ|Aᵢⱼ|` (a single
+/// One-pass symmetric inf-norm equilibration `s_i = 1/sqrt(max_j |A_ij|)` (a single
 /// Knight-Ruiz step). Cheaper than the iterative [`compute_infnorm`] and the
 /// historical [`crate::LdltSolver`] default: it tolerates a zero diagonal (the
 /// row max is taken over off-diagonals) and never iterates. An all-zero row is
-/// left unscaled (`sᵢ = 1`), surfacing as a singular pivot during factorization.
+/// left unscaled (`s_i = 1`), surfacing as a singular pivot during factorization.
 /// The scan folds in the symmetric partner `(j, i)` of every stored `(i, j)`, so
 /// it is correct for a lower-triangular *or* a full symmetric store (`max` is
 /// idempotent).
@@ -199,7 +199,7 @@ mod tests {
 
     /// Diagonal matrix diag(2, 3, 5). The oracle scaling is
     /// d = [1/sqrt(2), 1/sqrt(3), 1/sqrt(5)], so that
-    /// D·A·D = diag(1, 1, 1).
+    /// D*A*D = diag(1, 1, 1).
     #[test]
     fn diag_3x3() {
         let m = CscMatrix::from_triplets(3, &[0, 1, 2], &[0, 1, 2], &[2.0, 3.0, 5.0]).unwrap();
@@ -218,12 +218,12 @@ mod tests {
 
     /// 2x2 matrix [[4, 2], [2, 9]]. Row max [i=0]: max(|4|, |2|) = 4;
     /// row max [i=1]: max(|2|, |9|) = 9. After one KR sweep:
-    /// d = [1/2, 1/3]. Check D·A·D row norms converge to 1.
+    /// d = [1/2, 1/3]. Check D*A*D row norms converge to 1.
     #[test]
     fn sym_2x2() {
         let m = CscMatrix::from_triplets(2, &[0, 1, 1], &[0, 0, 1], &[4.0, 2.0, 9.0]).unwrap();
         let (d, _) = compute_infnorm(&m);
-        // D·A·D:
+        // D*A*D:
         //   [d0*d0*4, d0*d1*2]
         //   [d0*d1*2, d1*d1*9]
         let a00 = d[0] * d[0] * 4.0;
@@ -237,7 +237,7 @@ mod tests {
 
     /// Arrow matrix: diagonal [2, 3, 4, 5, 6, 7] with (5, 0..=4) = 1.
     /// Row 5 has 5 off-diagonal entries plus the diagonal 7; its
-    /// initial ∞-norm is max(1, 1, 1, 1, 1, 7) = 7. The first KR
+    /// initial inf-norm is max(1, 1, 1, 1, 1, 7) = 7. The first KR
     /// sweep should shrink d[5] by sqrt(7).
     #[test]
     fn arrow_6x6() {
@@ -257,7 +257,7 @@ mod tests {
         let m = CscMatrix::from_triplets(6, &rows, &cols, &vals).unwrap();
         let (d, _) = compute_infnorm(&m);
         // After KR convergence, every row's max-magnitude entry in
-        // D·A·D should be ≈ 1.
+        // D*A*D should be ~ 1.
         for i in 0..6 {
             let mut row_max = 0.0f64;
             for j in 0..6 {

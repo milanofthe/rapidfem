@@ -15,6 +15,7 @@ categories = ["mathematics", "science"]
 name = "rslab_metis"
 
 [dependencies]
+rayon = "1.10"
 rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
 rslab-amd = { path = "../rslab-amd", version = "0.2" }
 

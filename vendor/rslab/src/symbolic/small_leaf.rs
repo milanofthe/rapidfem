@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn all_small_leaves_pack_into_one_group() {
         // Five tiny leaves in a diagonal pattern: row_indices for each
-        // equals its own column range, so arena_size sums ncol².
+        // equals its own column range, so arena_size sums ncol^2.
         let snodes = vec![
             mk_leaf(0, 2, 2),
             mk_leaf(2, 2, 2),
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn non_leaf_breaks_group() {
-        // Leaf, leaf, non-leaf, leaf, leaf → two groups.
+        // Leaf, leaf, non-leaf, leaf, leaf -> two groups.
         let snodes = vec![
             mk_leaf(0, 2, 2),
             mk_leaf(2, 2, 2),
@@ -348,8 +348,8 @@ mod tests {
             ncol_max: 8,
             arena_budget: 5,
         };
-        // Three 2×2 leaves (4 each): first fits alone, second would
-        // push arena to 8 > 5 → new group.
+        // Three 2x2 leaves (4 each): first fits alone, second would
+        // push arena to 8 > 5 -> new group.
         let snodes = vec![mk_leaf(0, 2, 2), mk_leaf(2, 2, 2), mk_leaf(4, 2, 2)];
         let pat = diag_pattern(6);
         let (groups, snode_group) = find_small_leaf_groups(&snodes, &pat, &params);

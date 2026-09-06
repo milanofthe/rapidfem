@@ -1,6 +1,6 @@
 //! Small **dense** complex linear algebra for GCRO-DR harmonic-Ritz extraction
 //! (issue #5). These routines operate on tiny `(m+k)`-dimensional matrices
-//! (`m` = GMRES restart, typically ≤ 80) **once per restart cycle** - never in
+//! (`m` = GMRES restart, typically <= 80) **once per restart cycle** - never in
 //! the Krylov hot loop - so they are written for clarity and robustness, not
 //! peak speed, and everything runs in `Complex<f64>` regardless of the outer
 //! solve's scalar field.
@@ -8,7 +8,7 @@
 //! Two primitives are needed by [`harmonic_ritz_smallest`]:
 //!
 //! * a partial-pivot complex **LU solve** (`A X = B`), used both to form the
-//!   standard-form matrix `T = M₂⁻¹ M₁` and to run inverse iteration; and
+//!   standard-form matrix `T = M_2^-1 M_1` and to run inverse iteration; and
 //! * a complex **unsymmetric eigenvalue** routine (Hessenberg reduction + shifted
 //!   Givens QR) returning the eigenvalues of a general dense matrix.
 //!
@@ -23,10 +23,10 @@ use num_complex::Complex;
 
 type C = Complex<f64>;
 
-/// Solve the dense complex system `A X = B` by partial-pivot LU. `a` is `d×d`
-/// row-major (consumed as a working copy), `b` is `d×nrhs` row-major. Returns the
-/// solution `X` (`d×nrhs` row-major), or `None` if `A` is numerically singular
-/// (a pivot below `tol·‖A‖∞`), so the caller can skip the recycle update rather
+/// Solve the dense complex system `A X = B` by partial-pivot LU. `a` is `dxd`
+/// row-major (consumed as a working copy), `b` is `dxnrhs` row-major. Returns the
+/// solution `X` (`dxnrhs` row-major), or `None` if `A` is numerically singular
+/// (a pivot below `tol*||A||inf`), so the caller can skip the recycle update rather
 /// than divide by ~0.
 pub fn lu_solve(a: &[C], d: usize, b: &[C], nrhs: usize) -> Option<Vec<C>> {
     if d == 0 {
@@ -93,7 +93,7 @@ pub fn lu_solve(a: &[C], d: usize, b: &[C], nrhs: usize) -> Option<Vec<C>> {
     Some(x)
 }
 
-/// Reduce a general dense complex matrix `a` (`d×d`, row-major, modified in place)
+/// Reduce a general dense complex matrix `a` (`dxd`, row-major, modified in place)
 /// to upper **Hessenberg** form by Householder similarity transforms. Only the
 /// eigenvalues are needed downstream, so the accumulating transform is not formed.
 #[allow(clippy::needless_range_loop)]
@@ -131,7 +131,7 @@ fn to_hessenberg(a: &mut [C], d: usize) {
         if vnorm == 0.0 {
             continue;
         }
-        // H = I - 2 v vᴴ / (vᴴ v). Apply on the left: A ← H A.
+        // H = I - 2 v v^H / (v^H v). Apply on the left: A <- H A.
         for j in 0..d {
             let mut s = C::new(0.0, 0.0);
             for i in (col + 1)..d {
@@ -142,7 +142,7 @@ fn to_hessenberg(a: &mut [C], d: usize) {
                 a[i * d + j] -= f * v[i];
             }
         }
-        // Apply on the right: A ← A H.
+        // Apply on the right: A <- A H.
         for i in 0..d {
             let mut s = C::new(0.0, 0.0);
             for j in (col + 1)..d {
@@ -156,8 +156,8 @@ fn to_hessenberg(a: &mut [C], d: usize) {
     }
 }
 
-/// One shifted Givens QR step on the active leading `p×p` block of the upper
-/// Hessenberg matrix `h` (`d×d` row-major): `H ← R·Q + μI` where `H − μI = Q·R`.
+/// One shifted Givens QR step on the active leading `pxp` block of the upper
+/// Hessenberg matrix `h` (`dxd` row-major): `H <- R*Q + muI` where `H - muI = Q*R`.
 /// Rotations are applied to rows/cols `0..p` only; the eigenvector transform is
 /// not accumulated (eigenvalues only).
 fn qr_step(h: &mut [C], d: usize, p: usize, mu: C) {
@@ -181,7 +181,7 @@ fn qr_step(h: &mut [C], d: usize, p: usize, mu: C) {
         let s = b / r;
         cs[i] = c;
         sn[i] = s;
-        // Rows i, i+1 across columns i..p: [[c̄, s̄],[-s, c]].
+        // Rows i, i+1 across columns i..p: [[c_bar, s_bar],[-s, c]].
         for j in i..p {
             let hij = h[i * d + j];
             let hi1j = h[(i + 1) * d + j];
@@ -189,7 +189,7 @@ fn qr_step(h: &mut [C], d: usize, p: usize, mu: C) {
             h[(i + 1) * d + j] = -s * hij + c * hi1j;
         }
     }
-    // Right rotations: H ← R·Q, Q = G₀ᴴ G₁ᴴ … so apply the transpose from the
+    // Right rotations: H <- R*Q, Q = G_0^H G_1^H ... so apply the transpose from the
     // right to column pairs (i, i+1) across rows 0..=min(i+2, p)-1.
     for i in 0..(p - 1) {
         let c = cs[i];
@@ -208,8 +208,8 @@ fn qr_step(h: &mut [C], d: usize, p: usize, mu: C) {
     }
 }
 
-/// Wilkinson shift: the eigenvalue of the trailing `2×2` block of the active
-/// leading `p×p` submatrix that is closer to the corner entry `h[p-1,p-1]`.
+/// Wilkinson shift: the eigenvalue of the trailing `2x2` block of the active
+/// leading `pxp` submatrix that is closer to the corner entry `h[p-1,p-1]`.
 fn wilkinson_shift(h: &[C], d: usize, p: usize) -> C {
     let a = h[(p - 2) * d + (p - 2)];
     let b = h[(p - 2) * d + (p - 1)];
@@ -226,7 +226,7 @@ fn wilkinson_shift(h: &[C], d: usize, p: usize) -> C {
     }
 }
 
-/// Eigenvalues of a general dense complex matrix `a` (`d×d`, row-major).
+/// Eigenvalues of a general dense complex matrix `a` (`dxd`, row-major).
 /// Hessenberg reduction followed by shifted-QR with bottom-right deflation.
 /// Iterations are capped; any non-converged tail is reported as its current
 /// diagonal (safe - see the module note on why approximate spectra are fine).
@@ -263,12 +263,12 @@ pub fn eigenvalues(a: &[C], d: usize) -> Vec<C> {
     eigs
 }
 
-/// One-vector inverse iteration for the eigenvector of `a` (`d×d` row-major)
-/// belonging to the (accurate) eigenvalue `mu`: solve `(A − (μ+ε)I) w = w`
+/// One-vector inverse iteration for the eigenvector of `a` (`dxd` row-major)
+/// belonging to the (accurate) eigenvalue `mu`: solve `(A - (mu+eps)I) w = w`
 /// twice from a fixed seed, returning the unit-norm result. Returns `None` if the
 /// shifted solve is singular even after perturbation.
 fn inverse_iteration(a: &[C], d: usize, mu: C) -> Option<Vec<C>> {
-    // Perturb the shift slightly off the exact eigenvalue so (A − μI) is solvable.
+    // Perturb the shift slightly off the exact eigenvalue so (A - muI) is solvable.
     let scale = {
         let mut s = 0.0f64;
         for v in a.iter() {
@@ -309,17 +309,17 @@ fn normalize(w: &mut [C]) {
 }
 
 /// The `k` harmonic-Ritz pairs of **smallest magnitude** for the GCRO-DR
-/// generalized eigenproblem `M₁ g = θ M₂ g` (both `d×d`, row-major). Returns
-/// `(θᵢ, gᵢ)` sorted by ascending `|θ|`, at most `k` of them. The standard-form
-/// matrix `T = M₂⁻¹ M₁` is formed by an LU solve; its eigenvalues are the
+/// generalized eigenproblem `M_1 g = theta M_2 g` (both `dxd`, row-major). Returns
+/// `(theta_i, g_i)` sorted by ascending `|theta|`, at most `k` of them. The standard-form
+/// matrix `T = M_2^-1 M_1` is formed by an LU solve; its eigenvalues are the
 /// harmonic-Ritz values and its eigenvectors (via inverse iteration) the
-/// coefficient vectors `gᵢ`. On a singular `M₂` the empty list is returned (the
+/// coefficient vectors `g_i`. On a singular `M_2` the empty list is returned (the
 /// caller then keeps its previous recycle subspace).
 pub fn harmonic_ritz_smallest(m1: &[C], m2: &[C], d: usize, k: usize) -> Vec<(C, Vec<C>)> {
     if d == 0 || k == 0 {
         return Vec::new();
     }
-    // T = M₂⁻¹ M₁ (solve M₂ T = M₁).
+    // T = M_2^-1 M_1 (solve M_2 T = M_1).
     let t = match lu_solve(m2, d, m1, d) {
         Some(t) => t,
         None => return Vec::new(),

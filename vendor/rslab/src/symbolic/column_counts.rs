@@ -20,7 +20,7 @@ use crate::sparse::csc::CscPattern;
 ///
 /// Test-only reference oracle: the production pipeline uses
 /// [`column_counts_gnp`] exclusively (bit-exact equivalence verified on the
-/// 169585-matrix corpus, Phase 2.5.1); this O(n²) simulation is kept solely so
+/// 169585-matrix corpus, Phase 2.5.1); this O(n^2) simulation is kept solely so
 /// the tests here and in `supernode.rs` can cross-check GNP against a
 /// first-principles implementation.
 #[cfg(test)]
@@ -80,19 +80,19 @@ pub fn total_factor_nnz(counts: &[usize]) -> usize {
     counts.iter().sum()
 }
 
-/// Gilbert-Ng-Peyton column counts (O(nnz(A) + n·α(n))).
+/// Gilbert-Ng-Peyton column counts (O(nnz(A) + n*alpha(n))).
 ///
 /// Equivalent to `column_counts` but asymptotically much faster on
 /// dense-ish patterns. Uses Liu's row-subtree characterization:
 ///
-/// - L(i, j) ≠ 0 iff j ∈ T^r_i (the row subtree for row i)
-/// - `c[j] = |{i : j ∈ T^r_i}|` (column count)
-/// - `c[j]` = sum over T^r_i of (leaves at j) − (LCAs at j), accumulated
+/// - L(i, j) != 0 iff j in T^r_i (the row subtree for row i)
+/// - `c[j] = |{i : j in T^r_i}|` (column count)
+/// - `c[j]` = sum over T^r_i of (leaves at j) - (LCAs at j), accumulated
 ///   up the etree
 ///
 /// References:
 /// - Gilbert, Ng, Peyton, *SIAM J. Matrix Anal. Appl.* 15(4):1075-1091, 1994
-/// - Davis, *Direct Methods for Sparse Linear Systems* §4.4
+/// - Davis, *Direct Methods for Sparse Linear Systems* section 4.4
 /// - CSparse `cs_counts.c` (BSD, structural reference)
 pub fn column_counts_gnp(pattern: &CscPattern, etree: &EliminationTree) -> Vec<usize> {
     let n = pattern.n;
@@ -202,10 +202,10 @@ mod tests {
     #[test]
     fn test_column_counts_tridiagonal() {
         // Tridiagonal 4x4: L has entries on diagonal and one subdiagonal
-        // Column 0: rows 0, 1 → count = 2
-        // Column 1: rows 1, 2 → count = 2
-        // Column 2: rows 2, 3 → count = 2
-        // Column 3: row 3      → count = 1
+        // Column 0: rows 0, 1 -> count = 2
+        // Column 1: rows 1, 2 -> count = 2
+        // Column 2: rows 2, 3 -> count = 2
+        // Column 3: row 3      -> count = 1
         let m =
             CscMatrix::from_triplets(4, &[0, 1, 1, 2, 2, 3, 3], &[0, 0, 1, 1, 2, 2, 3], &[1.0; 7])
                 .unwrap();
@@ -220,9 +220,9 @@ mod tests {
     #[test]
     fn test_column_counts_dense() {
         // Dense 3x3: L is full lower triangle
-        // Column 0: rows 0, 1, 2 → count = 3
-        // Column 1: rows 1, 2    → count = 2
-        // Column 2: row 2        → count = 1
+        // Column 0: rows 0, 1, 2 -> count = 3
+        // Column 1: rows 1, 2    -> count = 2
+        // Column 2: row 2        -> count = 1
         let m = CscMatrix::from_triplets(3, &[0, 1, 2, 1, 2, 2], &[0, 0, 0, 1, 1, 2], &[1.0; 6])
             .unwrap();
         let pat = m.symmetric_pattern();
@@ -237,11 +237,11 @@ mod tests {
     fn test_column_counts_arrow() {
         // Arrow 5x5: column 0 has entries at rows 0-4, others are diagonal
         // Eliminating column 0 creates fill among rows 1-4
-        // Column 0: rows 0,1,2,3,4 → count = 5
-        // Column 1: rows 1,2,3,4 (fill from col 0) → count = 4
-        // Column 2: rows 2,3,4 → count = 3
-        // Column 3: rows 3,4 → count = 2
-        // Column 4: row 4 → count = 1
+        // Column 0: rows 0,1,2,3,4 -> count = 5
+        // Column 1: rows 1,2,3,4 (fill from col 0) -> count = 4
+        // Column 2: rows 2,3,4 -> count = 3
+        // Column 3: rows 3,4 -> count = 2
+        // Column 4: row 4 -> count = 1
         let m = CscMatrix::from_triplets(
             5,
             &[0, 1, 2, 3, 4, 1, 2, 3, 4],

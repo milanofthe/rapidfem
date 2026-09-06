@@ -1,7 +1,7 @@
 //! The scalar field over which RLA factorizations operate.
 //!
-//! [`Scalar`] is implemented for [`f64`] (real symmetric LDLᵀ) and
-//! [`num_complex::Complex<f64>`] (complex *symmetric* LDLᵀ, PARDISO `mtype 6`).
+//! [`Scalar`] is implemented for [`f64`] (real symmetric LDL^T) and
+//! [`num_complex::Complex<f64>`] (complex *symmetric* LDL^T, PARDISO `mtype 6`).
 //!
 //! Design notes:
 //!
@@ -10,10 +10,10 @@
 //!   solver is an `f64`, so keeping magnitudes concrete keeps the pivot logic
 //!   uniform across the real and complex paths. A future `Complex<f32>` path,
 //!   if ever wanted, would revisit this.
-//! * The complex path is *symmetric* (A = Aᵀ), **not** Hermitian. On that path
+//! * The complex path is *symmetric* (A = A^T), **not** Hermitian. On that path
 //!   no value is ever conjugated. [`Scalar::conj`] is provided as the identity
 //!   for `f64` and as the genuine conjugate for `Complex<f64>` so a future
-//!   Hermitian (LDLᴴ) path can reuse the same trait; the current
+//!   Hermitian (LDL^H) path can reuse the same trait; the current
 //!   complex-symmetric kernels simply never call it.
 
 use num_complex::Complex;
@@ -45,10 +45,10 @@ pub trait Scalar:
     fn from_real(r: f64) -> Self;
 
     /// Euclidean magnitude `|z|`. For `f64` this is the absolute value; for
-    /// `Complex<f64>` the modulus `sqrt(re² + im²)`.
+    /// `Complex<f64>` the modulus `sqrt(re^2 + im^2)`.
     fn magnitude(self) -> f64;
 
-    /// Squared magnitude `|z|²`. Avoids the `sqrt` in [`magnitude`](Self::magnitude)
+    /// Squared magnitude `|z|^2`. Avoids the `sqrt` in [`magnitude`](Self::magnitude)
     /// when only comparisons are needed (the hot path in pivot selection).
     fn magnitude_sq(self) -> f64;
 
@@ -91,7 +91,7 @@ pub trait Scalar:
     fn is_finite(self) -> bool;
 }
 
-/// `a·b + c` through the hardware FMA **when the build enables it**
+/// `a*b + c` through the hardware FMA **when the build enables it**
 /// (`-C target-cpu=native` or `-C target-feature=+fma`; see
 /// `.cargo/config.toml`), else as a plain multiply-add. The guard is
 /// load-bearing: a bare [`Scalar::mul_add`] on a baseline x86-64 build lowers
@@ -207,7 +207,7 @@ impl Scalar for Complex<f64> {
 
     #[inline]
     fn magnitude(self) -> f64 {
-        // `norm` is the Euclidean modulus sqrt(re² + im²), computed via
+        // `norm` is the Euclidean modulus sqrt(re^2 + im^2), computed via
         // `hypot` to avoid spurious overflow.
         self.norm()
     }
@@ -229,7 +229,7 @@ impl Scalar for Complex<f64> {
 
     #[inline]
     fn recip(self) -> Self {
-        // True algebraic reciprocal 1/z = conj(z) / |z|². This is the value
+        // True algebraic reciprocal 1/z = conj(z) / |z|^2. This is the value
         // used to eliminate with a complex-symmetric pivot; it is NOT a
         // Hermitian operation.
         Complex::inv(&self)
@@ -237,7 +237,7 @@ impl Scalar for Complex<f64> {
 
     #[inline]
     fn mul_add(self, a: Self, b: Self) -> Self {
-        // (self·a + b) lowered to four real FMAs - uses the hardware FMA pipes
+        // (self*a + b) lowered to four real FMAs - uses the hardware FMA pipes
         // and halves the rounding versus `self * a + b` on `num_complex`.
         let re = f64::mul_add(self.re, a.re, f64::mul_add(-self.im, a.im, b.re));
         let im = f64::mul_add(self.re, a.im, f64::mul_add(self.im, a.re, b.im));

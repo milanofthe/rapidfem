@@ -8,7 +8,7 @@
 //! LP dual. Those duals are what get exponentiated into the
 //! row/column scalings in `mc64.rs`.
 //!
-//! Reference: citet:duff2001mc64 §4. Source model:
+//! Reference: citet:duff2001mc64 section 4. Source model:
 //! `ref/spral/src/scaling.f90::hungarian_match` (lines 938-1171),
 //! itself a clean-room rewrite of HSL_MC80. The algorithm is the
 //! standard shortest-augmenting-path variant - each augmenting
@@ -71,14 +71,14 @@ const NONE: usize = usize::MAX;
 ///   per-search `reset`. With the #80 fix this is `m + touched_total`
 ///   (linear in `n + nnz`). If the heap were reallocated per
 ///   unmatched column (the pre-#80 bug), every search would route a
-///   fresh `new(m)` through this counter, making it `≈ searches·m`
+///   fresh `new(m)` through this counter, making it `~ searches*m`
 ///   (quadratic on near-tree KKTs). The structural invariant
 ///   `heap_init_slots == m + touched_total` is what the guard checks.
 /// - `augment_searches`: number of shortest-augmenting-path searches
 ///   run in the main loop (one per still-unmatched column).
 /// - `touched_total`: sum of `|touched|` over all searches.
 /// - `phase3_inner_iters`: iterations of the length-2 augmentation
-///   inner loop in `hungarian_init_heuristic`. O(nnz²) blow-up there
+///   inner loop in `hungarian_init_heuristic`. O(nnz^2) blow-up there
 ///   shows up as super-linear growth of this counter vs nnz.
 /// - `main_loop_edge_scans`: total edges examined in the main
 ///   shortest-path loop (root-column scan + each popped row's matched
@@ -100,7 +100,7 @@ pub(crate) struct HungarianStats {
     pub main_loop_edge_scans: u64,
 }
 
-/// A large finite value used as "+∞" for shortest-path distances.
+/// A large finite value used as "+inf" for shortest-path distances.
 /// We avoid `f64::INFINITY` in arithmetic to match SPRAL's `RINF`
 /// style (it uses `huge(1.0_wp)/10`, a large finite constant). Any
 /// value strictly larger than the maximum finite cost in the graph
@@ -152,7 +152,7 @@ impl IndexHeap {
     /// after being pushed to `touched`. The `heap` backing array is left
     /// with stale entries; `len = 0` makes them unreachable. This turns
     /// the per-iteration `IndexHeap::new(m)` (O(m) alloc+zero per
-    /// unmatched column, i.e. O(n·m) overall) into O(|touched|).
+    /// unmatched column, i.e. O(n*m) overall) into O(|touched|).
     fn reset(&mut self, rows: &[usize], stats: &mut HungarianStats) {
         stats.heap_init_slots += rows.len() as u64;
         for &i in rows {
@@ -431,7 +431,7 @@ fn hungarian_init_heuristic(
 /// `u[i] + v[j] <= cost[i][j]` for every edge, with equality on
 /// matched edges (the LP complementary-slackness conditions).
 ///
-/// Algorithm: Duff & Koster 2001 §4, mirroring SPRAL's
+/// Algorithm: Duff & Koster 2001 section 4, mirroring SPRAL's
 /// `hungarian_match` at `ref/spral/src/scaling.f90:938-1171`.
 ///
 /// Structure of the working state (following SPRAL line-by-line):
@@ -515,7 +515,7 @@ pub(crate) fn hungarian_match_instrumented(cost: &CostGraph) -> (Matching, Hunga
     // Allocated once and reused across all augmenting searches; reset
     // incrementally (over `touched`) at the end of each iteration, the
     // same way `d` and `visited` are. Previously this was reallocated
-    // per unmatched column - O(n·m) alloc+zeroing that dominated MC64 on
+    // per unmatched column - O(n*m) alloc+zeroing that dominated MC64 on
     // large near-tree KKTs (issue #80).
     let mut heap = IndexHeap::new(m, &mut stats);
 
@@ -722,11 +722,11 @@ mod tests {
     //! Pre-Step 3 (the stub), tests that assert on identity-like
     //! behavior pass; tests that assert on non-trivial matchings
     //! or non-zero duals fail. This is intentional - the test file
-    //! is the red→green gate for Step 3.
+    //! is the red->green gate for Step 3.
     //!
     //! Hand-derivation method: any minimum-cost perfect matching on
     //! a bipartite graph satisfies the LP optimality conditions
-    //!   `u[i] + v[j] ≤ cost[i][j]`   for all edges,
+    //!   `u[i] + v[j] <= cost[i][j]`   for all edges,
     //!   `u[i] + v[j] == cost[i][j]`  on matched edges,
     //! so the matching plus any feasible dual that makes the total
     //! `sum(u) + sum(v)` equal to `sum(cost[matched])` is optimal.
@@ -761,7 +761,7 @@ mod tests {
     }
 
     /// Verify the LP optimality conditions for a `Matching` on a
-    /// `CostGraph`: for every edge `u[i] + v[j] ≤ cost[i][j]` with
+    /// `CostGraph`: for every edge `u[i] + v[j] <= cost[i][j]` with
     /// equality on matched edges.
     fn assert_matching_optimal(cost: &CostGraph, m: &Matching) {
         let n = cost.n;
@@ -803,7 +803,7 @@ mod tests {
         }
     }
 
-    /// 3×3 identity pattern: matching is trivially identity with
+    /// 3x3 identity pattern: matching is trivially identity with
     /// zero duals. The stub passes this because "identity matching
     /// with zero duals" is exactly what it returns.
     #[test]
@@ -815,11 +815,11 @@ mod tests {
         assert_matching_optimal(&cost, &m);
     }
 
-    /// 3×3 with a non-identity permutation pattern:
+    /// 3x3 with a non-identity permutation pattern:
     ///   cost(0, 1) = 0
     ///   cost(1, 2) = 0
     ///   cost(2, 0) = 0
-    /// The only perfect matching is 0↔1, 1↔2, 2↔0 (i.e., col 0 is
+    /// The only perfect matching is 0<->1, 1<->2, 2<->0 (i.e., col 0 is
     /// matched with row 2, etc.). The stub returns identity, which
     /// is NOT a valid matching on this sparsity pattern, so this
     /// test MUST fail on the stub.
@@ -837,17 +837,17 @@ mod tests {
         assert_matching_optimal(&cost, &m);
     }
 
-    /// 3×3 with a non-trivial cost matrix where the answer requires
+    /// 3x3 with a non-trivial cost matrix where the answer requires
     /// actual Hungarian logic. The costs are:
     ///    col 0: row 0 -> 3, row 1 -> 1
     ///    col 1: row 0 -> 2, row 2 -> 4
     ///    col 2: row 1 -> 5, row 2 -> 0
     /// Minimum total cost is 1 + 2 + 0 = 3 via matching
-    /// 0↔1, 1↔0, 2↔2 (col 0 ↔ row 1, col 1 ↔ row 0, col 2 ↔ row 2).
-    /// Alternative matching 0↔0, 1↔2, 2↔1 has cost 3 + 4 + 5 = 12.
+    /// 0<->1, 1<->0, 2<->2 (col 0 <-> row 1, col 1 <-> row 0, col 2 <-> row 2).
+    /// Alternative matching 0<->0, 1<->2, 2<->1 has cost 3 + 4 + 5 = 12.
     /// Only the first is optimal. The stub returns identity
     /// `perm = [0, 1, 2]`, which on this cost graph would be
-    /// 0↔0, 1↔1, 2↔2 - but (1,1) has no entry in our graph, so
+    /// 0<->0, 1<->1, 2<->2 - but (1,1) has no entry in our graph, so
     /// the stub's matching is not even feasible.
     ///
     /// Step 3 has landed; the real Hungarian kernel handles this.
@@ -878,7 +878,7 @@ mod tests {
         );
     }
 
-    /// 4×4 dense cost matrix. The optimal matching minimizes
+    /// 4x4 dense cost matrix. The optimal matching minimizes
     /// `sum cost[perm[j]][j]`. For
     ///
     ///        j=0 j=1 j=2 j=3
@@ -920,7 +920,7 @@ mod tests {
         );
     }
 
-    /// 5×5 sparse pattern with non-trivial connectivity. The pattern
+    /// 5x5 sparse pattern with non-trivial connectivity. The pattern
     /// forces most columns to use specific rows because alternatives
     /// are absent. Exercises the shortest-path search through a
     /// chain of augmentations (no one-shot greedy init suffices).
@@ -984,12 +984,12 @@ mod tests {
         }
     }
 
-    /// Build an n×n cost graph with `deg` distinct random rows per
+    /// Build an nxn cost graph with `deg` distinct random rows per
     /// column and random positive costs. With small constant `deg`,
     /// the greedy init leaves a constant fraction of columns unmatched,
-    /// so the main augmenting loop runs Θ(n) shortest-path searches -
+    /// so the main augmenting loop runs Theta(n) shortest-path searches -
     /// exactly the near-tree regime where the issue #80 per-column heap
-    /// reallocation was O(n·m). nnz = deg·n grows linearly in n.
+    /// reallocation was O(n*m). nnz = deg*n grows linearly in n.
     fn gen_random_sparse(n: usize, deg: usize, seed: u64) -> CostGraph {
         let mut rng = Lcg(seed);
         let mut by_col: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
@@ -1027,16 +1027,16 @@ mod tests {
 
     /// Deterministic scaling regression guard for MC64 (issue #80).
     ///
-    /// Two independent O(n²) hazards in the Hungarian kernel are
+    /// Two independent O(n^2) hazards in the Hungarian kernel are
     /// pinned here without any reliance on wall-clock (CI-noise-immune):
     ///
     /// 1. **Per-column heap reallocation (the #80 bug).** Before the
     ///    fix, `IndexHeap::new(m)` was called inside the per-unmatched-
-    ///    column loop, costing O(m) zeroing per search → O(searches·m)
-    ///    = O(n²) on near-tree KKTs. The fix allocates once and resets
+    ///    column loop, costing O(m) zeroing per search -> O(searches*m)
+    ///    = O(n^2) on near-tree KKTs. The fix allocates once and resets
     ///    incrementally over `touched`. The exact structural invariant
     ///    of the fix is `heap_init_slots == n + touched_total` (one
-    ///    O(n) allocation plus Σ|touched| reset work). A revert that
+    ///    O(n) allocation plus sum|touched| reset work). A revert that
     ///    re-allocates per search routes O(m) per search through the
     ///    same counter, breaking the equality at every size. This is a
     ///    stronger, threshold-free guard than a growth ratio - and
@@ -1045,10 +1045,10 @@ mod tests {
     ///    paths), so total heap work is not linear to begin with.
     ///
     /// 2. **Length-2 augmentation blow-up.** The phase-3 inner loop in
-    ///    `hungarian_init_heuristic` is O(nnz²) in the worst case. On
+    ///    `hungarian_init_heuristic` is O(nnz^2) in the worst case. On
     ///    this random-sparse family it is observed linear in nnz
-    ///    (~8.2× over an 8× size increase), so we assert the count
-    ///    grows sub-quadratically (8× ladder, quadratic ≈ 64×).
+    ///    (~8.2x over an 8x size increase), so we assert the count
+    ///    grows sub-quadratically (8x ladder, quadratic ~ 64x).
     ///
     /// The family is `gen_random_sparse(n, deg=3)`: with small constant
     /// degree, greedy init leaves a constant fraction of columns
@@ -1095,7 +1095,7 @@ mod tests {
         }
 
         // Phase-3 length-2 augmentation must stay sub-quadratic across
-        // the 8× size ladder (linear ≈ 8×, quadratic ≈ 64×).
+        // the 8x size ladder (linear ~ 8x, quadratic ~ 64x).
         assert!(phase3_first > 0, "phase-3 augmentation never exercised");
         assert!(
             phase3_last < 16 * phase3_first,
@@ -1106,7 +1106,7 @@ mod tests {
         );
     }
 
-    /// Structurally singular 3×3: only two distinct rows appear in
+    /// Structurally singular 3x3: only two distinct rows appear in
     /// the pattern (row 0 appears in two columns, but row 2 never
     /// appears at all), so at most two columns can be matched. The
     /// algorithm should report `n_matched < n` and leave the

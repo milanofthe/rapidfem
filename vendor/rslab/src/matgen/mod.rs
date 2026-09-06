@@ -8,7 +8,7 @@
 //! SuiteSparse / Matrix Market matrices. Conditioning is steered **structurally**
 //! (diagonal dominance, PDE refinement, near-resonance shift, coefficient jumps)
 //! for the sparse families, and **spectrally** (prescribed eigenvalues, `xLATMS`
-//! style) for the small dense [`spectral`] family where exact κ is needed.
+//! style) for the small dense [`spectral`] family where exact kappa is needed.
 //!
 //! The real-valued structural families are generic over [`Scalar`]; the inherently
 //! complex families (Helmholtz, BEM/MoM kernel) produce `Complex<f64>`.
@@ -142,7 +142,7 @@ mod integration {
 
     #[test]
     fn symmetric_families_factor_and_solve() {
-        // SPD stencil, complex-symmetric Helmholtz, banded, indefinite KKT (2×2 BK),
+        // SPD stencil, complex-symmetric Helmholtz, banded, indefinite KKT (2x2 BK),
         // and an exactly-ill-conditioned spectral matrix.
         let cases: Vec<(&str, CscMatrix<C>)> = vec![
             (
@@ -164,7 +164,7 @@ mod integration {
         ];
         for (name, a) in cases {
             let r = ldlt_resid(&a);
-            assert!(r < 1e-6, "{name}: LDLᵀ residual {r:.1e} too large");
+            assert!(r < 1e-6, "{name}: LDL^T residual {r:.1e} too large");
         }
     }
 
@@ -261,7 +261,7 @@ mod integration {
 
     #[test]
     fn diagnostics_and_estimate_wired_on_both_paths() {
-        // Symmetric → LDLᵀ.
+        // Symmetric -> LDL^T.
         let a = structured::banded::<C>(500, 8, 1.0, 1);
         let opts = SolverSettings::default().with_threads(3);
         let f = LdltSymbolic::analyze(&a)
@@ -284,7 +284,7 @@ mod integration {
             "transient > factor alone"
         );
 
-        // Unsymmetric → LU; threads=0 resolves to all cores.
+        // Unsymmetric -> LU; threads=0 resolves to all cores.
         let g = bem::kernel(600, &bem::BemOpts::default());
         let o2 = SolverSettings::default().with_threads(0);
         let lf = LuSymbolic::analyze(&g).unwrap().factor(&g, &o2).unwrap();

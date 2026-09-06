@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "rslab"
-version = "0.20.0"
+version = "0.33.0"
 dependencies = [
  "approx",
  "criterion",
@@ -1407,10 +1407,8 @@ dependencies = [
  "rayon",
  "rslab-amd",
  "rslab-amf",
- "rslab-kahip",
  "rslab-metis",
  "rslab-ordering-core",
- "rslab-scotch",
  "serde",
  "serde_json",
  "sysinfo",
@@ -1420,47 +1418,30 @@ dependencies = [
 
 [[package]]
 name = "rslab-amd"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rslab-ordering-core",
 ]
 
 [[package]]
 name = "rslab-amf"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
- "rslab-ordering-core",
-]
-
-[[package]]
-name = "rslab-kahip"
-version = "0.2.1"
-dependencies = [
- "rslab-amd",
- "rslab-metis",
  "rslab-ordering-core",
 ]
 
 [[package]]
 name = "rslab-metis"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
+ "rayon",
  "rslab-amd",
  "rslab-ordering-core",
 ]
 
 [[package]]
 name = "rslab-ordering-core"
-version = "0.2.1"
-
-[[package]]
-name = "rslab-scotch"
-version = "0.2.1"
-dependencies = [
- "rslab-amd",
- "rslab-metis",
- "rslab-ordering-core",
-]
+version = "0.2.2"
 
 [[package]]
 name = "rustix"
@@ -2222,15 +2203,6 @@ checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "xtask"
-version = "0.0.0"
-dependencies = [
- "num-complex",
- "rslab",
- "serde_json",
 ]
 
 [[package]]

@@ -53,7 +53,7 @@ impl HardwareInfo {
 /// Measured cost-model constants for this machine - the cached "wisdom".
 #[derive(Debug, Clone, Copy)]
 pub struct Calibration {
-    /// One-thread throughput in the `factor_flops` proxy unit, ×1e9 (giga/s), for a
+    /// One-thread throughput in the `factor_flops` proxy unit, x1e9 (giga/s), for a
     /// **real** (`f64`) factorization.
     pub geom_gflops: f64,
     /// Same proxy-flops/s rate for a **complex** (`Complex<f64>`) factorization:
@@ -70,7 +70,7 @@ pub struct Calibration {
     pub speedup4: f64,
     /// Coefficient of variation (std/mean) of the repeated single-thread factor
     /// time on this machine --- the measurement noise floor. The tuner's deviate
-    /// guard is set from this (`min_gain = z·cv`) so it never chases a speedup
+    /// guard is set from this (`min_gain = z*cv`) so it never chases a speedup
     /// smaller than the noise it measured on this hardware.
     pub time_cv: f64,
     pub fingerprint: u64,
@@ -179,7 +179,7 @@ impl Calibration {
     /// workers busy), which made the cost model pick far too few workers for
     /// production-size systems.
     pub fn measure(hw: &HardwareInfo) -> Self {
-        let a = grid3d_spd::<f64>(24); // ≈ 13 800 DOFs, a few hundred ms
+        let a = grid3d_spd::<f64>(24); // ~ 13 800 DOFs, a few hundred ms
         let Ok(sym) = LdltSymbolic::analyze(&a) else {
             return Self::fallback(hw);
         };
@@ -205,7 +205,7 @@ impl Calibration {
         let t1 = mean;
         let geom_gflops = (flops / t1.max(1e-9)) / 1e9;
 
-        // Parallel speedup on a larger, **complex** grid (≈ 33k DOFs). Complex
+        // Parallel speedup on a larger, **complex** grid (~ 33k DOFs). Complex
         // arithmetic is the flop-dense regime where the thread choice matters
         // and parallel scaling is real; the small/real grid is closer to
         // bandwidth-bound and measures a speedup (~1.3x on a 12-core desktop)
@@ -269,7 +269,7 @@ impl Calibration {
     }
 
     /// Data-driven deviate threshold for the tuner: a candidate must beat the
-    /// default by more than the measured timing noise (`z·time_cv`, `z=2` for ~95%
+    /// default by more than the measured timing noise (`z*time_cv`, `z=2` for ~95%
     /// confidence) before the tuner switches to it, so it never chases a predicted
     /// gain smaller than this machine's own single-shot variance. Clamped to a
     /// sensible range in case calibration measured an implausible value.
@@ -278,7 +278,7 @@ impl Calibration {
     }
 
     /// Interpolated speedup at `threads`: piecewise linear through the measured
-    /// points `(1, 1) → (4, speedup4) → (speedup_threads, speedup)`, flat beyond
+    /// points `(1, 1) -> (4, speedup4) -> (speedup_threads, speedup)`, flat beyond
     /// the calibrated peak (sparse-direct scaling saturates). The mid point keeps
     /// the curve honest at small counts, where a straight line toward the peak
     /// systematically misjudges the knee.
@@ -465,19 +465,19 @@ pub fn plan(
         // reduction factors are conservative rules of thumb (documented as such).
         if peak > maxm && budget.allow_mixed_precision && estimate.value_bytes > 4 {
             use_f32 = true;
-            peak /= 2; // single precision ≈ halves the factor + panels
+            peak /= 2; // single precision ~ halves the factor + panels
             notes.push("mixed-precision (factor in single)".into());
         }
         if peak > maxm {
             if let Some(tau) = budget.allow_drop_tol {
                 opts = opts.with_drop_tol(tau);
-                peak = (peak as f64 * 0.7) as u64; // incomplete factor ≈ −30%
+                peak = (peak as f64 * 0.7) as u64; // incomplete factor ~ -30%
                 notes.push(format!("incomplete factor (drop_tol={tau:.0e})"));
             }
         }
         if peak > maxm && budget.allow_blr {
             opts = opts.with_blr(BlrMode::contribution_blocks(1e-4));
-            peak = (peak as f64 * 0.7) as u64; // BLR ≈ −30% on big fronts
+            peak = (peak as f64 * 0.7) as u64; // BLR ~ -30% on big fronts
             notes.push("BLR compression".into());
         }
         if peak > maxm {
@@ -576,14 +576,14 @@ mod tests {
         let est = LdltSymbolic::analyze(&a).unwrap().estimate_memory::<f64>();
         assert!(est.factor_flops > 0);
 
-        // Generous budget → exact, fits, predicted runtime positive.
+        // Generous budget -> exact, fits, predicted runtime positive.
         let plan_ok = plan(&est, &Budget::default(), &hw, &calib);
         assert!(plan_ok.fits && !plan_ok.use_mixed_precision);
         assert!(plan_ok.est_runtime_ms > 0.0);
         // v2 cost-model thread selection (#61) picks the fewest cores that reach
         // near-minimum predicted time, for a small grid the critical path or
         // saturation dominates, so it may (correctly) choose fewer than all cores.
-        // The contract is 1 ≤ threads ≤ physical_cores, not "always all cores".
+        // The contract is 1 <= threads <= physical_cores, not "always all cores".
         match plan_ok.opts.threads {
             crate::numeric::multifrontal_ldlt::Threads::Fixed(t) => {
                 assert!(
@@ -594,7 +594,7 @@ mod tests {
             other => panic!("expected a fixed thread count, got {other:?}"),
         }
 
-        // Tight budget with all approximations allowed → planner applies them.
+        // Tight budget with all approximations allowed -> planner applies them.
         let tight = Budget {
             max_mem_bytes: Some(est.transient_peak_bytes / 8),
             max_threads: 0,
@@ -615,7 +615,7 @@ mod tests {
     }
 }
 
-/// 3D 7-point Laplacian (k³ grid, Dirichlet, SPD, lower triangle), generic over
+/// 3D 7-point Laplacian (k^3 grid, Dirichlet, SPD, lower triangle), generic over
 /// the scalar type - the calibration's representative matrix. Complex-typed, it is
 /// real-valued but factors through the complex kernel, so it times the complex
 /// proxy-flops/s rate.

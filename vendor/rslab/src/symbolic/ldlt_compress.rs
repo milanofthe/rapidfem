@@ -1,4 +1,4 @@
-//! LDLᵀ-aware ordering preprocessing: Duff-Pralet symmetric matching
+//! LDL^T-aware ordering preprocessing: Duff-Pralet symmetric matching
 //! plus quotient-graph compression, the preprocessing MUMPS exposes as
 //! `ICNTL(12) = 2`. Independent implementation of the published
 //! algorithm (Duff & Pralet, "Strategies for Scaling and Pivoting for
@@ -11,11 +11,11 @@
 //!
 //! The compression walks the MC64 matching permutation's cycle
 //! structure, contracts each 2-cycle into one super-variable, and
-//! decomposes k-cycles (k ≥ 3) into ⌊k/2⌋ pairs + an odd singleton.
+//! decomposes k-cycles (k >= 3) into floor(k/2) pairs + an odd singleton.
 //! The compressed graph is fed to AMD/METIS/SCOTCH; the returned
 //! super-permutation is then expanded so paired originals sit
 //! adjacent in the output permutation (so the downstream BK kernel
-//! sees each tentative 2×2 pair in consecutive columns).
+//! sees each tentative 2x2 pair in consecutive columns).
 
 use crate::sparse::csc::CscPattern;
 
@@ -44,13 +44,13 @@ impl SuperMap {
 /// the published Duff-Pralet rule (the same pairing MUMPS applies for
 /// its symmetric maximum-weight matching):
 ///
-/// - `perm[j] == j`     → singleton
-/// - `perm[j] != j` and `perm[perm[j]] == j` → pair `(j, perm[j])`
+/// - `perm[j] == j`     -> singleton
+/// - `perm[j] != j` and `perm[perm[j]] == j` -> pair `(j, perm[j])`
 ///   (canonicalised as `(min, max)` and emitted once)
-/// - length-k cycle (k ≥ 3) `j0 → j1 → ... → j_{k-1} → j0`:
+/// - length-k cycle (k >= 3) `j0 -> j1 -> ... -> j_{k-1} -> j0`:
 ///   pairs `(j0, j1), (j2, j3), ...` and `j_{k-1}` as singleton if
 ///   k is odd.
-/// - `perm[j] == usize::MAX` (unmatched) → singleton
+/// - `perm[j] == usize::MAX` (unmatched) -> singleton
 ///
 /// Emission order follows discovery (ascending `j`), deterministic.
 pub fn build_supermap(perm: &[usize]) -> SuperMap {
@@ -97,7 +97,7 @@ pub fn build_supermap(perm: &[usize]) -> SuperMap {
                 pairs.push(pair);
             }
             _ => {
-                // k ≥ 3: pair consecutive, odd leftover singleton.
+                // k >= 3: pair consecutive, odd leftover singleton.
                 let mut i = 0;
                 while i + 1 < cycle.len() {
                     let (a, b) = (cycle[i], cycle[i + 1]);
@@ -139,7 +139,7 @@ pub fn build_supermap(perm: &[usize]) -> SuperMap {
 /// row-sorted, with strictly increasing rows per column.
 ///
 /// Uses a per-column `Vec<u32>` mark array (tag-reset trick, same
-/// pattern as AMD) to deduplicate in O(nnz · avg_super_deg) without
+/// pattern as AMD) to deduplicate in O(nnz * avg_super_deg) without
 /// an explicit sort.
 pub fn compress_pattern(pat: &CscPattern, map: &SuperMap) -> CscPattern {
     let n_super = map.n_super();
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn supermap_all_singletons_identity_perm() {
-        // perm[j] = j for all j → all 1-cycles.
+        // perm[j] = j for all j -> all 1-cycles.
         let perm: Vec<usize> = (0..5).collect();
         let map = build_supermap(&perm);
         assert!(map.pairs.is_empty());
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn supermap_two_2cycles() {
-        // 0↔2 and 1↔3. perm[0]=2, perm[2]=0, perm[1]=3, perm[3]=1.
+        // 0<->2 and 1<->3. perm[0]=2, perm[2]=0, perm[1]=3, perm[3]=1.
         let perm = vec![2, 3, 0, 1];
         let map = build_supermap(&perm);
         assert_eq!(map.pairs, vec![(0, 2), (1, 3)]);
@@ -257,22 +257,22 @@ mod tests {
 
     #[test]
     fn supermap_three_cycle_plus_singletons() {
-        // 0→1→2→0, plus 3,4,5 fixed.
+        // 0->1->2->0, plus 3,4,5 fixed.
         let perm = vec![1, 2, 0, 3, 4, 5];
         let map = build_supermap(&perm);
-        // Cycle 0→1→2 discovered at start=0, cycle = [0,1,2].
+        // Cycle 0->1->2 discovered at start=0, cycle = [0,1,2].
         // Decomposes into pair (0,1) and singleton 2.
         assert_eq!(map.pairs, vec![(0, 1)]);
         assert_eq!(map.singletons, vec![2, 3, 4, 5]);
-        // super_of: 0→0, 1→0, 2→1 (first singleton, sid=pair_count+0=1),
-        //       3→2, 4→3, 5→4.
+        // super_of: 0->0, 1->0, 2->1 (first singleton, sid=pair_count+0=1),
+        //       3->2, 4->3, 5->4.
         assert_eq!(map.super_of, vec![0, 0, 1, 2, 3, 4]);
         assert_eq!(map.n_super(), 5);
     }
 
     #[test]
     fn supermap_unmatched_is_singleton() {
-        // perm[2] unmatched; 0↔1 paired.
+        // perm[2] unmatched; 0<->1 paired.
         let perm = vec![1, 0, usize::MAX];
         let map = build_supermap(&perm);
         assert_eq!(map.pairs, vec![(0, 1)]);
@@ -289,7 +289,7 @@ mod tests {
         let map = build_supermap(&perm);
         let super_iota: Vec<usize> = (0..map.n_super()).collect();
         let expanded = expand_permutation(&super_iota, &map);
-        // Pairs emit (0,2),(1,3) → [0,2,1,3]. Length n=4.
+        // Pairs emit (0,2),(1,3) -> [0,2,1,3]. Length n=4.
         assert_eq!(expanded, vec![0, 2, 1, 3]);
         let mut sorted = expanded.clone();
         sorted.sort();
@@ -338,11 +338,11 @@ mod tests {
 
     #[test]
     fn compress_contracts_paired_columns_and_drops_selfloops() {
-        // 4 variables, edges 0-2, 1-3, 0-1. Pair {0,2} → super 0;
-        // pair {1,3} → super 1. After contraction:
-        //   - edge 0-2 becomes self-loop on super 0 → dropped.
-        //   - edge 1-3 becomes self-loop on super 1 → dropped.
-        //   - edge 0-1 becomes edge super-0 ↔ super-1.
+        // 4 variables, edges 0-2, 1-3, 0-1. Pair {0,2} -> super 0;
+        // pair {1,3} -> super 1. After contraction:
+        //   - edge 0-2 becomes self-loop on super 0 -> dropped.
+        //   - edge 1-3 becomes self-loop on super 1 -> dropped.
+        //   - edge 0-1 becomes edge super-0 <-> super-1.
         let pat = build_full_pattern(4, &[(0, 2), (1, 3), (0, 1)]);
         let map = build_supermap(&[2, 3, 0, 1]);
         let cpat = compress_pattern(&pat, &map);
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn compress_dedups_parallel_edges() {
         // 4 variables, pair {0,2}, pair {1,3}. Edges 0-1 and 2-3 both
-        // contract to super-0 ↔ super-1 - the accumulator must emit
+        // contract to super-0 <-> super-1 - the accumulator must emit
         // the edge once per direction.
         let pat = build_full_pattern(4, &[(0, 1), (2, 3)]);
         let map = build_supermap(&[2, 3, 0, 1]);
@@ -372,7 +372,7 @@ mod tests {
         // Verify the compressed pattern is full-symmetric:
         // row `r` in col `c` iff row `c` in col `r`.
         let pat = build_full_pattern(6, &[(0, 1), (2, 3), (0, 4), (2, 5), (1, 5)]);
-        // perm: 0↔1 pair, 2↔3 pair, 4,5 singletons.
+        // perm: 0<->1 pair, 2<->3 pair, 4,5 singletons.
         let map = build_supermap(&[1, 0, 3, 2, 4, 5]);
         let cpat = compress_pattern(&pat, &map);
         // Build adjacency set and verify symmetry.

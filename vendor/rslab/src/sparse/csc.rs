@@ -467,7 +467,7 @@ mod tests {
         );
     }
 
-    /// The storage layer must hold a complex-symmetric matrix (A = Aᵀ with
+    /// The storage layer must hold a complex-symmetric matrix (A = A^T with
     /// complex entries), not just `f64`. This is the point of the generic
     /// threading: structure code is shared, only `values` carries the field.
     /// Oracle hand-computed below.
@@ -475,7 +475,7 @@ mod tests {
     fn complex_storage_symv_and_dense() {
         use num_complex::Complex;
         let c = |re, im| Complex::new(re, im);
-        // Lower triangle of A = [[1+i, 2], [2, 3-i]] (symmetric, A = Aᵀ).
+        // Lower triangle of A = [[1+i, 2], [2, 3-i]] (symmetric, A = A^T).
         let m: CscMatrix<Complex<f64>> = CscMatrix::from_triplets(
             2,
             &[0, 1, 1],
@@ -486,9 +486,9 @@ mod tests {
         m.validate().unwrap();
         assert_eq!(m.nnz(), 3);
 
-        // y = A·x with x = [1, i].
-        //   y0 = (1+i)·1 + 2·i        = 1 + 3i
-        //   y1 = 2·1     + (3-i)·i    = 3 + 3i   (since -i² = +1)
+        // y = A*x with x = [1, i].
+        //   y0 = (1+i)*1 + 2*i        = 1 + 3i
+        //   y1 = 2*1     + (3-i)*i    = 3 + 3i   (since -i^2 = +1)
         let x = [c(1.0, 0.0), c(0.0, 1.0)];
         let mut y = [c(0.0, 0.0); 2];
         m.symv(&x, &mut y);

@@ -28,6 +28,6 @@ pub struct AmfStats {
     pub ndiv: u64,
     /// Flop counter: LU multiply-subtracts.
     pub nms_lu: u64,
-    /// Flop counter: LDLᵀ multiply-subtracts.
+    /// Flop counter: LDL^T multiply-subtracts.
     pub nms_ldl: u64,
 }

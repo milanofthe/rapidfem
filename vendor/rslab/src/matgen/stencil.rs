@@ -1,6 +1,6 @@
 //! PDE finite-difference stencil generators - the workhorse family, modelling the
 //! EM-FEM structure. A Dirichlet Laplacian on a 2D/3D grid is SPD with condition
-//! number ∼ h⁻² (steered by grid size); a complex Helmholtz shift makes it
+//! number ~ h^-2 (steered by grid size); a complex Helmholtz shift makes it
 //! complex-symmetric and, near a resonance, ill-conditioned; anisotropy and
 //! jumping coefficients add further conditioning/structure stress.
 // Diagonal/triplet loops use the index as a value (push `i`, read `diag[i]`).
@@ -16,14 +16,14 @@ use super::Rng;
 /// Knobs for the grid Laplacian.
 #[derive(Clone)]
 pub struct StencilOpts {
-    /// Per-dimension conductivity (1.0 = isotropic). Strong anisotropy → harder.
+    /// Per-dimension conductivity (1.0 = isotropic). Strong anisotropy -> harder.
     pub aniso: [f64; 3],
     /// Added to every diagonal (regularization / Helmholtz real shift). `> 0`
     /// improves conditioning; negative pushes toward indefinite/singular.
     pub shift: f64,
     /// Coefficient contrast for a jumping-coefficient problem: `1.0` = constant,
     /// `> 1` draws a log-uniform per-node coefficient in `[1, contrast]` (high
-    /// contrast ⇒ ill-conditioned, as in heterogeneous media).
+    /// contrast => ill-conditioned, as in heterogeneous media).
     pub jump_contrast: f64,
     /// Seed for the jumping coefficient field.
     pub seed: u64,
@@ -77,7 +77,7 @@ fn laplacian_weights(dims: &[usize], opts: &StencilOpts) -> (Vec<f64>, Vec<(usiz
                 // + boundary (Dirichlet ghost): diagonal load only.
                 diag[i] += opts.aniso[d] * coeff[i];
             }
-            // − boundary: diagonal load only (interior − edges are some node's +).
+            // - boundary: diagonal load only (interior - edges are some node's +).
             if c == 0 {
                 diag[i] += opts.aniso[d] * coeff[i];
             }
@@ -107,10 +107,10 @@ pub fn laplacian<T: Scalar>(dims: &[usize], opts: &StencilOpts) -> CscMatrix<T> 
     super::build_sym(n, &rows, &cols, &vals)
 }
 
-/// Complex-symmetric **Helmholtz** operator `Δ − k² I` on a grid (lower triangle).
+/// Complex-symmetric **Helmholtz** operator `Lap - k^2 I` on a grid (lower triangle).
 /// `k2` is the (possibly complex, for lossy media) squared wavenumber: a large
 /// real `k2` makes the operator indefinite; an imaginary part models loss. This is
-/// the complex-symmetric EM-FEM analogue (`A = Aᵀ`, not Hermitian).
+/// the complex-symmetric EM-FEM analogue (`A = A^T`, not Hermitian).
 pub fn helmholtz(dims: &[usize], k2: Complex<f64>, opts: &StencilOpts) -> CscMatrix<Complex<f64>> {
     let n: usize = dims.iter().product();
     let (diag, tri) = laplacian_weights(dims, opts);
@@ -120,7 +120,7 @@ pub fn helmholtz(dims: &[usize], k2: Complex<f64>, opts: &StencilOpts) -> CscMat
     for i in 0..n {
         rows.push(i);
         cols.push(i);
-        // Δ − k²I : the Laplacian diagonal minus the complex shift.
+        // Lap - k^2 I : the Laplacian diagonal minus the complex shift.
         vals.push(Complex::new(diag[i], 0.0) - k2);
     }
     for (r, c, w) in tri {
@@ -145,9 +145,9 @@ mod tests {
                 let i = a.row_idx[k];
                 assert!(i >= j, "lower triangle only");
                 if i == j {
-                    assert!(a.values[k] >= 4.0 - 1e-12, "Dirichlet diagonal ≥ 2·ndim");
+                    assert!(a.values[k] >= 4.0 - 1e-12, "Dirichlet diagonal >= 2*ndim");
                 } else {
-                    assert!(a.values[k] < 0.0, "off-diagonal is −w");
+                    assert!(a.values[k] < 0.0, "off-diagonal is -w");
                 }
             }
         }
@@ -158,8 +158,8 @@ mod tests {
         let k2 = Complex::new(2.0, 0.3);
         let a = helmholtz(&[3, 3, 3], k2, &StencilOpts::default());
         assert_eq!(a.n, 27);
-        // Diagonal of node 0 (a corner): 6 stencil arms (3 dims × both signs) of
-        // weight 1 ⇒ 6, minus k².
+        // Diagonal of node 0 (a corner): 6 stencil arms (3 dims x both signs) of
+        // weight 1 => 6, minus k^2.
         let diag0 = a.values[a.col_ptr[0]];
         assert!((diag0 - (Complex::new(6.0, 0.0) - k2)).norm() < 1e-12);
     }
@@ -173,7 +173,7 @@ mod tests {
         };
         let a = laplacian::<f64>(&[8, 8, 8], &o);
         let b = laplacian::<f64>(&[8, 8, 8], &o);
-        assert_eq!(a.values, b.values, "same seed ⇒ identical matrix");
+        assert_eq!(a.values, b.values, "same seed => identical matrix");
         let c = laplacian::<f64>(&[8, 8, 8], &StencilOpts::default());
         assert_ne!(a.values.len(), 0);
         assert_ne!(a.values, c.values, "jumps change the weights");

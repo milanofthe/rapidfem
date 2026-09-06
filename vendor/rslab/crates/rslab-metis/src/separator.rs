@@ -1,7 +1,7 @@
 //! Convert an edge bisection to a node separator.
 //!
-//! Given `labels[v] ∈ {PART_A, PART_B}`, we compute a vertex set
-//! `S ⊆ boundary(A) ∪ boundary(B)` such that removing `S` disconnects
+//! Given `labels[v] in {PART_A, PART_B}`, we compute a vertex set
+//! `S subset boundary(A) union boundary(B)` such that removing `S` disconnects
 //! the remaining A-vertices from the remaining B-vertices. The
 //! minimum-weight such set is the minimum vertex cover of the
 //! bipartite graph between A-boundary and B-boundary induced by
@@ -13,21 +13,21 @@
 //!    incident to a crossing edge).
 //! 2. Build the bipartite crossing-edge graph.
 //! 3. Compute a maximum matching with Kuhn's augmenting-path
-//!    algorithm (O(V·E); sufficient at our graph sizes).
+//!    algorithm (O(V*E); sufficient at our graph sizes).
 //! 4. Use König's construction to extract the minimum vertex cover
 //!    from the matching, and relabel those vertices as `PART_SEP`.
 //!
 //! References:
 //! - Karypis & Kumar, *A Fast and High Quality Multilevel Scheme for
-//!   Partitioning Irregular Graphs*, 1998 (§5).
+//!   Partitioning Irregular Graphs*, 1998 (section 5).
 //! - METIS 5.2.0 `libmetis/separator.c::ConstructMinCoverSeparator`.
 
 use crate::fm_refine::PART_SEP;
 use crate::graph::Graph;
 use crate::initial_partition::{PART_A, PART_B};
 
-/// Convert an edge bisection (labels ∈ {PART_A, PART_B}) to a node
-/// separator (labels ∈ {PART_A, PART_B, PART_SEP}) in place.
+/// Convert an edge bisection (labels in {PART_A, PART_B}) to a node
+/// separator (labels in {PART_A, PART_B, PART_SEP}) in place.
 ///
 /// Returns the number of separator vertices.
 pub fn construct_separator(graph: &Graph, labels: &mut [u8]) -> usize {
@@ -105,9 +105,9 @@ pub fn construct_separator(graph: &Graph, labels: &mut [u8]) -> usize {
     }
 
     // 5. König's construction. Starting from unmatched A-vertices,
-    //    alternately walk unmatched edges (A→B) and matched edges (B→A).
+    //    alternately walk unmatched edges (A->B) and matched edges (B->A).
     //    Let Z be the set of reachable vertices.
-    //    Min vertex cover = (A \ Z) ∪ (B ∩ Z).
+    //    Min vertex cover = (A \ Z) union (B intersect Z).
     let mut in_z_a: Vec<bool> = vec![false; na];
     let mut in_z_b: Vec<bool> = vec![false; nb];
     let mut stack: Vec<i32> = Vec::new();
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn separator_empty_if_no_cut() {
         let g = grid(3, 3);
-        // All on one side → no crossing edges → no separator.
+        // All on one side -> no crossing edges -> no separator.
         let mut labels: Vec<u8> = vec![PART_A; 9];
         let sep_count = construct_separator(&g, &mut labels);
         assert_eq!(sep_count, 0);
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn min_cover_no_larger_than_lighter_boundary() {
-        // Kőnig guarantees |cover| = |max matching| ≤ min(|bnd_a|, |bnd_b|).
+        // Kőnig guarantees |cover| = |max matching| <= min(|bnd_a|, |bnd_b|).
         // So a trivial "take the lighter boundary" upper bound must hold.
         let g = grid(8, 8);
         let total: i64 = g.vwgt.iter().map(|&w| w as i64).sum();

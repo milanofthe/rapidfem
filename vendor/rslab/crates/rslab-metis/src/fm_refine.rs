@@ -16,7 +16,7 @@
 //! Priority queue: a lazy `BinaryHeap<(gain, Reverse(v))>` rather
 //! than METIS's bucket array. Correct; the O(log n) overhead per
 //! operation is acceptable at the graph sizes RSLAB targets
-//! (≤ 100k vertices, FM rarely dominates runtime).
+//! (<= 100k vertices, FM rarely dominates runtime).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -28,7 +28,7 @@ pub const PART_SEP: u8 = 2;
 
 /// Refine an edge bisection with FM, tracking the best balanced cut.
 ///
-/// `labels[v] ∈ {PART_A, PART_B}`. Modifies `labels` in place.
+/// `labels[v] in {PART_A, PART_B}`. Modifies `labels` in place.
 /// Returns the final edge cut.
 pub fn refine_bisection(
     graph: &Graph,
@@ -58,13 +58,13 @@ pub fn refine_bisection(
         // NOTE: every vertex is seeded here, not just the current
         // boundary. METIS seeds only boundary vertices and lazily
         // re-inserts a vertex the first time a neighbour move makes it
-        // a boundary vertex, costing Ω(boundary) per pass rather than
-        // the Ω(n log n) below. Interior vertices have
-        // gain = -internal_degree ≤ 0, so they sit at the bottom of
+        // a boundary vertex, costing Omega(boundary) per pass rather than
+        // the Omega(n log n) below. Interior vertices have
+        // gain = -internal_degree <= 0, so they sit at the bottom of
         // this max-heap and are only popped after the positive-gain
         // boundary moves that actually reduce the cut. Seeding all n is
         // a deliberate simplicity-over-speed trade at RSLAB's target
-        // sizes (≤ 100k vertices, where FM rarely dominates runtime);
+        // sizes (<= 100k vertices, where FM rarely dominates runtime);
         // see dev/tried-and-rejected.md (O11).
         for (v, &g) in gain.iter().enumerate().take(n) {
             heap.push((g, Reverse(v as i32), g));
@@ -123,10 +123,10 @@ pub fn refine_bisection(
                     continue;
                 }
                 // gain = ed - id. If neighbour u shared v's old side
-                // (`from`): edge (u,v) was internal, now crosses →
-                // u's ed +w, id -w → Δgain = +2w. If u shares v's
+                // (`from`): edge (u,v) was internal, now crosses ->
+                // u's ed +w, id -w -> delta gain = +2w. If u shares v's
                 // new side (`to`): edge was crossing, now internal
-                // → Δgain = -2w.
+                // -> delta gain = -2w.
                 let w = graph.adjwgt[k];
                 if labels[u] == from {
                     gain[u] += 2 * w;
@@ -274,7 +274,7 @@ mod tests {
     /// Regression test for the FM neighbour-update sign bug fixed
     /// alongside this test (see `dev/research/metis-fm-sign-bug.md`).
     ///
-    /// The bug flipped the signs at the `gain[u] ± 2w` neighbour
+    /// The bug flipped the signs at the `gain[u] +/- 2w` neighbour
     /// update, so on a graph where FM actually had to move vertices,
     /// `cur_cut` drifted into negative impossible territory and FM
     /// rolled every move back. Existing tests missed it because they
@@ -371,7 +371,7 @@ mod tests {
     fn refine_bisection_bad_init_improves() {
         // Start from an adversarial labeling (all on one side, one
         // vertex on the other) - FM must rebalance. I2 (cut never
-        // grows) does not apply across the imbalanced → balanced
+        // grows) does not apply across the imbalanced -> balanced
         // transition: the starting cut of 2 is achievable only
         // because 15 vertices are on one side.
         let g = grid(4, 4);
@@ -411,7 +411,7 @@ mod tests {
     }
 
     // Adversarial set A1-A10 from
-    // dev/research/metis-fm-sign-bug.md §5. Standing regression tests
+    // dev/research/metis-fm-sign-bug.md section 5. Standing regression tests
     // enforcing I1 (bookkeeping consistency) and, where meaningful,
     // I2 (cut never grows), I4 (balance respected at exit),
     // I6 (determinism).
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn a2_path_p20_alternating() {
-        // P_20 with alternating ABABAB…: every edge crosses → cut 19.
+        // P_20 with alternating ABABAB...: every edge crosses -> cut 19.
         // Optimum balanced cut is 1 (single middle edge).
         let g = path(20);
         let mut labels: Vec<u8> = (0..20u8)
@@ -476,7 +476,7 @@ mod tests {
     #[test]
     fn a3_cycle_c12_alternating() {
         // Even cycle C_12 with alternating labels: every edge crosses
-        // → cut 12. Optimum balanced cut is 2 (two "cut points" on
+        // -> cut 12. Optimum balanced cut is 2 (two "cut points" on
         // the cycle).
         let g = cycle(12);
         let mut labels: Vec<u8> = (0..12u8)
@@ -490,13 +490,13 @@ mod tests {
             "I2: cut never grows (before=12, after={})",
             returned
         );
-        assert!(returned >= 2, "cycle C_12 balanced cut is ≥ 2");
+        assert!(returned >= 2, "cycle C_12 balanced cut is >= 2");
     }
 
     #[test]
     fn a4_grid_4x4_checkerboard() {
-        // 4×4 grid with checkerboard labels (r+c) mod 2: every edge
-        // crosses → cut 24. Balanced optimum is 4 (one row/column).
+        // 4x4 grid with checkerboard labels (r+c) mod 2: every edge
+        // crosses -> cut 24. Balanced optimum is 4 (one row/column).
         let g = grid(4, 4);
         let mut labels: Vec<u8> = (0..16u8)
             .map(|k| {
@@ -517,12 +517,12 @@ mod tests {
             "FM must improve 4x4 checkerboard cut, got {}",
             returned
         );
-        assert!(returned >= 4, "4x4 grid balanced cut is ≥ 4");
+        assert!(returned >= 4, "4x4 grid balanced cut is >= 4");
     }
 
     #[test]
     fn a5_grid_6x6_mixed_boundary() {
-        // 6×6 grid with a mixed but deterministic label assignment
+        // 6x6 grid with a mixed but deterministic label assignment
         // (SplitMix-seeded). I1 and I2 are the load-bearing assertions;
         // the exact optimum depends on the initial labeling so we only
         // check cut never grows.
@@ -552,16 +552,16 @@ mod tests {
     fn a6_k44_unbalanced_init_rebalances() {
         // K_{4,4}, labels = [A, B, B, B, B, B, B, B]. Structure is
         // bipartite between {0..4} and {4..8}, so vertex 0 connects
-        // to 4,5,6,7 → starting cut 4 with a=1, b=7.
+        // to 4,5,6,7 -> starting cut 4 with a=1, b=7.
         //
-        // max_imbalance=0.50, total=8 → max_side=6. The 1-7 start
+        // max_imbalance=0.50, total=8 -> max_side=6. The 1-7 start
         // violates balance. Post-fix, refine_bisection treats an
         // imbalanced pass-start as "no valid rollback target" via a
         // None sentinel on best_prefix and unconditionally records
         // the first balanced state the FM trajectory reaches.
         //
         // The I2 (cut never grows) property does not apply across
-        // the imbalanced→balanced transition: the starting cut of 4
+        // the imbalanced->balanced transition: the starting cut of 4
         // is cheap only because the partition is violating.
         let g = complete_bipartite(4, 4);
         let mut labels: Vec<u8> = vec![PART_B; 8];
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn a10_empty_edge_set_no_moves() {
-        // n=8, no edges, half A / half B. No gains → no moves.
+        // n=8, no edges, half A / half B. No gains -> no moves.
         let cp: Vec<i32> = vec![0; 9];
         let ri: Vec<i32> = vec![];
         let pat = CscPattern::new(8, &cp, &ri).unwrap();

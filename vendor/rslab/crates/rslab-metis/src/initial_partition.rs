@@ -250,10 +250,10 @@ mod tests {
     #[test]
     fn cut_size_on_known_bisection() {
         let g = grid(2, 2); // four vertices, four edges
-                            // Split into {0,1} and {2,3}. Cut edges: (0,2) and (1,3) → 2.
+                            // Split into {0,1} and {2,3}. Cut edges: (0,2) and (1,3) -> 2.
         let labels = vec![PART_A, PART_A, PART_B, PART_B];
         assert_eq!(cut_size(&g, &labels), 2);
-        // All together → zero cut.
+        // All together -> zero cut.
         let zero = vec![PART_A; 4];
         assert_eq!(cut_size(&g, &zero), 0);
     }

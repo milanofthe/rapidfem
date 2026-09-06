@@ -47,7 +47,7 @@ use crate::{CscPattern, OrderingError};
 /// directly to the relevant entry point.
 #[derive(Debug, Clone)]
 pub struct WorkspaceOptions {
-    /// Dense-row threshold multiplier (Davis 1996 §5). A variable
+    /// Dense-row threshold multiplier (Davis 1996 section 5). A variable
     /// with initial degree exceeding
     /// `min(max(16, floor(dense_alpha * sqrt(n))), n)` is deferred to
     /// the end of the ordering - the `max(16)` floor is applied before

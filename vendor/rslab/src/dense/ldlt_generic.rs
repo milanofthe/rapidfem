@@ -1,8 +1,8 @@
-//! Generic dense Bunch-Kaufman LDLᵀ factorization over any [`Scalar`] field.
+//! Generic dense Bunch-Kaufman LDL^T factorization over any [`Scalar`] field.
 //!
 //! This is a clean, unblocked, correctness-first implementation of the
-//! symmetric-indefinite factorization `Pᵀ A P = L D Lᵀ`, where `L` is unit
-//! lower triangular and `D` is block diagonal with 1×1 and 2×2 blocks. It is
+//! symmetric-indefinite factorization `P^T A P = L D L^T`, where `L` is unit
+//! lower triangular and `D` is block diagonal with 1x1 and 2x2 blocks. It is
 //! generic over `T: Scalar`, so it serves both the real (`f64`) and the
 //! complex-*symmetric* (`Complex<f64>`, PARDISO `mtype 6`) paths.
 //!
@@ -10,8 +10,8 @@
 //! LAPACK's `?sytf2` (`xSYTF2`). For the complex-symmetric case this is exactly
 //! `zsytf2`: identical control flow to the real `dsytf2`, with magnitudes taken
 //! as the complex modulus `|z|` and **no conjugation** anywhere (the matrix is
-//! symmetric `A = Aᵀ`, not Hermitian). The pivot threshold is the classical
-//! `α = (1 + √17)/8`.
+//! symmetric `A = A^T`, not Hermitian). The pivot threshold is the classical
+//! `alpha = (1 + sqrt17)/8`.
 //!
 //! This is the shared, data-type-generic dense kernel that every multifrontal
 //! front reduces to (the former f64-dedicated dense path, with its blocked SIMD
@@ -23,9 +23,9 @@ use crate::error::RslabError;
 use crate::scalar::{fmadd, Scalar};
 use rayon::prelude::*;
 
-/// Result of a generic Bunch-Kaufman LDLᵀ factorization.
+/// Result of a generic Bunch-Kaufman LDL^T factorization.
 ///
-/// `Pᵀ A P = L D Lᵀ`. The permutation is symmetric (the same `P` acts on rows
+/// `P^T A P = L D L^T`. The permutation is symmetric (the same `P` acts on rows
 /// and columns), so factoring preserves symmetry.
 #[derive(Debug, Clone)]
 pub struct LdltFactors<T> {
@@ -33,25 +33,35 @@ pub struct LdltFactors<T> {
     /// Unit lower triangular `L` in CSC (compressed sparse column). Column `j`
     /// is `l_row_idx[l_col_ptr[j]..l_col_ptr[j+1]]` with matching `l_values`,
     /// sorted by row, and includes the explicit unit diagonal `(j, 1)`. For a
-    /// 2×2 pivot the intra-block entry `L[k+1][k]` is `0` (that coupling lives
+    /// 2x2 pivot the intra-block entry `L[k+1][k]` is `0` (that coupling lives
     /// in `D`, not `L`). Storing `L` sparsely keeps the factor `O(nnz(L))`
-    /// rather than `O(n²)`.
+    /// rather than `O(n^2)`.
     pub l_col_ptr: Vec<usize>,
     pub l_row_idx: Vec<usize>,
     pub l_values: Vec<T>,
     /// Diagonal of the block-diagonal `D`, length `n`.
     pub d_diag: Vec<T>,
     /// Sub-diagonal of `D`, length `n`. `d_subdiag[k]` is the `(k+1, k)` entry
-    /// of a 2×2 block starting at column `k`; it is `0` for 1×1 pivots and for
-    /// the second column of a 2×2 block.
+    /// of a 2x2 block starting at column `k`; it is `0` for 1x1 pivots and for
+    /// the second column of a 2x2 block.
     pub d_subdiag: Vec<T>,
-    /// `true` at the starting column of each 2×2 pivot block. The column after
-    /// such a start is the block's second column; every other column is a 1×1
+    /// `true` at the starting column of each 2x2 pivot block. The column after
+    /// such a start is the block's second column; every other column is a 1x1
     /// pivot.
     pub two_by_two: Vec<bool>,
     /// Symmetric pivot permutation (forward): `perm[i] = j` means original
     /// index `j` occupies pivot position `i`.
     pub perm: Vec<usize>,
+    /// Column partition of `L` into supernodes (the fronts of the numeric
+    /// factorization): `supernode_ptr[s]..supernode_ptr[s + 1]` are the
+    /// columns of supernode `s`, whose off-diagonal-block structure is
+    /// shared. Length `ns + 1`; empty when the producer does not know it
+    /// (the solve layout then detects supernodes from the structure).
+    pub supernode_ptr: Vec<usize>,
+    /// Parent of every supernode in the assembly tree (`usize::MAX` for a
+    /// root), the same length as `supernode_ptr` minus one; empty when
+    /// unknown. Every column's structure lies within its ancestors.
+    pub supernode_parent: Vec<usize>,
     /// Number of pivots that were statically perturbed (replaced by a floor)
     /// to avoid a singular/tiny pivot. Zero for an exact factorization;
     /// nonzero only when static-pivoting (preconditioner) mode is enabled. The
@@ -65,7 +75,7 @@ pub struct LdltFactors<T> {
     pub inertia: crate::inertia::Inertia,
 }
 
-/// The Bunch-Kaufman pivot threshold `α = (1 + √17)/8 ≈ 0.6404`.
+/// The Bunch-Kaufman pivot threshold `alpha = (1 + sqrt17)/8 ~ 0.6404`.
 #[inline]
 pub(crate) fn bk_alpha() -> f64 {
     (1.0 + 17.0_f64.sqrt()) / 8.0
@@ -109,13 +119,13 @@ pub(crate) fn swap_sym_lower_bounded<T: Scalar>(
     }
 }
 
-/// Factor a symmetric matrix `A` as `Pᵀ A P = L D Lᵀ` using unblocked
+/// Factor a symmetric matrix `A` as `P^T A P = L D L^T` using unblocked
 /// Bunch-Kaufman pivoting.
 ///
 /// Works for any [`Scalar`]; for `T = Complex<f64>` this is the
-/// complex-symmetric (`A = Aᵀ`) factorization. Returns
-/// [`RslabError::NumericallyRankDeficient`] if a structurally zero pivot (1×1
-/// of value 0, or a 2×2 block with zero determinant) is encountered.
+/// complex-symmetric (`A = A^T`) factorization. Returns
+/// [`RslabError::NumericallyRankDeficient`] if a structurally zero pivot (1x1
+/// of value 0, or a 2x2 block with zero determinant) is encountered.
 pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors<T>, RslabError> {
     matrix.validate()?;
     let n = matrix.n;
@@ -128,8 +138,8 @@ pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors
     let mut d_subdiag = vec![T::zero(); n];
     let mut two_by_two = vec![false; n];
     let mut inertia = crate::inertia::Inertia::new(0, 0, 0);
-    // 2×2-pivot multiplier scratch, hoisted out of the pivot loop (an
-    // indefinite matrix with many 2×2 blocks must not allocate per pivot).
+    // 2x2-pivot multiplier scratch, hoisted out of the pivot loop (an
+    // indefinite matrix with many 2x2 blocks must not allocate per pivot).
     // Only entries `[k+2, n)` are written/read each step, so stale values
     // left below are never observed - same invariant as `factor_front`.
     let mut l1 = vec![T::zero(); n];
@@ -188,7 +198,7 @@ pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors
         }
 
         if kstep == 1 {
-            // 1×1 pivot. Interchange index k with kp if needed.
+            // 1x1 pivot. Interchange index k with kp if needed.
             if kp != k {
                 swap_sym_lower(&mut a, n, k, kp);
                 perm.swap(k, kp);
@@ -223,7 +233,7 @@ pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors
             }
             k += 1;
         } else {
-            // 2×2 pivot at (k, k+1). Interchange index k+1 with kp if needed.
+            // 2x2 pivot at (k, k+1). Interchange index k+1 with kp if needed.
             if kp != k + 1 {
                 swap_sym_lower(&mut a, n, k + 1, kp);
                 perm.swap(k + 1, kp);
@@ -260,15 +270,15 @@ pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors
                 }
             }
 
-            // Multiplier columns L_i = D⁻¹ · [A[i][k], A[i][k+1]]ᵀ for i >= k+2,
-            // with D⁻¹ = (1/det)·[[d22, -d21], [-d21, d11]].
+            // Multiplier columns L_i = D^-1 * [A[i][k], A[i][k+1]]^T for i >= k+2,
+            // with D^-1 = (1/det)*[[d22, -d21], [-d21, d11]].
             for i in (k + 2)..n {
                 let wik = a[k * n + i];
                 let wik1 = a[(k + 1) * n + i];
                 l1[i] = (d22 * wik - d21 * wik1) * detinv;
                 l2[i] = (d11 * wik1 - d21 * wik) * detinv;
             }
-            // Trailing update A22[i][j] -= W1_i·l1_j + W2_i·l2_j, reading the
+            // Trailing update A22[i][j] -= W1_i*l1_j + W2_i*l2_j, reading the
             // original pivot columns (still intact) before overwriting them.
             for j in (k + 2)..n {
                 let l1j = l1[j];
@@ -328,14 +338,16 @@ pub fn factor_ldlt<T: Scalar>(matrix: &SymmetricMatrix<T>) -> Result<LdltFactors
         d_subdiag,
         two_by_two,
         perm,
+        supernode_ptr: vec![0, n],
+        supernode_parent: vec![usize::MAX],
         n_perturbed: 0,
         inertia,
     })
 }
 
-/// Solve `A · x = rhs` from a generic LDLᵀ factorization.
+/// Solve `A * x = rhs` from a generic LDL^T factorization.
 ///
-/// Applies the five-step sequence `x = P L⁻ᵀ D⁻¹ L⁻¹ Pᵀ rhs`.
+/// Applies the five-step sequence `x = P L^-T D^-1 L^-1 P^T rhs`.
 pub fn solve_ldlt<T: Scalar>(factors: &LdltFactors<T>, rhs: &[T]) -> Result<Vec<T>, RslabError> {
     let n = factors.n;
     if rhs.len() != n {
@@ -344,13 +356,13 @@ pub fn solve_ldlt<T: Scalar>(factors: &LdltFactors<T>, rhs: &[T]) -> Result<Vec<
             got: rhs.len(),
         });
     }
-    // y = Pᵀ · rhs : y[i] = rhs[perm[i]].
+    // y = P^T * rhs : y[i] = rhs[perm[i]].
     let mut y = vec![T::zero(); n];
     for (i, yi) in y.iter_mut().enumerate() {
         *yi = rhs[factors.perm[i]];
     }
     solve_ldlt_permuted(factors, &mut y)?;
-    // x = P · v : x[perm[i]] = v[i].
+    // x = P * v : x[perm[i]] = v[i].
     let mut x = vec![T::zero(); n];
     for (i, &vi) in y.iter().enumerate() {
         x[factors.perm[i]] = vi;
@@ -359,7 +371,7 @@ pub fn solve_ldlt<T: Scalar>(factors: &LdltFactors<T>, rhs: &[T]) -> Result<Vec<
 }
 
 /// The three sweeps of [`solve_ldlt`] on an already-permuted right-hand side,
-/// in place: forward `L z = y`, block-diagonal `D w = z`, backward `Lᵀ v = w`.
+/// in place: forward `L z = y`, block-diagonal `D w = z`, backward `L^T v = w`.
 /// Split out so callers that fold their own gather/scatter around the solve
 /// (e.g. the equilibrated [`crate::LdltSolver`], which fuses the diagonal
 /// scaling into the permutation passes) share one implementation.
@@ -369,7 +381,7 @@ pub(crate) fn solve_ldlt_permuted<T: Scalar>(
 ) -> Result<(), RslabError> {
     let n = factors.n;
 
-    // Forward solve L · z = y (unit lower, CSC column-oriented): once y[j] is
+    // Forward solve L * z = y (unit lower, CSC column-oriented): once y[j] is
     // final, propagate it down its column. Axpys via `fmadd` (FMA on native
     // builds); `CompressedLdltFactors::solve` mirrors the exact same
     // expressions to stay bit-identical.
@@ -391,7 +403,7 @@ pub(crate) fn solve_ldlt_permuted<T: Scalar>(
         }
     }
 
-    // D-block solve: w = D⁻¹ · z, in place in y.
+    // D-block solve: w = D^-1 * z, in place in y.
     let mut k = 0;
     while k < n {
         if factors.two_by_two[k] {
@@ -418,7 +430,7 @@ pub(crate) fn solve_ldlt_permuted<T: Scalar>(
         }
     }
 
-    // Backward solve Lᵀ · v = w (CSC column j = row j of Lᵀ): dot column j's
+    // Backward solve L^T * v = w (CSC column j = row j of L^T): dot column j's
     // multipliers against the already-solved tail (diagonal-first layout, so
     // the dot starts at `col_ptr[j] + 1`). Deliberately mul+sub, NOT `fmadd`:
     // this accumulator is a loop-carried dependency, and the FMA's higher
@@ -441,7 +453,7 @@ pub(crate) fn solve_ldlt_permuted<T: Scalar>(
 /// pivot permutation stored as `u32` instead of `usize`, halving the index
 /// footprint on 64-bit targets when `n < 2^31` (and `nnz(L) < 2^32`). Indices
 /// are the non-value half of a sparse factor, so this shrinks the stored factor
-/// by up to `4·(nnz(L) + 2n)` bytes at **no accuracy cost**: the values are moved
+/// by up to `4*(nnz(L) + 2n)` bytes at **no accuracy cost**: the values are moved
 /// in unchanged and [`solve`](Self::solve) is bit-identical to [`solve_ldlt`]
 /// (only the index *type* differs, cast back to `usize` on read). A pure memory
 /// axis for the exact factor - build it from a full factor and drop the original.
@@ -539,7 +551,7 @@ impl<T: Scalar> CompressedLdltFactors<T> {
                 k += 1;
             }
         }
-        // Backward solve Lᵀ v = w (mul+sub like `solve_ldlt`: the accumulator
+        // Backward solve L^T v = w (mul+sub like `solve_ldlt`: the accumulator
         // chain is latency-bound, see the note there).
         for j in (0..n).rev() {
             let (s, e) = (self.l_col_ptr[j] as usize, self.l_col_ptr[j + 1] as usize);
@@ -564,8 +576,8 @@ impl<T: Scalar> CompressedLdltFactors<T> {
 const PAR_SOLVE_MIN_RHS: usize = 8;
 const PAR_SOLVE_MIN_WORK: usize = 1 << 18;
 
-/// Solve `A · X = B` for `nrhs` right-hand sides at once. `b` and the returned
-/// `x` are **row-major** `n × nrhs` buffers (row `i`'s `nrhs` values contiguous,
+/// Solve `A * X = B` for `nrhs` right-hand sides at once. `b` and the returned
+/// `x` are **row-major** `n x nrhs` buffers (row `i`'s `nrhs` values contiguous,
 /// i.e. `b[i*nrhs + c]` is RHS `c` at row `i`). Processing the RHS as a block
 /// loads each `L`/`D` value once and applies it to all `nrhs` columns - the
 /// memory-bound amortization that makes one block solve beat `nrhs` separate
@@ -584,7 +596,7 @@ pub fn solve_ldlt_many<T: Scalar>(
 }
 
 /// [`solve_ldlt_many`] with an optional symmetric row scaling `D = diag(s)`
-/// fused into the permutation gather/scatter: solves `D A D · X = B` reading
+/// fused into the permutation gather/scatter: solves `D A D * X = B` reading
 /// `B` and writing `X` unscaled. `None` is exactly [`solve_ldlt_many`].
 pub(crate) fn solve_ldlt_many_scaled<T: Scalar>(
     factors: &LdltFactors<T>,
@@ -605,7 +617,7 @@ pub(crate) fn solve_ldlt_many_scaled<T: Scalar>(
     }
     // Split the RHS columns into `nchunks` independent contiguous ranges and solve
     // each on its own worker. Each chunk is gathered into a compact row-major
-    // `n × w` sub-block, solved with the serial block kernel, then scattered back.
+    // `n x w` sub-block, solved with the serial block kernel, then scattered back.
     let nchunks = nthreads.min(nrhs);
     let chunk = nrhs.div_ceil(nchunks);
     let ranges: Vec<(usize, usize)> = (0..nchunks)
@@ -648,7 +660,7 @@ fn solve_ldlt_block<T: Scalar>(
     scale: Option<&[f64]>,
 ) -> Result<Vec<T>, RslabError> {
     let n = factors.n;
-    // Y = Pᵀ (D B) (gather rows; each row's `nrhs` block moves as a unit, the
+    // Y = P^T (D B) (gather rows; each row's `nrhs` block moves as a unit, the
     // optional equilibration applied on the way in).
     let mut y = vec![T::zero(); n * nrhs];
     for i in 0..n {
@@ -687,7 +699,7 @@ fn solve_ldlt_block<T: Scalar>(
         }
     }
 
-    // D-block solve W = D⁻¹ Z, in place.
+    // D-block solve W = D^-1 Z, in place.
     let mut k = 0;
     while k < n {
         if factors.two_by_two[k] {
@@ -721,7 +733,7 @@ fn solve_ldlt_block<T: Scalar>(
         }
     }
 
-    // Backward solve Lᵀ V = W. Accumulate column `j`'s update in the local buffer
+    // Backward solve L^T V = W. Accumulate column `j`'s update in the local buffer
     // (the sources `y[i]`, `i > j`, are already solved and not touched here), then
     // write it back.
     for j in (0..n).rev() {
@@ -761,7 +773,7 @@ mod tests {
     use super::*;
     use num_complex::Complex;
 
-    /// ‖A·x − b‖∞ for a real or complex symmetric `A` (via `symv`).
+    /// ||A*x - b||inf for a real or complex symmetric `A` (via `symv`).
     fn residual_inf<T: Scalar>(a: &SymmetricMatrix<T>, x: &[T], b: &[T]) -> f64 {
         let mut ax = vec![T::zero(); a.n];
         a.symv(x, &mut ax);
@@ -860,7 +872,7 @@ mod tests {
         let b: Vec<f64> = (0..n * nrhs).map(|k| ((k % 13) as f64) - 6.0).collect();
         let x_par = solve_ldlt_many(&factors, &b, nrhs).unwrap();
 
-        // Reference: solve each column on its own (nrhs = 1 → serial block, w = 1).
+        // Reference: solve each column on its own (nrhs = 1 -> serial block, w = 1).
         for c in 0..nrhs {
             let bc: Vec<f64> = (0..n).map(|i| b[i * nrhs + c]).collect();
             let xc = solve_ldlt_many(&factors, &bc, 1).unwrap();
@@ -878,7 +890,7 @@ mod tests {
 
     #[test]
     fn f64_indefinite_2x2_pivot() {
-        // A = [[0, 1], [1, 0]] has a zero diagonal: forces a 2×2 pivot.
+        // A = [[0, 1], [1, 0]] has a zero diagonal: forces a 2x2 pivot.
         let a = SymmetricMatrix::<f64>::from_lower_triangle(
             2,
             &[(0, 0, 0.0), (1, 0, 1.0), (1, 1, 0.0)],
@@ -912,7 +924,7 @@ mod tests {
 
     #[test]
     fn f64_larger_indefinite_residual() {
-        // A symmetric indefinite 5×5 exercising both 1×1 and 2×2 pivots.
+        // A symmetric indefinite 5x5 exercising both 1x1 and 2x2 pivots.
         let entries = [
             (0, 0, 1.0),
             (1, 0, 3.0),
@@ -934,12 +946,12 @@ mod tests {
         assert!(residual_inf(&a, &x, &b) < 1e-10);
     }
 
-    // ---- Complex symmetric (A = Aᵀ, PARDISO mtype 6) ------------------------
+    // ---- Complex symmetric (A = A^T, PARDISO mtype 6) ------------------------
 
     #[test]
     fn complex_antidiagonal_2x2_pivot() {
         let c = |re, im| Complex::new(re, im);
-        // A = [[0, 1], [1, 0]] (complex symmetric, zero diagonal -> 2×2 pivot).
+        // A = [[0, 1], [1, 0]] (complex symmetric, zero diagonal -> 2x2 pivot).
         let a = SymmetricMatrix::<Complex<f64>>::from_lower_triangle(
             2,
             &[
@@ -960,7 +972,7 @@ mod tests {
     #[test]
     fn complex_diagonal_pivots() {
         let c = |re, im| Complex::new(re, im);
-        // Diagonally dominant complex symmetric: all 1×1 pivots.
+        // Diagonally dominant complex symmetric: all 1x1 pivots.
         let a = SymmetricMatrix::<Complex<f64>>::from_lower_triangle(
             3,
             &[
@@ -981,7 +993,7 @@ mod tests {
     #[test]
     fn complex_indefinite_mixed_pivots() {
         let c = |re, im| Complex::new(re, im);
-        // 5×5 complex symmetric with small/zero diagonals to force 2×2 pivots.
+        // 5x5 complex symmetric with small/zero diagonals to force 2x2 pivots.
         let a = SymmetricMatrix::<Complex<f64>>::from_lower_triangle(
             5,
             &[

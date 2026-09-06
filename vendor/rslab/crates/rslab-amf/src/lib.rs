@@ -62,7 +62,7 @@ impl Default for AmfOptions {
 /// Compute a fill-reducing AMF ordering.
 ///
 /// Returns a permutation `perm` (new-to-old) such that factoring
-/// `P·A·Pᵀ` with `P[k] = perm[k]` produces less fill than the
+/// `P*A*P^T` with `P[k] = perm[k]` produces less fill than the
 /// natural ordering. The input must be the full symmetric pattern
 /// (both halves present).
 pub fn amf_order(pattern: &CscPattern<'_>) -> Result<Vec<i32>, OrderingError> {

@@ -13,7 +13,7 @@
 //! A self-contained replacement for PARDISO's sparse symmetric path, with no
 //! MKL or other native dependency. RSLAB factors **real symmetric** (`f64`,
 //! PARDISO `mtype 2`) and **complex symmetric** (`Complex<f64>`, `mtype 6`)
-//! matrices as `Pᵀ A P = L D Lᵀ` by a rayon-parallel multifrontal
+//! matrices as `P^T A P = L D L^T` by a rayon-parallel multifrontal
 //! Bunch-Kaufman method with a SIMD (`gemm`) Schur kernel.
 //!
 //! Three intended uses:
@@ -24,7 +24,7 @@
 //! * **Circuit-shaped unsymmetric solve** - the sequential, bit-deterministic
 //!   [`KluSolver`] (BTF + per-block Gilbert-Peierls) with a numeric-only
 //!   [`refactor`](KluSolver::refactor) for fixed-pattern sweeps and a
-//!   [`solve_transpose`](KluSolver::solve_transpose) (`Aᵀx = b` on the same
+//!   [`solve_transpose`](KluSolver::solve_transpose) (`A^Tx = b` on the same
 //!   factors) for adjoint / sensitivity solves.
 //!
 //! ## PARDISO-style phased workflow (FEM)
@@ -35,7 +35,7 @@
 //! ```
 //! # fn main() -> Result<(), rslab::RslabError> {
 //! use rslab::prelude::*;
-//! // Real symmetric matrix, lower triangle (i ≥ j).
+//! // Real symmetric matrix, lower triangle (i >= j).
 //! let a = CscMatrix::<f64>::from_triplets(3, &[0, 1, 2, 1], &[0, 1, 2, 0],
 //!                                         &[2.0, 2.0, 2.0, -1.0])?;
 //! let analysis = LdltSymbolic::analyze(&a)?;                 // phase 1
@@ -89,6 +89,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod error;
 pub(crate) mod inertia;
 pub(crate) mod io;
+pub mod logging;
 /// Parametrized test-matrix generators (feature `matgen`): PDE stencils, BEM/MoM
 /// kernels, banded/arrow, random + spectral. Optional `matgen-download` adds a
 /// SuiteSparse / Matrix Market fetcher.
@@ -109,14 +110,15 @@ pub(crate) mod scalar;
 // `LdltCompress` matching (`compute_mc64_cache`/`Mc64Cache`, structural only),
 // `ScalingStrategy`, and the inf-norm / one-pass equilibration used by the
 // factor path.
-pub(crate) mod scaling;
-pub(crate) mod sparse;
 /// Symbolic analysis internals. Not part of the embedder API beyond the root
 /// re-exports (`OrderingMethod`, `RelaxAmalgamation`):
 /// `pub` because the in-tree tests drive `symbolic::{symbolic_factorize,
 /// column_counts_gnp, ...}` and `symbolic::supernode::OrderingPreprocess` by
 /// path; hidden from public docs.
 #[doc(hidden)]
+pub mod refine;
+pub(crate) mod scaling;
+pub(crate) mod sparse;
 pub mod symbolic;
 /// Hardware-aware auto-tuning + resource governor (feature `tuning`): hardware
 /// probe, calibration cache, and a budget-driven factorization planner.
@@ -132,26 +134,33 @@ pub mod tuning;
 // stack. (The legacy f64-dedicated multifrontal path has been removed.)
 pub use analysis::recommend_threads_from;
 pub use dense::matrix::SymmetricMatrix;
-pub use diagnostics::{Diagnostics, MemoryEstimate, StageReport};
+pub use diagnostics::{
+    Decisions, Diagnostics, MemoryEstimate, NumericReport, Rates, SolveCounter, SolveStats,
+    StageReport,
+};
 pub use error::RslabError;
+pub use logging::{LogLevel, LogSink};
 pub use numeric::gemm_tuning::{
     GemmThresholds, DEFAULT_PANEL_NB, DEFAULT_PAR_CDIV, DEFAULT_PAR_GEMM, DEFAULT_SCALAR_GATE,
 };
+pub use refine::{BackwardError, RefineOutcome, RefinePolicy};
 pub use scalar::Scalar;
 pub use scaling::ScalingStrategy;
-// Generic dense LDLᵀ kernel (the multifrontal fronts reduce to this).
+// Generic dense LDL^T kernel (the multifrontal fronts reduce to this).
 pub use dense::ldlt_generic::{
     factor_ldlt, solve_ldlt, solve_ldlt_many, CompressedLdltFactors, LdltFactors,
 };
 // Shared options + the low-level multifrontal symbolic/numeric building blocks.
 pub use numeric::multifrontal_ldlt::{
     analyze, analyze_with, factor_numeric, factor_sparse_ldlt, factor_sparse_ldlt_with,
-    with_threads, BlrMode, FactorMethod, MemoryMode, MultifrontalSymbolic, ReorderMode,
-    SolverSettings, Threads, ZeroPivotAction,
+    with_threads, BlrMode, FactorMethod, FactorPath, LdltNumeric, MemoryMode, MultifrontalSymbolic,
+    ReorderMode, SolverSettings, Threads, ZeroPivotAction,
 };
-// High-level symmetric LDLᵀ solver: `LdltSymbolic::analyze → .factor → LdltSolver`.
+// The supernodal panel form of a factor (`LdltNumeric::factor`).
+pub use numeric::panel_factor::PanelFactor;
+// High-level symmetric LDL^T solver: `LdltSymbolic::analyze -> .factor -> LdltSolver`.
 pub use numeric::sparse_solver::{LdltSolver, LdltSymbolic};
-// High-level unsymmetric LU solver: `LuSymbolic::analyze → .factor → LuSolver`,
+// High-level unsymmetric LU solver: `LuSymbolic::analyze -> .factor -> LuSolver`,
 // plus the raw factor type and free building blocks.
 pub use inertia::Inertia;
 pub use io::mtx::{
@@ -160,13 +169,13 @@ pub use io::mtx::{
 };
 pub use numeric::iterative::{
     cocg, cocr, gmres, gmres_block, gmres_block_fn, gmres_block_fn_mon, gmres_block_mon, gmres_fn,
-    gmres_recycled, BlockKrylovResult, Factorization, KrylovResult, LinearOperator, LowPrecisionLu,
-    LowPrecisionPreconditioner, NoPreconditioner, Preconditioner, Recycle, RecycleScalar,
-    StopReason,
+    gmres_recycled, gmres_recycled_fn, BlockKrylovResult, Factorization, KrylovResult,
+    LinearOperator, LowPrecisionLu, LowPrecisionPreconditioner, NoPreconditioner, Preconditioner,
+    Recycle, RecycleScalar, StopReason,
 };
 pub use numeric::multifrontal_lu::{
     factor_general_lu, factor_general_lu_numeric, solve_lu, solve_lu_many, solve_lu_refined,
-    solve_lu_transpose, LuFactors, LuSolver, LuSymbolic,
+    solve_lu_transpose, LuFactors, LuNumeric, LuSolver, LuSymbolic,
 };
 // KLU-style third direct path (BTF + per-block Gilbert-Peierls): sequential,
 // bit-deterministic, built for circuit-shaped matrices and sweep refactoring.
@@ -195,7 +204,7 @@ pub mod prelude {
         CscMatrix,
         Factorization,
         GeneralCsc,
-        // high-level phased solvers: `XSymbolic::analyze → .factor → XSolver`
+        // high-level phased solvers: `XSymbolic::analyze -> .factor -> XSolver`
         KluSettings,
         KluSolver,
         KluSymbolic,

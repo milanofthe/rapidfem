@@ -784,24 +784,24 @@ fn order_blocks<T: Scalar>(
                 a.col_ptr[c + 1] - a.col_ptr[c]
             })
             .sum();
+        // The block's off-diagonal pattern by column (`bri`, rows ascending)
+        // and by row (`tri`, columns ascending) from counting passes: the
+        // input columns are sorted by original row, not by block row, so the
+        // transpose is taken twice rather than sorting every column.
         let mut bcol = Vec::with_capacity(bn + 1);
         bcol.push(0usize);
         let mut bri: Vec<i32> = Vec::with_capacity(cap);
         for lj in 0..bn {
             let c = col_perm[bs + lj];
-            let seg = bri.len();
             for &r in &a.row_idx[a.col_ptr[c]..a.col_ptr[c + 1]] {
                 let pre = pinv0[r] as usize;
                 if pre >= bs && pre < be && pre - bs != lj {
                     bri.push((pre - bs) as i32);
                 }
             }
-            bri[seg..].sort_unstable();
             bcol.push(bri.len());
         }
         let m = bcol[bn];
-        // 2) B^T via counting transpose; columns arrive sorted because the
-        // source columns are visited in ascending order.
         let mut tcol = vec![0usize; bn + 1];
         for &li in &bri {
             tcol[li as usize + 1] += 1;
@@ -819,7 +819,16 @@ fn order_blocks<T: Scalar>(
                 }
             }
         }
-        // 3) Per-column sorted merge of B, B^T, and the diagonal, deduped.
+        {
+            // Transpose back: rows ascending within every column.
+            let mut cur = bcol[..bn].to_vec();
+            for li in 0..bn {
+                for &lj in &tri[tcol[li]..tcol[li + 1]] {
+                    bri[cur[lj as usize]] = li as i32;
+                    cur[lj as usize] += 1;
+                }
+            }
+        }
         let mut colptr_i32 = Vec::with_capacity(bn + 1);
         let mut rowidx_i32 = Vec::with_capacity(2 * m + bn);
         colptr_i32.push(0i32);
@@ -1428,13 +1437,18 @@ fn factor_impl<T: Scalar>(
         // Same fill heuristics as the per-block reserves (MNA class ~6x
         // input): caps the doubling-growth copies of the append at one.
         // (The parallel branch replaces these vectors with exact-size
-        // allocations instead, so the reserves live here.)
-        l_rowidx.reserve(sym.nnz * 4);
-        l_val.reserve(sym.nnz * 4);
-        u_rowidx.reserve(sym.nnz * 2);
-        u_val.reserve(sym.nnz * 2);
-        f_rowidx.reserve(sym.nnz / 4);
-        f_val.reserve(sym.nnz / 4);
+        // allocations instead, so the reserves live here.) A single block
+        // (one irreducible matrix, the common case for a logic circuit) is
+        // moved out of the block buffer instead of copied, so nothing is
+        // reserved for it.
+        if nblocks > 1 {
+            l_rowidx.reserve(sym.nnz * 4);
+            l_val.reserve(sym.nnz * 4);
+            u_rowidx.reserve(sym.nnz * 2);
+            u_val.reserve(sym.nnz * 2);
+            f_rowidx.reserve(sym.nnz / 4);
+            f_val.reserve(sym.nnz / 4);
+        }
         let mut scratch = KluScratch::<T>::new(max_bn);
         let mut out = BlockOut::<T>::default();
         for b in 0..nblocks {
@@ -1456,16 +1470,26 @@ fn factor_impl<T: Scalar>(
             // whose final positions are already in `fin_of_pre`.
             fin_of_pre[bs..be].copy_from_slice(&out.fin_abs);
             let (lo, uo, fo) = (l_rowidx.len(), u_rowidx.len(), f_rowidx.len());
-            l_rowidx.extend_from_slice(&out.l_rowidx);
-            l_val.extend_from_slice(&out.l_val);
-            u_rowidx.extend_from_slice(&out.u_rowidx);
-            u_val.extend_from_slice(&out.u_val);
+            if nblocks == 1 {
+                l_rowidx = std::mem::take(&mut out.l_rowidx);
+                l_val = std::mem::take(&mut out.l_val);
+                u_rowidx = std::mem::take(&mut out.u_rowidx);
+                u_val = std::mem::take(&mut out.u_val);
+                l_colptr = std::mem::take(&mut out.l_colptr);
+                u_colptr = std::mem::take(&mut out.u_colptr);
+                udiag = std::mem::take(&mut out.udiag);
+            } else {
+                l_rowidx.extend_from_slice(&out.l_rowidx);
+                l_val.extend_from_slice(&out.l_val);
+                u_rowidx.extend_from_slice(&out.u_rowidx);
+                u_val.extend_from_slice(&out.u_val);
+                l_colptr.extend(out.l_colptr[1..].iter().map(|&p| lo + p));
+                u_colptr.extend(out.u_colptr[1..].iter().map(|&p| uo + p));
+                udiag.extend_from_slice(&out.udiag);
+            }
             f_rowidx.extend(out.f_pre.iter().map(|&pre| fin_of_pre[pre as usize]));
             f_val.extend_from_slice(&out.f_val);
-            l_colptr.extend(out.l_colptr[1..].iter().map(|&p| lo + p));
-            u_colptr.extend(out.u_colptr[1..].iter().map(|&p| uo + p));
             f_colptr.extend(out.f_colptr[1..].iter().map(|&p| fo + p));
-            udiag.extend_from_slice(&out.udiag);
             for (i, &k) in out.f_k.iter().enumerate() {
                 scatter_expect[k as usize] = f_rowidx[fo + i];
                 scatter_target[k as usize] = KI_FBIT | (fo + i) as Ki;
@@ -1613,7 +1637,8 @@ fn factor_impl<T: Scalar>(
     // pipeline internally (and with how many workers), and whether the blocks
     // themselves run in parallel. One work/Amdahl principle for both, see
     // [`compute_replay_plan`].
-    let (pipelined, par_refactor) = if settings.parallel == KluParallel::Off {
+    // One block has nothing to pipeline: skip the replay plan.
+    let (pipelined, par_refactor) = if settings.parallel == KluParallel::Off || nblocks == 1 {
         (Vec::new(), false)
     } else {
         compute_replay_plan(

@@ -13,6 +13,7 @@
 
 pub use rapidfem_core::{constants, materials, mesh, mesh_io, quadrature};
 
+mod dump;
 pub mod excitation;
 pub mod coefficients;
 pub mod dofmap;

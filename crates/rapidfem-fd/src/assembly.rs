@@ -446,6 +446,7 @@ pub fn frequency_sweep_with_pml(
     let mut coo_vals: Vec<C64> = Vec::with_capacity(coo_cap);
     let mut bempty = basis.empty_tri_matrix();
 
+    let dump = crate::dump::target();
     for (fi, &freq) in frequencies.iter().enumerate() {
         let t_freq = web_time::Instant::now();
         let exc = crate::excitation::Excitation::new(freq, mesh.l0);
@@ -544,6 +545,15 @@ pub fn frequency_sweep_with_pml(
         let s_eq = equilibration_scaling(n_free, &coo_rows, &coo_cols, &coo_vals);
         apply_equilibration(&coo_rows, &coo_cols, &mut coo_vals, &s_eq);
 
+        // Port right-hand sides in the equilibrated scaling.
+        let b_frees: Vec<Vec<C64>> = port_bvecs.iter()
+            .map(|bvec| free_dofs.iter().enumerate()
+                .map(|(fi_d, &d)| bvec[d] * C64::from(s_eq[fi_d])).collect())
+            .collect();
+        if let Some(target) = &dump {
+            crate::dump::write_system(target, fi, 2.0 * std::f64::consts::PI * freq / 299_792_458.0, n_free, &coo_rows, &coo_cols, &coo_vals, &b_frees)?;
+        }
+
         // Factor (symbolic once via `factorize`, then `refactorize` per freq
         // reusing the sparsity pattern) and solve via the backend-agnostic
         // SparseSolver trait.
@@ -555,10 +565,6 @@ pub fn frequency_sweep_with_pml(
         }
 
         // Batched multi-port solve on the shared factorisation.
-        let b_frees: Vec<Vec<C64>> = port_bvecs.iter()
-            .map(|bvec| free_dofs.iter().enumerate()
-                .map(|(fi_d, &d)| bvec[d] * C64::from(s_eq[fi_d])).collect())
-            .collect();
         let x_frees = solver.solve_many(&b_frees)?;
         let mut solutions = Vec::new();
         for x_free in x_frees {

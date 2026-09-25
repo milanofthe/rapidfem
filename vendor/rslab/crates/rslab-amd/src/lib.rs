@@ -1,19 +1,17 @@
 //! Approximate Minimum Degree (AMD) fill-reducing ordering.
 //!
 //! Standalone implementation of the in-place quotient-graph AMD
-//! algorithm (Amestoy, Davis & Duff 1996, 2004). See the crate
-//! README and `dev/plans/ordering-amd-upgrade.md` for scope and
+//! algorithm (Amestoy, Davis & Duff 1996, 2004), including mass
+//! elimination, supervariable detection, aggressive absorption and
+//! dense-row deferral. The ordering matches SuiteSparse / faer on the
+//! pinned oracle fixture suite. See the crate README for scope and
 //! references.
 //!
-//! Slice B is complete: mass elimination (Commit 9) and
-//! supervariable detection (Commit 10) are both live, so the
-//! ordering matches SuiteSparse / faer on the full oracle
-//! fixture suite.
-//!
-//! The public surface conforms to the RSLAB ordering-crate
-//! contract (`dev/plans/ordering-crate-contract.md`). `CscPattern`,
-//! `OrderingStats`, `OrderingError`, and `CONTRACT_VERSION` are
-//! re-exported from `rslab-ordering-core`.
+//! The elimination itself runs on the shared quotient-graph engine
+//! of `rslab-ordering-core` with the minimum-degree metric. The
+//! public surface conforms to the ordering-crate contract of
+//! `rslab-ordering-core`: `CscPattern`, `OrderingStats`,
+//! `OrderingError`, and `CONTRACT_VERSION` are re-exported from it.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -95,16 +93,15 @@ pub fn amd_order_opts(
 /// Contract-conforming ordering producer.
 ///
 /// Signature matches the shape every RSLAB ordering crate must
-/// expose per `dev/plans/ordering-crate-contract.md`: input is a
+/// expose per the `rslab-ordering-core` contract: input is a
 /// full-symmetric [`CscPattern`] and options; output is a
 /// three-tuple of `(perm, OrderingStats, crate-stats)`, with
 /// errors in [`OrderingError`].
 ///
 /// `OrderingStats.time_us` is the wall-clock time of this call.
 /// `fill_estimate` and `flop_estimate` are left as `None` for AMD -
-/// the per-crate [`AmdStats`] carries `ndiv` / `nms_lu` / `nms_ldl`
-/// flop counters that may be surfaced here in a future revision
-/// without bumping the contract.
+/// the per-crate [`AmdStats`] carries the `ndiv` / `nms_lu` /
+/// `nms_ldl` flop counters instead.
 pub fn amd_order_full(
     pattern: &CscPattern<'_>,
     opts: &AmdOptions,
@@ -140,14 +137,11 @@ pub fn amd_order_full(
 /// [`amd_order_full`]'s [`OrderingStats::time_us`], modulo a few
 /// hundred ns of `Instant::now()` overhead.
 ///
-/// Used by the small-n diagnostic probe
-/// `rslab::bin::diag_amd_substages` to attribute the per-call AMD
-/// cost between workspace allocation, the main elimination loop,
-/// and permutation finalisation. See
-/// `dev/plans/phase-2.13-tail-diagnostic.md` step 5.
+/// Attributes the per-call AMD cost between workspace allocation,
+/// the main elimination loop, and permutation finalisation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AmdSubstages {
-    /// Time spent in `AmdWorkspace::new`: input ingest, vector
+    /// Time spent in `Workspace::new`: input ingest, vector
     /// allocations, initial degree lists, dense-row deferral.
     pub workspace_new_us: u64,
     /// Time spent in the main pivot/eliminate/finalize loop
@@ -163,7 +157,7 @@ pub struct AmdSubstages {
 ///
 /// Behaves identically to [`amd_order_full`] but additionally
 /// returns an [`AmdSubstages`] split of the wall-clock time across
-/// `workspace::new`, `run_elimination`, and `finalize_permutation`.
+/// `Workspace::new`, `run_elimination`, and `finalize_permutation`.
 /// Diagnostic-only - production callers should keep using
 /// [`amd_order`] / [`amd_order_full`]. The `Instant::now()` calls
 /// add at most ~100 ns vs the un-profiled path, but the API surface

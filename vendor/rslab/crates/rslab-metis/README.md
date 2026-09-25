@@ -6,17 +6,18 @@ clean-room from the published METIS papers.
 
 - **License:** MIT
 - **Dependencies:** `rslab-ordering-core`, `rslab-amd` (used as the
-  small-leaf base case).
+  small-leaf base case), `rayon` (the two sides of a bisection are
+  ordered in parallel).
 - **MSRV:** stable Rust, edition 2021. No `unsafe`.
 
 ## What METIS does
 
 METIS computes a fill-reducing permutation by recursively bisecting
 the adjacency graph of `A`. At each level it (1) coarsens the graph
-by heavy-edge matching, (2) computes an initial bisection on the
-coarsest graph, (3) uncoarsens with Fiduccia-Mattheyses (FM)
-boundary refinement at every level, and (4) extracts a vertex
-separator from the resulting edge bisection. The two halves recurse
+by heavy-edge matching, (2) computes an initial edge bisection on the
+coarsest graph, refined with Fiduccia-Mattheyses (FM), (3) turns it
+into a vertex separator there, and (4) uncoarsens, refining the
+vertex separator at every level. The two halves recurse
 independently; small subgraphs fall through to AMD as the leaf
 algorithm. The resulting permutation tends to outperform AMD on
 large 2D / 3D mesh-shaped problems and underperform AMD on small or
@@ -34,8 +35,6 @@ make at the analysis boundary.
 - Karypis, G., and Kumar, V. (1999). *A Fast and Highly Quality
   Multilevel Scheme for Partitioning Irregular Graphs.* Companion
   paper covering the nested-dissection driver.
-
-Full BibTeX in `dev/references.bib` of the parent repository.
 
 ## Contract
 
@@ -55,9 +54,9 @@ let perm = metis_order(&pattern).expect("metis_order");
 
 Implemented from the published METIS papers, not from the
 GPL-licensed reference C codebase. Algorithmic decisions (matching
-heuristic, initial-partition strategy, FM gain computation, leaf
-threshold) are documented per-module in source comments and in
-`dev/plans/ordering-metis.md` of the parent repository.
+heuristic, initial-partition strategy, FM gain computation, separator
+refinement, leaf threshold) are documented per-module in source
+comments.
 
 ## License
 

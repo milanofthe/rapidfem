@@ -2,11 +2,10 @@ use super::elimination_tree::EliminationTree;
 
 #[cfg(test)]
 thread_local! {
-    /// S1 (dev/research/repo-review-2026-06-09.md) work counter: total
-    /// number of child-list elements materialized+sorted across all
-    /// per-node sorts in [`postorder`]. Linear in `n` for the fixed
-    /// (sort-once-per-node) traversal; quadratic for the old
-    /// sort-on-every-stack-visit version. Test-only; compiled out of
+    /// Work counter: total number of child-list elements
+    /// materialized+sorted across all per-node sorts in [`postorder`].
+    /// Linear in `n` for the sort-once-per-node traversal; quadratic for
+    /// a sort-on-every-stack-visit version. Test-only; compiled out of
     /// production builds.
     static SORT_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -17,67 +16,16 @@ thread_local! {
 /// - `postorder[k]` = the node visited at position k (new-to-old)
 /// - `inv_postorder[node]` = the position of node in the postorder (old-to-new)
 ///
-/// Children are visited in order of ascending subtree size (smallest first)
-/// to minimize peak memory usage in the ContribPool.
+/// Children are visited in order of ascending subtree size (smallest first).
 pub fn postorder(etree: &EliminationTree) -> (Vec<usize>, Vec<usize>) {
-    let n = etree.n;
-    if n == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
-    let children = etree.children();
-    let sizes = etree.subtree_sizes();
-    let roots = etree.roots();
-
-    let mut order = Vec::with_capacity(n);
-
-    // DFS stack carries each node's already-sorted child list plus a cursor:
-    // `(node, sorted_children, child_idx)`. The sort runs exactly once per
-    // node - when the node is first pushed - not once per stack visit.
-    //
-    // The previous version stored only `(node, child_idx)` and re-cloned and
-    // re-sorted `children[node]` on every `stack.last_mut()` iteration. A node
-    // with `c` children sits on top of the stack `c+1` times (once per child
-    // push + once for the final pop), so it paid `O(c^2*log c)`. On a star
-    // etree (one root with `n-1` children - the arrow/bordered-KKT shape AMD
-    // produces for a dense trailing border) that made the default symbolic
-    // pipeline `O(n^2*log n)`. See S1, dev/research/repo-review-2026-06-09.md,
-    // and the matching cursor layout in `biased_postorder` /
-    // `EliminationTree::postorder`.
-    let mut stack: Vec<(usize, Vec<usize>, usize)> = Vec::new();
-
-    // Process roots in ascending subtree size order
-    let mut sorted_roots = roots;
-    sorted_roots.sort_unstable_by_key(|&r| sizes[r]);
-
-    for &root in &sorted_roots {
-        stack.push((root, sorted_children_by_size(&children[root], &sizes), 0));
-
-        while let Some((node, sorted_children, child_idx)) = stack.last_mut() {
-            let node_id = *node;
-            if *child_idx < sorted_children.len() {
-                let child = sorted_children[*child_idx];
-                *child_idx += 1;
-                let next = sorted_children_by_size(&children[child], &sizes);
-                stack.push((child, next, 0));
-            } else {
-                // All children visited - emit this node (postorder)
-                order.push(node_id);
-                stack.pop();
-            }
-        }
-    }
-
-    // Compute inverse
-    let mut inv = vec![0usize; n];
-    for (k, &node) in order.iter().enumerate() {
-        inv[node] = k;
-    }
-
-    (order, inv)
+    postorder_with(etree, |kids, sizes| {
+        #[cfg(test)]
+        SORT_WORK.with(|w| w.set(w.get() + kids.len()));
+        kids.sort_unstable_by_key(|&c| sizes[c]);
+    })
 }
 
-/// Phase 2.12 merge-biased postorder.
+/// Merge-biased postorder.
 ///
 /// Like [`postorder`], but when descending into a parent's children
 /// it partitions them into `bias[child] == false` (emit *first*) and
@@ -96,78 +44,69 @@ pub fn postorder(etree: &EliminationTree) -> (Vec<usize>, Vec<usize>) {
 /// Invariant: `biased_postorder(etree, &vec![false; n]) ==
 /// postorder(etree)`.
 pub fn biased_postorder(etree: &EliminationTree, bias: &[bool]) -> (Vec<usize>, Vec<usize>) {
-    let n = etree.n;
     debug_assert_eq!(
         bias.len(),
-        n,
+        etree.n,
         "biased_postorder bias length must equal etree.n"
     );
+    let mut late = Vec::new();
+    postorder_with(etree, |kids, sizes| {
+        // Unbiased children first, the biased ones (to be merged into the
+        // parent) last, next to it; each part by subtree size.
+        late.clear();
+        late.extend(kids.iter().copied().filter(|&c| bias[c]));
+        let mut w = 0;
+        for r in 0..kids.len() {
+            if !bias[kids[r]] {
+                kids[w] = kids[r];
+                w += 1;
+            }
+        }
+        kids[w..].copy_from_slice(&late);
+        let (early, tail) = kids.split_at_mut(w);
+        early.sort_unstable_by_key(|&c| sizes[c]);
+        tail.sort_unstable_by_key(|&c| sizes[c]);
+    })
+}
+
+/// The postorder visiting each node's children in the order `order_children`
+/// leaves them in (called once per node on its children, ascending, with the
+/// subtree sizes); roots by subtree size. Returns `(postorder, inverse)`.
+fn postorder_with(
+    etree: &EliminationTree,
+    mut order_children: impl FnMut(&mut [usize], &[usize]),
+) -> (Vec<usize>, Vec<usize>) {
+    let n = etree.n;
     if n == 0 {
         return (Vec::new(), Vec::new());
     }
-
-    let children = etree.children();
     let sizes = etree.subtree_sizes();
-    let roots = etree.roots();
-
+    let (ptr, mut idx) = etree.children_flat();
+    for v in 0..n {
+        order_children(&mut idx[ptr[v]..ptr[v + 1]], &sizes);
+    }
+    let mut roots = etree.roots();
+    roots.sort_unstable_by_key(|&r| sizes[r]);
     let mut order = Vec::with_capacity(n);
-    let mut stack: Vec<(usize, Vec<usize>, usize)> = Vec::new();
-
-    // Roots are not biased (no parent to be adjacent to). Use the
-    // unbiased subtree-size order.
-    let mut sorted_roots = roots;
-    sorted_roots.sort_unstable_by_key(|&r| sizes[r]);
-
-    for &root in &sorted_roots {
-        let merged = merge_bias_partition(&children[root], &sizes, bias);
-        stack.push((root, merged, 0));
-
-        while let Some((node, sorted_children, child_idx)) = stack.last_mut() {
-            let node_id = *node;
-            if *child_idx < sorted_children.len() {
-                let child = sorted_children[*child_idx];
-                *child_idx += 1;
-                let next_children = merge_bias_partition(&children[child], &sizes, bias);
-                stack.push((child, next_children, 0));
+    let mut next = ptr[..n].to_vec();
+    let mut stack: Vec<usize> = Vec::new();
+    for root in roots {
+        stack.push(root);
+        while let Some(&v) = stack.last() {
+            if next[v] < ptr[v + 1] {
+                stack.push(idx[next[v]]);
+                next[v] += 1;
             } else {
-                order.push(node_id);
+                order.push(v);
                 stack.pop();
             }
         }
     }
-
     let mut inv = vec![0usize; n];
-    for (k, &node) in order.iter().enumerate() {
-        inv[node] = k;
+    for (k, &v) in order.iter().enumerate() {
+        inv[v] = k;
     }
     (order, inv)
-}
-
-/// Sort a node's children by ascending subtree size (smallest first), the
-/// peak-memory-minimizing visit order used by [`postorder`]. Factored out so
-/// the clone+sort runs exactly once per node (see S1,
-/// `dev/research/repo-review-2026-06-09.md`).
-fn sorted_children_by_size(children: &[usize], sizes: &[usize]) -> Vec<usize> {
-    #[cfg(test)]
-    SORT_WORK.with(|w| w.set(w.get() + children.len()));
-    let mut v = children.to_vec();
-    v.sort_unstable_by_key(|&c| sizes[c]);
-    v
-}
-
-/// Order a parent's children for the merge-biased postorder.
-///
-/// Partition: `bias[child] == false` first (emit early), then
-/// `bias[child] == true` (emit late, adjacent to the parent). Within
-/// each partition, ascending subtree size - the same heuristic as
-/// the unbiased postorder, applied independently to each partition.
-fn merge_bias_partition(children: &[usize], sizes: &[usize], bias: &[bool]) -> Vec<usize> {
-    let mut early: Vec<usize> = children.iter().copied().filter(|&c| !bias[c]).collect();
-    let mut late: Vec<usize> = children.iter().copied().filter(|&c| bias[c]).collect();
-    early.sort_unstable_by_key(|&c| sizes[c]);
-    late.sort_unstable_by_key(|&c| sizes[c]);
-    early.extend(late);
-    early
 }
 
 #[cfg(test)]
@@ -293,18 +232,18 @@ mod tests {
         EliminationTree::from_pattern(&pat)
     }
 
-    /// S1 (dev/research/repo-review-2026-06-09.md): the previous `postorder`
-    /// re-cloned and re-sorted `children[node]` on every stack visit, so a
-    /// node with `c` children (on top of the stack `c+1` times) paid
-    /// O(c^2*log c). On a star etree (one root with `n-1` children) that is
-    /// O(n^2*log n) - quadratic - in the default symbolic pipeline.
+    /// A `postorder` that re-cloned and re-sorted `children[node]` on every
+    /// stack visit would make a node with `c` children (on top of the stack
+    /// `c+1` times) pay O(c^2*log c). On a star etree (one root with `n-1`
+    /// children) that is O(n^2*log n) - quadratic - in the symbolic
+    /// pipeline.
     ///
-    /// Reproduction is deterministic via the `SORT_WORK` counter (total
+    /// The check is deterministic via the `SORT_WORK` counter (total
     /// child-list elements materialized across all per-node sorts), so no
-    /// flaky wall-clock timing is needed. Pre-fix the root's `(n-1)`-element
-    /// child list is materialized `n` times -> `~n^2` elements. Post-fix it is
-    /// materialized exactly once -> `~n` elements. The assertion `work <= 4*n`
-    /// fails on the quadratic version and passes on the linear fix.
+    /// flaky wall-clock timing is needed. Sorting per visit materializes the
+    /// root's `(n-1)`-element child list `n` times -> `~n^2` elements;
+    /// sorting once per node materializes it exactly once -> `~n` elements.
+    /// The assertion `work <= 4*n` separates the two.
     #[test]
     fn test_postorder_star_sort_work_is_linear() {
         let n = 2000;
@@ -326,8 +265,8 @@ mod tests {
             }
         }
 
-        // The fix: child-sorting work is linear, not quadratic. The old
-        // sort-on-every-visit code materializes ~n^2 elements here.
+        // Child-sorting work is linear, not quadratic. Sort-on-every-visit
+        // code would materialize ~n^2 elements here.
         assert!(
             work <= 4 * n,
             "postorder sort work {work} exceeds the linear bound {} (n={n}); \

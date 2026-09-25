@@ -1,2 +1,3 @@
-pub mod ldlt_generic;
-pub mod matrix;
+pub mod gemm_backend;
+#[cfg(test)]
+pub(crate) mod matrix;

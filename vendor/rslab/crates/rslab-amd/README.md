@@ -4,11 +4,12 @@ Approximate Minimum Degree (AMD) fill-reducing ordering for sparse
 symmetric matrices, implemented in pure Rust using the in-place
 quotient-graph algorithm of Amestoy, Davis and Duff (1996, 2004).
 
-- **Status:** feature-complete (Slice A + Slice B of the development
-  plan). Byte-for-byte match with the SuiteSparse AMD reference on
-  the pinned oracle fixture suite.
+- **Status:** complete (mass elimination, supervariable detection,
+  aggressive absorption, dense-row deferral). Byte-for-byte match with
+  the SuiteSparse AMD reference on the pinned oracle fixture suite.
 - **License:** MIT
-- **Dependencies:** none in the runtime library.
+- **Dependencies:** `rslab-ordering-core` only, which hosts the shared
+  quotient-graph engine.
 - **MSRV:** stable Rust, edition 2021. No `unsafe`.
 
 ## What AMD does
@@ -24,9 +25,9 @@ compute.
 
 The canonical reference algorithm is Tim Davis's `amd_2.c` inside
 SuiteSparse (BSD-3-Clause). `rslab-amd` is a clean-room Rust
-transliteration, cross-checked line-by-line against the in-tree
-[faer-rs](https://github.com/sarah-quinones/faer-rs) port of the same
-algorithm.
+transliteration, cross-checked line-by-line against the
+[faer-rs](https://github.com/sarah-quinones/faer-rs) implementation of
+the same algorithm.
 
 ## Literature
 
@@ -49,10 +50,6 @@ algorithm.
   *A Survey of Direct Methods for Sparse Linear Systems.* Acta
   Numerica, 25, 383-566. Places AMD in the broader ecosystem of
   direct methods.
-
-Full BibTeX entries live in `../../dev/references.bib`. Curated
-organisation-level notes are in `../../.crucible/wiki/concepts/approximate-minimum-degree.org`
-and `../../.crucible/wiki/summaries/amestoy1996-amd.org` / `amestoy2004-amd-implementation.org`.
 
 ## Algorithm
 
@@ -82,12 +79,13 @@ of supervariables eliminated so far. At each step it:
 
 ### Dense-row handling
 
-Variables whose initial degree exceeds `max(16, min(n, alpha*sqrt(n)))` with
+Variables whose initial degree exceeds `min(max(16, alpha*sqrt(n)), n)` with
 `alpha = 10` by default are classified as "dense" and deferred to the end
 of the permutation. This is a structural device - it keeps a few hub
 vertices (e.g. an arrow-matrix's central row) from dominating the
-degree computation for every other variable. A negative `alpha` disables
-the heuristic.
+degree computation for every other variable. A negative `alpha` uses
+`n - 2` in place of `alpha*sqrt(n)`, which defers only true hubs of
+degree `n - 1`.
 
 ### Garbage collection
 
@@ -196,16 +194,17 @@ Two additional tests assert `n_mass_elim > 0` on patterns where
 mass elimination must fire (tridiag_10, band_20_3, grid_7x7), and
 two assert `n_supervar_merge > 0` on patterns where supervariable
 detection must fire (band_20_3, grid_7x7). These guard against a
-regression that silently disables either Slice B branch even if the
-permutation still happens to line up.
+regression that silently disables mass elimination or supervariable
+detection even if the permutation still happens to line up.
 
 ### Unit tests
 
-`src/` contains 36 `#[cfg(test)]` unit tests covering:
+The quotient-graph engine lives in `rslab-ordering-core`, and so do
+its unit tests:
 
 - Input validation in `CscPattern::new` (bad lengths, monotone
-  col_ptr, out-of-range row indices).
-- `AmdWorkspace::new` fast paths: empty pattern, pure diagonal,
+  col_ptr, out-of-range and unsorted row indices).
+- `Workspace::new` fast paths: empty pattern, pure diagonal,
   dense-deferred hub, zero-degree variable, `dense_alpha < 0`.
 - `clear_flag` wrap behaviour at the `wbig` boundary.
 - `flip` involution.
@@ -215,9 +214,7 @@ permutation still happens to line up.
 Run everything with:
 
 ```
-$ cargo test -p rslab-amd
-test result: ok. 36 passed; 0 failed; 0 ignored
-test result: ok. 12 passed; 0 failed; 0 ignored
+$ cargo test -p rslab-amd -p rslab-ordering-core
 ```
 
 ### Static checks
@@ -233,9 +230,9 @@ The library uses `#![forbid(unsafe_code)]` and `#![deny(missing_docs)]`.
 
 The `amd` crate appears **only** in the throwaway fixture-generation
 harness at `tests/data/amd_oracle/harness/*.txt`, which is not built
-by Cargo. `crates/rslab-amd/Cargo.toml` has zero runtime dependencies
-and no dev-dependencies on `amd`. A workspace grep guards the
-invariant:
+by Cargo. `crates/rslab-amd/Cargo.toml` depends only on
+`rslab-ordering-core` and has no dev-dependencies on `amd`. A grep
+checks the invariant:
 
 ```
 $ grep -r 'amd = "' crates/rslab-amd/Cargo.toml | grep -v harness
@@ -247,43 +244,34 @@ $ grep -r 'amd = "' crates/rslab-amd/Cargo.toml | grep -v harness
 ```
 src/
 +-- lib.rs         Public surface: amd_order, amd_order_with_stats,
-|                  amd_order_opts, AmdOptions.
-+-- pattern.rs     CscPattern - borrowed CSC sparsity pattern with
-|                  validation.
-+-- error.rs       AmdError (IndexOverflow, NonSymmetric,
-|                  MalformedInput).
+|                  amd_order_opts, amd_order_full, amd_order_substages,
+|                  AmdOptions.
 +-- stats.rs       AmdStats (ncmpa, n_mass_elim, n_supervar_merge,
 |                  n_dense_deferred, ndiv, nms_ldl, nms_lu).
-+-- workspace.rs   AmdWorkspace::new - owns pe/iw/len/nv/elen/degree
-|                  scratch arrays and runs initialization (dense-row
-|                  classification, zero-degree fast path, degree-bucket
-|                  construction).
-+-- algo.rs        run_elimination + finalize_permutation - the main
-|                  loop and the post-order expansion.
 \-- bin/
     +-- rslab-amd.rs       Triplet-file CLI.
     \-- rslab-amd-bench.rs Small in-crate bench skeleton.
 ```
 
-Every function that ports a block of faer's `amd.rs` cites the faer
-line range in its doc comment so the translation is auditable.
+`CscPattern`, `OrderingStats` and `OrderingError` come from
+`rslab-ordering-core`, whose `quotient_graph` module holds the
+workspace (initialization, dense-row classification, degree buckets)
+and the elimination loop, run here with the `MinDegree` metric.
+Functions that transliterate a block of faer's `amd.rs` cite the faer
+line range in their doc comments so the translation is auditable.
 
 ## Limitations and scope
 
 - **Input type is deliberately minimal.** `CscPattern<'a>` borrows
-  two `&[usize]` slices. The crate does not depend on any sparse
+  two `&[i32]` slices. The crate does not depend on any sparse
   matrix library; downstream solvers convert at the boundary.
-- **Not yet integrated into `rslab`.** Integration will come via
-  `dev/plans/ordering-integration.md` once the sibling ordering
-  crates (METIS, SCOTCH, KaHIP) also exist.
 - **Matrices must be structurally symmetric.** AMD operates on
   `A + A^T`; handing it an unsymmetric pattern produces meaningless
-  orderings. Debug builds assert symmetry; release builds trust the
-  caller for the sake of speed.
+  orderings. Symmetry is not checked; the caller is trusted.
 - **`i32` index space.** The scratch arrays use `i32` with a
   sentinel of `-1`, matching SuiteSparse. Matrices too large for
-  `i32` workspaces return `AmdError::IndexOverflow` from
-  `AmdWorkspace::new` rather than silently wrapping.
+  `i32` workspaces return `OrderingError::IndexOverflow` rather than
+  silently wrapping.
 
 ## Reproducing the oracle fixtures
 
@@ -300,11 +288,3 @@ diff -ru /tmp/amd_oracle_out .../tests/data/amd_oracle/
 
 Harness SHA-256s are listed in `tests/data/amd_oracle/README.md` so
 re-generated fixtures can be audit-checked.
-
-## Plan and history
-
-- Full design and commit-by-commit plan:
-  `../../dev/plans/ordering-amd-upgrade.md`
-- Per-commit journal (decisions, tried-and-rejected, evidence):
-  `../../dev/journal/2026-04-16-01.org`
-- Session checkpoint: `../../dev/sessions/2026-04-16-01.md`

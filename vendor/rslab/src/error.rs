@@ -22,17 +22,6 @@ pub enum RslabError {
     /// An I/O or parse error occurred (e.g. reading a Matrix Market file).
     IoError(String),
 
-    /// A supernode received more delayed pivots from its children at
-    /// numeric time than the symbolic-analysis phase budgeted for.
-    /// Mirrors MUMPS's `INFO(2)` workspace-overflow path: a predictable,
-    /// recoverable failure that bounds worst-case front growth.
-    /// See issue #55 and `dev/research/symbolic-delay-budget-2026-05-27.md`.
-    DelayBudgetExceeded {
-        supernode: usize,
-        required: usize,
-        capacity: usize,
-    },
-
     /// The KLU path found a numerically singular column: no pivot candidate
     /// in the column's reach had a nonzero finite magnitude at factor time,
     /// or a frozen pivot came up zero during a numeric-only
@@ -45,7 +34,7 @@ pub enum RslabError {
     /// The matrix is structurally singular: no complete matching of columns
     /// onto rows with structural nonzeros exists, so the matrix is singular
     /// for *every* value assignment. Detected by the KLU path's maximum
-    /// transversal (issue #15) before any numeric work.
+    /// transversal before any numeric work.
     StructurallySingular,
 }
 
@@ -63,18 +52,6 @@ impl std::fmt::Display for RslabError {
                 write!(f, "dimension mismatch: expected {}, got {}", expected, got)
             }
             RslabError::IoError(msg) => write!(f, "I/O error: {}", msg),
-            RslabError::DelayBudgetExceeded {
-                supernode,
-                required,
-                capacity,
-            } => {
-                write!(
-                    f,
-                    "delayed-pivot budget exceeded at supernode {}: \
-                     required {} delayed columns, capacity {} (issue #55)",
-                    supernode, required, capacity
-                )
-            }
             RslabError::SingularBasis { column } => {
                 write!(f, "numerically singular at column {}", column)
             }

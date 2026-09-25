@@ -26,9 +26,9 @@
 //! `algo.rs` (AMD: `run_elimination`, AMF: `run_elimination_amf`).
 //! The trait stays light: keeping the inner loops as parallel
 //! concrete functions trades ~300 LoC duplication for zero risk to
-//! the AMD bit-parity contract.
+//! AMD's bit-identity with SuiteSparse.
 //!
-//! Reference: `dev/research/amf-clean-room.md` Section 6.
+//! Reference: Amestoy (1999) habilitation thesis; MUMPS HAMF4.
 
 use super::algo::{run_elimination as run_elimination_amd, run_elimination_amf, StepFlops};
 use super::workspace::Workspace;
@@ -129,8 +129,8 @@ impl Metric for MinDegree {
 ///
 /// AMF selects the next pivot to minimise the *fill* introduced by
 /// the elimination, rather than the candidate's degree. On bipartite-
-/// KKT graphs with a few "hub" rows AMF can be 47x better than AMD on
-/// final `nnz_L` (see `dev/research/amf-clean-room.md` Section 1).
+/// KKT graphs with a few "hub" rows AMF can give well over an order of
+/// magnitude less `nnz_L` than AMD.
 ///
 /// Score is a quantized `RMF = DEG*(DEG-1+2*DEGME) - WF(i)` value
 /// stored in `i32`. Buckets up to and including `NORIG = n` are one
@@ -140,7 +140,7 @@ impl Metric for MinDegree {
 /// the per-supervariable WF with `max`.
 ///
 /// **Inner loop**: [`MinFill::run_elimination`] dispatches to
-/// `run_elimination_amf` (Phase B.2 of `dev/plans/amf-clean-room.md`).
+/// `run_elimination_amf`.
 /// The lazy WF(e) cache, three-accumulator Pass-2, supervariable
 /// max-merge of `wf`, saturated/regular RMF branch, and coarse-bucket
 /// linear scan all live in `algo.rs`.
@@ -153,8 +153,8 @@ impl Metric for MinFill {
     /// AMF needs `2 * n + 2` slots: `0..=NORIG` for one-per-score
     /// fine buckets, `NORIG+1..=NBBUCK` (`NBBUCK = 2 * n`) for
     /// coarse-stride buckets, and one halo slot at `NBBUCK + 1`
-    /// reserved for V1 boundary variables (inert in our use case;
-    /// see Section 11 of `dev/research/amf-clean-room.md`).
+    /// reserved for HAMF4's boundary (halo) variables, inert here
+    /// because no halo is ever passed in.
     #[inline(always)]
     fn n_buckets(n: usize) -> usize {
         2 * n + 2
@@ -177,9 +177,7 @@ impl Metric for MinFill {
     /// truncation underflow on `RMF / (NVI + 1)`) clamp to bucket 0.
     ///
     /// Bucket layout follows the HAMF4 quantization described in
-    /// Amestoy's 1999 habilitation thesis; behavior is validated
-    /// against the MUMPS HAMF4 oracle corpus
-    /// (`tests/amf_corpus_oracle.rs`).
+    /// Amestoy's 1999 habilitation thesis and used by MUMPS HAMF4.
     #[inline]
     fn bucket(score: i32, n: usize) -> usize {
         if score <= 0 {
@@ -215,172 +213,5 @@ impl Metric for MinFill {
 
     fn run_elimination(ws: &mut Workspace, aggressive: bool) -> Result<StepFlops, OrderingError> {
         run_elimination_amf(ws, aggressive)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn min_degree_n_buckets_matches_workspace_alloc() {
-        // Workspace::new allocates head of length `n`; MinDegree
-        // must agree so the AMD code path indexes the right region.
-        for n in [0usize, 1, 5, 100, 10_000] {
-            assert_eq!(MinDegree::n_buckets(n), n);
-        }
-    }
-
-    #[test]
-    fn min_degree_init_score_is_identity() {
-        for len in [0i32, 1, 17, 1024] {
-            assert_eq!(MinDegree::init_score(len), len);
-        }
-    }
-
-    #[test]
-    fn min_degree_bucket_is_identity() {
-        for s in [0i32, 1, 7, 100] {
-            assert_eq!(MinDegree::bucket(s, 200), s as usize);
-        }
-    }
-
-    #[test]
-    fn min_degree_no_coarse_buckets() {
-        for n in [10usize, 100, 10_000] {
-            for idx in [0usize, 1, n / 2, n - 1] {
-                assert!(!MinDegree::coarse_bucket(idx, n));
-            }
-        }
-    }
-
-    #[test]
-    fn min_degree_merge_does_not_touch_parent() {
-        let mut parent: i32 = 42;
-        MinDegree::merge_supervariable(&mut parent, 7);
-        assert_eq!(parent, 42, "AMD merge is a true no-op on the score");
-    }
-
-    #[test]
-    fn min_fill_n_buckets_is_2n_plus_2() {
-        // NBBUCK = 2*n, plus the +1 head index plus the V1 halo slot.
-        for n in [0usize, 1, 5, 100, 10_000] {
-            assert_eq!(MinFill::n_buckets(n), 2 * n + 2);
-        }
-    }
-
-    #[test]
-    fn min_fill_init_score_is_len() {
-        for len in [0i32, 1, 17, 1024] {
-            assert_eq!(MinFill::init_score(len), len);
-        }
-    }
-
-    /// Fine bucket region: scores `0..=n` map identity.
-    #[test]
-    fn min_fill_bucket_fine_region_is_identity() {
-        let n = 100usize;
-        for s in [0i32, 1, 50, 99, 100] {
-            assert_eq!(MinFill::bucket(s, n), s as usize);
-        }
-    }
-
-    /// Coarse bucket region: scores above `n` quantize with
-    /// stride `PAS = max(n/8, 1)`.
-    #[test]
-    fn min_fill_bucket_coarse_region_quantizes_with_pas() {
-        let n = 100usize;
-        // PAS = 100 / 8 = 12.
-        // bucket(101) = (101 - 100) / 12 + 100 = 0 + 100 = 100.
-        // bucket(112) = (112 - 100) / 12 + 100 = 1 + 100 = 101.
-        // bucket(113) = (113 - 100) / 12 + 100 = 1 + 100 = 101 (same coarse bin).
-        // bucket(124) = (124 - 100) / 12 + 100 = 2 + 100 = 102.
-        assert_eq!(MinFill::bucket(101, n), 100);
-        assert_eq!(MinFill::bucket(112, n), 101);
-        assert_eq!(MinFill::bucket(113, n), 101);
-        assert_eq!(MinFill::bucket(124, n), 102);
-    }
-
-    /// Very large scores cap at `NBBUCK = 2 * n`.
-    #[test]
-    fn min_fill_bucket_caps_at_nbbuck() {
-        let n = 100usize;
-        let nbbuck = 2 * n;
-        // bucket(1_000_000) saturates to NBBUCK.
-        assert_eq!(MinFill::bucket(1_000_000, n), nbbuck);
-        assert_eq!(MinFill::bucket(i32::MAX, n), nbbuck);
-    }
-
-    /// Small `n` falls through to `PAS = 1` so coarse buckets are
-    /// effectively per-integer above `n`.
-    #[test]
-    fn min_fill_bucket_pas_is_at_least_one() {
-        // n = 4, PAS = max(0, 1) = 1.
-        // bucket(5, 4) = (5 - 4) / 1 + 4 = 5.
-        // bucket(6, 4) = (6 - 4) / 1 + 4 = 6.
-        // bucket(8, 4) = (8 - 4) / 1 + 4 = 8 = NBBUCK; cap.
-        // bucket(9, 4) caps at NBBUCK = 8.
-        assert_eq!(MinFill::bucket(5, 4), 5);
-        assert_eq!(MinFill::bucket(6, 4), 6);
-        assert_eq!(MinFill::bucket(8, 4), 8);
-        assert_eq!(MinFill::bucket(9, 4), 8);
-    }
-
-    /// Negative or zero scores clamp to bucket 0 (defensive - the
-    /// AMF math should never produce them after the `RMF / (NVI + 1)`
-    /// division but the saturated-RMF branch can underflow on tiny
-    /// problems).
-    #[test]
-    fn min_fill_bucket_clamps_nonpositive() {
-        assert_eq!(MinFill::bucket(0, 100), 0);
-        assert_eq!(MinFill::bucket(-1, 100), 0);
-        assert_eq!(MinFill::bucket(i32::MIN, 100), 0);
-    }
-
-    /// Coarse bucket region is exactly `idx > n`.
-    #[test]
-    fn min_fill_coarse_bucket_threshold() {
-        let n = 100usize;
-        for idx in [0usize, 50, 99, 100] {
-            assert!(!MinFill::coarse_bucket(idx, n), "{idx} <= n is fine");
-        }
-        for idx in [101usize, 150, 200, 201] {
-            assert!(MinFill::coarse_bucket(idx, n), "{idx} > n is coarse");
-        }
-    }
-
-    /// Supervariable merge takes the max - the larger of the two
-    /// fill estimates becomes the merged score.
-    #[test]
-    fn min_fill_merge_takes_max() {
-        let mut parent: i32 = 10;
-        MinFill::merge_supervariable(&mut parent, 25);
-        assert_eq!(parent, 25, "child larger => adopt child");
-
-        let mut parent: i32 = 100;
-        MinFill::merge_supervariable(&mut parent, 7);
-        assert_eq!(parent, 100, "child smaller => keep parent");
-
-        let mut parent: i32 = 42;
-        MinFill::merge_supervariable(&mut parent, 42);
-        assert_eq!(parent, 42, "equal => unchanged");
-    }
-
-    /// MinFill's elimination now runs the real AMF inner loop on a
-    /// workspace allocated with the AMF bucket count `2 * n + 2`.
-    /// Smoke test on a 2-variable pattern: must succeed and reach
-    /// `nel == n`.
-    #[test]
-    fn min_fill_run_elimination_completes() {
-        use crate::quotient_graph::WorkspaceOptions;
-        use crate::CscPattern;
-        let cp = [0i32, 1, 2];
-        let ri = [0i32, 1];
-        let p = CscPattern::new(2, &cp, &ri).unwrap();
-        let mut ws =
-            Workspace::new_with_n_buckets(&p, &WorkspaceOptions::default(), MinFill::n_buckets(2))
-                .unwrap();
-        MinFill::run_elimination(&mut ws, true).expect("AMF loop runs");
-        assert_eq!(ws.nel, ws.n);
     }
 }

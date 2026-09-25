@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn min_cover_no_larger_than_lighter_boundary() {
-        // Kőnig guarantees |cover| = |max matching| <= min(|bnd_a|, |bnd_b|).
+        // Konig guarantees |cover| = |max matching| <= min(|bnd_a|, |bnd_b|).
         // So a trivial "take the lighter boundary" upper bound must hold.
         let g = grid(8, 8);
         let total: i64 = g.vwgt.iter().map(|&w| w as i64).sum();

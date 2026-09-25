@@ -13,9 +13,10 @@
 //! full COO triplets are filtered to the lower triangle (rslab's `CscMatrix`
 //! convention, duplicates summed by `from_triplets`).
 //!
-//! Sweep amortisation: the first `factorize` runs `LdltSolver::tuned` (symbolic
-//! analysis + auto-tuned settings) and caches both; `refactorize` reuses them
-//! and only redoes the numeric phase. rslab validates that the pattern (n,
+//! Sweep amortisation: the first `factorize` runs the symbolic analysis (the
+//! ordering race; the worker count comes from the calibration when
+//! `install_diagnose` has run) and caches it with the settings; `refactorize`
+//! reuses both and only redoes the numeric phase. rslab validates that the pattern (n,
 //! nnz) is unchanged and errors otherwise — `refactorize` then falls back to a
 //! fresh `factorize` instead of solving on a stale symbolic.
 //!
@@ -26,7 +27,7 @@
 //! the post-factor diagnostics (factor nnz, perturbed pivots) go to the log.
 
 use num_complex::Complex64 as C64;
-use rslab::{CscMatrix, FactorMethod, LdltSolver, LdltSymbolic, SolverSettings};
+use rslab::{CscMatrix, LdltSolver, LdltSymbolic, SolverSettings};
 use rslab::OrderingMethod;
 use super::SparseSolver;
 
@@ -35,17 +36,12 @@ use super::SparseSolver;
 /// caller's field data; beyond it the machine swaps long before OOM.
 const MEM_BUDGET_FRACTION: f64 = 0.8;
 
-/// A-priori memory gate: estimate the factorisation's transient peak for the
-/// tuned method and error out (before any numeric work) if it exceeds the
-/// budget. Returns the log line describing the estimate.
-fn check_memory(sym: &LdltSymbolic, settings: &SolverSettings) -> Result<String, String> {
+/// A-priori memory gate: estimate the factorisation's transient peak and
+/// error out (before any numeric work) if it exceeds the budget. Returns the
+/// log line describing the estimate.
+fn check_memory(sym: &LdltSymbolic) -> Result<String, String> {
     let est = sym.estimate_memory::<C64>();
-    // The transient peak differs per factorisation schedule; compare the one
-    // the tuner actually picked (multifrontal holds more than left-looking).
-    let peak = match settings.method {
-        FactorMethod::Multifrontal => est.mf_transient_peak_bytes,
-        _ => est.transient_peak_bytes,
-    };
+    let peak = est.transient_peak_bytes;
     let hw = rslab::tuning::HardwareInfo::probe();
     let budget = (hw.total_ram_bytes as f64 * MEM_BUDGET_FRACTION) as u64;
     let line = format!(
@@ -122,42 +118,24 @@ impl SparseSolver for RslabSolver {
     ) -> Result<(), String> {
         let a = self.build_matrix(n, rows, cols, vals)?;
         dump_matrix(&a);
-        let (mut sym, mut settings) = LdltSolver::<C64>::tuned(&a)
-            .map_err(|e| format!("rslab analyze/tune: {e:?}"))?;
-        // Escape hatches over the heuristic pick (rslab >= 0.19: deterministic
-        // tuned() = adaptive ordering + exact ND bakeoff + calibrated worker
-        // count; the ML tuner moved to the opt-in tuned_model). These are for
-        // experiments, not correctness.
-        // RAPIDFEM_RSLAB_ORDERING=amd|amf|metis|scotch, RAPIDFEM_RSLAB_METHOD=ll|mf.
+        // The default is the ordering race; RAPIDFEM_RSLAB_ORDERING=
+        // amd|amf|metis|rcm pins one, for experiments, not correctness.
+        let mut settings = SolverSettings::default();
         if let Ok(v) = std::env::var("RAPIDFEM_RSLAB_ORDERING") {
-            let ord = match v.to_ascii_lowercase().as_str() {
-                "amd" => Some(OrderingMethod::Amd),
-                "amf" => Some(OrderingMethod::Amf),
-                "metis" => Some(OrderingMethod::MetisND),
-                other => {
-                    eprintln!("  rslab: unknown RAPIDFEM_RSLAB_ORDERING={other:?}, ignoring");
-                    None
-                }
-            };
-            if let Some(ord) = ord {
-                if ord != settings.ordering {
-                    settings.ordering = ord;
-                    sym = LdltSymbolic::analyze_with(&a, &settings)
-                        .map_err(|e| format!("rslab analyze ({v}): {e:?}"))?;
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("RAPIDFEM_RSLAB_METHOD") {
             match v.to_ascii_lowercase().as_str() {
-                "ll" => settings.method = FactorMethod::LeftLooking,
-                "mf" => settings.method = FactorMethod::Multifrontal,
-                other => eprintln!("  rslab: unknown RAPIDFEM_RSLAB_METHOD={other:?}, ignoring"),
+                "amd" => settings.ordering.method = OrderingMethod::Amd,
+                "amf" => settings.ordering.method = OrderingMethod::Amf,
+                "metis" => settings.ordering.method = OrderingMethod::MetisND,
+                "rcm" => settings.ordering.method = OrderingMethod::Rcm,
+                other => eprintln!("  rslab: unknown RAPIDFEM_RSLAB_ORDERING={other:?}, ignoring"),
             }
         }
-        let mem_line = check_memory(&sym, &settings)?;
+        let sym = LdltSymbolic::analyze(&a, &settings)
+            .map_err(|e| format!("rslab analyze: {e:?}"))?;
+        let mem_line = check_memory(&sym)?;
         eprintln!(
-            "  rslab: {:?}/{:?}, {mem_line}, est. {:.2e} flops",
-            settings.method, settings.ordering,
+            "  rslab: {:?}, {mem_line}, est. {:.2e} flops",
+            settings.ordering.method,
             sym.estimate_memory::<C64>().factor_flops as f64,
         );
         let solver = sym.factor(&a, &settings)
@@ -175,7 +153,7 @@ impl SparseSolver for RslabSolver {
         Ok(())
     }
 
-    /// Numeric-only refactor on the cached symbolic + tuned settings. Falls
+    /// Numeric-only refactor on the cached symbolic and settings. Falls
     /// back to a full `factorize` when no symbolic is cached or the sparsity
     /// pattern changed (rslab rejects a pattern mismatch explicitly).
     fn refactorize(
@@ -217,7 +195,7 @@ impl SparseSolver for RslabSolver {
     }
 
     /// Batched multi-RHS solve: one factor traversal for all RHS. Falls back
-    /// to sequential solves when the row-major staging buffers (~3·n·nrhs
+    /// to sequential solves when the staging buffers (~3·n·nrhs
     /// complex values: packed input, equilibrated copy, output) would not
     /// comfortably fit in the currently AVAILABLE RAM.
     fn solve_many(&mut self, bs: &[Vec<C64>]) -> Result<Vec<Vec<C64>>, String> {
@@ -244,18 +222,10 @@ impl SparseSolver for RslabSolver {
             return bs.iter().map(|b| self.solve(b)).collect();
         }
         let solver = self.solver.as_ref().unwrap();
-        // Pack row-major n×nrhs (rslab's solve_many layout), solve, unpack.
-        let mut packed = vec![C64::new(0.0, 0.0); n * nrhs];
-        for (c, b) in bs.iter().enumerate() {
-            for i in 0..n {
-                packed[i * nrhs + c] = b[i];
-            }
-        }
-        let x = solver.solve_many(&packed, nrhs)
+        // rslab takes the block column-major: the right-hand sides back to back.
+        let x = solver.solve_many(&bs.concat(), nrhs)
             .map_err(|e| format!("rslab solve_many: {e:?}"))?;
-        Ok((0..nrhs)
-            .map(|c| (0..n).map(|i| x[i * nrhs + c]).collect())
-            .collect())
+        Ok(x.chunks(n).map(<[C64]>::to_vec).collect())
     }
 
     fn name(&self) -> &'static str { "rslab LDLᵀ" }

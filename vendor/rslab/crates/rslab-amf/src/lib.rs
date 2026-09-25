@@ -15,8 +15,8 @@
 //! RMF branch, lives in `rslab-ordering-core` behind the `MinFill`
 //! `Metric` impl.
 //!
-//! The public surface conforms to the RSLAB ordering-crate
-//! contract (`dev/plans/ordering-crate-contract.md`). `CscPattern`,
+//! The public surface conforms to the ordering-crate contract of
+//! `rslab-ordering-core`. `CscPattern`,
 //! `OrderingStats`, `OrderingError`, and `CONTRACT_VERSION` are
 //! re-exported from `rslab-ordering-core`.
 //!
@@ -95,16 +95,15 @@ pub fn amf_order_opts(
 /// Contract-conforming ordering producer.
 ///
 /// Signature matches the shape every RSLAB ordering crate must
-/// expose per `dev/plans/ordering-crate-contract.md`: input is a
+/// expose per the `rslab-ordering-core` contract: input is a
 /// full-symmetric [`CscPattern`] and options; output is a
 /// three-tuple of `(perm, OrderingStats, crate-stats)`, with
 /// errors in [`OrderingError`].
 ///
 /// `OrderingStats.time_us` is the wall-clock time of this call.
 /// `fill_estimate` and `flop_estimate` are left as `None` for AMF -
-/// the per-crate [`AmfStats`] carries `ndiv` / `nms_lu` / `nms_ldl`
-/// flop counters that may be surfaced here in a future revision
-/// without bumping the contract.
+/// the per-crate [`AmfStats`] carries the `ndiv` / `nms_lu` /
+/// `nms_ldl` flop counters instead.
 pub fn amf_order_full(
     pattern: &CscPattern<'_>,
     opts: &AmfOptions,

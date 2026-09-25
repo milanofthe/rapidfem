@@ -161,6 +161,20 @@ pub fn emit(level: LogLevel, msg: &str) {
     }
 }
 
+/// Run `f`, and at the `debug` level report its wall time as `what: .. ms`
+/// (the label is only built when the record is emitted). Safe from
+/// concurrent tasks: each record stands alone.
+pub(crate) fn timed<R>(what: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
+    if !enabled(LogLevel::Debug) {
+        return f();
+    }
+    let t = crate::clock::Instant::now();
+    let r = f();
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    debug(&format!("{}: {ms:.1} ms", what()));
+    r
+}
+
 pub fn debug(msg: &str) {
     emit(LogLevel::Debug, msg);
 }

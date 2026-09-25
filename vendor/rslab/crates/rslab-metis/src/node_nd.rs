@@ -72,10 +72,6 @@ impl AtomicStats {
     }
 }
 
-/// Subproblems at least this large fork their two sides onto the rayon
-/// pool; smaller ones recurse sequentially (the fork cost would show).
-const PARALLEL_MIN_VERTICES: usize = 4096;
-
 /// A child's seed: derived from the parent's seed and the child's place, so
 /// the ordering is a function of the seed alone, however the subproblems
 /// are scheduled.
@@ -85,10 +81,17 @@ fn child_seed(seed: u64, which: u64) -> u64 {
 
 pub(crate) fn nd_order(
     pattern: &CscPattern<'_>,
+    vwgt: Option<&[i32]>,
     opts: &MetisOptions,
     stats: &mut MetisStats,
 ) -> Result<Vec<i32>, OrderingError> {
-    let graph = Graph::from_csc_pattern(pattern)?;
+    let mut graph = Graph::from_csc_pattern(pattern)?;
+    if let Some(w) = vwgt {
+        if w.len() != graph.nvtxs as usize || w.iter().any(|&x| x < 1) {
+            return Err(OrderingError::MalformedInput);
+        }
+        graph.vwgt = w.to_vec();
+    }
     let n = graph.nvtxs as usize;
     let writer = IpermWriter::new(n);
     let acc = AtomicStats::default();
@@ -219,7 +222,7 @@ fn nd_subproblem(
     acc.add(&local);
 
     let (seed_a, seed_b) = (child_seed(seed, 1), child_seed(seed, 2));
-    if n >= PARALLEL_MIN_VERTICES && rayon::current_num_threads() > 1 {
+    if n >= opts.parallel_min_vertices && rayon::current_num_threads() > 1 {
         let (ra, rb) = rayon::join(
             || nd_subproblem(sub_a, map_a, offset, seed_a, opts, writer, acc),
             || nd_subproblem(sub_b, map_b, offset + na, seed_b, opts, writer, acc),
@@ -242,8 +245,7 @@ fn nd_subproblem(
 ///
 /// Refining the node separator through the hierarchy - instead of
 /// refining the edge bisection and converting at the finest level - is
-/// what closes the fill gap on 3D meshes; see
-/// `dev/research/metis-node-separator-2026-07.md`.
+/// what closes the fill gap on 3D meshes.
 fn multilevel_node_bisection(
     graph: &Graph,
     opts: &MetisOptions,
@@ -289,13 +291,7 @@ fn multilevel_node_bisection(
     // Convert the edge bisection to a node separator at the coarsest
     // level and refine it there (METIS InitSeparator tail).
     construct_separator(coarsest, &mut labels);
-    refine_node_separator(
-        coarsest,
-        &mut labels,
-        opts.max_imbalance,
-        opts.fm_passes,
-        rng,
-    );
+    refine_node_separator(coarsest, &mut labels, opts, rng);
     stats.n_fm_passes += opts.fm_passes;
 
     // Uncoarsen: project the tri-section and refine the node separator
@@ -316,13 +312,7 @@ fn multilevel_node_bisection(
         }
         labels = proj;
         balance_node_separator(prev_graph, &mut labels, opts.max_imbalance, rng);
-        refine_node_separator(
-            prev_graph,
-            &mut labels,
-            opts.max_imbalance,
-            opts.fm_passes,
-            rng,
-        );
+        refine_node_separator(prev_graph, &mut labels, opts, rng);
         stats.n_fm_passes += opts.fm_passes;
     }
 
@@ -389,8 +379,7 @@ fn graph_to_csc_pattern(graph: &Graph) -> (Vec<i32>, Vec<i32>) {
 /// into the old->new permutation `perm` (where `perm[new_pos] = old`).
 ///
 /// Rejects an out-of-range or duplicated target position rather than
-/// silently emitting a non-bijection - parity with the scotch/kahip
-/// `invert_iperm` helpers (O20).
+/// silently emitting a non-bijection.
 fn invert_iperm(iperm: &[i32], n: usize) -> Result<Vec<i32>, OrderingError> {
     let mut perm: Vec<i32> = vec![-1; n];
     for (old, &new_pos) in iperm.iter().enumerate() {
@@ -563,8 +552,7 @@ mod tests {
         // iperm[old] = new_pos: old0->2, old1->0, old2->1 => perm = [1, 2, 0].
         assert_eq!(invert_iperm(&[2, 0, 1], 3).unwrap(), vec![1, 2, 0]);
         // Two olds claiming the same position must be rejected, not
-        // silently overwritten into a non-bijection (parity with the
-        // scotch/kahip duplicate-position check; O20).
+        // silently overwritten into a non-bijection.
         assert!(matches!(
             invert_iperm(&[0, 0, 2], 3),
             Err(OrderingError::Internal(_))
@@ -600,7 +588,7 @@ mod tests {
         let pat = CscPattern::new(100, &cp, &ri).unwrap();
         let opts = MetisOptions::default();
         let mut stats = MetisStats::default();
-        let perm = nd_order(&pat, &opts, &mut stats).unwrap();
+        let perm = nd_order(&pat, None, &opts, &mut stats).unwrap();
         assert_eq!(perm.len(), 100);
         assert_permutation(&perm);
         assert!(stats.n_amd_leaf_calls >= 1);
@@ -615,7 +603,7 @@ mod tests {
         let pat = CscPattern::new(400, &cp, &ri).unwrap();
         let opts = MetisOptions::default();
         let mut stats = MetisStats::default();
-        let perm = nd_order(&pat, &opts, &mut stats).unwrap();
+        let perm = nd_order(&pat, None, &opts, &mut stats).unwrap();
         assert_eq!(perm.len(), 400);
         assert_permutation(&perm);
         assert!(
@@ -633,8 +621,8 @@ mod tests {
         let opts = MetisOptions::default();
         let mut s1 = MetisStats::default();
         let mut s2 = MetisStats::default();
-        let p1 = nd_order(&pat, &opts, &mut s1).unwrap();
-        let p2 = nd_order(&pat, &opts, &mut s2).unwrap();
+        let p1 = nd_order(&pat, None, &opts, &mut s1).unwrap();
+        let p2 = nd_order(&pat, None, &opts, &mut s2).unwrap();
         assert_eq!(p1, p2);
     }
 
@@ -649,7 +637,7 @@ mod tests {
         let pat = CscPattern::new(72, &cp, &ri).unwrap();
         let opts = MetisOptions::default();
         let mut stats = MetisStats::default();
-        let perm = nd_order(&pat, &opts, &mut stats).unwrap();
+        let perm = nd_order(&pat, None, &opts, &mut stats).unwrap();
         assert_eq!(perm.len(), 72);
         assert_permutation(&perm);
         assert_eq!(stats.n_components, 2);
@@ -767,7 +755,7 @@ mod tests {
 
         // Full ND for the total separator count.
         let mut stats2 = MetisStats::default();
-        let perm = nd_order(&pat, &opts, &mut stats2).unwrap();
+        let perm = nd_order(&pat, None, &opts, &mut stats2).unwrap();
         assert_eq!(perm.len(), n);
         println!(
             "full nd: sep_total={} amd_leaves={} levels={} two_hop={}",

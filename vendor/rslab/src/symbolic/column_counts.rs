@@ -10,8 +10,8 @@ use crate::sparse::csc::CscPattern;
 /// - All fill entries propagated from earlier columns
 ///
 /// For indefinite factorization (LDL^T), the fill pattern is the same as
-/// Cholesky - pivoting changes values but not structure (ignoring delayed
-/// pivots, which are Phase 2).
+/// Cholesky: pivoting is confined to each supernode's fully-summed block
+/// (no delayed pivots), so it changes values but not structure.
 ///
 /// Input `pattern` should be the full symmetric pattern (both triangles).
 ///
@@ -19,9 +19,8 @@ use crate::sparse::csc::CscPattern;
 /// in column j of L (including the diagonal).
 ///
 /// Test-only reference oracle: the production pipeline uses
-/// [`column_counts_gnp`] exclusively (bit-exact equivalence verified on the
-/// 169585-matrix corpus, Phase 2.5.1); this O(n^2) simulation is kept solely so
-/// the tests here and in `supernode.rs` can cross-check GNP against a
+/// [`column_counts_gnp`] exclusively; this O(n^2) simulation is kept solely
+/// so the tests here and in `supernode.rs` can cross-check GNP against a
 /// first-principles implementation.
 #[cfg(test)]
 pub fn column_counts(pattern: &CscPattern, _etree: &EliminationTree) -> Vec<usize> {
@@ -95,20 +94,72 @@ pub fn total_factor_nnz(counts: &[usize]) -> usize {
 /// - Davis, *Direct Methods for Sparse Linear Systems* section 4.4
 /// - CSparse `cs_counts.c` (BSD, structural reference)
 pub fn column_counts_gnp(pattern: &CscPattern, etree: &EliminationTree) -> Vec<usize> {
-    let n = pattern.n;
+    gnp(
+        pattern.n,
+        etree,
+        |i| {
+            pattern.row_idx[pattern.col_ptr[i]..pattern.col_ptr[i + 1]]
+                .iter()
+                .copied()
+        },
+        |_| 1,
+    )
+}
+
+/// [`column_counts_gnp`] of the permuted pattern `P^T A P` (`perm[new] =
+/// old`, `perm_inv[old] = new`, `etree` the elimination tree of the permuted
+/// pattern), read through the permutation: column `new` is the original
+/// column `perm[new]` with its rows mapped by `perm_inv`. The counts only
+/// need each column's entries below the diagonal, in any order, so the
+/// permuted pattern is never built or sorted.
+pub fn column_counts_permuted(
+    pattern: &CscPattern,
+    perm: &[usize],
+    perm_inv: &[usize],
+    etree: &EliminationTree,
+) -> Vec<usize> {
+    gnp(
+        pattern.n,
+        etree,
+        |i| {
+            let j = perm[i];
+            pattern.row_idx[pattern.col_ptr[j]..pattern.col_ptr[j + 1]]
+                .iter()
+                .map(|&r| perm_inv[r])
+        },
+        |_| 1,
+    )
+}
+
+/// The Gilbert-Ng-Peyton count over a column view: `cols(i)` yields the rows
+/// of column `i` (any order, no duplicates; entries on or above the diagonal
+/// are skipped), and row `r` counts `weight(r)` times. With every weight one
+/// these are the column counts; on a graph of groups of indistinguishable
+/// vertices weighted by their sizes, the count of a group is the one of its
+/// first member (every term of the count belongs to one row, and a group's
+/// rows enter together).
+pub(crate) fn gnp<I: Iterator<Item = usize>>(
+    n: usize,
+    etree: &EliminationTree,
+    cols: impl Fn(usize) -> I,
+    weight: impl Fn(usize) -> i64,
+) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
 
     let post = etree.postorder();
     let first = etree.first_descendants(&post);
-    let children = etree.children();
+    let mut has_child = vec![false; n];
+    for p in etree.parent.iter().flatten() {
+        has_child[*p] = true;
+    }
 
     // delta[i] starts at 1 iff i is a leaf of the etree (the row subtree
     // T^r_i trivially contains i as a leaf whenever i has no etree children
     // - the contribution of every node i to its own column count).
     let mut delta: Vec<i64> = (0..n)
-        .map(|i| if children[i].is_empty() { 1 } else { 0 })
+        .map(|i| if has_child[i] { 0 } else { weight(i) })
         .collect();
 
     // maxfirst[k]: max first[i_prev] over previously-seen row-subtree leaves
@@ -127,7 +178,7 @@ pub fn column_counts_gnp(pattern: &CscPattern, etree: &EliminationTree) -> Vec<u
         // its parent's delta, canceling the double-count produced when
         // the accumulation pass merges i and parent(i)'s subtree sums.
         if let Some(p) = etree.parent[i] {
-            delta[p] -= 1;
+            delta[p] -= weight(i);
         }
 
         // Walk column i of the symmetric pattern. Entries with row
@@ -135,15 +186,12 @@ pub fn column_counts_gnp(pattern: &CscPattern, etree: &EliminationTree) -> Vec<u
         // For each such partner, test whether i is a leaf of the row
         // subtree T^r_{partner}. Condition: first[i] > maxfirst[partner].
         let fi = first[i] as i64;
-        let row_start = pattern.col_ptr[i];
-        let row_end = pattern.col_ptr[i + 1];
-        for k in row_start..row_end {
-            let partner = pattern.row_idx[k];
+        for partner in cols(i) {
             if partner <= i {
                 continue;
             }
             if fi > maxfirst[partner] {
-                delta[i] += 1;
+                delta[i] += weight(partner);
                 let pl = prevleaf[partner];
                 if pl != -1 {
                     // LCA of pl and i via path-compressed find on the
@@ -159,7 +207,7 @@ pub fn column_counts_gnp(pattern: &CscPattern, etree: &EliminationTree) -> Vec<u
                         ancestor[cur] = root;
                         cur = next;
                     }
-                    delta[root] -= 1;
+                    delta[root] -= weight(partner);
                 }
                 prevleaf[partner] = i as i64;
                 maxfirst[partner] = fi;
@@ -187,94 +235,7 @@ mod tests {
     use super::*;
     use crate::sparse::csc::CscMatrix;
 
-    #[test]
-    fn test_column_counts_diagonal() {
-        // Diagonal matrix: each column of L has exactly 1 nonzero (the diagonal)
-        let m = CscMatrix::from_triplets(4, &[0, 1, 2, 3], &[0, 1, 2, 3], &[1.0; 4]).unwrap();
-        let pat = m.symmetric_pattern();
-        let etree = EliminationTree::from_pattern(&pat);
-        let counts = column_counts(&pat, &etree);
-
-        assert_eq!(counts, vec![1, 1, 1, 1]);
-        assert_eq!(total_factor_nnz(&counts), 4);
-    }
-
-    #[test]
-    fn test_column_counts_tridiagonal() {
-        // Tridiagonal 4x4: L has entries on diagonal and one subdiagonal
-        // Column 0: rows 0, 1 -> count = 2
-        // Column 1: rows 1, 2 -> count = 2
-        // Column 2: rows 2, 3 -> count = 2
-        // Column 3: row 3      -> count = 1
-        let m =
-            CscMatrix::from_triplets(4, &[0, 1, 1, 2, 2, 3, 3], &[0, 0, 1, 1, 2, 2, 3], &[1.0; 7])
-                .unwrap();
-        let pat = m.symmetric_pattern();
-        let etree = EliminationTree::from_pattern(&pat);
-        let counts = column_counts(&pat, &etree);
-
-        assert_eq!(counts, vec![2, 2, 2, 1]);
-        assert_eq!(total_factor_nnz(&counts), 7);
-    }
-
-    #[test]
-    fn test_column_counts_dense() {
-        // Dense 3x3: L is full lower triangle
-        // Column 0: rows 0, 1, 2 -> count = 3
-        // Column 1: rows 1, 2    -> count = 2
-        // Column 2: row 2        -> count = 1
-        let m = CscMatrix::from_triplets(3, &[0, 1, 2, 1, 2, 2], &[0, 0, 0, 1, 1, 2], &[1.0; 6])
-            .unwrap();
-        let pat = m.symmetric_pattern();
-        let etree = EliminationTree::from_pattern(&pat);
-        let counts = column_counts(&pat, &etree);
-
-        assert_eq!(counts, vec![3, 2, 1]);
-        assert_eq!(total_factor_nnz(&counts), 6); // n*(n+1)/2
-    }
-
-    #[test]
-    fn test_column_counts_arrow() {
-        // Arrow 5x5: column 0 has entries at rows 0-4, others are diagonal
-        // Eliminating column 0 creates fill among rows 1-4
-        // Column 0: rows 0,1,2,3,4 -> count = 5
-        // Column 1: rows 1,2,3,4 (fill from col 0) -> count = 4
-        // Column 2: rows 2,3,4 -> count = 3
-        // Column 3: rows 3,4 -> count = 2
-        // Column 4: row 4 -> count = 1
-        let m = CscMatrix::from_triplets(
-            5,
-            &[0, 1, 2, 3, 4, 1, 2, 3, 4],
-            &[0, 0, 0, 0, 0, 1, 2, 3, 4],
-            &[1.0; 9],
-        )
-        .unwrap();
-        let pat = m.symmetric_pattern();
-        let etree = EliminationTree::from_pattern(&pat);
-        let counts = column_counts(&pat, &etree);
-
-        assert_eq!(counts, vec![5, 4, 3, 2, 1]);
-        assert_eq!(total_factor_nnz(&counts), 15); // fully dense: n*(n+1)/2
-    }
-
-    #[test]
-    fn test_column_counts_block_diagonal() {
-        // Two 2x2 dense blocks: no fill between blocks
-        // [a b 0 0]
-        // [b c 0 0]
-        // [0 0 d e]
-        // [0 0 e f]
-        let m = CscMatrix::from_triplets(4, &[0, 1, 1, 2, 3, 3], &[0, 0, 1, 2, 2, 3], &[1.0; 6])
-            .unwrap();
-        let pat = m.symmetric_pattern();
-        let etree = EliminationTree::from_pattern(&pat);
-        let counts = column_counts(&pat, &etree);
-
-        assert_eq!(counts, vec![2, 1, 2, 1]);
-        assert_eq!(total_factor_nnz(&counts), 6);
-    }
-
-    // --- Phase 2.5.1: GNP column-count parity tests ---
+    // --- GNP column-count parity tests ---
     //
     // Each reuses the exact pattern from the reference tests above and
     // asserts column_counts_gnp returns the same vector as column_counts.

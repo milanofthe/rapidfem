@@ -17,4 +17,3 @@ name = "rslab_amd"
 [dependencies]
 rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
 
-[dev-dependencies]

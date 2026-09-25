@@ -1,8 +1,7 @@
 //! AMD elimination-loop primitives: pivot selection and element
 //! construction (plus standard absorption).
 //!
-//! This module lands Commit 4 of the Slice A plan. It ports faer's
-//! `amd.rs:220-365` line-by-line:
+//! Transliterates faer's `amd.rs:220-365` line-by-line:
 //!
 //! - [`select_pivot`]: linear scan from `mindeg`, LIFO unlink.
 //! - [`create_element`]: both the in-place (`elenme == 0`) and
@@ -19,8 +18,9 @@
 //! Pass-1 `w[e]` seeding (`amd.rs:366-385`), Pass-2 approximate
 //! degree (`amd.rs:386-465`), aggressive absorption, monotone
 //! degree cap, and re-insertion into degree lists (`amd.rs:516-546`)
-//! live in [`finalize_step`]. Mass elimination and supervariable
-//! detection are Slice B (Commits 9-10).
+//! live in [`finalize_step`], together with mass elimination and
+//! supervariable detection. The `_amf` variants are the AMF
+//! counterparts (see `metric.rs`).
 
 #![allow(dead_code)]
 
@@ -106,8 +106,8 @@ pub fn select_pivot(ws: &mut Workspace) -> Option<usize> {
 /// - For every absorbed element `e != me` in the elenme>0 branch:
 ///   `pe[e] = flip(me)`, `w[e] = 0`. This is **standard absorption**
 ///   (faer `amd.rs:355-358`) - it fires unconditionally at each
-///   `knt1` iter's end. Aggressive absorption (Pass-2 only) lands
-///   in Commit 5.
+///   `knt1` iter's end. Aggressive absorption happens in Pass-2
+///   ([`finalize_step`]).
 /// - `ws.wflg` bumped via `clear_flag`.
 /// - `ws.nel` incremented by `nvpiv`.
 ///
@@ -404,7 +404,7 @@ pub fn finalize_step(
                 let e = ws.iw[p] as usize;
                 let we = ws.w[e];
                 if we != 0 {
-                    // Invariant (O4): a live element in the non-aggressive pass
+                    // Invariant: a live element in the non-aggressive pass
                     // always has `we >= ws.wflg`, so the difference is
                     // non-negative. Guard the unchecked `as usize` cast - a
                     // future regression that broke the invariant would
@@ -656,10 +656,9 @@ fn amf_bucket_of(score: i64, n: usize) -> usize {
 /// Computed in `i64`: both factors are `O(n)`, so the product reaches
 /// ~`n^2` and overflows `i32` for `n` >~ 46k (`i32::MAX` is
 /// 2_147_483_647 and `46342 * 46341 = 2_147_534_622` already exceeds
-/// it). In release the old `i32` form wrapped silently, feeding garbage
-/// into the RMF pivot score; in debug it panicked. The value is later
-/// consumed as `f64`, so widening loses no precision (O1,
-/// `dev/research/repo-review-2026-06-09.md`).
+/// it). In `i32` it would wrap silently in release, feeding garbage
+/// into the RMF pivot score, and panic in debug. The value is later
+/// consumed as `f64`, so widening loses no precision.
 #[inline(always)]
 fn amf_wf_surface(dext: i64, degree: i64) -> i64 {
     dext * (2 * degree - dext - 1)
@@ -670,7 +669,7 @@ fn amf_wf_surface(dext: i64, degree: i64) -> i64 {
 /// HAMF4 variant). Computed in `i64` for the same
 /// `O(n^2)` overflow reason as [`amf_wf_surface`]: `nvi` (supervariable
 /// size) and `wf3` (sum of neighbour supervariable sizes) are each
-/// `O(n)` (O1, `dev/research/repo-review-2026-06-09.md`).
+/// `O(n)`.
 #[inline(always)]
 fn amf_wf_combine(wf4: i64, nvi: i64, wf3: i64) -> i64 {
     wf4 + 2 * nvi * wf3
@@ -688,8 +687,6 @@ const AMF_DUMMY_I32: i32 = i32::MAX - 1;
 /// Side effects: `ws.mindeg` advances to the chosen bucket index. The
 /// chosen `me` is unlinked from its degree-list chain (head update for
 /// fine buckets, doubly-linked unlink for coarse buckets).
-///
-/// Behavior validated against the HAMF4 oracle corpus.
 pub fn select_pivot_amf(ws: &mut Workspace) -> Option<usize> {
     let n = ws.n;
     let nbuck = ws.head.len();
@@ -905,8 +902,7 @@ pub fn create_element_amf(
 /// computes the quantized RMF score and inserts at
 /// `head[amf_bucket_of(wf[i], n)]`.
 ///
-/// Six metric-specific sites compared to AMD (numbered per
-/// `dev/research/amf-clean-room.md` Section 6):
+/// Six metric-specific sites compared to AMD:
 /// 1. Pass-1 also resets `wf[e] = 0` on the first touch of each
 ///    element (lazy cache sentinel).
 /// 2. Pass-2 element walk caches `wf[e] = dext * (2*deg(e) - dext - 1)`
@@ -919,9 +915,6 @@ pub fn create_element_amf(
 /// 6. Re-insertion uses the saturated/regular RMF formula with
 ///    `dummy = i32::MAX - 1`, quantizes via `bucket(wf[i], n)`, and
 ///    threads through `head` of length `2 * n + 2`.
-///
-/// Behavior validated against the HAMF4 oracle corpus
-/// (`tests/amf_corpus_oracle.rs`, 183k matrices within 1.10x fill).
 #[allow(clippy::too_many_arguments)]
 pub fn finalize_step_amf(
     ws: &mut Workspace,
@@ -953,7 +946,7 @@ pub fn finalize_step_amf(
                     we -= nvi;
                 } else if we != 0 {
                     we = ws.degree[e] + wnvi;
-                    // O21 (repo-review-2026-06-09): `wf[e] = 0` is the
+                    // `wf[e] = 0` is the
                     // lazy-cache "surface not yet computed this iteration"
                     // sentinel for Pass-2 below. It is intentionally NOT
                     // distinct from a genuine surface contribution of 0:
@@ -973,8 +966,6 @@ pub fn finalize_step_amf(
                     // quantization), so -1 would have to be proven never to
                     // leak into either across the AMD and AMF paths - added
                     // correctness risk for a handful of saved ops.
-                    // "Correctness before performance." See
-                    // dev/tried-and-rejected.md (O21).
                     ws.wf[e] = 0;
                 }
                 ws.w[e] = we;
@@ -1004,7 +995,7 @@ pub fn finalize_step_amf(
                     let dext = we - ws.wflg;
                     if dext > 0 {
                         // `wf[e] == 0` means "uncached this iter" OR a genuine
-                        // 0 surface (O21) - recompute on the latter is benign
+                        // 0 surface - recompute on the latter is benign
                         // (same value). See the Pass-1 reset comment above.
                         if ws.wf[e] == 0 {
                             // First touch this iter: cache the surface
@@ -1029,7 +1020,7 @@ pub fn finalize_step_amf(
                 let we = ws.w[e];
                 if we != 0 {
                     let dext = we - ws.wflg;
-                    // Invariant (O4): non-aggressive pass keeps `we >= ws.wflg`,
+                    // Invariant: non-aggressive pass keeps `we >= ws.wflg`,
                     // so `dext >= 0`. Guard the `dext as usize` cast below
                     // against a future regression wrapping a negative dext to
                     // ~2^64.
@@ -1039,7 +1030,7 @@ pub fn finalize_step_amf(
                         ws.wflg
                     );
                     // `wf[e] == 0` means "uncached this iter" OR a genuine 0
-                    // surface (O21) - recompute on the latter is benign (same
+                    // surface - recompute on the latter is benign (same
                     // value). See the Pass-1 reset comment above.
                     if ws.wf[e] == 0 {
                         ws.wf[e] = amf_wf_surface(dext as i64, ws.degree[e] as i64);
@@ -1301,10 +1292,11 @@ pub fn run_elimination_amf(
 /// has been either pivoted or dense-deferred. Returns the
 /// accumulated flop counts.
 ///
-/// Mass elimination and supervariable detection are absent (Slice
-/// B). Inline garbage collection is live; fixtures whose working
-/// set transiently exceeds `iwlen` recover via in-place compaction
-/// and bump `ws.ncmpa`.
+/// Each step runs [`select_pivot`], [`create_element`] and
+/// [`finalize_step`] (which includes mass elimination and
+/// supervariable detection). Inline garbage collection is live;
+/// fixtures whose working set transiently exceeds `iwlen` recover via
+/// in-place compaction and bump `ws.ncmpa`.
 ///
 /// At exit: `ws.nel == ws.n`, every `pe[i]` either points to a
 /// live parent (to be path-compressed by the postorder phase) or
@@ -1342,8 +1334,7 @@ pub fn run_elimination(ws: &mut Workspace, aggressive: bool) -> Result<StepFlops
 /// 2. Path compression (`amd.rs:573-590`): each absorbed
 ///    supervariable `i` (`nv[i] == 0`) has its `pe` chain walked
 ///    until a pivot is found, then all intermediates are rewritten
-///    to point at that pivot directly. Inert in Slice A - becomes
-///    active once supervariable detection (Slice B) lands.
+///    to point at that pivot directly.
 /// 3. Assembly-tree postorder with big-child-last heuristic
 ///    (`amd.rs:5-49`, `amd.rs:51-124`, `amd.rs:593-599`). Reuses
 ///    `head`/`next`/`last` as child/sibling/stack scratch; writes
@@ -1571,7 +1562,7 @@ mod tests {
         Workspace::new(&p, &WorkspaceOptions::default()).unwrap()
     }
 
-    /// O1 (repo-review-2026-06-09.md): the AMF working-fill kernels must
+    /// The AMF working-fill kernels must
     /// be computed in `i64`. Both factors are `O(n)`, so for `n` >~ 46k
     /// the products exceed `i32::MAX` (2_147_483_647) and wrap silently
     /// in release / panic in debug, feeding garbage into the RMF pivot
@@ -1744,11 +1735,9 @@ mod tests {
         assert_eq!(ws.nel, n);
     }
 
-    /// Grid 7x7: five-point stencil. Faer's oracle reports
-    /// `ncmpa == 0`, but Slice A lacks mass elimination and
-    /// supervariable detection, so it consumes more `iw` space and
-    /// may trip the inline GC. With Commit 6 the loop terminates
-    /// cleanly regardless of how many compactions are needed.
+    /// Grid 7x7: five-point stencil. The loop must terminate cleanly
+    /// and eliminate every variable regardless of how many inline GC
+    /// compactions are needed.
     #[test]
     fn run_elimination_grid_7x7() {
         let m = 7usize;
@@ -1787,7 +1776,7 @@ mod tests {
     }
 
     /// Band(20,3) triggers garbage collection in faer (oracle
-    /// ncmpa=1). Commit 6 must run the compaction and finish the
+    /// ncmpa=1). The loop must run the compaction and finish the
     /// elimination; verify both.
     #[test]
     fn run_elimination_band_20_3_triggers_gc() {

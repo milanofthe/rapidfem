@@ -63,8 +63,7 @@ impl Default for RefinePolicy {
 }
 
 impl RefinePolicy {
-    /// The historical `solve_refined(a, b, max_iter)` behaviour: a fixed step
-    /// budget, no early stop.
+    /// A fixed budget of `max_steps` steps, no early stop.
     pub fn steps(max_steps: usize) -> Self {
         Self {
             max_steps,

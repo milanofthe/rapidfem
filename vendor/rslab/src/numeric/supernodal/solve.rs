@@ -12,7 +12,7 @@
 //! per entry, and runs the inner loops over contiguous memory.
 //!
 //! Parallelism comes from the supernodal elimination tree. The tree is cut
-//! into a fixed number of independent leaf subtrees ([`LEAF_SUBTREES`], not a
+//! into a fixed number of independent leaf subtrees (`SolveSettings::leaf_subtrees`, not a
 //! function of the thread count) plus the ancestors above the cut. In the
 //! forward sweep the subtrees run in parallel; updates that leave a subtree
 //! (into ancestor rows) go to a per-subtree accumulator and are reduced in
@@ -29,30 +29,12 @@
 
 use rayon::prelude::*;
 
-use crate::dense::ldlt_generic::LdltFactors;
 use crate::error::RslabError;
-use crate::numeric::panel_factor::PanelFactor;
+use crate::numeric::ldlt::LdltPivots;
+use crate::numeric::supernodal::panel::PanelFactor;
 use crate::scalar::{fmadd, Scalar};
 
 const NONE: u32 = u32::MAX;
-
-/// Number of independent leaf subtrees the elimination tree is cut into (the
-/// summation order, and with it the result, does not depend on threads).
-const LEAF_SUBTREES: usize = 128;
-
-/// Column block of the ancestor-node sweeps: a block's triangle is one
-/// sequential task, its update of the rows below (the bulk of the work) is
-/// spread over row-range tasks.
-const TRI_NB: usize = 512;
-
-/// Columns per product / dot task of the ancestor sweeps.
-const ANCESTOR_COL_CHUNK: usize = 32;
-
-/// Panel entries from which an ancestor node uses the blocked, chunked
-/// sweep (with parallel sections when it runs alone); smaller ancestors use
-/// the plain node kernels. A size rule, so the arithmetic of a node never
-/// depends on the thread count.
-const APEX_MIN_WORK: usize = 1 << 18;
 
 /// One leaf subtree of the cut: its supernodes in elimination order and the
 /// ancestor columns its off-tree updates accumulate into.
@@ -91,6 +73,8 @@ pub(crate) struct SolvePlan<T> {
     top_paths: Vec<Vec<u32>>,
     /// Position of a supernode in `top` (`NONE` below the cut).
     top_index: Vec<u32>,
+    /// The blocking of the sweeps.
+    cfg: crate::SolveSettings,
 }
 
 /// Per-task scratch vectors, reused across nodes: the big nodes need
@@ -139,7 +123,12 @@ impl<T: Scalar> SolvePlan<T> {
     /// tree of the analysis (`usize::MAX` for a root); an empty or
     /// mismatched one is replaced by the parent implied by the first
     /// off-block row of every supernode.
-    pub fn from_panels(factor: PanelFactor<T>, supernode_parent: &[usize], unit: bool) -> Self {
+    pub fn from_panels(
+        factor: PanelFactor<T>,
+        supernode_parent: &[usize],
+        unit: bool,
+        cfg: crate::SolveSettings,
+    ) -> Self {
         let n = factor.n;
         let ns = factor.n_supernodes();
         let sn_col: Vec<u32> = factor.sn_col.clone();
@@ -209,7 +198,7 @@ impl<T: Scalar> SolvePlan<T> {
             .filter(|&s| parent[s] == NONE)
             .map(|s| work[s])
             .sum();
-        let leaf_cap = total / LEAF_SUBTREES as u64;
+        let leaf_cap = total / cfg.leaf_subtrees.max(1) as u64;
 
         // Cut: split the heaviest subtree until every leaf subtree is under
         // the cap (or a single supernode).
@@ -383,6 +372,11 @@ impl<T: Scalar> SolvePlan<T> {
             top_levels,
             top_paths,
             top_index,
+            cfg: crate::SolveSettings {
+                block: cfg.block.max(1),
+                ancestor_chunk: cfg.ancestor_chunk.max(1),
+                ..cfg
+            },
         }
     }
 
@@ -411,7 +405,11 @@ impl<T: Scalar> SolvePlan<T> {
     /// `acc` (rows outside the subtree).
     fn fwd_node(&self, s: u32, y: &mut [T], acc: &mut [T], t: &mut Vec<T>) {
         let (c0, w, r0, m, ld, panel) = self.node(s);
+        let unit = self.diag_inv.is_empty();
         for k in 0..w {
+            if !unit {
+                y[c0 + k] = y[c0 + k] * self.diag_inv[c0 + k];
+            }
             let yk = y[c0 + k];
             let col = &panel[k * ld..k * ld + w];
             for i in k + 1..w {
@@ -498,11 +496,11 @@ impl<T: Scalar> SolvePlan<T> {
     }
 
     /// Solve `L D L^T y = y` in place on the permuted, scaled right-hand side.
-    pub fn solve_in_place(&self, f: &LdltFactors<T>, y: &mut [T]) -> Result<(), RslabError> {
+    pub fn solve_in_place(&self, f: &LdltPivots<T>, y: &mut [T]) -> Result<(), RslabError> {
         Self::in_pool(|| self.solve_in_place_inner(f, y))
     }
 
-    fn solve_in_place_inner(&self, f: &LdltFactors<T>, y: &mut [T]) -> Result<(), RslabError> {
+    fn solve_in_place_inner(&self, f: &LdltPivots<T>, y: &mut [T]) -> Result<(), RslabError> {
         debug_assert_eq!(y.len(), self.n);
         let mut phases = PhaseTrace::start();
         self.forward_single(y);
@@ -616,7 +614,7 @@ impl<T: Scalar> SolvePlan<T> {
                 let len = self.top_paths[self.top_index[s as usize] as usize].len() * nr;
                 // SAFETY: node `i` owns `acc_all[offsets[i]..offsets[i] + len]`.
                 let acc = unsafe { &mut accs.slice()[offsets[i]..offsets[i] + len] };
-                if self.work(s) >= APEX_MIN_WORK {
+                if self.work(s) >= self.cfg.apex_min_work {
                     self.apex_forward(s, nr, y, acc, par, sc);
                 } else if nr == 1 {
                     self.fwd_node(s, y, acc, &mut sc.t);
@@ -659,7 +657,7 @@ impl<T: Scalar> SolvePlan<T> {
         for level in &self.top_levels {
             let node_par = level.len() >= nt || nt == 1;
             let sweep = |s: u32, x: &mut [T], par: bool, sc: &mut Scratch<T>| {
-                if self.work(s) >= APEX_MIN_WORK {
+                if self.work(s) >= self.cfg.apex_min_work {
                     self.apex_backward(s, nr, x, par, sc);
                 } else if nr == 1 {
                     self.bwd_node(s, x, &mut sc.g);
@@ -684,7 +682,7 @@ impl<T: Scalar> SolvePlan<T> {
 
     /// Forward sweep through one large ancestor node: the extended vector
     /// `v = [y_block, t]` (`t` the negated off-block product) in column
-    /// blocks of `TRI_NB`; the block triangle sequential, the update of the
+    /// blocks of `block`; the block triangle sequential, the update of the
     /// rows below as column-chunk products into private slabs plus a
     /// reduction in fixed chunk order, both parallel when `par` (the same
     /// arithmetic either way). The off-block rows end up in `acc` (the
@@ -703,16 +701,17 @@ impl<T: Scalar> SolvePlan<T> {
         v.clear();
         v.extend_from_slice(&y[c0 * nr..(c0 + w) * nr]);
         v.resize(ld * nr, T::zero());
-        let gmax = TRI_NB.div_ceil(ANCESTOR_COL_CHUNK);
+        let gmax = self.cfg.block.div_ceil(self.cfg.ancestor_chunk);
         let partial = &mut sc.partial;
-        for (jb, je) in col_blocks(w) {
-            tri_forward(v, panel, ld, nr, jb, je);
+        for (jb, je) in col_blocks(w, self.cfg.block) {
+            let dinv = self.diag_inv.get(c0..c0 + w).unwrap_or(&[]);
+            tri_forward(v, panel, dinv, ld, nr, jb, je);
             if je == ld {
                 break;
             }
             let chunks: Vec<(usize, usize)> = (jb..je)
-                .step_by(ANCESTOR_COL_CHUNK)
-                .map(|k| (k, (k + ANCESTOR_COL_CHUNK).min(je)))
+                .step_by(self.cfg.ancestor_chunk)
+                .map(|k| (k, (k + self.cfg.ancestor_chunk).min(je)))
                 .collect();
             let rows = ld - je;
             let slab = rows * nr;
@@ -725,7 +724,13 @@ impl<T: Scalar> SolvePlan<T> {
                     let vk = &vhead[k * nr..(k + 1) * nr];
                     let col = &panel[k * ld + je..(k + 1) * ld];
                     if nr == 1 {
-                        axpy(out, vk[0], col);
+                        // `col[i] * vk`, the block branch's operand order: the fused complex
+                        // multiply-add is not symmetric in its factors (the imaginary part
+                        // nests the two cross products in operand order), so the other order
+                        // made a one-column solve differ from a block column under FMA.
+                        for (o, &l) in out.iter_mut().zip(col) {
+                            *o = fmadd(l, vk[0], *o);
+                        }
                     } else {
                         for (row, &l) in out.chunks_exact_mut(nr).zip(col) {
                             axpy(row, l, vk);
@@ -783,27 +788,27 @@ impl<T: Scalar> SolvePlan<T> {
         let accv = &mut sc.accv;
         accv.clear();
         accv.resize(w * nr, T::zero());
-        for (jb, je) in col_blocks(w).into_iter().rev() {
+        for (jb, je) in col_blocks(w, self.cfg.block).into_iter().rev() {
             if je < ld {
                 let tail: &[T] = &v[je * nr..ld * nr];
                 let dots = |c: usize, outs: &mut [T]| {
                     for (kk, out) in outs.chunks_exact_mut(nr).enumerate() {
-                        let k = jb + c * ANCESTOR_COL_CHUNK + kk;
+                        let k = jb + c * self.cfg.ancestor_chunk + kk;
                         let col = &panel[k * ld + je..(k + 1) * ld];
                         if nr == 1 {
                             out[0] = dot4(col, tail);
                         } else {
-                            gemv_t_block(out, col, tail, nr);
+                            dot4_block(out, col, tail, nr);
                         }
                     }
                 };
                 let ab = &mut accv[jb * nr..je * nr];
                 if par {
-                    ab.par_chunks_mut(ANCESTOR_COL_CHUNK * nr)
+                    ab.par_chunks_mut(self.cfg.ancestor_chunk * nr)
                         .enumerate()
                         .for_each(|(c, outs)| dots(c, outs));
                 } else {
-                    for (c, outs) in ab.chunks_mut(ANCESTOR_COL_CHUNK * nr).enumerate() {
+                    for (c, outs) in ab.chunks_mut(self.cfg.ancestor_chunk * nr).enumerate() {
                         dots(c, outs);
                     }
                 }
@@ -822,6 +827,11 @@ impl<T: Scalar> SolvePlan<T> {
         let (c0, w, r0, m, ld, panel) = self.node(s);
         for k in 0..w {
             let (head, tail) = y.split_at_mut((c0 + k + 1) * nr);
+            if let Some(&d) = self.diag_inv.get(c0 + k) {
+                for v in &mut head[(c0 + k) * nr..] {
+                    *v = *v * d;
+                }
+            }
             let yk = &head[(c0 + k) * nr..];
             let col = &panel[k * ld..k * ld + w];
             for i in k + 1..w {
@@ -865,8 +875,7 @@ impl<T: Scalar> SolvePlan<T> {
         accv.resize(nr, T::zero());
         for k in (0..w).rev() {
             let col = &panel[k * ld..(k + 1) * ld];
-            accv.iter_mut().for_each(|a| *a = T::zero());
-            gemv_t_block(accv, &col[w..], g, nr);
+            dot4_block(accv, &col[w..], g, nr);
             for i in k + 1..w {
                 let l = col[i];
                 let xi = &x[(c0 + i) * nr..(c0 + i + 1) * nr];
@@ -884,7 +893,7 @@ impl<T: Scalar> SolvePlan<T> {
     /// Solve `L D L^T Y = Y` in place on a row-major `n x nrhs` block.
     pub fn solve_block_in_place(
         &self,
-        f: &LdltFactors<T>,
+        f: &LdltPivots<T>,
         y: &mut [T],
         nr: usize,
     ) -> Result<(), RslabError> {
@@ -893,7 +902,7 @@ impl<T: Scalar> SolvePlan<T> {
 
     fn solve_block_inner(
         &self,
-        f: &LdltFactors<T>,
+        f: &LdltPivots<T>,
         y: &mut [T],
         nr: usize,
     ) -> Result<(), RslabError> {
@@ -966,29 +975,34 @@ fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
     }
 }
 
-/// `out += sum_i col[i] * g[i, :]` over the row-major `g` (`nr` wide), with
-/// four independent partial sums to hide the FMA latency (fixed order).
+/// `out[c] = dot4(col, g[:, c])` for every column of the row-major `g` (`nr`
+/// wide): four independent partial sums to hide the FMA latency, in exactly
+/// the association of [`dot4`]. A column's value therefore does not depend on
+/// how many right-hand sides share the sweep, which a non-flexible Krylov
+/// method needs (its update applies the solve to one column, its Arnoldi
+/// steps to a block; any difference breaks the Arnoldi relation).
 #[inline(always)]
-fn gemv_t_block<T: Scalar>(out: &mut [T], col: &[T], g: &[T], nr: usize) {
+fn dot4_block<T: Scalar>(out: &mut [T], col: &[T], g: &[T], nr: usize) {
     let m = col.len().min(g.len() / nr.max(1));
-    let mut acc1 = vec![T::zero(); nr];
-    let mut acc2 = vec![T::zero(); nr];
-    let mut acc3 = vec![T::zero(); nr];
+    let mut s = vec![T::zero(); 4 * nr];
+    let (s0, rest) = s.split_at_mut(nr);
+    let (s1, rest) = rest.split_at_mut(nr);
+    let (s2, s3) = rest.split_at_mut(nr);
     let mut i = 0;
     while i + 4 <= m {
-        axpy(out, col[i], &g[i * nr..(i + 1) * nr]);
-        axpy(&mut acc1, col[i + 1], &g[(i + 1) * nr..(i + 2) * nr]);
-        axpy(&mut acc2, col[i + 2], &g[(i + 2) * nr..(i + 3) * nr]);
-        axpy(&mut acc3, col[i + 3], &g[(i + 3) * nr..(i + 4) * nr]);
+        axpy(s0, col[i], &g[i * nr..(i + 1) * nr]);
+        axpy(s1, col[i + 1], &g[(i + 1) * nr..(i + 2) * nr]);
+        axpy(s2, col[i + 2], &g[(i + 2) * nr..(i + 3) * nr]);
+        axpy(s3, col[i + 3], &g[(i + 3) * nr..(i + 4) * nr]);
         i += 4;
+    }
+    for c in 0..nr {
+        out[c] = (s0[c] + s1[c]) + (s2[c] + s3[c]);
     }
     while i < m {
         axpy(out, col[i], &g[i * nr..(i + 1) * nr]);
         i += 1;
     }
-    add_assign(out, &acc1);
-    add_assign(out, &acc2);
-    add_assign(out, &acc3);
 }
 
 /// `y -= a * x`.
@@ -1060,9 +1074,23 @@ impl PhaseTrace {
 
 /// Unit-lower triangular solve of column block `[jb, je)` on `v` (row-major
 /// `nr` wide), in place.
-fn tri_forward<T: Scalar>(v: &mut [T], panel: &[T], ld: usize, nr: usize, jb: usize, je: usize) {
+#[allow(clippy::too_many_arguments)]
+fn tri_forward<T: Scalar>(
+    v: &mut [T],
+    panel: &[T],
+    diag_inv: &[T],
+    ld: usize,
+    nr: usize,
+    jb: usize,
+    je: usize,
+) {
     for k in jb..je {
         let (head, tail) = v.split_at_mut((k + 1) * nr);
+        if let Some(&d) = diag_inv.get(k) {
+            for x in &mut head[k * nr..] {
+                *x = *x * d;
+            }
+        }
         let vk = &head[k * nr..];
         let col = &panel[k * ld + k + 1..k * ld + je];
         if nr == 1 {
@@ -1095,9 +1123,10 @@ fn tri_backward<T: Scalar>(
         if nr == 1 {
             ak[0] = ak[0] + dot4(col, &tail[..je - k - 1]);
         } else {
-            for (&l, xi) in col.iter().zip(tail[..(je - k - 1) * nr].chunks_exact(nr)) {
-                axpy(ak, l, xi);
-            }
+            // as the single column: the dot first, then onto the accumulator
+            let mut d = vec![T::zero(); nr];
+            dot4_block(&mut d, col, &tail[..(je - k - 1) * nr], nr);
+            add_assign(ak, &d);
         }
         let xk = &mut head[k * nr..];
         sub_assign(xk, ak);
@@ -1108,11 +1137,11 @@ fn tri_backward<T: Scalar>(
     }
 }
 
-/// Column blocks `[jb, je)` of width `TRI_NB` over `w` columns.
-fn col_blocks(w: usize) -> Vec<(usize, usize)> {
+/// Column blocks `[jb, je)` of width `nb` over `w` columns.
+fn col_blocks(w: usize, nb: usize) -> Vec<(usize, usize)> {
     (0..w)
-        .step_by(TRI_NB)
-        .map(|jb| (jb, (jb + TRI_NB).min(w)))
+        .step_by(nb)
+        .map(|jb| (jb, (jb + nb).min(w)))
         .collect()
 }
 
@@ -1139,7 +1168,7 @@ fn dot4<T: Scalar>(a: &[T], b: &[T]) -> T {
 
 /// `D z = y` for the block diagonal (1x1 and 2x2 pivots), on `nr` right-hand
 /// sides stored row-major.
-fn solve_diagonal<T: Scalar>(f: &LdltFactors<T>, y: &mut [T], nr: usize) -> Result<(), RslabError> {
+fn solve_diagonal<T: Scalar>(f: &LdltPivots<T>, y: &mut [T], nr: usize) -> Result<(), RslabError> {
     let n = f.n;
     let mut k = 0;
     while k < n {
@@ -1177,7 +1206,6 @@ fn solve_diagonal<T: Scalar>(f: &LdltFactors<T>, y: &mut [T], nr: usize) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use crate::dense::ldlt_generic::solve_ldlt_many;
     use crate::{CscMatrix, LdltSolver, SolverSettings};
 
     /// A 2D grid Laplacian shifted to be indefinite (2x2 pivots appear).
@@ -1266,7 +1294,7 @@ mod tests {
             let opts = SolverSettings::default()
                 .with_threads(1)
                 .with_ordering(crate::OrderingMethod::MetisND);
-            let s = LdltSolver::factor_with(a, &opts).unwrap();
+            let s = LdltSolver::factor(a, &opts).unwrap();
             let b: Vec<f64> = (0..n).map(|i| ((i * 31) % 17) as f64 - 8.0).collect();
             let x1 = s.solve(&b).unwrap();
             assert!(residual(a, &x1, &b) < 1e-10, "residual m={m} shift={shift}");
@@ -1277,18 +1305,11 @@ mod tests {
                 .collect();
             let xb = s.solve_many(&bb, nrhs).unwrap();
             for c in 0..nrhs {
-                let bc: Vec<f64> = (0..n).map(|i| bb[i * nrhs + c]).collect();
+                let bc: Vec<f64> = (0..n).map(|i| bb[c * n + i]).collect();
                 let xc = s.solve(&bc).unwrap();
                 for i in 0..n {
-                    assert!((xb[i * nrhs + c] - xc[i]).abs() <= 1e-9 * (1.0 + xc[i].abs()));
+                    assert!((xb[c * n + i] - xc[i]).abs() <= 1e-9 * (1.0 + xc[i].abs()));
                 }
-            }
-            // The scalar CSC kernel on the same factor gives the same answer
-            // up to rounding.
-            let f = crate::factor_sparse_ldlt_with(a, &opts).unwrap();
-            let xs = solve_ldlt_many(&f, &b, 1).unwrap();
-            for i in 0..n {
-                assert!((xs[i] - x1[i]).abs() <= 1e-9 * (1.0 + x1[i].abs()));
             }
             // Bit-identical for every thread count.
             for threads in [1usize, 2, 5] {
@@ -1307,10 +1328,10 @@ mod tests {
     #[test]
     fn plan_cuts_the_tree_and_falls_back_on_pruned_factors() {
         let a = grid(60, 0.0);
-        let s = LdltSolver::factor_with(&a, &SolverSettings::default().with_threads(1)).unwrap();
+        let s = LdltSolver::factor(&a, &SolverSettings::default().with_threads(1)).unwrap();
         assert!(s.plan.subtrees.len() > 1);
         assert!(!s.plan.top_levels.is_empty());
-        let pruned = LdltSolver::factor_with(
+        let pruned = LdltSolver::factor(
             &a,
             &SolverSettings::default().with_threads(1).with_drop_tol(0.2),
         )
@@ -1371,39 +1392,31 @@ mod tests {
     #[test]
     fn lu_plans_solve_and_are_thread_invariant() {
         use crate::{LuSolver, OrderingMethod};
-        for (m, method) in [
-            (30usize, crate::FactorMethod::LeftLooking),
-            (30, crate::FactorMethod::Multifrontal),
-            (60, crate::FactorMethod::LeftLooking),
-        ] {
+        for m in [30usize, 60] {
             let a = convdiff(m);
             let n = a.n;
             let opts = SolverSettings::default()
                 .with_threads(1)
-                .with_method(method)
                 .with_ordering(OrderingMethod::MetisND);
             let s = LuSolver::factor(&a, &opts).unwrap();
             let b: Vec<f64> = (0..n).map(|i| ((i * 31) % 17) as f64 - 8.0).collect();
             let x1 = s.solve(&b).unwrap();
-            assert!(
-                residual_general(&a, &x1, &b) < 1e-10,
-                "residual m={m} {method:?}"
-            );
+            assert!(residual_general(&a, &x1, &b) < 1e-10, "residual m={m}");
             let nrhs = 3;
             let bb: Vec<f64> = (0..n * nrhs)
                 .map(|k| ((k * 13) % 11) as f64 - 5.0)
                 .collect();
             let xb = s.solve_many(&bb, nrhs).unwrap();
             for c in 0..nrhs {
-                let bc: Vec<f64> = (0..n).map(|i| bb[i * nrhs + c]).collect();
+                let bc: Vec<f64> = (0..n).map(|i| bb[c * n + i]).collect();
                 let xc = s.solve(&bc).unwrap();
                 for i in 0..n {
-                    assert!((xb[i * nrhs + c] - xc[i]).abs() <= 1e-9 * (1.0 + xc[i].abs()));
+                    assert!((xb[c * n + i] - xc[i]).abs() <= 1e-9 * (1.0 + xc[i].abs()));
                 }
             }
             // Refinement runs through the plans too.
             let (xr, out) = s
-                .solve_refined_with(&a, &b, &crate::RefinePolicy::steps(2))
+                .solve_refined(&a, &b, &crate::RefinePolicy::steps(2))
                 .unwrap();
             assert!(out.steps <= 2);
             assert!(residual_general(&a, &xr, &b) < 1e-12);

@@ -20,8 +20,9 @@
 //! [`PanelFactor::to_csc`] materializes the compressed-column form on demand
 //! for the reference solves and the public CSC factor types.
 
-use crate::numeric::ll_common::PanelPtr;
+use crate::numeric::supernodal::PanelPtr;
 use crate::scalar::Scalar;
+use rayon::prelude::*;
 
 /// A lower triangular factor in supernodal panel form (see the module docs).
 #[derive(Clone, Debug)]
@@ -89,147 +90,6 @@ impl<T: Scalar> PanelFactor<T> {
         let rows: usize = self.rows.iter().map(|r| r.len()).sum();
         self.vals.len() * std::mem::size_of::<T>() + rows * 4
     }
-
-    /// The compressed-column form `(col_ptr, row_idx, values)` with the rows of
-    /// every column ascending. For a unit factor the explicit unit diagonal
-    /// leads each column; exact zeros are dropped, as a sparse factor would
-    /// never have stored them.
-    pub fn to_csc(&self, unit: bool) -> (Vec<usize>, Vec<usize>, Vec<T>) {
-        let n = self.n;
-        let mut col_ptr = Vec::with_capacity(n + 1);
-        col_ptr.push(0);
-        let mut row_idx: Vec<usize> = Vec::with_capacity(self.nnz());
-        let mut values: Vec<T> = Vec::with_capacity(self.nnz());
-        let zero = T::zero();
-        for s in 0..self.n_supernodes() {
-            let (c0, w, m) = self.shape(s);
-            let ld = w + m;
-            let panel = self.panel(s);
-            let rows = &self.rows[s];
-            for k in 0..w {
-                let col = &panel[k * ld..(k + 1) * ld];
-                row_idx.push(c0 + k);
-                values.push(if unit { T::one() } else { col[k] });
-                for (i, &v) in col.iter().enumerate().take(w).skip(k + 1) {
-                    if v != zero {
-                        row_idx.push(c0 + i);
-                        values.push(v);
-                    }
-                }
-                for (i, &r) in rows.iter().enumerate() {
-                    let v = col[w + i];
-                    if v != zero {
-                        row_idx.push(r as usize);
-                        values.push(v);
-                    }
-                }
-                col_ptr.push(row_idx.len());
-            }
-        }
-        debug_assert_eq!(col_ptr.len(), n + 1, "every column emitted once");
-        (col_ptr, row_idx, values)
-    }
-
-    /// Build from a lower-triangular CSC factor whose columns list the
-    /// diagonal first and the rows ascending. `supernode_ptr` gives the column
-    /// partition (`ns + 1` entries, first 0, last `n`); an unusable partition
-    /// is replaced by maximal runs of nested columns.
-    pub fn from_csc(
-        n: usize,
-        col_ptr: &[usize],
-        row_idx: &[usize],
-        values: &[T],
-        supernode_ptr: &[usize],
-    ) -> Self {
-        const NONE: u32 = u32::MAX;
-        let zero = T::zero();
-        let mut sn_col: Vec<u32> = vec![0];
-        let known = supernode_ptr.len() >= 2
-            && supernode_ptr[0] == 0
-            && supernode_ptr.last().copied() == Some(n)
-            && supernode_ptr.windows(2).all(|p| p[0] < p[1]);
-        if known {
-            for p in supernode_ptr.windows(2) {
-                sn_col.push(p[1] as u32);
-            }
-        } else {
-            // mark[r] = c0 of the run whose first column has row r
-            let mut mark = vec![NONE; n];
-            let mut j = 0;
-            while j < n {
-                let c0 = j;
-                for &r in &row_idx[col_ptr[c0]..col_ptr[c0 + 1]] {
-                    mark[r] = c0 as u32;
-                }
-                let mut c1 = c0 + 1;
-                while c1 < n {
-                    let fits = row_idx[col_ptr[c1]..col_ptr[c1 + 1]]
-                        .iter()
-                        .all(|&r| mark[r] == c0 as u32 || (r >= c0 && r <= c1));
-                    if !fits {
-                        break;
-                    }
-                    c1 += 1;
-                }
-                sn_col.push(c1 as u32);
-                j = c1;
-            }
-        }
-        let ns = sn_col.len() - 1;
-        let mut rows: Vec<Vec<u32>> = Vec::with_capacity(ns);
-        let mut val_ptr: Vec<usize> = Vec::with_capacity(ns + 1);
-        val_ptr.push(0);
-        let mut vals: Vec<T> = Vec::new();
-        let mut pos = vec![NONE; n];
-        for s in 0..ns {
-            let (c0, c1) = (sn_col[s] as usize, sn_col[s + 1] as usize);
-            let w = c1 - c0;
-            let mut sn_rows: Vec<u32> = Vec::new();
-            for c in c0..c1 {
-                for &r in &row_idx[col_ptr[c]..col_ptr[c + 1]] {
-                    if r >= c1 && pos[r] == NONE {
-                        pos[r] = 0;
-                        sn_rows.push(r as u32);
-                    }
-                }
-            }
-            sn_rows.sort_unstable();
-            let m = sn_rows.len();
-            let ld = w + m;
-            for (i, &r) in sn_rows.iter().enumerate() {
-                pos[r as usize] = (w + i) as u32;
-            }
-            for (k, p) in pos[c0..c1].iter_mut().enumerate() {
-                *p = k as u32;
-            }
-            let v0 = vals.len();
-            vals.resize(v0 + ld * w, zero);
-            for c in c0..c1 {
-                let k = c - c0;
-                let col = &mut vals[v0 + k * ld..v0 + (k + 1) * ld];
-                for e in col_ptr[c]..col_ptr[c + 1] {
-                    let r = row_idx[e];
-                    debug_assert_ne!(pos[r], NONE, "row outside the supernode panel");
-                    col[pos[r] as usize] = values[e];
-                }
-            }
-            for &r in &sn_rows {
-                pos[r as usize] = NONE;
-            }
-            for p in &mut pos[c0..c1] {
-                *p = NONE;
-            }
-            rows.push(sn_rows);
-            val_ptr.push(vals.len());
-        }
-        PanelFactor {
-            n,
-            sn_col,
-            rows,
-            val_ptr,
-            vals,
-        }
-    }
 }
 
 /// Reorder the rows of a column-major `(ld) x w` panel in place so that row
@@ -261,8 +121,8 @@ pub fn permute_panel_rows<T: Copy>(
 /// The factor's buffer while a numeric driver fills it: one slot per
 /// supernode of the analysis, sized `(w + m) x w` from the symbolic row
 /// counts, back to back in supernode order. Each slot is written by the one
-/// task that owns its supernode (the left-looking drivers factor straight
-/// into it; the multifrontal drivers copy a finished front in), read by the
+/// task that owns its supernode (the drivers factor straight into it), read
+/// by the
 /// tasks that update from it once it is published, and finished in place
 /// ([`finish_panel`]). [`finish`](Self::finish) then closes the gaps left by
 /// dropped rows and yields the [`PanelFactor`].
@@ -287,7 +147,18 @@ impl<T: Scalar> PanelArena<T> {
             slot_ptr.push(slot_ptr.last().copied().unwrap_or(0) + len);
         }
         let total = slot_ptr.last().copied().unwrap_or(0);
-        let mut vals = vec![T::zero(); total];
+        // The whole factor, often hundreds of MB: zero it across the calling
+        // pool rather than on one thread (41 ms serial on a 465 MB factor).
+        let mut vals: Vec<T> = Vec::with_capacity(total);
+        vals.spare_capacity_mut()
+            .par_chunks_mut(1 << 16)
+            .for_each(|chunk| {
+                chunk.iter_mut().for_each(|v| {
+                    v.write(T::zero());
+                })
+            });
+        // SAFETY: every element of the first `total` was written above.
+        unsafe { vals.set_len(total) };
         let base = PanelPtr(vals.as_mut_ptr());
         PanelArena {
             slot_ptr,
@@ -501,24 +372,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn csc_round_trip_keeps_values() {
-        // Two supernodes: columns {0,1} with off-block rows {2,3}, column {2},
-        // column {3}.
-        let col_ptr = vec![0, 4, 7, 9, 10];
-        let row_idx = vec![0, 1, 2, 3, 1, 2, 3, 2, 3, 3];
-        let values: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 1.0, 5.0, 6.0, 1.0, 7.0, 1.0];
-        let f = PanelFactor::from_csc(4, &col_ptr, &row_idx, &values, &[0, 2, 3, 4]);
-        assert_eq!(f.n_supernodes(), 3);
-        assert_eq!(f.rows[0], vec![2, 3]);
-        assert_eq!(f.panel(0).len(), 8);
-        let (cp, ri, v) = f.to_csc(true);
-        assert_eq!(cp, col_ptr);
-        assert_eq!(ri, row_idx);
-        assert_eq!(v, values);
-        assert_eq!(f.nnz(), 10);
-    }
-
-    #[test]
     fn row_permutation_in_place() {
         // 3 x 2 panel, column-major.
         let mut panel = vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0];
@@ -550,9 +403,5 @@ mod tests {
         assert_eq!(f.vals, vec![1.0, 5.0, 1.0, 6.0, 1.0]);
         assert_eq!(f.val_ptr, vec![0, 2, 4, 5]);
         assert_eq!(f.rows, vec![vec![1], vec![2], vec![]]);
-        let (cp, ri, v) = f.to_csc(true);
-        assert_eq!(cp, vec![0, 2, 4, 5]);
-        assert_eq!(ri, vec![0, 1, 1, 2, 2]);
-        assert_eq!(v, vec![1.0, 5.0, 1.0, 6.0, 1.0]);
     }
 }

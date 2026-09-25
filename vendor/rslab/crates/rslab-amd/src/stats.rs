@@ -18,10 +18,9 @@ pub struct AmdStats {
     /// elimination requires `n` on the order of tens of thousands, so
     /// the true count is `0` on every practically testable input.
     pub n_clear_flag: u32,
-    /// Number of variables absorbed by mass elimination
-    /// (Slice B).
+    /// Number of variables absorbed by mass elimination.
     pub n_mass_elim: u32,
-    /// Number of supervariable merges detected (Slice B).
+    /// Number of supervariable merges detected.
     pub n_supervar_merge: u32,
     /// Number of variables placed into the dense-deferred bucket
     /// at initialization.

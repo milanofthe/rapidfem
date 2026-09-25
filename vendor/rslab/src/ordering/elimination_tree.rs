@@ -52,7 +52,10 @@ impl EliminationTree {
     /// Liu's union-find etree construction over an abstract column-entry view:
     /// `cols(j)` yields the row indices of column `j` (any order; entries
     /// `>= j` are skipped). The result is a unique function of the pattern.
-    fn from_cols<I: Iterator<Item = usize>>(n: usize, cols: impl Fn(usize) -> I) -> Self {
+    pub(crate) fn from_cols<I: Iterator<Item = usize>>(
+        n: usize,
+        cols: impl Fn(usize) -> I,
+    ) -> Self {
         let mut parent: Vec<Option<usize>> = vec![None; n];
         let mut ancestor = vec![0usize; n]; // union-find forest
 
@@ -88,6 +91,28 @@ impl EliminationTree {
     }
 
     /// Compute children lists from parent pointers.
+    /// Children of every node in one flat array, each node's children
+    /// ascending: those of `v` are `idx[ptr[v]..ptr[v + 1]]`.
+    pub(crate) fn children_flat(&self) -> (Vec<usize>, Vec<usize>) {
+        let n = self.n;
+        let mut ptr = vec![0usize; n + 1];
+        for p in self.parent.iter().flatten() {
+            ptr[p + 1] += 1;
+        }
+        for v in 0..n {
+            ptr[v + 1] += ptr[v];
+        }
+        let mut next = ptr[..n].to_vec();
+        let mut idx = vec![0usize; ptr[n]];
+        for j in 0..n {
+            if let Some(p) = self.parent[j] {
+                idx[next[p]] = j;
+                next[p] += 1;
+            }
+        }
+        (ptr, idx)
+    }
+
     pub fn children(&self) -> Vec<Vec<usize>> {
         let mut ch = vec![Vec::new(); self.n];
         for j in 0..self.n {
@@ -126,17 +151,17 @@ impl EliminationTree {
     pub fn postorder(&self) -> Vec<usize> {
         let n = self.n;
         let mut out = Vec::with_capacity(n);
-        let children = self.children();
-        let mut next_child = vec![0usize; n];
+        let (ptr, idx) = self.children_flat();
+        let mut next_child = ptr[..n].to_vec();
         let mut stack: Vec<usize> = Vec::with_capacity(n);
 
         for root in self.roots() {
             stack.push(root);
             while let Some(&node) = stack.last() {
                 let k = next_child[node];
-                if k < children[node].len() {
+                if k < ptr[node + 1] {
                     next_child[node] = k + 1;
-                    stack.push(children[node][k]);
+                    stack.push(idx[k]);
                 } else {
                     out.push(node);
                     stack.pop();
@@ -202,9 +227,7 @@ mod tests {
 
     #[test]
     fn test_etree_arrow() {
-        // Arrow matrix: node 0 is connected to all others
-        // After natural ordering, etree should have 0 as root
-        // with nodes 1,2,3,4 filling through 0
+        // Arrow matrix: node 0 is connected to all others.
         let m = CscMatrix::from_triplets(
             5,
             &[0, 1, 2, 3, 4, 1, 2, 3, 4],
@@ -215,16 +238,10 @@ mod tests {
         let pat = m.symmetric_pattern();
         let etree = EliminationTree::from_pattern(&pat);
 
-        // With natural ordering on arrow matrix:
-        // All nodes 1-4 connect to 0, and eliminating 0 creates a clique
-        // among 1-4. So the etree should be 0->1->2->3->4 (chain from fill).
-        // Actually: parent[j] = min { i > j : L(i,j) != 0 }
-        // For column 0: rows 1,2,3,4 all have entries -> parent[0] = 1 (not a root!)
-        // Wait - arrow has column 0 connected to rows 1,2,3,4
-        // Column 0: entries at rows 1,2,3,4 -> parent[0] = min(1,2,3,4) = 1
-        // Column 1: entry at row 0 (but 0 < 1, skip). Fill from eliminating 0: rows 2,3,4
-        //   -> parent[1] = 2
-        // etc. So etree is a chain 0->1->2->3->4, root = 4
+        // With natural ordering, eliminating 0 creates a clique among 1-4.
+        // parent[j] = min { i > j : L(i,j) != 0 }: column 0 has rows 1-4
+        // -> parent[0] = 1; column 1 gets fill rows 2-4 -> parent[1] = 2;
+        // and so on. The etree is the chain 0->1->2->3->4, root = 4.
         assert_eq!(etree.parent[4], None);
         assert_eq!(etree.roots(), vec![4]);
     }

@@ -53,6 +53,7 @@ pub fn coarsen_level(
     fine: &Graph,
     rng: &mut SplitMix,
     two_hop_threshold: f64,
+    parallel_min_edges: usize,
     counters: &mut CoarsenCounters,
 ) -> CoarseGraph {
     let n = fine.nvtxs as usize;
@@ -69,7 +70,7 @@ pub fn coarsen_level(
     // leaves as self-matches, inflating the coarse graph on the
     // irregular / power-law inputs SHEM is meant for. `sort_by_key` is
     // stable, so the random shuffle survives as the within-degree
-    // tie-break, preserving seed determinism. [O7]
+    // tie-break, preserving seed determinism.
     let mut order: Vec<i32> = (0..fine.nvtxs).collect();
     rng.shuffle(&mut order);
     order.sort_by_key(|&v| fine.xadj[v as usize + 1] - fine.xadj[v as usize]);
@@ -119,7 +120,7 @@ pub fn coarsen_level(
     }
 
     // --- Contract ---
-    let graph = contract(fine, &cmap, cnvtxs);
+    let graph = contract(fine, &cmap, cnvtxs, parallel_min_edges);
     CoarseGraph { graph, cmap }
 }
 
@@ -139,15 +140,21 @@ pub fn coarsen(
         if cur.nvtxs <= opts.coarsen_floor as i32 {
             break;
         }
-        let level = coarsen_level(cur, rng, opts.two_hop_ratio_threshold, counters);
+        let level = coarsen_level(
+            cur,
+            rng,
+            opts.two_hop_ratio_threshold,
+            opts.parallel_min_edges,
+            counters,
+        );
         let new_nvtxs = level.graph.nvtxs;
         if new_nvtxs == 0 || new_nvtxs as f64 > 0.95 * prev_nvtxs as f64 {
             // Stalled: this level made <5% progress, so stop. Keep it
             // only if it actually shrank, independent of whether earlier
-            // levels exist. The old `!levels.is_empty()` gate both
-            // discarded a *first* level that genuinely shrank (returning
-            // an empty hierarchy) and pushed a zero-progress later level
-            // (breaking the strictly-decreasing-nvtxs invariant). [O8]
+            // levels exist: a first level that genuinely shrank must not
+            // be discarded (that would return an empty hierarchy), and a
+            // zero-progress later level must not be pushed (that would
+            // break the strictly-decreasing-nvtxs invariant).
             if new_nvtxs > 0 && new_nvtxs < prev_nvtxs {
                 levels.push(level);
             }
@@ -214,63 +221,134 @@ fn two_hop_pass(fine: &Graph, match_: &mut [i32], cmap: &mut [i32]) -> i32 {
 }
 
 /// Build the coarse graph from a fine graph and a fine-to-coarse map.
-fn contract(fine: &Graph, cmap: &[i32], cnvtxs: i32) -> Graph {
+fn contract(fine: &Graph, cmap: &[i32], cnvtxs: i32, parallel_min_edges: usize) -> Graph {
     let cn = cnvtxs as usize;
+    let n = fine.nvtxs as usize;
     // Accumulate vertex weights.
     let mut vwgt: Vec<i32> = vec![0; cn];
-    for v in 0..fine.nvtxs as usize {
+    for v in 0..n {
         vwgt[cmap[v] as usize] = vwgt[cmap[v] as usize].saturating_add(fine.vwgt[v]);
     }
     // Group fine vertices by coarse id to avoid rescans.
     let mut head: Vec<i32> = vec![-1; cn];
-    let mut next: Vec<i32> = vec![-1; fine.nvtxs as usize];
-    for v in 0..fine.nvtxs as usize {
+    let mut next: Vec<i32> = vec![-1; n];
+    for v in 0..n {
         let c = cmap[v] as usize;
         next[v] = head[c];
         head[c] = v as i32;
     }
-    // Contract one coarse vertex at a time with an edge-weight marker.
-    let mut marker: Vec<i32> = vec![-1; cn];
-    let mut weight_to: Vec<i32> = vec![0; cn];
-    let mut xadj: Vec<i32> = Vec::with_capacity(cn + 1);
-    let mut adjncy: Vec<i32> = Vec::with_capacity(fine.adjncy.len());
-    let mut adjwgt: Vec<i32> = Vec::with_capacity(fine.adjncy.len());
-    xadj.push(0);
-    let mut touched: Vec<i32> = Vec::new();
-    for (c, &head_c) in head.iter().enumerate().take(cn) {
-        touched.clear();
-        let mut v = head_c;
-        while v >= 0 {
-            let vu = v as usize;
-            let lo = fine.xadj[vu] as usize;
-            let hi = fine.xadj[vu + 1] as usize;
-            for k in lo..hi {
-                let nbr = fine.adjncy[k];
-                let cn2 = cmap[nbr as usize];
-                if cn2 == c as i32 {
-                    // self-loop after contraction - drop
-                    continue;
+    // The adjacency of coarse vertices `c0..c1`, one coarse vertex at a time
+    // with an edge-weight marker, appended to `adjncy`/`adjwgt` with each
+    // vertex's end offset pushed to `ends`. `slot[cu]` holds the tag (the
+    // coarse vertex being contracted) and the accumulated weight side by
+    // side; it needs no reset between calls: its tags are coarse ids, and
+    // each is contracted exactly once.
+    let range = |c0: usize,
+                 c1: usize,
+                 slot: &mut [[i32; 2]],
+                 touched: &mut Vec<i32>,
+                 ends: &mut Vec<usize>,
+                 adjncy: &mut Vec<i32>,
+                 adjwgt: &mut Vec<i32>| {
+        for (c, &first) in head.iter().enumerate().take(c1).skip(c0) {
+            touched.clear();
+            let mut v = first;
+            while v >= 0 {
+                let vu = v as usize;
+                let lo = fine.xadj[vu] as usize;
+                let hi = fine.xadj[vu + 1] as usize;
+                for k in lo..hi {
+                    let nbr = fine.adjncy[k];
+                    let cn2 = cmap[nbr as usize];
+                    if cn2 == c as i32 {
+                        // self-loop after contraction - drop
+                        continue;
+                    }
+                    let sl = &mut slot[cn2 as usize];
+                    if sl[0] != c as i32 {
+                        *sl = [c as i32, fine.adjwgt[k]];
+                        touched.push(cn2);
+                    } else {
+                        sl[1] = sl[1].saturating_add(fine.adjwgt[k]);
+                    }
                 }
-                let cu = cn2 as usize;
-                if marker[cu] != c as i32 {
-                    marker[cu] = c as i32;
-                    weight_to[cu] = fine.adjwgt[k];
-                    touched.push(cn2);
-                } else {
-                    weight_to[cu] = weight_to[cu].saturating_add(fine.adjwgt[k]);
-                }
+                v = next[vu];
             }
-            v = next[vu];
+            for &tgt in touched.iter() {
+                adjncy.push(tgt);
+                adjwgt.push(slot[tgt as usize][1]);
+            }
+            ends.push(adjncy.len());
         }
-        for &tgt in &touched {
-            adjncy.push(tgt);
-            adjwgt.push(weight_to[tgt as usize]);
+    };
+
+    // Coarse vertices are independent, so large levels contract in parallel
+    // blocks whose outputs are concatenated in order: the coarse graph is the
+    // same as the serial loop's, whatever the thread count. On the top levels
+    // of a large nested dissection this was most of the coarsening time.
+    let blocks = if fine.adjncy.len() >= parallel_min_edges && rayon::current_num_threads() > 1 {
+        (8 * rayon::current_num_threads()).min(cn)
+    } else {
+        1
+    };
+    let (mut xadj, adjncy, adjwgt) = if blocks <= 1 {
+        let mut ends = Vec::with_capacity(cn);
+        let mut adjncy = Vec::with_capacity(fine.adjncy.len());
+        let mut adjwgt = Vec::with_capacity(fine.adjncy.len());
+        range(
+            0,
+            cn,
+            &mut vec![[-1, 0]; cn],
+            &mut Vec::new(),
+            &mut ends,
+            &mut adjncy,
+            &mut adjwgt,
+        );
+        (ends, adjncy, adjwgt)
+    } else {
+        use rayon::prelude::*;
+        let parts: Vec<(Vec<usize>, Vec<i32>, Vec<i32>)> = (0..blocks)
+            .into_par_iter()
+            .map_init(
+                || (vec![[-1i32, 0]; cn], Vec::new()),
+                |(slot, touched), b| {
+                    let (c0, c1) = (b * cn / blocks, (b + 1) * cn / blocks);
+                    // The block's fine degree sum bounds its coarse edges.
+                    let mut bound = 0usize;
+                    for &first in &head[c0..c1] {
+                        let mut v = first;
+                        while v >= 0 {
+                            let vu = v as usize;
+                            bound += (fine.xadj[vu + 1] - fine.xadj[vu]) as usize;
+                            v = next[vu];
+                        }
+                    }
+                    let mut part = (
+                        Vec::with_capacity(c1 - c0),
+                        Vec::with_capacity(bound),
+                        Vec::with_capacity(bound),
+                    );
+                    range(c0, c1, slot, touched, &mut part.0, &mut part.1, &mut part.2);
+                    part
+                },
+            )
+            .collect();
+        let total: usize = parts.iter().map(|p| p.1.len()).sum();
+        let mut ends = Vec::with_capacity(cn);
+        let mut adjncy = Vec::with_capacity(total);
+        let mut adjwgt = Vec::with_capacity(total);
+        for (part_ends, part_adj, part_wgt) in parts {
+            let base = adjncy.len();
+            ends.extend(part_ends.iter().map(|&e| base + e));
+            adjncy.extend(part_adj);
+            adjwgt.extend(part_wgt);
         }
-        xadj.push(adjncy.len() as i32);
-    }
+        (ends, adjncy, adjwgt)
+    };
+    xadj.insert(0, 0);
     Graph {
         nvtxs: cnvtxs,
-        xadj,
+        xadj: xadj.into_iter().map(|e| e as i32).collect(),
         adjncy,
         vwgt,
         adjwgt,
@@ -305,6 +383,32 @@ mod tests {
             col_ptr.push(row_idx.len() as i32);
         }
         (col_ptr, row_idx)
+    }
+
+    #[test]
+    fn parallel_contract_matches_serial() {
+        // A 500 x 500 grid has ~1M directed edges, above the parallel
+        // threshold; contracting it in a 1-thread and a 4-thread pool must
+        // give the same coarse graph, entry for entry.
+        let g = grid(500, 500);
+        assert!(g.adjncy.len() >= 200_000);
+        let level = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut rng = SplitMix::new(3);
+                coarsen_level(&g, &mut rng, 0.95, 200_000, &mut CoarsenCounters::default())
+            })
+        };
+        let (a, b) = (level(1), level(4));
+        assert_eq!(a.cmap, b.cmap);
+        assert_eq!(a.graph.nvtxs, b.graph.nvtxs);
+        assert_eq!(a.graph.xadj, b.graph.xadj);
+        assert_eq!(a.graph.adjncy, b.graph.adjncy);
+        assert_eq!(a.graph.adjwgt, b.graph.adjwgt);
+        assert_eq!(a.graph.vwgt, b.graph.vwgt);
     }
 
     fn grid(m: usize, n: usize) -> Graph {
@@ -380,7 +484,7 @@ mod tests {
         let g = grid(8, 8);
         let mut rng = SplitMix::new(1);
         let mut ctr = CoarsenCounters::default();
-        let cg = coarsen_level(&g, &mut rng, 0.85, &mut ctr);
+        let cg = coarsen_level(&g, &mut rng, 0.85, 200_000, &mut ctr);
         assert_valid_coarse(&g, &cg);
         // On a 2D grid SHEM should pair ~half the vertices.
         assert!(
@@ -408,7 +512,7 @@ mod tests {
         // 3<->2, then 0<->1 -> 2 coarse vertices. Ascending-degree
         // visitation is the defining property of METIS Match_SHEM
         // (Karypis & Kumar Sec. 3.1); plain shuffle order is HEM,
-        // not the advertised SHEM. [O7]
+        // not the advertised SHEM.
         let t = [
             (0, 0),
             (1, 1),
@@ -424,7 +528,7 @@ mod tests {
         let g = Graph::from_csc_pattern(&pat).unwrap();
         let mut rng = SplitMix::new(1);
         let mut ctr = CoarsenCounters::default();
-        let cg = coarsen_level(&g, &mut rng, 0.85, &mut ctr);
+        let cg = coarsen_level(&g, &mut rng, 0.85, 200_000, &mut ctr);
         assert_valid_coarse(&g, &cg);
         assert_eq!(
             cg.graph.nvtxs, 2,
@@ -439,7 +543,7 @@ mod tests {
         let g = tridiag(10);
         let mut rng = SplitMix::new(1);
         let mut ctr = CoarsenCounters::default();
-        let cg = coarsen_level(&g, &mut rng, 0.85, &mut ctr);
+        let cg = coarsen_level(&g, &mut rng, 0.85, 200_000, &mut ctr);
         assert_valid_coarse(&g, &cg);
         assert!(cg.graph.nvtxs <= 6);
     }
@@ -451,8 +555,8 @@ mod tests {
         let mut r2 = SplitMix::new(42);
         let mut c1 = CoarsenCounters::default();
         let mut c2 = CoarsenCounters::default();
-        let a = coarsen_level(&g, &mut r1, 0.85, &mut c1);
-        let b = coarsen_level(&g, &mut r2, 0.85, &mut c2);
+        let a = coarsen_level(&g, &mut r1, 0.85, 200_000, &mut c1);
+        let b = coarsen_level(&g, &mut r2, 0.85, 200_000, &mut c2);
         assert_eq!(a.cmap, b.cmap);
         assert_eq!(a.graph.xadj, b.graph.xadj);
         assert_eq!(a.graph.adjncy, b.graph.adjncy);
@@ -496,8 +600,8 @@ mod tests {
         // that still trips the <5% "stall" branch. The two-hop fallback
         // is disabled (threshold > 1) so nothing rescues the leaves and
         // the stall branch is the only exit. The level genuinely shrank
-        // and must be kept; the old code discarded it because `levels`
-        // was still empty, returning an empty hierarchy. [O8]
+        // and must be kept even though `levels` is still empty;
+        // dropping it would return an empty hierarchy.
         let mut t: Vec<(usize, usize)> = vec![(0, 0)];
         for l in 1..=24usize {
             t.push((l, l));
@@ -544,7 +648,7 @@ mod tests {
         let fine = Graph::from_csc_pattern(&pat).unwrap();
         // Force a matching 0<->3 by custom cmap.
         let cmap: Vec<i32> = vec![0, 1, 2, 0];
-        let coarse = contract(&fine, &cmap, 3);
+        let coarse = contract(&fine, &cmap, 3, 200_000);
         // Coarse vertex 0 = {0,3}: weight 2 to coarse vertex 1 (via
         // 0-1 and 3-1), weight 2 to coarse vertex 2.
         let mut got: Vec<(i32, i32)> = Vec::new();

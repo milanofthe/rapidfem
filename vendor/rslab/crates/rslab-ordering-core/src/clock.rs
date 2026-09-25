@@ -1,7 +1,7 @@
 //! Monotonic clock for the ordering crates' stats timing, portable to targets
 //! without an OS clock (wasm32-unknown-unknown: `std::time::Instant::now()`
-//! panics with "time not implemented on this platform", which trapped every
-//! symbolic analysis in the browser). Native builds re-export
+//! panics with "time not implemented on this platform", which would trap
+//! every symbolic analysis in the browser). Native builds re-export
 //! [`std::time::Instant`] unchanged; on wasm32 the instant is inert and every
 //! duration reads zero, so `OrderingStats` timings become no-ops instead of
 //! trapping.

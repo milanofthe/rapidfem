@@ -38,7 +38,7 @@
 //! // Real symmetric matrix, lower triangle (i >= j).
 //! let a = CscMatrix::<f64>::from_triplets(3, &[0, 1, 2, 1], &[0, 1, 2, 0],
 //!                                         &[2.0, 2.0, 2.0, -1.0])?;
-//! let analysis = LdltSymbolic::analyze(&a)?;                 // phase 1
+//! let analysis = LdltSymbolic::analyze(&a, &SolverSettings::default())?;                 // phase 1
 //! let factor = analysis.factor(&a, &SolverSettings::default())?; // 2/3
 //! let x = factor.solve(&[1.0, 2.0, 3.0])?;
 //! # let _ = x; Ok(()) }
@@ -58,7 +58,7 @@
 //!     3, &[0, 1, 2, 1], &[0, 1, 2, 0],
 //!     &[c(4.0, 1.0), c(4.0, 1.0), c(4.0, 1.0), c(-1.0, 0.2)])?;
 //! let opts = SolverSettings::preconditioner(1e-8).with_drop_tol(1e-2); // composable
-//! let m = LdltSolver::factor_with(&a, &opts)?;          // preconditioner
+//! let m = LdltSolver::factor(&a, &opts)?;          // preconditioner
 //! let b = vec![c(1.0, 0.0); 3];
 //! let res = cocg(&a, &b, &m, 1e-10, 100)?;
 //! assert!(res.converged);
@@ -79,7 +79,6 @@
 // -------------------------------------------------------------------------
 
 /// Single-solve thread-count policy from the symbolic analysis.
-pub(crate) mod analysis;
 /// Monotonic clock shim: std Instant natively, inert on wasm32 (no OS clock).
 pub(crate) mod clock;
 pub(crate) mod dense;
@@ -132,57 +131,38 @@ pub mod tuning;
 // Flat public API re-exported at crate root - a single data-type-generic
 // (`Scalar`: f64, Complex<f64>, f32, Complex<f32>) sparse direct + iterative
 // stack. (The legacy f64-dedicated multifrontal path has been removed.)
-pub use analysis::recommend_threads_from;
-pub use dense::matrix::SymmetricMatrix;
 pub use diagnostics::{
-    Decisions, Diagnostics, MemoryEstimate, NumericReport, Rates, SolveCounter, SolveStats,
-    StageReport,
+    Decisions, Diagnostics, MemoryEstimate, NumericReport, Rates, SolveStats, StageReport,
 };
 pub use error::RslabError;
-pub use logging::{LogLevel, LogSink};
-pub use numeric::gemm_tuning::{
-    GemmThresholds, DEFAULT_PANEL_NB, DEFAULT_PAR_CDIV, DEFAULT_PAR_GEMM, DEFAULT_SCALAR_GATE,
-};
-pub use refine::{BackwardError, RefineOutcome, RefinePolicy};
-pub use scalar::Scalar;
-pub use scaling::ScalingStrategy;
-// Generic dense LDL^T kernel (the multifrontal fronts reduce to this).
-pub use dense::ldlt_generic::{
-    factor_ldlt, solve_ldlt, solve_ldlt_many, CompressedLdltFactors, LdltFactors,
-};
-// Shared options + the low-level multifrontal symbolic/numeric building blocks.
-pub use numeric::multifrontal_ldlt::{
-    analyze, analyze_with, factor_numeric, factor_sparse_ldlt, factor_sparse_ldlt_with,
-    with_threads, BlrMode, FactorMethod, FactorPath, LdltNumeric, MemoryMode, MultifrontalSymbolic,
-    ReorderMode, SolverSettings, Threads, ZeroPivotAction,
-};
-// The supernodal panel form of a factor (`LdltNumeric::factor`).
-pub use numeric::panel_factor::PanelFactor;
-// High-level symmetric LDL^T solver: `LdltSymbolic::analyze -> .factor -> LdltSolver`.
-pub use numeric::sparse_solver::{LdltSolver, LdltSymbolic};
-// High-level unsymmetric LU solver: `LuSymbolic::analyze -> .factor -> LuSolver`,
-// plus the raw factor type and free building blocks.
 pub use inertia::Inertia;
 pub use io::mtx::{
     parse_mtx, parse_mtx_complex, parse_mtx_complex_general, read_mtx, read_mtx_any,
     read_mtx_complex, MtxLoaded, MtxMatrix,
 };
-pub use numeric::iterative::{
-    cocg, cocr, gmres, gmres_block, gmres_block_fn, gmres_block_fn_mon, gmres_block_mon, gmres_fn,
-    gmres_recycled, gmres_recycled_fn, BlockKrylovResult, Factorization, KrylovResult,
-    LinearOperator, LowPrecisionLu, LowPrecisionPreconditioner, NoPreconditioner, Preconditioner,
-    Recycle, RecycleScalar, StopReason,
-};
-pub use numeric::multifrontal_lu::{
-    factor_general_lu, factor_general_lu_numeric, solve_lu, solve_lu_many, solve_lu_refined,
-    solve_lu_transpose, LuFactors, LuNumeric, LuSolver, LuSymbolic,
-};
-// KLU-style third direct path (BTF + per-block Gilbert-Peierls): sequential,
-// bit-deterministic, built for circuit-shaped matrices and sweep refactoring.
+pub use logging::{LogLevel, LogSink};
+pub use refine::{BackwardError, RefineOperator, RefineOutcome, RefinePolicy};
+pub use scalar::Scalar;
+pub use scaling::ScalingStrategy;
+// The three direct solvers: `XSymbolic::analyze -> .factor -> XSolver`.
 pub use numeric::klu::{KluParallel, KluSettings, KluSolver, KluSymbolic};
+pub use numeric::ldlt::{LdltSolver, LdltSymbolic};
+pub use numeric::lu::{LuSolver, LuSymbolic};
+pub use numeric::settings::{
+    AmalgamationSettings, AmdOptions, AmfOptions, KernelSettings, MatchingSettings, MetisOptions,
+    OrderingSettings, PivotSettings, RaceSettings, SolveSettings, SolverSettings, Threads,
+    ZeroPivotAction,
+};
+// The Krylov solvers and their operator and preconditioner traits.
+pub use numeric::krylov::{
+    cocg, cocr, gmres, gmres_block, gmres_block_mon, gmres_recycled, BlockKrylovResult,
+    Factorization, FnOperator, FnPreconditioner, KrylovResult, LinearOperator, LowPrecisionLu,
+    LowPrecisionPreconditioner, NoPreconditioner, Preconditioner, Recycle, RecycleScalar,
+    StopReason,
+};
 pub use sparse::csc::{CscMatrix, CscPattern};
 pub use sparse::general::GeneralCsc;
-pub use symbolic::{OrderingMethod, RelaxAmalgamation};
+pub use symbolic::{AmalgamationStrategy, OrderingMethod, RelaxAmalgamation};
 
 /// Ergonomic imports for embedding RSLAB as a PARDISO-style sparse solver /
 /// preconditioner. `use rslab::prelude::*;` brings in the matrix type, the

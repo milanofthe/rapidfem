@@ -103,12 +103,6 @@ pub(super) fn well_conditioned_dim_flat<T: Scalar>(h: &[T], stride: usize, jdim:
     jdim
 }
 
-/// Fixed row-block size for the block-orthogonalization reductions below. A
-/// compile-time constant (never thread-count dependent), so the chunked sums are
-/// **bit-identical across thread counts** - preserving the block solve's
-/// determinism guarantee while spreading the reduction over all cores.
-pub(super) const ORTHO_CHUNK: usize = 2048;
-
 /// The scoped rayon pool for the block-GMRES orthogonalization reductions,
 /// from the preconditioner's [`Threads`] policy. `Ambient`
 /// returns `None` - the reductions then run on the caller's current pool (the
@@ -163,16 +157,18 @@ pub(super) fn ortho_in_pool<R: Send>(
 /// fixed row-chunk sum folded in chunk order -> deterministic regardless of the
 /// thread count.
 /// `scratch` is a caller-owned reduction buffer of length `>= nchunks * width`
-/// (`nchunks = ceil(n/ORTHO_CHUNK)`, `width = blocks*sa`), reused across steps so the
+/// (`nchunks = ceil(n / chunk)`, `width = blocks*sa`), reused across steps so the
 /// hot loop allocates nothing. Each chunk writes its `width` partial sums into its
 /// own slice; the slices are then folded in chunk order.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn block_project<T: Scalar>(
     vbas: &[T],
     w: &[T],
     blocks: usize,
     sa: usize,
     n: usize,
+    chunk: usize,
     proj: &mut [T],
     scratch: &mut [T],
 ) {
@@ -183,13 +179,13 @@ pub(super) fn block_project<T: Scalar>(
     if width == 0 || n == 0 {
         return;
     }
-    let nchunks = n.div_ceil(ORTHO_CHUNK);
+    let nchunks = n.div_ceil(chunk);
     let part = &mut scratch[..nchunks * width];
     part.par_chunks_mut(width)
         .enumerate()
         .for_each(|(ci, out)| {
-            let r0 = ci * ORTHO_CHUNK;
-            let r1 = (r0 + ORTHO_CHUNK).min(n);
+            let r0 = ci * chunk;
+            let r1 = (r0 + chunk).min(n);
             for i in 0..blocks {
                 for ap in 0..sa {
                     let vb = (i * sa + ap) * n;
@@ -223,24 +219,23 @@ pub(super) fn block_subtract<T: Scalar>(
     blocks: usize,
     sa: usize,
     n: usize,
+    chunk: usize,
     proj: &[T],
 ) {
     for ap in 0..sa {
         let wcol = &mut w[ap * n..ap * n + n];
-        wcol.par_chunks_mut(ORTHO_CHUNK)
-            .enumerate()
-            .for_each(|(ci, wc)| {
-                let r0 = ci * ORTHO_CHUNK;
-                for i in 0..blocks {
-                    let hij = proj[i * sa + ap];
-                    if hij == T::zero() {
-                        continue;
-                    }
-                    let vb = (i * sa + ap) * n + r0;
-                    for k in 0..wc.len() {
-                        wc[k] = wc[k] - hij * vbas[vb + k];
-                    }
+        wcol.par_chunks_mut(chunk).enumerate().for_each(|(ci, wc)| {
+            let r0 = ci * chunk;
+            for i in 0..blocks {
+                let hij = proj[i * sa + ap];
+                if hij == T::zero() {
+                    continue;
                 }
-            });
+                let vb = (i * sa + ap) * n + r0;
+                for k in 0..wc.len() {
+                    wc[k] = wc[k] - hij * vbas[vb + k];
+                }
+            }
+        });
     }
 }

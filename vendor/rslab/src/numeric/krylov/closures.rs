@@ -11,7 +11,7 @@ use crate::scalar::Scalar;
 /// solvers issue applies one at a time.
 ///
 /// ```
-/// use rslab::{gmres_block, FnOperator, FnPreconditioner};
+/// use rslab::{gmres_block, FnOperator, FnPreconditioner, KrylovSettings};
 /// let n = 3;
 /// let op = FnOperator::new(n, |x: &[f64], y: &mut [f64], s: usize| {
 ///     for k in 0..n * s {
@@ -22,7 +22,8 @@ use crate::scalar::Scalar;
 ///     z.copy_from_slice(r);
 ///     Ok(())
 /// });
-/// let r = gmres_block(&op, &[2.0; 3], 1, &pc, 1e-12, 10, 10, None).unwrap();
+/// let s = KrylovSettings::default().with_tol(1e-12);
+/// let r = gmres_block(&op, &[2.0; 3], 1, &pc, &s, None, None).unwrap();
 /// assert!(r.x.iter().all(|&v| (v - 1.0).abs() < 1e-12));
 /// ```
 pub struct FnOperator<F> {

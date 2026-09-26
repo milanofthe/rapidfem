@@ -42,13 +42,14 @@ mod gmres;
 mod operator;
 mod recycle;
 mod result;
+mod settings;
 #[cfg(test)]
 mod tests;
 mod util;
 #[cfg(test)]
 mod warmstart_tests;
 
-pub use block::{gmres_block, gmres_block_mon, BlockKrylovResult};
+pub use block::{gmres_block, BlockKrylovResult};
 pub use cg::{cocg, cocr};
 pub use closures::{FnOperator, FnPreconditioner};
 pub use gmres::gmres;
@@ -58,3 +59,4 @@ pub use operator::{
 };
 pub use recycle::{gmres_recycled, Recycle, RecycleScalar};
 pub use result::{KrylovResult, StopReason};
+pub use settings::KrylovSettings;

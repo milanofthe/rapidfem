@@ -1,53 +1,77 @@
-// Deny `.unwrap()` and `.expect()` in production code, but allow them in
-// test modules (inside `#[cfg(test)]` blocks) where panics are acceptable.
-// This is a structural enforcement of the CLAUDE.md hard rule against
-// unwrap in `src/`, replacing the ad-hoc grep check in CI.
+// No `.unwrap()` or `.expect()` outside the tests.
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![cfg_attr(not(test), deny(clippy::expect_used))]
-// Style lints that fire only in test scaffolding - relaxed under cfg(test).
-// The lib build keeps default clippy strictness.
 #![cfg_attr(test, allow(clippy::needless_range_loop))]
 
-//! # RSLAB - a pure-Rust sparse symmetric direct solver and preconditioner
+//! # RSLAB
 //!
-//! A self-contained replacement for PARDISO's sparse symmetric path, with no
-//! MKL or other native dependency. RSLAB factors **real symmetric** (`f64`,
-//! PARDISO `mtype 2`) and **complex symmetric** (`Complex<f64>`, `mtype 6`)
-//! matrices as `P^T A P = L D L^T` by a rayon-parallel multifrontal
-//! Bunch-Kaufman method with a SIMD (`gemm`) Schur kernel.
+//! A sparse direct solver for real and complex matrices in pure Rust (no
+//! BLAS, LAPACK or MKL), generic over `f64`, `f32`, `Complex<f64>` and
+//! `Complex<f32>`. Three paths, matched to their operator classes:
 //!
-//! Three intended uses:
-//! * **FEM direct solve** - factor once, solve many right-hand sides.
-//! * **MoM sparse preconditioner** - a robust, memory-light approximate factor
-//!   (static pivoting, `f32` mixed precision, incomplete-factor dropping)
-//!   driving a [`cocg`]/[`cocr`] iteration.
-//! * **Circuit-shaped unsymmetric solve** - the sequential, bit-deterministic
-//!   [`KluSolver`] (BTF + per-block Gilbert-Peierls) with a numeric-only
-//!   [`refactor`](KluSolver::refactor) for fixed-pattern sweeps and a
-//!   [`solve_transpose`](KluSolver::solve_transpose) (`A^Tx = b` on the same
-//!   factors) for adjoint / sensitivity solves.
+//! | path | factorization | for |
+//! |---|---|---|
+//! | [`LdltSolver`] | `P^T A P = L D L^T`, Bunch-Kaufman | symmetric and complex-symmetric (PARDISO `mtype 2`, `6`) |
+//! | [`LuSolver`] | `P^T A P = L U`, threshold pivoting | general unsymmetric (`mtype 11`, `13`) |
+//! | [`KluSolver`] | block triangular form, per-block Gilbert-Peierls LU | circuit-shaped matrices |
 //!
-//! ## PARDISO-style phased workflow (FEM)
+//! The LDL^T and LU paths are left-looking supernodal and run in parallel over
+//! the elimination tree; the factor is bit-identical for every thread count.
+//! Every factor is also a [`Preconditioner`] for the Krylov solvers.
 //!
-//! Analyze the sparsity pattern once, then factor many value sets that share it
-//! (Newton steps, time stepping, frequency sweep):
+//! ## Analyze once, factor many
+//!
+//! The analysis (ordering, elimination tree, supernodes) depends on the
+//! pattern only; factor as many value sets on it as needed (Newton steps,
+//! frequency sweeps), and solve against one or many right-hand sides.
 //!
 //! ```
 //! # fn main() -> Result<(), rslab::RslabError> {
 //! use rslab::prelude::*;
-//! // Real symmetric matrix, lower triangle (i >= j).
+//! // Symmetric matrices pass the lower triangle (i >= j).
 //! let a = CscMatrix::<f64>::from_triplets(3, &[0, 1, 2, 1], &[0, 1, 2, 0],
 //!                                         &[2.0, 2.0, 2.0, -1.0])?;
-//! let analysis = LdltSymbolic::analyze(&a, &SolverSettings::default())?;                 // phase 1
-//! let factor = analysis.factor(&a, &SolverSettings::default())?; // 2/3
-//! let x = factor.solve(&[1.0, 2.0, 3.0])?;
-//! # let _ = x; Ok(()) }
+//! let s = SolverSettings::default();
+//! let sym = LdltSymbolic::analyze(&a, &s)?;
+//! let f = sym.factor(&a, &s)?;
+//! let x = f.solve(&[1.0, 2.0, 3.0])?;
+//! let xs = f.solve_many(&vec![1.0; 3 * 4], 4)?; // 4 right-hand sides, n x nrhs column-major
+//! # let _ = (x, xs); Ok(()) }
 //! ```
 //!
-//! ## Complex-symmetric MoM preconditioner
+//! [`LuSymbolic`] and [`KluSymbolic`] take a [`GeneralCsc`] the same way,
+//! and the one-shot forms ([`LdltSolver::factor`], [`LuSolver::factor`],
+//! [`KluSolver::factor`]) analyze and factor in one call. All three solvers
+//! implement [`Factorization`]: `solve`, `solve_many`, `solve_transpose`,
+//! `solve_refined` and the diagnostics behind one trait object.
 //!
-//! A robust, low-memory factor (never-fail static pivoting + incomplete
-//! dropping) used to precondition COCG:
+//! ## Circuit-shaped matrices
+//!
+//! The KLU path adds a numeric-only [`refactor`](KluSolver::refactor) (frozen
+//! pattern and pivots) for sweeps, a transpose solve for adjoints, and exports
+//! its factors ([`l_matrix`](KluSolver::l_matrix)).
+//!
+//! ```
+//! # fn main() -> Result<(), rslab::RslabError> {
+//! use rslab::prelude::*;
+//! let a = GeneralCsc::<f64>::from_triplets(3, &[0, 1, 2, 0], &[0, 1, 2, 2],
+//!                                          &[4.0, 3.0, 2.0, 1.0])?;
+//! let sym = KluSymbolic::analyze(&a, &KluSettings::default())?;
+//! let mut f = sym.factor(&a, &KluSettings::default())?;
+//! let x = f.solve(&[1.0, 1.0, 1.0])?;
+//! let xt = f.solve_transpose(&[1.0, 1.0, 1.0])?; // A^T x = b
+//! f.refactor(&a)?; // new values on the same pattern, no pivot search
+//! # let _ = (x, xt); Ok(()) }
+//! ```
+//!
+//! ## Preconditioners
+//!
+//! Static pivoting ([`SolverSettings::preconditioner`]) never fails, and a
+//! drop tolerance trades fill for iterations. [`gmres`], [`gmres_block`],
+//! [`cocg`] (complex symmetric) and [`cocr`] take any [`LinearOperator`] and
+//! [`Preconditioner`] with their [`KrylovSettings`]; a `Complex<f32>`
+//! factor preconditions an `f64` iteration through
+//! [`LowPrecisionPreconditioner`].
 //!
 //! ```
 //! # fn main() -> Result<(), rslab::RslabError> {
@@ -57,80 +81,82 @@
 //! let a = CscMatrix::<Complex<f64>>::from_triplets(
 //!     3, &[0, 1, 2, 1], &[0, 1, 2, 0],
 //!     &[c(4.0, 1.0), c(4.0, 1.0), c(4.0, 1.0), c(-1.0, 0.2)])?;
-//! let opts = SolverSettings::preconditioner(1e-8).with_drop_tol(1e-2); // composable
-//! let m = LdltSolver::factor(&a, &opts)?;          // preconditioner
-//! let b = vec![c(1.0, 0.0); 3];
-//! let res = cocg(&a, &b, &m, 1e-10, 100)?;
+//! let m = LdltSolver::factor(&a, &SolverSettings::preconditioner(1e-8).with_drop_tol(1e-2))?;
+//! let res = cocg(&a, &vec![c(1.0, 0.0); 3], &m, &KrylovSettings::default().with_tol(1e-10))?;
 //! assert!(res.converged);
 //! # Ok(()) }
 //! ```
+//!
+//! ## Threads
+//!
+//! A factorization runs in a scoped pool of its own. The default
+//! [`Threads::Auto`] predicts the worker count from the analysis (from the
+//! calibrated cost model once the one-time install diagnosis of feature
+//! `tuning` has run), capped at 4 so concurrent solves coexist;
+//! [`Threads::Fixed`] pins it and [`Threads::Ambient`] runs on the
+//! surrounding rayon pool, which keeps a factorization and the solves after
+//! it on one pool. A caller-owned flag ([`SolverSettings::with_interrupt`])
+//! cancels a running factorization at the next supernode or panel boundary.
+//!
+//! ## Tuning
+//!
+//! Every constant of the analysis, the kernels and the solves is a field of
+//! [`SolverSettings`] (grouped as [`OrderingSettings`], [`RaceSettings`],
+//! [`MetisOptions`], [`AmalgamationSettings`], [`KernelSettings`],
+//! [`SolveSettings`]) or [`KluSettings`], with the tuned value as its
+//! default.
+//!
+//! ## Diagnostics and estimates
+//!
+//! Before any numeric work, [`LdltSymbolic::estimate_memory`] (and its LU and
+//! KLU twins) predicts the factor storage, the transient peak and the flops
+//! from the structure alone ([`MemoryEstimate`]). After it, every factor
+//! answers `diagnostics()` ([`Diagnostics`]): stage times, fill, threads, the
+//! decisions taken (ordering, scaling, pivoting), and the settings the chosen
+//! path did not read. [`logging`] has one level (`RLA_LOG`, default
+//! `warning`) and one replaceable sink. Refined solves report what they
+//! achieved ([`RefinePolicy`], [`RefineOutcome`]).
+//!
+//! ## Allocator
+//!
+//! The dense kernels allocate per product. A caching allocator such as
+//! `mimalloc` as the global allocator speeds up the factorization, most on
+//! Windows, whose system heap maps large blocks afresh each time.
 
-// -------------------------------------------------------------------------
-// Module visibility (audit finding M4).
-//
-// The embedder contract is the curated root `pub use` set below - that is the
-// ONLY surface `cargo doc` should show. Every module is therefore `pub(crate)`;
-// the intended-public items are re-exported at the crate root and documented
-// there. The exceptions are modules that in-tree tooling (benches, integration
-// tests, xtask) reaches by their full module path for
-// internal building blocks that are deliberately NOT part of the embedder API:
-// those stay `pub` but `#[doc(hidden)]`, so they compile as external crates see
-// them yet never appear in the public docs. Each such case is commented.
-// -------------------------------------------------------------------------
+// The public API is the root `pub use` set below. Modules are `pub(crate)`
+// except those the in-tree benches, tests and xtask reach by path: those are
+// `pub` but `#[doc(hidden)]`, not part of the API.
 
-/// Single-solve thread-count policy from the symbolic analysis.
-/// Monotonic clock shim: std Instant natively, inert on wasm32 (no OS clock).
+// Monotonic clock shim: std Instant natively, inert on wasm32.
 pub(crate) mod clock;
 pub(crate) mod dense;
-/// Deterministic resource diagnostics: a-priori peak-memory estimate + per-stage
-/// runtime/memory report for solver-in-the-loop scheduling.
 pub(crate) mod diagnostics;
 pub(crate) mod error;
 pub(crate) mod inertia;
 pub(crate) mod io;
 pub mod logging;
-/// Parametrized test-matrix generators (feature `matgen`): PDE stencils, BEM/MoM
-/// kernels, banded/arrow, random + spectral. Optional `matgen-download` adds a
-/// SuiteSparse / Matrix Market fetcher.
-///
-/// Not part of the embedder API: `pub` only so the in-tree benches can build
-/// test matrices; hidden from the public docs.
+// Test-matrix generators (feature `matgen`) for the benches and tests;
+// `matgen-download` adds a SuiteSparse / Matrix Market fetcher.
 #[cfg(feature = "matgen")]
 #[doc(hidden)]
 pub mod matgen;
 pub(crate) mod numeric;
-/// Fill-reducing ordering internals. Not part of the embedder API: `pub` only
-/// because the in-tree benches/tests reach `ordering::amd::permute_pattern` and
-/// `ordering::elimination_tree::EliminationTree` by path; hidden from public docs.
+// Ordering internals the benches and tests reach by path.
 #[doc(hidden)]
 pub mod ordering;
+pub(crate) mod refine;
 pub(crate) mod scalar;
-// MC64 max-product matching + equilibration. The wired surface is the
-// `LdltCompress` matching (`compute_mc64_cache`/`Mc64Cache`, structural only),
-// `ScalingStrategy`, and the inf-norm / one-pass equilibration used by the
-// factor path.
-/// Symbolic analysis internals. Not part of the embedder API beyond the root
-/// re-exports (`OrderingMethod`, `RelaxAmalgamation`):
-/// `pub` because the in-tree tests drive `symbolic::{symbolic_factorize,
-/// column_counts_gnp, ...}` and `symbolic::supernode::OrderingPreprocess` by
-/// path; hidden from public docs.
-#[doc(hidden)]
-pub mod refine;
+// MC64 max-product matching and the equilibrations of the factor paths.
 pub(crate) mod scaling;
 pub(crate) mod sparse;
+// Symbolic analysis internals the tests and examples reach by path.
+#[doc(hidden)]
 pub mod symbolic;
-/// Hardware-aware auto-tuning + resource governor (feature `tuning`): hardware
-/// probe, calibration cache, and a budget-driven factorization planner.
-///
-/// Not part of the embedder API: `pub` only so xtask can drive calibration
-/// (`tuning::{Calibration, HardwareInfo}`); hidden from the public docs.
+// Hardware calibration (feature `tuning`), driven by xtask.
 #[cfg(feature = "tuning")]
 #[doc(hidden)]
 pub mod tuning;
 
-// Flat public API re-exported at crate root - a single data-type-generic
-// (`Scalar`: f64, Complex<f64>, f32, Complex<f32>) sparse direct + iterative
-// stack. (The legacy f64-dedicated multifrontal path has been removed.)
 pub use diagnostics::{
     Decisions, Diagnostics, MemoryEstimate, NumericReport, Rates, SolveStats, StageReport,
 };
@@ -155,8 +181,8 @@ pub use numeric::settings::{
 };
 // The Krylov solvers and their operator and preconditioner traits.
 pub use numeric::krylov::{
-    cocg, cocr, gmres, gmres_block, gmres_block_mon, gmres_recycled, BlockKrylovResult,
-    Factorization, FnOperator, FnPreconditioner, KrylovResult, LinearOperator, LowPrecisionLu,
+    cocg, cocr, gmres, gmres_block, gmres_recycled, BlockKrylovResult, Factorization, FnOperator,
+    FnPreconditioner, KrylovResult, KrylovSettings, LinearOperator, LowPrecisionLu,
     LowPrecisionPreconditioner, NoPreconditioner, Preconditioner, Recycle, RecycleScalar,
     StopReason,
 };
@@ -189,6 +215,7 @@ pub mod prelude {
         KluSolver,
         KluSymbolic,
         KrylovResult,
+        KrylovSettings,
         LdltSolver,
         LdltSymbolic,
         LinearOperator,

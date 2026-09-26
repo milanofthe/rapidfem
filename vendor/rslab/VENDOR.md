@@ -3,7 +3,7 @@
 Library copy of the rslab sparse direct solver
 (https://github.com/milanofthe/rslab).
 
-- Vendored from: commit `08f06fa` (rslab 0.38.0), "Test race, LU matching and KLU thread invariance, race settings and complex KLU export; fix stale diagnostics docs (#134)"
+- Vendored from: commit `2a22923` (rslab 1.0.0), "release 1.0.0 (#137)"
 - Contents: `src/` (library only) plus the ordering crates
   `crates/{rslab-ordering-core,rslab-amd,rslab-amf,rslab-metis}`, the license files, and a manifest trimmed
   to the library.

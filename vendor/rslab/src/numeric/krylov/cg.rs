@@ -21,8 +21,7 @@ pub fn cocg<T, A, M>(
     op: &A,
     b: &[T],
     precond: &M,
-    tol: f64,
-    max_iter: usize,
+    settings: &KrylovSettings,
 ) -> Result<KrylovResult<T>, RslabError>
 where
     T: Scalar,
@@ -30,6 +29,7 @@ where
     M: Preconditioner<T> + ?Sized,
 {
     let n = op.n();
+    let (tol, max_iter) = (settings.tol, settings.max_iter);
     if b.len() != n {
         return Err(RslabError::DimensionMismatch {
             expected: n,
@@ -114,8 +114,7 @@ pub fn cocr<T, A, M>(
     op: &A,
     b: &[T],
     precond: &M,
-    tol: f64,
-    max_iter: usize,
+    settings: &KrylovSettings,
 ) -> Result<KrylovResult<T>, RslabError>
 where
     T: Scalar,
@@ -123,6 +122,7 @@ where
     M: Preconditioner<T> + ?Sized,
 {
     let n = op.n();
+    let (tol, max_iter) = (settings.tol, settings.max_iter);
     if b.len() != n {
         return Err(RslabError::DimensionMismatch {
             expected: n,

@@ -30,9 +30,7 @@ pub fn gmres<T, A, M>(
     op: &A,
     b: &[T],
     precond: &M,
-    tol: f64,
-    max_iter: usize,
-    restart: usize,
+    settings: &KrylovSettings,
     x0: Option<&[T]>,
 ) -> Result<KrylovResult<T>, RslabError>
 where
@@ -47,10 +45,11 @@ where
             got: b.len(),
         });
     }
-    // DGKS reorthogonalization threshold: redo the projection only when a single
-    // MGS pass cancelled more than this fraction of the vector's length.
-    const REORTH_ETA: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let m = restart.max(1);
+    // DGKS reorthogonalization: redo the projection only when a single MGS
+    // pass cancelled more than `reorth_eta` of the vector's length.
+    let (tol, max_iter, reorth_eta) = (settings.tol, settings.max_iter, settings.reorth_eta);
+    // Flexible GMRES stores two bases, V and Z.
+    let m = settings.restart_for(n, 1, std::mem::size_of::<T>(), 2);
     let bnorm = norm2(b);
     // Warm start: seed `x` from the caller's initial guess `x0`; the
     // per-cycle true residual `r = b - A x` then measures progress from that
@@ -162,7 +161,7 @@ where
                 }
             }
             let mut hn = norm2(&w);
-            if hn < REORTH_ETA * wnorm0 {
+            if hn < reorth_eta * wnorm0 {
                 for i in 0..=j {
                     let s = dotc(&v[i * n..i * n + n], &w);
                     h[i * m + j] = h[i * m + j] + s;

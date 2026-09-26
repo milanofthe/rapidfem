@@ -44,7 +44,15 @@ fn cocg_unpreconditioned_solves_complex_symmetric() {
     let a = grid(8, c(4.0, 0.5), c(-1.0, 0.1));
     let n = a.n;
     let b: Vec<C> = (0..n).map(|i| c((i % 5) as f64 - 2.0, 1.0)).collect();
-    let res = cocg(&a, &b, &NoPreconditioner, 1e-10, 2000).unwrap();
+    let res = cocg(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(2000),
+    )
+    .unwrap();
     assert!(res.converged, "COCG should converge, res={}", res.final_res);
     assert_eq!(res.stop, StopReason::Converged);
     // Verify against the actual residual.
@@ -55,7 +63,15 @@ fn cocg_unpreconditioned_solves_complex_symmetric() {
 
     // Starve the budget: the same solve capped at one iteration must report
     // `MaxIter`, not a false `Converged`.
-    let capped = cocg(&a, &b, &NoPreconditioner, 1e-14, 1).unwrap();
+    let capped = cocg(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-14)
+            .with_max_iter(1),
+    )
+    .unwrap();
     assert!(!capped.converged);
     assert_eq!(capped.stop, StopReason::MaxIter);
 }
@@ -68,7 +84,15 @@ fn cocr_solves_complex_symmetric_pre_and_unpre() {
     let b: Vec<C> = (0..n).map(|i| c((i % 5) as f64 - 2.0, 1.0)).collect();
 
     // Unpreconditioned COCR converges to the true solution.
-    let un = cocr(&a, &b, &NoPreconditioner, 1e-10, 3000).unwrap();
+    let un = cocr(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(3000),
+    )
+    .unwrap();
     assert!(un.converged, "COCR res={}", un.final_res);
     let mut ax = vec![C::default(); n];
     a.symv(&un.x, &mut ax);
@@ -77,7 +101,15 @@ fn cocr_solves_complex_symmetric_pre_and_unpre() {
 
     // RLA-preconditioned COCR collapses to a handful of iterations.
     let m = LdltSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let pre = cocr(&a, &b, &m, 1e-10, 3000).unwrap();
+    let pre = cocr(
+        &a,
+        &b,
+        &m,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(3000),
+    )
+    .unwrap();
     assert!(pre.converged && pre.iters <= 3, "iters {}", pre.iters);
 }
 
@@ -121,12 +153,32 @@ fn gmres_solves_unsymmetric_with_lu_preconditioner() {
     let b: Vec<C> = (0..n).map(|i| c((i % 5) as f64 - 2.0, 1.0)).collect();
 
     // Unpreconditioned GMRES converges (well-conditioned).
-    let un = gmres(&a, &b, &NoPreconditioner, 1e-10, 2000, 40, None).unwrap();
+    let un = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(2000)
+            .with_restart(40),
+        None,
+    )
+    .unwrap();
     assert!(un.converged, "GMRES res={}", un.final_res);
 
     // LU factor as preconditioner -> 1-2 iterations.
     let lu = LuSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let pre = gmres(&a, &b, &lu, 1e-10, 200, 40, None).unwrap();
+    let pre = gmres(
+        &a,
+        &b,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+    )
+    .unwrap();
     assert!(pre.converged, "preconditioned GMRES res={}", pre.final_res);
     assert!(
         pre.iters <= 3,
@@ -157,7 +209,17 @@ fn gmres_singular_operator_breaks_down_without_nan() {
     let a =
         GeneralCsc::<C>::from_triplets(3, &[0, 1], &[0, 1], &[c(1.0, 0.0), c(1.0, 0.0)]).unwrap();
     let b = vec![c(1.0, 0.0), c(1.0, 0.0), c(1.0, 0.0)];
-    let res = gmres(&a, &b, &NoPreconditioner, 1e-12, 50, 10, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-12)
+            .with_max_iter(50)
+            .with_restart(10),
+        None,
+    )
+    .unwrap();
     // No NaN/Inf reached the solution or the residual.
     assert!(
         res.x.iter().all(|z| z.re.is_finite() && z.im.is_finite()),
@@ -257,7 +319,17 @@ fn fgmres_saves_one_precond_apply_per_restart_cycle() {
         inner: &lu,
         applies: std::sync::atomic::AtomicUsize::new(0),
     };
-    let res = gmres(&a, &b, &counting, 1e-10, 2000, restart, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &counting,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(2000)
+            .with_restart(restart),
+        None,
+    )
+    .unwrap();
     assert!(res.converged, "FGMRES must converge, res={}", res.final_res);
     let applies = counting.applies.load(std::sync::atomic::Ordering::Relaxed);
     // Multiple restart cycles actually occurred (proves the saving is nonzero).
@@ -303,7 +375,17 @@ fn gmres_warm_start_cuts_total_iterations_on_related_sequence() {
     // Cold: every solve from x0 = 0.
     let mut cold_total = 0usize;
     for k in 0..steps {
-        let r = gmres(&a, &bk(k), &NoPreconditioner, tol, maxit, restart, None).unwrap();
+        let r = gmres(
+            &a,
+            &bk(k),
+            &NoPreconditioner,
+            &crate::KrylovSettings::default()
+                .with_tol(tol)
+                .with_max_iter(maxit)
+                .with_restart(restart),
+            None,
+        )
+        .unwrap();
         assert!(r.converged, "cold solve {k} did not converge");
         cold_total += r.iters;
     }
@@ -316,9 +398,10 @@ fn gmres_warm_start_cuts_total_iterations_on_related_sequence() {
             &a,
             &bk(k),
             &NoPreconditioner,
-            tol,
-            maxit,
-            restart,
+            &crate::KrylovSettings::default()
+                .with_tol(tol)
+                .with_max_iter(maxit)
+                .with_restart(restart),
             prev.as_deref(),
         )
         .unwrap();
@@ -350,8 +433,30 @@ fn gmres_block_single_rhs_matches_scalar_gmres() {
     let n = a.n;
     let b: Vec<C> = (0..n).map(|i| c((i % 5) as f64 - 2.0, 1.0)).collect();
     let lu = LuSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let single = gmres(&a, &b, &lu, 1e-10, 200, 40, None).unwrap();
-    let blk = gmres_block(&a, &b, 1, &lu, 1e-10, 200, 40, None).unwrap();
+    let single = gmres(
+        &a,
+        &b,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+    )
+    .unwrap();
+    let blk = gmres_block(
+        &a,
+        &b,
+        1,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(blk.converged);
     assert!(
         (blk.iters as i64 - single.iters as i64).abs() <= 1,
@@ -382,7 +487,19 @@ fn gmres_block_multi_rhs_solves_each_column() {
         }
     }
     let lu = LuSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let res = gmres_block(&a, &bblk, s, &lu, 1e-10, 200, 40, None).unwrap();
+    let res = gmres_block(
+        &a,
+        &bblk,
+        s,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "block GMRES must converge; res={:?}",
@@ -399,7 +516,17 @@ fn gmres_block_multi_rhs_solves_each_column() {
     }
     // Each column must equal the single-RHS solve of that column.
     for k in 0..s {
-        let single = gmres(&a, &bblk[k * n..k * n + n], &lu, 1e-10, 200, 40, None).unwrap();
+        let single = gmres(
+            &a,
+            &bblk[k * n..k * n + n],
+            &lu,
+            &crate::KrylovSettings::default()
+                .with_tol(1e-10)
+                .with_max_iter(200)
+                .with_restart(40),
+            None,
+        )
+        .unwrap();
         let diff = (0..n)
             .map(|i| (res.x[k * n + i] - single.x[i]).norm())
             .fold(0.0, f64::max);
@@ -464,7 +591,19 @@ fn gmres_block_within_cycle_deflation_shrinks_applies() {
         inner: &a,
         widths: Mutex::new(Vec::new()),
     };
-    let res = gmres_block(&op, &bblk, s, &NoPreconditioner, 1e-12, 200, 40, None).unwrap();
+    let res = gmres_block(
+        &op,
+        &bblk,
+        s,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-12)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "block GMRES must converge; res={:?}",
@@ -477,9 +616,10 @@ fn gmres_block_within_cycle_deflation_shrinks_applies() {
             &a,
             &bblk[k * n..k * n + n],
             &NoPreconditioner,
-            1e-12,
-            200,
-            40,
+            &crate::KrylovSettings::default()
+                .with_tol(1e-12)
+                .with_max_iter(200)
+                .with_restart(40),
             None,
         )
         .unwrap();
@@ -539,7 +679,21 @@ fn gmres_block_bcgs2_bit_identical_across_thread_counts() {
         }
     }
     let lu = LuSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let solve = || gmres_block(&a, &bblk, s, &lu, 1e-10, 300, 60, None).unwrap();
+    let solve = || {
+        gmres_block(
+            &a,
+            &bblk,
+            s,
+            &lu,
+            &crate::KrylovSettings::default()
+                .with_tol(1e-10)
+                .with_max_iter(300)
+                .with_restart(60),
+            None,
+            None,
+        )
+        .unwrap()
+    };
     let x1 = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -602,9 +756,33 @@ fn block_gmres_orthogonalization_respects_factor_thread_cap() {
 
     // The full solve is identical bare vs. inside a wide ambient pool: the
     // internal cap governs concurrency only, never the result.
-    let bare = gmres_block(&a, &bblk, s, &lu, 1e-10, 300, 60, None).unwrap();
+    let bare = gmres_block(
+        &a,
+        &bblk,
+        s,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(300)
+            .with_restart(60),
+        None,
+        None,
+    )
+    .unwrap();
     let in_wide = with_threads(8, || {
-        gmres_block(&a, &bblk, s, &lu, 1e-10, 300, 60, None).unwrap()
+        gmres_block(
+            &a,
+            &bblk,
+            s,
+            &lu,
+            &crate::KrylovSettings::default()
+                .with_tol(1e-10)
+                .with_max_iter(300)
+                .with_restart(60),
+            None,
+            None,
+        )
+        .unwrap()
     });
     assert!(bare.converged);
     assert!(
@@ -631,8 +809,32 @@ fn ambient_threads_factor_matches_default_and_runs_on_shared_pool() {
         assert_eq!(rayon::current_num_threads(), 2);
         LuSolver::factor(&a, &opts_amb).unwrap()
     });
-    let x_def = gmres_block(&a, &b, 1, &lu_default, 1e-10, 200, 40, None).unwrap();
-    let x_amb = gmres_block(&a, &b, 1, &lu_amb, 1e-10, 200, 40, None).unwrap();
+    let x_def = gmres_block(
+        &a,
+        &b,
+        1,
+        &lu_default,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
+    let x_amb = gmres_block(
+        &a,
+        &b,
+        1,
+        &lu_amb,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(
         x_def.x == x_amb.x,
         "ambient-pool factor must be bit-identical to the default factor"
@@ -687,7 +889,17 @@ fn f32_lu_preconditioner_keeps_f64_accuracy_in_gmres() {
     // use the f64 factor for tighter tolerances.)
     let pc = LowPrecisionLu::factor(&a, &SolverSettings::default()).unwrap();
     assert!(pc.factor_nnz() > 0);
-    let res = gmres(&a, &b, &pc, 1e-6, 200, 50, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &pc,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-6)
+            .with_max_iter(200)
+            .with_restart(50),
+        None,
+    )
+    .unwrap();
     assert!(res.converged, "mixed-precision GMRES res={}", res.final_res);
     assert!(res.iters <= 6, "iters {}", res.iters);
     let mut y = vec![C::default(); n];
@@ -707,7 +919,15 @@ fn cocr_handles_indefinite_helmholtz() {
     let b: Vec<C> = (0..n).map(|i| c(1.0, (i % 3) as f64 - 1.0)).collect();
     let opts = SolverSettings::preconditioner(1e-10);
     let m = LdltSolver::factor(&a, &opts).unwrap();
-    let pre = cocr(&a, &b, &m, 1e-9, 500).unwrap();
+    let pre = cocr(
+        &a,
+        &b,
+        &m,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-9)
+            .with_max_iter(500),
+    )
+    .unwrap();
     assert!(
         pre.converged,
         "indefinite COCR res={} iters={}",
@@ -740,8 +960,24 @@ fn incomplete_factor_reduces_fill_and_still_preconditions() {
         full.factor_nnz()
     );
 
-    let rf = cocg(&a, &b, &full, 1e-10, 1000).unwrap();
-    let ri = cocg(&a, &b, &inc, 1e-10, 1000).unwrap();
+    let rf = cocg(
+        &a,
+        &b,
+        &full,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(1000),
+    )
+    .unwrap();
+    let ri = cocg(
+        &a,
+        &b,
+        &inc,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(1000),
+    )
+    .unwrap();
     assert!(ri.converged, "incomplete-preconditioned COCG must converge");
     assert!(
         ri.iters >= rf.iters,
@@ -764,7 +1000,15 @@ fn f32_preconditioner_keeps_f64_accuracy() {
     let b: Vec<C> = (0..n).map(|i| c((i % 7) as f64 - 3.0, 0.5)).collect();
 
     let m = LowPrecisionPreconditioner::factor(&a, &SolverSettings::default()).unwrap();
-    let res = cocg(&a, &b, &m, 1e-10, 500).unwrap();
+    let res = cocg(
+        &a,
+        &b,
+        &m,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(500),
+    )
+    .unwrap();
     assert!(res.converged, "mixed-precision COCG res={}", res.final_res);
     // A few iterations suffice; the f32 factor is a strong preconditioner.
     assert!(res.iters <= 12, "f32-preconditioned iters {}", res.iters);
@@ -785,9 +1029,25 @@ fn rla_preconditioner_collapses_iteration_count() {
     let n = a.n;
     let b: Vec<C> = (0..n).map(|i| c((i % 7) as f64 - 3.0, 0.5)).collect();
 
-    let unpre = cocg(&a, &b, &NoPreconditioner, 1e-10, 5000).unwrap();
+    let unpre = cocg(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(5000),
+    )
+    .unwrap();
     let m = LdltSolver::factor(&a, &SolverSettings::default()).unwrap();
-    let pre = cocg(&a, &b, &m, 1e-10, 5000).unwrap();
+    let pre = cocg(
+        &a,
+        &b,
+        &m,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(5000),
+    )
+    .unwrap();
 
     assert!(pre.converged && unpre.converged);
     assert!(
@@ -861,7 +1121,17 @@ fn gmres_unpreconditioned_nonnormal_needs_many_restarts() {
     let c = |re: f64, im: f64| Complex::new(re, im);
     let b: Vec<C> = (0..n).map(|i| c(((i % 5) as f64) - 2.0, 0.5)).collect();
     let restart = 20;
-    let res = gmres(&a, &b, &NoPreconditioner, 1e-8, 8000, restart, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-8)
+            .with_max_iter(8000)
+            .with_restart(restart),
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "non-normal GMRES must converge, res={}",
@@ -908,7 +1178,17 @@ fn gmres_reorthogonalization_keeps_illconditioned_arnoldi_accurate() {
     let b: Vec<C> = (0..n).map(|_| c(1.0, 0.2)).collect();
     // Long restart (single cycle) so the ill-conditioned basis is not masked by
     // a restart - the reorthogonalization alone keeps it usable.
-    let res = gmres(&a, &b, &NoPreconditioner, 1e-10, 4000, n, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(4000)
+            .with_restart(n),
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "reorth must keep GMRES converging, res={}",
@@ -945,7 +1225,17 @@ fn gmres_happy_breakdown_on_eigenvector_rhs() {
     // `e_0` is an eigenvector (eigenvalue `a[0][0]`); its Krylov space is 1-D.
     let mut b = vec![C::default(); n];
     b[0] = c(1.0, 0.0);
-    let res = gmres(&a, &b, &NoPreconditioner, 1e-12, 50, 30, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-12)
+            .with_max_iter(50)
+            .with_restart(30),
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "eigenvector RHS must converge, res={}",
@@ -1016,7 +1306,19 @@ fn gmres_block_incomplete_factor_multirate_deflation() {
         inner: &a,
         widths: std::sync::Mutex::new(Vec::new()),
     };
-    let res = gmres_block(&op, &bblk, s, &lu, 1e-10, 200, 40, None).unwrap();
+    let res = gmres_block(
+        &op,
+        &bblk,
+        s,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(200)
+            .with_restart(40),
+        None,
+        None,
+    )
+    .unwrap();
     assert!(
         res.converged,
         "block GMRES must converge; res={:?}",
@@ -1025,7 +1327,17 @@ fn gmres_block_incomplete_factor_multirate_deflation() {
 
     // Every column equals its single-RHS solve (deflation must not corrupt it).
     for k in 0..s {
-        let single = gmres(&a, &bblk[k * n..k * n + n], &lu, 1e-10, 200, 40, None).unwrap();
+        let single = gmres(
+            &a,
+            &bblk[k * n..k * n + n],
+            &lu,
+            &crate::KrylovSettings::default()
+                .with_tol(1e-10)
+                .with_max_iter(200)
+                .with_restart(40),
+            None,
+        )
+        .unwrap();
         let diff = (0..n)
             .map(|i| (res.x[k * n + i] - single.x[i]).norm())
             .fold(0.0, f64::max);
@@ -1099,9 +1411,30 @@ fn gmres_recycled_matches_plain_on_hard_matrix() {
     };
     let lu = LuSolver::factor(&a, &opts).unwrap();
     let (tol, maxit, restart) = (1e-10, 4000, 12);
-    let plain = gmres(&a, &b, &lu, tol, maxit, restart, None).unwrap();
+    let plain = gmres(
+        &a,
+        &b,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
+        None,
+    )
+    .unwrap();
     let mut rec = Recycle::new(8);
-    let recd = gmres_recycled(&a, &b, &lu, tol, maxit, restart, None, &mut rec).unwrap();
+    let recd = gmres_recycled(
+        &a,
+        &b,
+        &lu,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
+        None,
+        &mut rec,
+    )
+    .unwrap();
     assert!(plain.converged, "plain FGMRES did not converge");
     assert!(recd.converged, "recycled did not converge");
     let diff = (0..n)
@@ -1129,15 +1462,26 @@ fn gmres_recycled_within_solve_reduces_restarts() {
     let b: Vec<C> = (0..n).map(|i| c(1.0, 0.2 * (i as f64).cos())).collect();
     let (tol, maxit, restart) = (1e-9, 5000, 10);
 
-    let plain = gmres(&a, &b, &NoPreconditioner, tol, maxit, restart, None).unwrap();
+    let plain = gmres(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
+        None,
+    )
+    .unwrap();
     let mut rec = Recycle::new(6);
     let recd = gmres_recycled(
         &a,
         &b,
         &NoPreconditioner,
-        tol,
-        maxit,
-        restart,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
         None,
         &mut rec,
     )
@@ -1199,7 +1543,17 @@ fn gmres_recycled_cross_solve_beats_warm_and_cold() {
     let mut cold = 0usize;
     for kk in 0..steps {
         let a = ak(kk);
-        let r = gmres(&a, &bk(kk), &NoPreconditioner, tol, maxit, restart, None).unwrap();
+        let r = gmres(
+            &a,
+            &bk(kk),
+            &NoPreconditioner,
+            &crate::KrylovSettings::default()
+                .with_tol(tol)
+                .with_max_iter(maxit)
+                .with_restart(restart),
+            None,
+        )
+        .unwrap();
         assert!(r.converged, "cold {kk} stalled");
         cold += r.iters;
     }
@@ -1212,9 +1566,10 @@ fn gmres_recycled_cross_solve_beats_warm_and_cold() {
             &a,
             &bk(kk),
             &NoPreconditioner,
-            tol,
-            maxit,
-            restart,
+            &crate::KrylovSettings::default()
+                .with_tol(tol)
+                .with_max_iter(maxit)
+                .with_restart(restart),
             prev.as_deref(),
         )
         .unwrap();
@@ -1232,9 +1587,10 @@ fn gmres_recycled_cross_solve_beats_warm_and_cold() {
             &a,
             &bk(kk),
             &NoPreconditioner,
-            tol,
-            maxit,
-            restart,
+            &crate::KrylovSettings::default()
+                .with_tol(tol)
+                .with_max_iter(maxit)
+                .with_restart(restart),
             prevr.as_deref(),
             &mut rec,
         )
@@ -1278,9 +1634,10 @@ fn gmres_recycled_composes_with_warm_start() {
         &a,
         &b0,
         &NoPreconditioner,
-        tol,
-        maxit,
-        restart,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
         None,
         &mut rec,
     )
@@ -1292,9 +1649,10 @@ fn gmres_recycled_composes_with_warm_start() {
         &a,
         &b1,
         &NoPreconditioner,
-        tol,
-        maxit,
-        restart,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
         Some(&first.x),
     )
     .unwrap();
@@ -1302,9 +1660,10 @@ fn gmres_recycled_composes_with_warm_start() {
         &a,
         &b1,
         &NoPreconditioner,
-        tol,
-        maxit,
-        restart,
+        &crate::KrylovSettings::default()
+            .with_tol(tol)
+            .with_max_iter(maxit)
+            .with_restart(restart),
         Some(&first.x),
         &mut rec,
     )
@@ -1364,7 +1723,18 @@ fn gmres_recycled_real_scalar_path() {
     let a = GeneralCsc::<f64>::from_triplets(n, &rr, &cc, &vv).unwrap();
     let b: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();
     let mut rec = Recycle::<f64>::new(6);
-    let r = gmres_recycled(&a, &b, &NoPreconditioner, 1e-9, 5000, 12, None, &mut rec).unwrap();
+    let r = gmres_recycled(
+        &a,
+        &b,
+        &NoPreconditioner,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-9)
+            .with_max_iter(5000)
+            .with_restart(12),
+        None,
+        &mut rec,
+    )
+    .unwrap();
     assert!(r.converged, "real recycled solve did not converge");
     let mut ax = vec![0.0f64; n];
     a.matvec(&r.x, &mut ax);

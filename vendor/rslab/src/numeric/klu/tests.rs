@@ -848,7 +848,17 @@ fn klu_composes_as_gmres_preconditioner() {
     let m = KluSolver::factor(&a, &KluSettings::default()).unwrap();
     let b: Vec<f64> = (0..a.n).map(|i| (i % 7) as f64 - 3.0).collect();
     // Exact preconditioner -> GMRES converges in one iteration.
-    let res = gmres(&a, &b, &m, 1e-12, 5, 5, None).unwrap();
+    let res = gmres(
+        &a,
+        &b,
+        &m,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-12)
+            .with_max_iter(5)
+            .with_restart(5),
+        None,
+    )
+    .unwrap();
     assert!(res.converged);
     assert!(res.iters <= 2, "iterations {}", res.iters);
     assert!(resid(&a, &res.x, &b) < 1e-10);

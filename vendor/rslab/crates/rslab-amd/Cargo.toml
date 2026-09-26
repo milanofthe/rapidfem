@@ -1,6 +1,6 @@
 [package]
 name = "rslab-amd"
-version = "0.2.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Approximate Minimum Degree (AMD) fill-reducing ordering, quotient-graph algorithm (Amestoy, Davis & Duff 1996, 2004). Pure Rust, standalone."
@@ -15,5 +15,5 @@ categories = ["mathematics", "science"]
 name = "rslab_amd"
 
 [dependencies]
-rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "1.0" }
 

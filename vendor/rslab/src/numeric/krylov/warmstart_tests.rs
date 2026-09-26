@@ -42,10 +42,34 @@ fn closure_warm_start_converges_immediately() {
     let mut b = vec![C::new(0.0, 0.0); n * s];
     op.apply_block(&xs, &mut b, s);
 
-    let cold = gmres_block(&op, &b, s, &ident, 1e-10, 500, 30, None).expect("cold");
+    let cold = gmres_block(
+        &op,
+        &b,
+        s,
+        &ident,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(500)
+            .with_restart(30),
+        None,
+        None,
+    )
+    .expect("cold");
     assert!(cold.iters > 3, "cold solve trivial: {}", cold.iters);
 
-    let warm = gmres_block(&op, &b, s, &ident, 1e-10, 500, 30, Some(&xs)).expect("warm");
+    let warm = gmres_block(
+        &op,
+        &b,
+        s,
+        &ident,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(500)
+            .with_restart(30),
+        Some(&xs),
+        None,
+    )
+    .expect("warm");
     assert_eq!(warm.iters, 0, "exact seed must converge immediately");
     for k in 0..n * s {
         assert!((warm.x[k] - xs[k]).norm() < 1e-8);
@@ -53,7 +77,19 @@ fn closure_warm_start_converges_immediately() {
 
     // Perturbed seed: strictly fewer iterations than cold.
     let near: Vec<C> = xs.iter().map(|v| v * C::new(1.001, 0.0)).collect();
-    let warm2 = gmres_block(&op, &b, s, &ident, 1e-10, 500, 30, Some(&near)).expect("warm2");
+    let warm2 = gmres_block(
+        &op,
+        &b,
+        s,
+        &ident,
+        &crate::KrylovSettings::default()
+            .with_tol(1e-10)
+            .with_max_iter(500)
+            .with_restart(30),
+        Some(&near),
+        None,
+    )
+    .expect("warm2");
     assert!(
         warm2.iters < cold.iters,
         "near seed not faster: {} vs {}",

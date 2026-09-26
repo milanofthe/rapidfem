@@ -485,9 +485,7 @@ pub fn gmres_recycled<T, A, M>(
     op: &A,
     b: &[T],
     precond: &M,
-    tol: f64,
-    max_iter: usize,
-    restart: usize,
+    settings: &KrylovSettings,
     x0: Option<&[T]>,
     recycle: &mut Recycle<T>,
 ) -> Result<KrylovResult<T>, RslabError>
@@ -503,8 +501,8 @@ where
             got: b.len(),
         });
     }
-    const REORTH_ETA: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let m = restart.max(1);
+    let (tol, max_iter, reorth_eta) = (settings.tol, settings.max_iter, settings.reorth_eta);
+    let m = settings.restart_for(n, 1, std::mem::size_of::<T>(), 2);
     // Cap the recycle dimension at restart/2 so the Arnoldi space (m - k) is never
     // starved. `k = 0` (or an empty handle) degrades to plain FGMRES.
     let k = recycle.k.min(m / 2);
@@ -625,7 +623,7 @@ where
             }
             let mut hn = norm2(&w);
             // Conditional DGKS second pass (against C and V).
-            if hn < REORTH_ETA * wnorm0 {
+            if hn < reorth_eta * wnorm0 {
                 for i in 0..ncur {
                     let s = dotc(&cmat[i * n..i * n + n], &w);
                     bmat[i * p_arn + j] = bmat[i * p_arn + j] + s;

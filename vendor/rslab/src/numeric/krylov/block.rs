@@ -103,9 +103,10 @@ where
 /// **Memory:** the Arnoldi basis is a single up-front allocation of
 /// `n*s*(restart+1)` scalars (plus a handful of `n*s` work panels), *independent*
 /// of how few iterations actually run - so a large `restart` on a big `n*s` can
-/// allocate many GB (`n=100k, s=10, Complex<f64>, restart=80` ~ 13 GB). Size
-/// `restart` to the memory budget; the Python binding caps an unspecified
-/// `restart` automatically (an explicit value is honoured exactly).
+/// allocate many GB (`n=100k, s=10, Complex<f64>, restart=80` ~ 13 GB). An
+/// unset [`KrylovSettings::restart`] is capped to
+/// [`KrylovSettings::basis_budget_bytes`]; an explicit value is honoured
+/// exactly.
 ///
 /// **Threads:** the parallel orthogonalization reductions run in a
 /// scoped pool derived from the preconditioner's [`Threads`](crate::Threads) policy
@@ -124,42 +125,20 @@ where
 /// block solve with `s = 1` is **not** bit-identical to [`gmres`] and may differ by
 /// up to +/-1 iteration - both still converge to `tol`. See the module-level
 /// "Orthogonalization" note for the rationale.
+/// **Monitor:** at the start of every restart cycle, right after the true
+/// residuals `||b - A*x||/||b||` of all live columns were recomputed, `mon` receives
+/// `(iters_done, worst_live_residual, n_active_columns)` and returns whether the solve
+/// should CONTINUE. Long solves stop being a black box: the caller can stream residual
+/// trajectories to its log, and a `false` return cancels the solve early (a stagnation
+/// detector cutting a stopped-contracting iteration) with `StopReason::Stalled` and the
+/// best solution so far.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn gmres_block<T, A, M>(
     op: &A,
     b: &[T],
     s: usize,
     precond: &M,
-    tol: f64,
-    max_iter: usize,
-    restart: usize,
-    x0: Option<&[T]>,
-) -> Result<BlockKrylovResult<T>, RslabError>
-where
-    T: Scalar,
-    A: LinearOperator<T> + ?Sized,
-    M: Preconditioner<T> + ?Sized,
-{
-    gmres_block_mon(op, b, s, precond, tol, max_iter, restart, x0, None)
-}
-
-/// [`gmres_block`] with an optional per-cycle progress monitor: at the start
-/// of every restart cycle, right after the true
-/// residuals `||b - A*x||/||b||` of all live columns were recomputed, `mon` receives
-/// `(iters_done, worst_live_residual, n_active_columns)` and returns whether the solve
-/// should CONTINUE. Long solves stop being a black box: the caller can stream residual
-/// trajectories to its log, and a `false` return cancels the solve early (a stagnation
-/// detector cutting a stopped-contracting iteration) with `StopReason::Stalled` and the
-/// best solution so far. `None` is exactly [`gmres_block`].
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-pub fn gmres_block_mon<T, A, M>(
-    op: &A,
-    b: &[T],
-    s: usize,
-    precond: &M,
-    tol: f64,
-    max_iter: usize,
-    restart: usize,
+    settings: &KrylovSettings,
     x0: Option<&[T]>,
     mut mon: Option<&mut dyn FnMut(usize, f64, usize) -> bool>,
 ) -> Result<BlockKrylovResult<T>, RslabError>
@@ -175,8 +154,9 @@ where
             got: b.len(),
         });
     }
-    const REORTH_ETA: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let m = restart.max(1);
+    let (tol, max_iter, reorth_eta) = (settings.tol, settings.max_iter, settings.reorth_eta);
+    let chunk = settings.ortho_chunk.max(1);
+    let m = settings.restart_for(n, s, std::mem::size_of::<T>(), 1);
     // Solve-phase thread policy: orthogonalize in a pool of the same
     // width the preconditioner was factored with, so factor and solve share one
     // concurrency budget. `None` (Ambient / no factor) keeps the caller's pool.
@@ -220,7 +200,7 @@ where
     let mut reorth_col = vec![false; s]; // per-column DGKS second-pass flags
                                          // Reduction scratch for `block_project`: `nchunks * (m*s)`, reused every step
                                          // so the orthogonalization allocates nothing in the hot loop.
-    let mut proj_scratch = vec![T::zero(); n.div_ceil(ORTHO_CHUNK) * m * s];
+    let mut proj_scratch = vec![T::zero(); n.div_ceil(chunk) * m * s];
 
     // Per-active-position Arnoldi state (indexed `0..sa`, reset each cycle).
     let mut h: Vec<Vec<Vec<T>>> = (0..s).map(|_| vec![vec![T::zero(); m]; m + 1]).collect();
@@ -331,10 +311,19 @@ where
                 wnorm0[ap] = norm2(&wblk[ap * n..ap * n + n]);
             }
             ortho_in_pool(&ortho_pool, || {
-                block_project(&vbas, &wblk, blocks, sa, n, &mut proj1, &mut proj_scratch)
+                block_project(
+                    &vbas,
+                    &wblk,
+                    blocks,
+                    sa,
+                    n,
+                    chunk,
+                    &mut proj1,
+                    &mut proj_scratch,
+                )
             });
             ortho_in_pool(&ortho_pool, || {
-                block_subtract(&vbas, &mut wblk, blocks, sa, n, &proj1)
+                block_subtract(&vbas, &mut wblk, blocks, sa, n, chunk, &proj1)
             });
             // **Per-column** DGKS second pass: decide the reorth *per
             // column* from its own norm collapse, not panel-globally. Frozen
@@ -347,13 +336,22 @@ where
             let mut any_reorth = false;
             for ap in 0..sa {
                 let need =
-                    !inner_done[ap] && norm2(&wblk[ap * n..ap * n + n]) < REORTH_ETA * wnorm0[ap];
+                    !inner_done[ap] && norm2(&wblk[ap * n..ap * n + n]) < reorth_eta * wnorm0[ap];
                 reorth_col[ap] = need;
                 any_reorth |= need;
             }
             if any_reorth {
                 ortho_in_pool(&ortho_pool, || {
-                    block_project(&vbas, &wblk, blocks, sa, n, &mut proj2, &mut proj_scratch)
+                    block_project(
+                        &vbas,
+                        &wblk,
+                        blocks,
+                        sa,
+                        n,
+                        chunk,
+                        &mut proj2,
+                        &mut proj_scratch,
+                    )
                 });
                 // Zero the second-pass projection for columns that do not need it, so
                 // `block_subtract` skips them (its `hij == 0` guard) and their `w`
@@ -366,7 +364,7 @@ where
                     }
                 }
                 ortho_in_pool(&ortho_pool, || {
-                    block_subtract(&vbas, &mut wblk, blocks, sa, n, &proj2)
+                    block_subtract(&vbas, &mut wblk, blocks, sa, n, chunk, &proj2)
                 });
             }
             for ap in 0..sa {

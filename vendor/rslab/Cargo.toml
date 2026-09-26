@@ -1,5 +1,5 @@
 # Vendored copy of rslab (https://github.com/milanofthe/rslab) at commit
-# 08f06fa, written by rslab's tools/vendor.py (see VENDOR.md). The upstream
+# 2a22923, written by rslab's tools/vendor.py (see VENDOR.md). The upstream
 # manifest trimmed to the library: its features and dependencies, no
 # benches, tests, examples or dev-dependencies. The own [workspace] keeps
 # the vendored tree out of the consuming workspace.
@@ -15,7 +15,7 @@ resolver = "2"
 
 [package]
 name = "rslab"
-version = "0.38.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "RSLAB - pure-Rust sparse complex/real direct solver (symmetric LDL^T + unsymmetric LU) and preconditioner, a PARDISO-style embeddable replacement."
@@ -47,10 +47,10 @@ rayon = "1.10"
 # dispatch; the AVX-512 kernels exist only with `x86-v4`).
 gemm = { version = "0.19", features = ["x86-v4"] }
 # The fill-reducing orderings behind `OrderingMethod`.
-rslab-ordering-core = { path = "crates/rslab-ordering-core", version = "0.2" }
-rslab-amd = { path = "crates/rslab-amd", version = "0.2" }
-rslab-amf = { path = "crates/rslab-amf", version = "0.2" }
-rslab-metis = { path = "crates/rslab-metis", version = "0.2" }
+rslab-ordering-core = { path = "crates/rslab-ordering-core", version = "1.0" }
+rslab-amd = { path = "crates/rslab-amd", version = "1.0" }
+rslab-amf = { path = "crates/rslab-amf", version = "1.0" }
+rslab-metis = { path = "crates/rslab-metis", version = "1.0" }
 # Optional, only for the `matgen-download` feature (SuiteSparse/Matrix Market
 # fetcher). Pure Rust: ureq+rustls (no OpenSSL), flate2/miniz_oxide, tar.
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }

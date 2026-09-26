@@ -1,6 +1,6 @@
 [package]
 name = "rslab-metis"
-version = "0.2.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Multilevel nested-dissection fill-reducing ordering (Karypis & Kumar 1998). Pure Rust, clean-room, standalone. Implements the RSLAB ordering-crate contract."
@@ -16,7 +16,6 @@ name = "rslab_metis"
 
 [dependencies]
 rayon = "1.10"
-rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
-rslab-amd = { path = "../rslab-amd", version = "0.2" }
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "1.0" }
+rslab-amd = { path = "../rslab-amd", version = "1.0" }
 
-[dev-dependencies]

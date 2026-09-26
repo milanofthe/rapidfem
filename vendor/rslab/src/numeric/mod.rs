@@ -1,11 +1,9 @@
-pub mod blr;
 pub mod dense_eig;
+pub(crate) mod direct;
 pub mod gemm_tuning;
-pub mod iterative;
 pub mod klu;
-pub(crate) mod ll_common;
-pub mod multifrontal_ldlt;
-pub mod multifrontal_lu;
-pub mod panel_factor;
-pub mod sparse_solver;
-pub(crate) mod supernodal_solve;
+pub mod krylov;
+pub mod ldlt;
+pub mod lu;
+pub mod settings;
+pub(crate) mod supernodal;

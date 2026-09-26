@@ -2,22 +2,17 @@
 //! matrices.
 //!
 //! Given a symmetric CSC matrix `A`, compute a diagonal `d` such that
-//! each row of `D*A*D` has infinity-norm ~ 1, where `D = diag(d)`.
-//! This is the same algorithm used by the dense path in
-//! `src/dense/equilibrate.rs`, adapted to iterate over lower-triangular
-//! CSC storage.
+//! each row of `D*A*D` has infinity-norm ~ 1, where `D = diag(d)`,
+//! iterating over lower-triangular CSC storage.
 //!
-//! Phase 2.2.3 follow-up: the dense BK factorization succeeds on
-//! HYDCAR20 / METHANL8 / SWOPF / HATFLDG because it equilibrates the
-//! matrix before BK. The sparse multifrontal path was missing this
-//! step - MC64 matching happens to classify these matrices as already
-//! balanced even when their row norms span 4+ orders of magnitude.
-//! Porting the dense path's equilibration recovers these matrices for
-//! the sparse path.
+//! Inf-norm balancing complements MC64: matching can classify a matrix
+//! as already balanced even when its row norms span 4+ orders of
+//! magnitude (HYDCAR20 / METHANL8 / SWOPF / HATFLDG are examples), and
+//! those matrices need this equilibration before Bunch-Kaufman pivoting.
 //!
-//! Algorithm (Jacobi-style, converges in the same number of iterations
-//! as the Gauss-Seidel variant used by `dense::equilibrate` while being
-//! simpler to implement over CSC lower-triangle storage):
+//! Algorithm (Jacobi-style; converges in about as many iterations as a
+//! Gauss-Seidel variant while being simpler to implement over CSC
+//! lower-triangle storage):
 //!
 //! 1. Initialize `d = 1`.
 //! 2. Repeat up to `max_iter` times:
@@ -38,8 +33,8 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
     }
     let mut d = vec![1.0f64; n];
 
-    // 10 iterations is the same cap the dense path uses. Most matrices
-    // converge in 2-4 iterations; a few pathological ones need all 10.
+    // Most matrices converge in 2-4 iterations; a few pathological ones
+    // need all 10.
     let max_iter = 10;
     let tol = 1e-8;
 
@@ -65,7 +60,7 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
         // contribution. Off-diagonal entries (i > j) update both
         // `row_max[i]` and `col_max`.
         //
-        // Bit-identical to the prior formulation: max(*,*) is
+        // Bit-identical to updating `row_max` in place: max(*,*) is
         // associative on non-NaN inputs (every `v` is `|*|` of finite
         // products), so combining via a register accumulator then
         // folding into `row_max[j]` produces the same value as in-place
@@ -115,8 +110,8 @@ pub fn compute_infnorm(matrix: &CscMatrix) -> (Vec<f64>, ScalingInfo) {
 }
 
 /// One-pass symmetric inf-norm equilibration `s_i = 1/sqrt(max_j |A_ij|)` (a single
-/// Knight-Ruiz step). Cheaper than the iterative [`compute_infnorm`] and the
-/// historical [`crate::LdltSolver`] default: it tolerates a zero diagonal (the
+/// Knight-Ruiz step) and the [`crate::LdltSolver`] default. Cheaper than the
+/// iterative [`compute_infnorm`]: it tolerates a zero diagonal (the
 /// row max is taken over off-diagonals) and never iterates. An all-zero row is
 /// left unscaled (`s_i = 1`), surfacing as a singular pivot during factorization.
 /// The scan folds in the symmetric partner `(j, i)` of every stored `(i, j)`, so
@@ -149,7 +144,7 @@ mod tests {
     use super::*;
     use crate::sparse::csc::CscMatrix;
 
-    /// Feral issue #119 port: the guarded Knight-Ruiz step applies `d/sqrt(m)`
+    /// The guarded Knight-Ruiz step applies `d/sqrt(m)`
     /// only when it stays finite and positive, else holds `d`. Healthy inputs
     /// are unchanged; overflow (`d/sqrt(m) -> Inf`), underflow-to-zero
     /// (`m = Inf`), and `NaN` inputs all return the input `d`.
@@ -165,7 +160,7 @@ mod tests {
         assert_eq!(crate::scaling::kr_guarded_update(1.0, f64::NAN), 1.0);
     }
 
-    /// Feral issue #119 port: a subnormal off-diagonal coupling with no
+    /// A subnormal off-diagonal coupling with no
     /// diagonal in row 0 drives the unguarded iteration to `d = [NaN, 0.0]`
     /// on a finite input. The guarded iteration must return all-finite,
     /// strictly-positive factors, and the scaled entry must stay finite.

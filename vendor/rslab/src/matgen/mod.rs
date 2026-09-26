@@ -4,11 +4,10 @@
 //!
 //! Design follows the established packages (MatrixDepot.jl, MATLAB `gallery`,
 //! LAPACK `xLATMS`): parametrized *generators* for structured coverage plus an
-//! optional *downloader* ([`download`], feature `matgen-download`) for real
-//! SuiteSparse / Matrix Market matrices. Conditioning is steered **structurally**
-//! (diagonal dominance, PDE refinement, near-resonance shift, coefficient jumps)
-//! for the sparse families, and **spectrally** (prescribed eigenvalues, `xLATMS`
-//! style) for the small dense [`spectral`] family where exact kappa is needed.
+//! optional *downloader* (module `download`, feature `matgen-download`) for
+//! real SuiteSparse / Matrix Market matrices. Conditioning is steered
+//! **structurally**: diagonal dominance, PDE refinement, near-resonance shift,
+//! coefficient jumps.
 //!
 //! The real-valued structural families are generic over [`Scalar`]; the inherently
 //! complex families (Helmholtz, BEM/MoM kernel) produce `Complex<f64>`.
@@ -108,7 +107,7 @@ mod integration {
 
     fn ldlt_resid(a: &CscMatrix<C>) -> f64 {
         let b = rhs(a.n);
-        let f = LdltSymbolic::analyze(a)
+        let f = LdltSymbolic::analyze(a, &SolverSettings::default())
             .unwrap()
             .factor(a, &SolverSettings::default())
             .unwrap();
@@ -125,7 +124,7 @@ mod integration {
 
     fn lu_resid(a: &GeneralCsc<C>) -> f64 {
         let b = rhs(a.n);
-        let f = LuSymbolic::analyze(a)
+        let f = LuSymbolic::analyze(a, &SolverSettings::default())
             .unwrap()
             .factor(a, &SolverSettings::default())
             .unwrap();
@@ -191,7 +190,7 @@ mod integration {
             let b: Vec<T> = (0..a.n)
                 .map(|i| T::from_real((i % 7) as f64 - 3.0))
                 .collect();
-            let f = LdltSymbolic::analyze(&a)
+            let f = LdltSymbolic::analyze(&a, &SolverSettings::default())
                 .unwrap()
                 .factor(&a, &SolverSettings::default())
                 .unwrap();
@@ -215,7 +214,7 @@ mod integration {
             let b: Vec<T> = (0..a.n)
                 .map(|i| T::from_real((i % 5) as f64 - 2.0))
                 .collect();
-            let f = LuSymbolic::analyze(&a)
+            let f = LuSymbolic::analyze(&a, &SolverSettings::default())
                 .unwrap()
                 .factor(&a, &SolverSettings::default())
                 .unwrap();
@@ -246,9 +245,11 @@ mod integration {
 
         // The memory estimator scales with the scalar size - agnostic too.
         let a32 = random::random_unsym::<f32>(150, 8, 2.0, 1);
-        let e32 = LuSymbolic::analyze(&a32).unwrap().estimate_memory::<f32>();
+        let e32 = LuSymbolic::analyze(&a32, &SolverSettings::default())
+            .unwrap()
+            .estimate_memory::<f32>();
         let ac64 = random::random_unsym::<Complex<f64>>(150, 8, 2.0, 1);
-        let ec64 = LuSymbolic::analyze(&ac64)
+        let ec64 = LuSymbolic::analyze(&ac64, &SolverSettings::default())
             .unwrap()
             .estimate_memory::<Complex<f64>>();
         assert_eq!(e32.value_bytes, 4);
@@ -264,7 +265,7 @@ mod integration {
         // Symmetric -> LDL^T.
         let a = structured::banded::<C>(500, 8, 1.0, 1);
         let opts = SolverSettings::default().with_threads(3);
-        let f = LdltSymbolic::analyze(&a)
+        let f = LdltSymbolic::analyze(&a, &SolverSettings::default())
             .unwrap()
             .factor(&a, &opts)
             .unwrap();
@@ -287,7 +288,10 @@ mod integration {
         // Unsymmetric -> LU; threads=0 resolves to all cores.
         let g = bem::kernel(600, &bem::BemOpts::default());
         let o2 = SolverSettings::default().with_threads(0);
-        let lf = LuSymbolic::analyze(&g).unwrap().factor(&g, &o2).unwrap();
+        let lf = LuSymbolic::analyze(&g, &SolverSettings::default())
+            .unwrap()
+            .factor(&g, &o2)
+            .unwrap();
         let ld = lf.diagnostics();
         assert!(ld.threads >= 1);
         assert!(ld.estimate.is_some());

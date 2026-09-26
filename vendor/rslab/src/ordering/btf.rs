@@ -3,8 +3,8 @@
 //! Two purely structural, sequential, deterministic passes used by the KLU
 //! path ([`crate::numeric::klu`]):
 //!
-//! 1. **Maximum transversal** ([`max_transversal`]): an MC21-style
-//!    augmenting-path matching that pairs every column with a distinct row
+//! 1. **Maximum transversal** ([`max_transversal`]): an augmenting-path
+//!    (Hopcroft-Karp) matching that pairs every column with a distinct row
 //!    holding a structural nonzero, giving the permuted matrix a zero-free
 //!    diagonal. An incomplete matching proves the matrix structurally
 //!    singular (its structural rank is the matching size).

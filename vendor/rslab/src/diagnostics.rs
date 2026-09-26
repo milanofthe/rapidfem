@@ -27,16 +27,8 @@ pub struct MemoryEstimate {
     pub panel_live_peak_bytes: u64,
     /// Estimated overall transient peak for the **left-looking** path: live panels
     /// plus the accumulated compact factor plus the equilibrated input copy/copies.
-    /// The number to compare against RAM for [`FactorMethod::LeftLooking`](crate::FactorMethod::LeftLooking).
+    /// The number to compare against RAM.
     pub transient_peak_bytes: u64,
-    /// Estimated transient peak for the **multifrontal** path: the
-    /// contribution-block-stack model (the active front plus the live CBs of
-    /// completed subtrees not yet consumed by their parent) + factor + input.
-    /// Multifrontal holds more transiently than left-looking, so this is the
-    /// number to compare against RAM for [`FactorMethod::Multifrontal`](crate::FactorMethod::Multifrontal).
-    /// Defaults to [`transient_peak_bytes`](Self::transient_peak_bytes) until the
-    /// path-specific model fills it.
-    pub mf_transient_peak_bytes: u64,
     /// Geometric factorization work proxy `sum nrow^2*ncol` over supernodes (type-
     /// independent). Divide by a calibrated geometric-flops/s rate for a runtime
     /// estimate - see [`est_runtime_ms`](Self::est_runtime_ms).
@@ -117,7 +109,7 @@ pub(crate) fn estimate_left_looking<'a>(
     nsuper: usize,
     panel_bytes: &dyn Fn(usize) -> u64,
     compact_bytes: &dyn Fn(usize) -> u64,
-    updaters: &dyn Fn(usize) -> &'a [crate::numeric::ll_common::Li],
+    updaters: &dyn Fn(usize) -> &'a [crate::numeric::supernodal::Li],
     value_bytes: usize,
     input_bytes: u64,
     zero_copy: bool,
@@ -185,49 +177,10 @@ pub(crate) fn estimate_left_looking<'a>(
         panels_all_bytes: panels_all,
         panel_live_peak_bytes: panel_live_peak,
         transient_peak_bytes: transient,
-        // Default to the left-looking peak; the multifrontal model overrides this
-        // in the path-aware caller (it needs the assembly-tree child structure).
-        mf_transient_peak_bytes: transient,
         factor_flops: 0,        // set by the caller (needs supernode dimensions)
         critical_path_flops: 0, // set by the caller (needs the assembly tree)
         max_tree_width: 0,      // set by the caller (needs the level structure)
     }
-}
-
-/// Multifrontal transient-peak model: the **contribution-block stack** under the
-/// rayon work-stealing schedule. Unlike left-looking, multifrontal holds dense
-/// fronts plus the contribution blocks (packed lower triangles,
-/// `cnrow*(cnrow+1)/2` each, the symmetric-LDL^T storage the numeric path
-/// actually uses) of completed subtrees not yet consumed by their parent. The
-/// driver factors a whole assembly-tree level concurrently, so the
-/// conservative peak is, over the levels, the level's total front memory
-/// (`sum nrow^2`) plus the contribution blocks of its children feeding the
-/// assembly. Assuming a full level live at once never under-predicts at any
-/// thread count - the transient the left-looking estimate does not capture.
-/// (LDL^T-path model only; the unsymmetric LU path stores full-square CBs and
-/// does not consult this.)
-pub(crate) fn estimate_multifrontal_active_peak(
-    by_level: &[Vec<usize>],
-    nrow: &dyn Fn(usize) -> u64,
-    ncol: &dyn Fn(usize) -> u64,
-    children: &[Vec<usize>],
-    value_bytes: u64,
-) -> u64 {
-    let cb = |s: usize| -> u64 {
-        let cn = nrow(s).saturating_sub(ncol(s));
-        cn * (cn + 1) / 2 * value_bytes
-    };
-    let mut peak: u64 = 0;
-    for level in by_level {
-        let fronts: u64 = level.iter().map(|&s| nrow(s) * nrow(s) * value_bytes).sum();
-        let child_cb: u64 = level
-            .iter()
-            .flat_map(|&s| children[s].iter())
-            .map(|&c| cb(c))
-            .sum();
-        peak = peak.max(fronts + child_cb);
-    }
-    peak
 }
 
 // ---------------------------------------------------------------------------
@@ -254,14 +207,12 @@ pub struct Decisions {
     pub ordering_requested: String,
     /// The ordering actually dispatched after `Auto` resolution.
     pub ordering_used: String,
-    /// The ordering preprocessor actually used (`None` / `LdltCompress`).
-    pub preprocess: String,
     /// The supernode amalgamation strategy actually used.
     pub amalgamation: String,
     /// The equilibration applied before factoring (the symmetric path); the
     /// unsymmetric paths name their built-in scaling.
     pub scaling: String,
-    /// The numeric kernel (`LeftLooking`, `Multifrontal`, `Klu`).
+    /// The numeric kernel (`LeftLooking`, `Klu`).
     pub method: String,
     pub n_supernodes: usize,
     /// Largest front (rows) after amalgamation.
@@ -308,7 +259,7 @@ impl SolveStats {
 /// through `&self`; cloning snapshots the counters (a cloned handle starts a
 /// separate account).
 #[derive(Debug, Default)]
-pub struct SolveCounter(std::sync::Mutex<SolveStats>);
+pub(crate) struct SolveCounter(std::sync::Mutex<SolveStats>);
 
 impl SolveCounter {
     pub fn record(&self, rhs: usize, wall_ms: f64, refine_steps: usize) {
@@ -328,14 +279,6 @@ impl Clone for SolveCounter {
     }
 }
 
-/// Everything one factorization can tell about itself: the per-stage cost,
-/// the decisions taken, the numeric outcome, the settings that had no effect
-/// on the chosen path, and the solve-phase accumulators. Per-call and
-/// concurrency-safe (no global state), so a solver-in-the-loop with many
-/// concurrent solves gets correct per-solve numbers. Carries the a-priori
-/// [`MemoryEstimate`] alongside the measured factor time for estimate-vs-actual
-/// feedback. Logged as one `Info` line per factorization (see
-/// [`summary`](Self::summary)) and readable from the factor handle.
 /// Throughput of a factorization and its solves, derived from the stage
 /// records: the numbers to compare across orderings, thread counts and
 /// machines. Rates are `0.0` where the stage is absent or took no time.
@@ -361,6 +304,14 @@ pub struct Rates {
     pub solve_mdof_s: f64,
 }
 
+/// Everything one factorization can tell about itself: the per-stage cost,
+/// the decisions taken, the numeric outcome, the settings that had no effect
+/// on the chosen path, and the solve-phase accumulators. Per-call and
+/// concurrency-safe (no global state), so a solver-in-the-loop with many
+/// concurrent solves gets correct per-solve numbers. Carries the a-priori
+/// [`MemoryEstimate`] alongside the measured factor time for estimate-vs-actual
+/// feedback. Logged as one `Info` line per factorization (see
+/// [`summary`](Self::summary)) and readable from the factor handle.
 #[derive(Debug, Clone, Default)]
 pub struct Diagnostics {
     /// `analyze` (ordering + symbolic; the analysis time of the reused
@@ -503,8 +454,8 @@ impl fmt::Display for Diagnostics {
         writeln!(f, "factorization diagnostics: {}", self.summary())?;
         writeln!(
             f,
-            "  decisions: preprocess={} amalgamation={} scaling={}",
-            self.decisions.preprocess, self.decisions.amalgamation, self.decisions.scaling
+            "  decisions: amalgamation={} scaling={}",
+            self.decisions.amalgamation, self.decisions.scaling
         )?;
         if let Some((p, n, z)) = self.numeric.inertia {
             writeln!(f, "  inertia: +{p} -{n} 0:{z}")?;

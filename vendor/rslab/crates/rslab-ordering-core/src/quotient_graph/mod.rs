@@ -2,19 +2,18 @@
 //! orderings.
 //!
 //! This module hosts the workspace, elimination loop, and assembly-
-//! tree postorder used by `rslab-amd` and (planned) `rslab-amf`.
+//! tree postorder used by `rslab-amd` and `rslab-amf`.
 //! Both orderings share the quotient-graph data structures
 //! (`PE / IW / LEN / NV / ELEN`), the standard / aggressive element
 //! absorption logic, the mass-elimination fast path, the
 //! supervariable hash bucket detection, and the inline garbage
 //! collector. They differ only in the *selection metric* -
 //! approximate degree (AMD) vs approximate fill (AMF) - which is
-//! abstracted behind the [`Metric`] trait. Phase A shipped the trait
-//! plus the AMD-specialised [`MinDegree`] impl; Phase B.2 added
-//! [`MinFill`] driving the parallel `run_elimination_amf` /
+//! abstracted behind the [`Metric`] trait: [`MinDegree`] drives the
+//! AMD loop, [`MinFill`] the parallel `run_elimination_amf` /
 //! `create_element_amf` / `select_pivot_amf` / `finalize_step_amf`
-//! family in `algo.rs`. The duplicated inner loops trade LoC for a
-//! zero-risk AMD bit-parity contract.
+//! family in `algo.rs`. The duplicated inner loops trade LoC for
+//! keeping the AMD path bit-identical to SuiteSparse.
 //!
 //! Reference: Amestoy, Davis, Duff (1996) "An approximate minimum
 //! degree ordering algorithm," SIAM J. Matrix Analysis 17:886-905;
@@ -22,9 +21,9 @@
 
 #![allow(dead_code)]
 // Quotient-graph internals (Workspace fields, StepFlops fields, etc.)
-// are pub because the planned `rslab-amf` crate will read them
-// directly. They are deliberately not part of the locked
-// ordering-crate contract; see CONTRACT_VERSION.
+// are pub so the ordering crates can read them directly. They are
+// deliberately not part of the ordering-crate contract; see
+// CONTRACT_VERSION.
 #![allow(missing_docs)]
 
 mod algo;
@@ -90,7 +89,7 @@ pub struct OrderDiagnostics {
 /// ```
 ///
 /// `M` selects the metric (and, transitively, the elimination loop).
-/// AMD uses [`MinDegree`]; the planned AMF crate will pass `MinFill`.
+/// AMD uses [`MinDegree`], AMF uses [`MinFill`].
 pub fn order<M: Metric>(
     pattern: &CscPattern<'_>,
     opts: &WorkspaceOptions,

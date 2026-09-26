@@ -27,8 +27,6 @@ deferral.
   Scientific Computation, Modelling and Applied Mathematics
   (IMACS-15). The HAMF / HAMF4 algorithm.
 
-Full BibTeX in `dev/references.bib` of the parent repository.
-
 ## Contract
 
 `rslab-amf` conforms to the RSLAB ordering-crate contract defined by

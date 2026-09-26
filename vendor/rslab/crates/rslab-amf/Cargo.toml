@@ -1,6 +1,6 @@
 [package]
 name = "rslab-amf"
-version = "0.2.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Approximate Minimum Fill (AMF / HAMF4) fill-reducing ordering, quotient-graph algorithm (Amestoy 1999). Pure Rust, standalone."
@@ -15,6 +15,5 @@ categories = ["mathematics", "science"]
 name = "rslab_amf"
 
 [dependencies]
-rslab-ordering-core = { path = "../rslab-ordering-core", version = "0.2" }
+rslab-ordering-core = { path = "../rslab-ordering-core", version = "1.0" }
 
-[dev-dependencies]

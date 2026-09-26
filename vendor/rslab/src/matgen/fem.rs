@@ -333,15 +333,18 @@ mod tests {
         assert!(max_im > 0.0, "curl-curl carries complex values");
         // Factors via the preconditioner path (indefinite / near-singular curl-curl
         // needs perturbation), then refines to a small residual.
-        let sym = LdltSymbolic::analyze(&a).unwrap();
+        let sym = LdltSymbolic::analyze(&a, &SolverSettings::default()).unwrap();
         let opts = SolverSettings::default()
-            .with_pivot(ZeroPivotAction::PerturbToEps { abs_floor: 1e-10 });
+            .with_zero_pivot(ZeroPivotAction::PerturbToEps { abs_floor: 1e-10 });
         let solver = sym.factor(&a, &opts).unwrap();
         let n = a.n;
         let b: Vec<Complex<f64>> = (0..n)
             .map(|i| Complex::new((i % 5) as f64 - 2.0, 0.5))
             .collect();
-        let x = solver.solve_refined(&a, &b, 40).unwrap();
+        let x = solver
+            .solve_refined(&a, &b, &crate::RefinePolicy::steps(40))
+            .unwrap()
+            .0;
         let mut ax = vec![Complex::new(0.0, 0.0); n];
         a.symv(&x, &mut ax);
         let res = (0..n).map(|i| (ax[i] - b[i]).norm()).fold(0.0, f64::max)
@@ -354,13 +357,16 @@ mod tests {
         let a = saddle_point::<f64>(&[10usize, 10], 0.1);
         // The pressure block makes it indefinite: a plain Cholesky-style exact
         // factor would hit a non-positive pivot; Bunch-Kaufman handles it.
-        let sym = LdltSymbolic::analyze(&a).unwrap();
+        let sym = LdltSymbolic::analyze(&a, &SolverSettings::default()).unwrap();
         let opts = SolverSettings::default()
-            .with_pivot(ZeroPivotAction::PerturbToEps { abs_floor: 1e-12 });
+            .with_zero_pivot(ZeroPivotAction::PerturbToEps { abs_floor: 1e-12 });
         let solver = sym.factor(&a, &opts).unwrap();
         let n = a.n;
         let b: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();
-        let x = solver.solve_refined(&a, &b, 40).unwrap();
+        let x = solver
+            .solve_refined(&a, &b, &crate::RefinePolicy::steps(40))
+            .unwrap()
+            .0;
         let mut ax = vec![0.0; n];
         a.symv(&x, &mut ax);
         let res = (0..n).map(|i| (ax[i] - b[i]).abs()).fold(0.0, f64::max)
@@ -394,7 +400,7 @@ mod tests {
         }
         assert!(asymmetric, "convection-diffusion is unsymmetric");
         // Factors and solves through the unsymmetric LU path.
-        let sym = LuSymbolic::analyze(&a).unwrap();
+        let sym = LuSymbolic::analyze(&a, &SolverSettings::default()).unwrap();
         let solver = sym.factor(&a, &SolverSettings::default()).unwrap();
         let n = a.n;
         let b: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();

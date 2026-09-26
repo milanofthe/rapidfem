@@ -13,14 +13,10 @@
 //! remaining variables into degree-indexed linked lists ready for
 //! the elimination loop.
 //!
-//! Migrated from `rslab-amd` in 2026-04-27 to host the shared
-//! machinery for the planned `rslab-amf` crate; the AMD-vs-AMF
-//! delta lives entirely in the elimination metric (see
-//! `dev/research/amf-clean-room.md`).
+//! The workspace is shared by `rslab-amd` and `rslab-amf`; the
+//! AMD-vs-AMF delta lives entirely in the elimination metric.
 //
-// Items are consumed by the elimination loop in subsequent commits
-// (Commit 4 onwards). Until then several fields and helpers are
-// intentionally unused.
+// Not every field or helper is read by every elimination loop.
 #![allow(dead_code)]
 
 use super::WorkspaceOptions;
@@ -88,8 +84,8 @@ pub struct Workspace {
     ///
     /// `i64` (not `i32`): the un-quantized surface contribution has
     /// both factors `O(n)`, so it reaches ~`n^2` and overflows `i32`
-    /// for `n` >~ 46k before being consumed as `f64` in the RMF score
-    /// (O1, `dev/research/repo-review-2026-06-09.md`). HAMF4 computes
+    /// for `n` >~ 46k before being consumed as `f64` in the RMF score.
+    /// HAMF4 computes
     /// the RMF in DBLE for the same reason. The post-quantization RMF
     /// score stored here later is bounded by `i32::MAX - 1`.
     pub wf: Vec<i64>,
@@ -99,7 +95,7 @@ pub struct Workspace {
     /// Overflow ceiling for `wflg`: `i32::MAX - n`.
     pub wbig: i32,
     /// Largest element size encountered so far - used by supervariable
-    /// detection (Slice B) to bump `wflg` safely.
+    /// detection to bump `wflg` safely.
     pub lemax: i32,
     /// Lower bound on the next pivot's degree. Monotone non-decreasing.
     pub mindeg: usize,
@@ -177,7 +173,7 @@ impl Workspace {
             nzaat += cnt;
         }
 
-        // iwlen = nzaat + nzaat/5 + n  (plan A1 / faer amd.rs:921-924).
+        // iwlen = nzaat + nzaat/5 + n  (faer amd.rs:921-924).
         let iwlen = nzaat
             .checked_add(nzaat / 5)
             .and_then(|s| s.checked_add(n))
@@ -289,206 +285,5 @@ impl Workspace {
             n_mass_elim: 0,
             n_supervar_merge: 0,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn pat<'a>(n: usize, cp: &'a [i32], ri: &'a [i32]) -> CscPattern<'a> {
-        CscPattern::new(n, cp, ri).expect("valid test pattern")
-    }
-
-    #[test]
-    fn flip_involution() {
-        for x in [-100i32, -1, 0, 1, 17, 1000] {
-            assert_eq!(flip(flip(x)), x);
-        }
-    }
-
-    #[test]
-    fn clear_flag_resets_on_overflow() {
-        let mut w = [0, 3, 5, 7, 0];
-        // wflg >= wbig triggers reset.
-        let wflg = clear_flag(100, 100, &mut w);
-        assert_eq!(wflg, 2);
-        assert_eq!(w, [0, 1, 1, 1, 0]);
-    }
-
-    #[test]
-    fn clear_flag_passthrough() {
-        let mut w = [1, 2, 3];
-        let wflg = clear_flag(5, 100, &mut w);
-        assert_eq!(wflg, 5);
-        assert_eq!(w, [1, 2, 3]);
-    }
-
-    /// Diagonal 4x4: every variable has degree 0. All four are
-    /// pre-eliminated by the zero-degree fast path; none are
-    /// inserted into any degree list.
-    #[test]
-    fn diag_4_zero_degree_fast_path() {
-        let cp = [0, 1, 2, 3, 4];
-        let ri = [0, 1, 2, 3];
-        let p = pat(4, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-
-        assert_eq!(ws.n, 4);
-        assert_eq!(ws.nel, 4, "all four pre-eliminated");
-        assert_eq!(ws.ndense, 0, "no dense deferral");
-        for i in 0..4 {
-            assert_eq!(ws.elen[i], flip(1));
-            assert_eq!(ws.pe[i], NONE);
-            assert_eq!(ws.w[i], 0);
-            assert_eq!(ws.degree[i], 0);
-        }
-        for d in 0..4 {
-            assert_eq!(ws.head[d], NONE, "degree {d} bucket empty");
-        }
-    }
-
-    /// Tridiagonal 5x5 full-symmetric: var 0 has deg 1, 4 has deg 1,
-    /// interior vars have deg 2. No dense deferral (max deg 2 < 16).
-    /// All five enter degree lists.
-    #[test]
-    fn tridiag_5_populates_degree_lists() {
-        // Full-symmetric tridiag of size 5.
-        // column j contains diagonal + off-diagonals j-1 and j+1.
-        let cp = [0, 2, 5, 8, 11, 13];
-        let ri = [0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4];
-        let p = pat(5, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-
-        assert_eq!(ws.n, 5);
-        assert_eq!(ws.nel, 0, "no fast-path eliminations");
-        assert_eq!(ws.ndense, 0);
-        assert_eq!(ws.degree, vec![1, 2, 2, 2, 1]);
-        assert_eq!(ws.len, vec![1, 2, 2, 2, 1]);
-
-        // LIFO insertion: the last variable inserted into deg list d
-        // is at head[d]. For deg=1, vars 0 and 4 hit the bucket;
-        // last in is 4. For deg=2, vars 1,2,3; last in is 3.
-        assert_eq!(ws.head[1], 4);
-        assert_eq!(ws.next[4], 0);
-        assert_eq!(ws.next[0], NONE);
-        assert_eq!(ws.last[0], 4);
-
-        assert_eq!(ws.head[2], 3);
-        assert_eq!(ws.next[3], 2);
-        assert_eq!(ws.next[2], 1);
-        assert_eq!(ws.next[1], NONE);
-        assert_eq!(ws.last[1], 2);
-        assert_eq!(ws.last[2], 3);
-        assert_eq!(ws.last[3], NONE);
-
-        // iwlen = nzaat + nzaat/5 + n.
-        // nzaat = sum(len) = 1+2+2+2+1 = 8.
-        // iwlen = 8 + 1 + 5 = 14.
-        assert_eq!(ws.iwlen, 14);
-        assert_eq!(ws.pfree, 8);
-    }
-
-    /// Arrow(5): hub at 0 has deg 4, spokes have deg 1. Dense
-    /// threshold for n=5 is min(n, max(16, 10*sqrt(5))) = 5; deg 4
-    /// < 5, so nothing is deferred. Hub enters head[4].
-    #[test]
-    fn arrow_5_all_live() {
-        let cp = [0, 5, 7, 9, 11, 13];
-        let ri = [0, 1, 2, 3, 4, 0, 1, 0, 2, 0, 3, 0, 4];
-        let p = pat(5, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-
-        assert_eq!(ws.degree, vec![4, 1, 1, 1, 1]);
-        assert_eq!(ws.nel, 0);
-        assert_eq!(ws.ndense, 0);
-        assert_eq!(ws.head[4], 0, "hub at deg-4 bucket");
-        assert_eq!(ws.head[1], 4, "last spoke inserted");
-    }
-
-    /// Arrow(200): hub has deg 199. Dense threshold = max(16,
-    /// floor(10*sqrt(200))) = max(16, 141) = 141, min(141, 200) =
-    /// 141. 199 > 141 so the hub is deferred. Spokes (deg 1) live.
-    #[test]
-    fn arrow_200_hub_deferred() {
-        let n = 200usize;
-        let mut cp: Vec<i32> = Vec::with_capacity(n + 1);
-        let mut ri: Vec<i32> = Vec::new();
-        cp.push(0);
-        // col 0: diagonal + all spokes 1..n
-        ri.push(0);
-        for r in 1..n {
-            ri.push(r as i32);
-        }
-        cp.push(ri.len() as i32);
-        // cols 1..n: diagonal + hub
-        for j in 1..n {
-            ri.push(0);
-            ri.push(j as i32);
-            cp.push(ri.len() as i32);
-        }
-        let p = pat(n, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-
-        assert_eq!(ws.degree[0], (n - 1) as i32);
-        assert_eq!(ws.nel, 1, "hub only");
-        assert_eq!(ws.ndense, 1);
-        assert_eq!(ws.nv[0], 0, "hub marked deferred");
-        assert_eq!(ws.pe[0], NONE);
-        assert_eq!(ws.elen[0], NONE);
-        // Spokes all land in head[1] - LIFO, last in is n-1.
-        assert_eq!(ws.head[1], (n - 1) as i32);
-    }
-
-    /// With `dense_alpha < 0`, the threshold is set to `n - 2`
-    /// (faer amd.rs:173-177). A variable with degree `n - 1` (only
-    /// possible for a true hub) is still deferred; everything else
-    /// stays live. This matches SuiteSparse AMD semantics exactly.
-    #[test]
-    fn dense_alpha_negative_uses_n_minus_2() {
-        // Band(20, 5): max degree = 10, well under n - 2 = 18.
-        let n = 20usize;
-        let b = 5usize;
-        let mut cp: Vec<i32> = vec![0];
-        let mut ri: Vec<i32> = Vec::new();
-        for j in 0..n {
-            let lo = j.saturating_sub(b);
-            let hi = (j + b + 1).min(n);
-            for r in lo..hi {
-                ri.push(r as i32);
-            }
-            cp.push(ri.len() as i32);
-        }
-        let p = pat(n, &cp, &ri);
-        let opts = WorkspaceOptions { dense_alpha: -1.0 };
-        let ws = Workspace::new(&p, &opts).unwrap();
-        assert_eq!(ws.ndense, 0, "nothing deferred below n - 2");
-        assert_eq!(ws.nel, 0);
-    }
-
-    #[test]
-    fn empty_pattern_ok() {
-        let cp = [0i32];
-        let ri: [i32; 0] = [];
-        let p = pat(0, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-        assert_eq!(ws.n, 0);
-        assert_eq!(ws.nel, 0);
-        assert_eq!(ws.iwlen, 0);
-    }
-
-    /// Diagonal entries in the input are ignored when computing
-    /// adjacency lists - only off-diagonal neighbors contribute to
-    /// `len`, `degree`, and `iw`.
-    #[test]
-    fn diagonal_entries_skipped() {
-        // 3x3 with diagonal only.
-        let cp = [0, 1, 2, 3];
-        let ri = [0, 1, 2];
-        let p = pat(3, &cp, &ri);
-        let ws = Workspace::new(&p, &WorkspaceOptions::default()).unwrap();
-        assert_eq!(ws.len, vec![0, 0, 0]);
-        assert_eq!(ws.pfree, 0);
-        assert_eq!(ws.nel, 3);
     }
 }

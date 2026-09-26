@@ -1,7 +1,6 @@
 //! `rslab-amd-bench`: run AMD on a small built-in fixture suite and
-//! report wall-clock time + stats. Intentionally minimal - a full
-//! benchmark harness with larger matrices and comparison against
-//! oracle lnz counts is deferred.
+//! report wall-clock time + stats. Intentionally minimal: no large
+//! matrices and no comparison against oracle lnz counts.
 
 use std::time::Instant;
 

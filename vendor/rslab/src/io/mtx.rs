@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::dense::matrix::SymmetricMatrix;
 use crate::error::RslabError;
 use crate::scalar::Scalar;
@@ -21,7 +22,8 @@ impl<T: Scalar> MtxMatrix<T> {
     /// X2 (REG-4): duplicate coordinates are **summed**, matching `to_csc`
     /// (which sums via `CscMatrix::from_triplets`) and the Matrix Market /
     /// COO convention used by scipy and MATLAB.
-    pub fn to_dense(&self) -> SymmetricMatrix<T> {
+    #[cfg(test)]
+    pub(crate) fn to_dense(&self) -> SymmetricMatrix<T> {
         let mut mat = SymmetricMatrix::zeros(self.n);
         for &(i, j, v) in &self.entries {
             let prev = mat.get(i, j);
@@ -410,7 +412,7 @@ mod tests {
         assert_eq!(dense.get(2, 0), 0.0); // not set
     }
 
-    /// X10 (dev/research/repo-review-2026-06-09.md): the entries Vec was
+    /// The entries Vec was
     /// reserved with `Vec::with_capacity(nnz)` straight from the untrusted
     /// MTX size line. A corrupt header declaring an enormous nnz turns that
     /// into a multi-exabyte allocation request; the allocator returns null
@@ -517,7 +519,7 @@ mod tests {
         );
     }
 
-    /// X11 (dev/research/repo-review-2026-06-09.md): the banner was compared
+    /// The banner was compared
     /// against the exact single-space string. A legal MTX banner separates
     /// its five fields with arbitrary whitespace; the NIST `mmio` reference
     /// tokenizes it. Pre-fix this multi-space banner failed the exact-string
@@ -732,7 +734,7 @@ mod tests {
             Complex::new(0.0, 1.0),
             Complex::new(-1.0, 0.5),
         ];
-        let solver = LdltSolver::factor(&a).unwrap();
+        let solver = LdltSolver::factor(&a, &crate::SolverSettings::default()).unwrap();
         let x = solver.solve(&b).unwrap();
         let mut ax = vec![Complex::new(0.0, 0.0); 3];
         a.symv(&x, &mut ax);

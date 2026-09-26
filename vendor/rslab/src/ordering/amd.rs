@@ -44,28 +44,45 @@ pub fn permute_pattern(pattern: &CscPattern, perm: &[usize]) -> CscPattern {
 
     let nnz = col_ptr[n];
     let mut row_idx = vec![0usize; nnz];
-    let mut offsets: Vec<usize> = col_ptr[..n].to_vec();
 
-    // Pass 2: fill row_idx with the permuted row values.
-    for old_j in 0..n {
-        let new_j = inv_perm[old_j];
-        let start = pattern.col_ptr[old_j];
-        let end = pattern.col_ptr[old_j + 1];
-        for k in start..end {
-            let new_i = inv_perm[pattern.row_idx[k]];
-            row_idx[offsets[new_j]] = new_i;
-            offsets[new_j] += 1;
+    // Pass 2: new column `j` is old column `perm[j]` with its rows renumbered,
+    // sorted. Columns are independent, so contiguous blocks of them, balanced
+    // by entry count, fill in parallel; every column comes out the same as
+    // serially, whatever the thread count.
+    let fill = |j0: usize, j1: usize, out: &mut [usize]| {
+        let base = col_ptr[j0];
+        for j in j0..j1 {
+            let dst = &mut out[col_ptr[j] - base..col_ptr[j + 1] - base];
+            let old = perm[j];
+            let src = &pattern.row_idx[pattern.col_ptr[old]..pattern.col_ptr[old + 1]];
+            for (d, &r) in dst.iter_mut().zip(src) {
+                *d = inv_perm[r];
+            }
+            dst.sort_unstable();
         }
-    }
-
-    // Sort each column's row indices. Downstream code (column_counts,
-    // factorization) does not strictly require sorted order, but the
-    // previous implementation produced sorted columns and keeping that
-    // invariant avoids subtle coupling with callers that may rely on it.
-    for j in 0..n {
-        let start = col_ptr[j];
-        let end = col_ptr[j + 1];
-        row_idx[start..end].sort_unstable();
+    };
+    const PARALLEL_MIN_NNZ: usize = 1 << 16;
+    if nnz < PARALLEL_MIN_NNZ || rayon::current_num_threads() == 1 {
+        fill(0, n, &mut row_idx);
+    } else {
+        use rayon::prelude::*;
+        let target = nnz.div_ceil(8 * rayon::current_num_threads());
+        let mut blocks: Vec<(usize, usize, &mut [usize])> = Vec::new();
+        let mut rest: &mut [usize] = &mut row_idx;
+        let mut j0 = 0;
+        while j0 < n {
+            let mut j1 = j0 + 1;
+            while j1 < n && col_ptr[j1] - col_ptr[j0] < target {
+                j1 += 1;
+            }
+            let (head, tail) = rest.split_at_mut(col_ptr[j1] - col_ptr[j0]);
+            blocks.push((j0, j1, head));
+            rest = tail;
+            j0 = j1;
+        }
+        blocks
+            .into_par_iter()
+            .for_each(|(j0, j1, out)| fill(j0, j1, out));
     }
 
     CscPattern {

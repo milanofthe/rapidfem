@@ -6,25 +6,15 @@
 //! taken from an indexed max-heap keyed by gain (in-place key updates, one
 //! entry per vertex, most recently touched vertex first among equal gains),
 //! moves are journaled, and the pass rolls back to the best separator seen.
-//! A pass stops when the heap drains, after [`MOVE_LIMIT`] consecutive moves
+//! A pass stops when the heap drains, after `move_limit` consecutive moves
 //! without improvement, or when the separator has grown past
-//! [`MAX_OVERSHOOT`] times the best one.
+//! `max_overshoot` times the best one.
 
 use crate::fm_refine::PART_SEP;
 use crate::graph::Graph;
 use crate::initial_partition::{PART_A, PART_B};
 use crate::rng::SplitMix;
-
-/// Consecutive non-improving moves after which a pass gives up. Effectively
-/// unbounded: the one-sided passes find their best separators at the end of
-/// long hill traversals (a METIS-style limit of 300 costs 10 to 35 percent
-/// fill on 2D and 3D grids for a 15 percent time saving), so a pass runs
-/// until the heap drains or the overshoot cap trips.
-const MOVE_LIMIT: usize = 1 << 20;
-
-/// A pass also stops when the separator has grown to this multiple of the
-/// best separator seen (a safety net for pathological hill climbs).
-const MAX_OVERSHOOT: f64 = 4.0;
+use crate::MetisOptions;
 
 /// Weight of `v`'s neighbors that carry label `s`.
 #[inline]
@@ -295,6 +285,7 @@ fn side_pass(
     labels: &mut [u8],
     into: usize,
     side_cap: i64,
+    opts: &MetisOptions,
     rng: &mut SplitMix,
     ws: &mut Workspace,
 ) -> i64 {
@@ -320,7 +311,9 @@ fn side_pass(
         } else {
             since_best += 1;
             let overshoot = sep_w - best_w;
-            if since_best > MOVE_LIMIT || overshoot as f64 > MAX_OVERSHOOT * best_w.max(1) as f64 {
+            if since_best > opts.move_limit
+                || overshoot as f64 > opts.max_overshoot * best_w.max(1) as f64
+            {
                 break;
             }
         }
@@ -338,10 +331,10 @@ fn side_pass(
 pub(crate) fn refine_node_separator(
     graph: &Graph,
     labels: &mut [u8],
-    max_imbalance: f64,
-    max_rounds: u32,
+    opts: &MetisOptions,
     rng: &mut SplitMix,
 ) -> i64 {
+    let (max_imbalance, max_rounds) = (opts.max_imbalance, opts.fm_passes);
     let class_w = class_weights(graph, labels);
     let mut sep_w = class_w[PART_SEP as usize];
     if sep_w == 0 {
@@ -358,8 +351,8 @@ pub(crate) fn refine_node_separator(
         } else {
             PART_B as usize
         };
-        let after_first = side_pass(graph, labels, first, side_cap, rng, &mut ws);
-        let after_second = side_pass(graph, labels, 1 - first, side_cap, rng, &mut ws);
+        let after_first = side_pass(graph, labels, first, side_cap, opts, rng, &mut ws);
+        let after_second = side_pass(graph, labels, 1 - first, side_cap, opts, rng, &mut ws);
         let round_end = after_first.min(after_second);
         if round_end >= sep_w {
             sep_w = round_end;
@@ -487,7 +480,7 @@ mod tests {
         let mut labels = initial_bisect_ggp(&g, &mut rng, total / 2);
         construct_separator(&g, &mut labels);
         let before = separator_weight(&g, &labels);
-        let after = refine_node_separator(&g, &mut labels, 0.20, 10, &mut rng);
+        let after = refine_node_separator(&g, &mut labels, &MetisOptions::default(), &mut rng);
         (g, labels, before - after)
     }
 
@@ -499,7 +492,7 @@ mod tests {
             // Returned weight must match a from-scratch recount.
             let mut labels2 = labels.clone();
             let mut rng = SplitMix::new(99);
-            let w = refine_node_separator(&g, &mut labels2, 0.20, 10, &mut rng);
+            let w = refine_node_separator(&g, &mut labels2, &MetisOptions::default(), &mut rng);
             assert_eq!(w, separator_weight(&g, &labels2), "bookkeeping");
             assert!(is_valid_trisection(&g, &labels2));
         }
@@ -528,7 +521,7 @@ mod tests {
         let before = separator_weight(&g, &labels);
         assert_eq!(before, 24);
         let mut rng = SplitMix::new(3);
-        let after = refine_node_separator(&g, &mut labels, 0.20, 10, &mut rng);
+        let after = refine_node_separator(&g, &mut labels, &MetisOptions::default(), &mut rng);
         assert!(is_valid_trisection(&g, &labels));
         assert_eq!(after, separator_weight(&g, &labels), "bookkeeping");
         assert!(
@@ -579,7 +572,7 @@ mod tests {
             let mut rng = SplitMix::new(42);
             let mut labels = initial_bisect_ggp(&g, &mut rng, total / 2);
             construct_separator(&g, &mut labels);
-            let w = refine_node_separator(&g, &mut labels, 0.20, 10, &mut rng);
+            let w = refine_node_separator(&g, &mut labels, &MetisOptions::default(), &mut rng);
             (labels, w)
         };
         let (l1, w1) = mk();
@@ -593,7 +586,7 @@ mod tests {
         let g = grid(4, 4);
         let mut labels = vec![PART_A; 16];
         let mut rng = SplitMix::new(1);
-        let w = refine_node_separator(&g, &mut labels, 0.20, 10, &mut rng);
+        let w = refine_node_separator(&g, &mut labels, &MetisOptions::default(), &mut rng);
         assert_eq!(w, 0);
         assert_eq!(labels, vec![PART_A; 16]);
         balance_node_separator(&g, &mut labels, 0.20, &mut rng);

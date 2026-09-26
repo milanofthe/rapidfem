@@ -2,7 +2,7 @@
 //!
 //! [`CscMatrix`](crate::sparse::csc::CscMatrix) stores only the lower triangle
 //! of a *symmetric* matrix. The unsymmetric LU path
-//! ([`crate::numeric::multifrontal_lu`]) needs the **full** matrix with both
+//! ([`crate::numeric::lu`]) needs the **full** matrix with both
 //! triangles and genuinely distinct `A_ij != A_ji`; this type provides that.
 
 use crate::error::RslabError;
@@ -146,22 +146,6 @@ impl<T: Scalar> GeneralCsc<T> {
             row_idx,
             values,
         }
-    }
-
-    /// One-norm `||A||_1 = max_j sum_i |a_ij|` (max absolute column sum) - the
-    /// norm side of the Hager-Higham condition estimate (feral #94 port).
-    pub fn one_norm(&self) -> f64 {
-        let mut worst = 0.0f64;
-        for j in 0..self.n {
-            let mut colsum = 0.0f64;
-            for k in self.col_ptr[j]..self.col_ptr[j + 1] {
-                colsum += self.values[k].magnitude();
-            }
-            if colsum > worst {
-                worst = colsum;
-            }
-        }
-        worst
     }
 
     /// Validate structural invariants - the full canonical-form contract the

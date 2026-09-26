@@ -7,11 +7,9 @@
 //! pass rolls back to the best balanced state.
 //!
 //! Node-*separator* refinement lives in `sep_refine` (an independent
-//! implementation from published descriptions); the former greedy
-//! positive-gain `refine_separator` was removed when the multilevel
-//! node-separator pipeline replaced the "edge-FM everywhere, convert
-//! at the end" scheme (see
-//! `dev/research/metis-node-separator-2026-07.md`).
+//! implementation from published descriptions): the node separator is
+//! refined through the whole hierarchy instead of refining the edge
+//! bisection and converting at the finest level.
 //!
 //! Priority queue: a lazy `BinaryHeap<(gain, Reverse(v))>` rather
 //! than METIS's bucket array. Correct; the O(log n) overhead per
@@ -64,8 +62,7 @@ pub fn refine_bisection(
         // this max-heap and are only popped after the positive-gain
         // boundary moves that actually reduce the cut. Seeding all n is
         // a deliberate simplicity-over-speed trade at RSLAB's target
-        // sizes (<= 100k vertices, where FM rarely dominates runtime);
-        // see dev/tried-and-rejected.md (O11).
+        // sizes (<= 100k vertices, where FM rarely dominates runtime).
         for (v, &g) in gain.iter().enumerate().take(n) {
             heap.push((g, Reverse(v as i32), g));
         }
@@ -271,22 +268,21 @@ mod tests {
         Graph::from_csc_pattern(&pat).unwrap()
     }
 
-    /// Regression test for the FM neighbour-update sign bug fixed
-    /// alongside this test (see `dev/research/metis-fm-sign-bug.md`).
+    /// Regression test for the sign of the FM neighbour gain update.
     ///
-    /// The bug flipped the signs at the `gain[u] +/- 2w` neighbour
-    /// update, so on a graph where FM actually had to move vertices,
-    /// `cur_cut` drifted into negative impossible territory and FM
-    /// rolled every move back. Existing tests missed it because they
-    /// either started from already-optimal cuts (`initial_bisect_ggp`
-    /// on grid is at the optimum), let the balance guard block every
-    /// move, or only checked permutation validity.
+    /// Flipped signs at the `gain[u] +/- 2w` neighbour update make
+    /// `cur_cut` drift into negative impossible territory on a graph
+    /// where FM actually has to move vertices, and FM then rolls every
+    /// move back. Tests that start from already-optimal cuts
+    /// (`initial_bisect_ggp` on a grid is at the optimum), let the
+    /// balance guard block every move, or only check permutation
+    /// validity cannot catch that.
     ///
     /// Two assertions matter here:
     ///
     /// 1. **I1 (bookkeeping consistency).** `returned_cut` must equal
     ///    `cut_size(graph, labels)` recomputed from scratch. This is
-    ///    the assertion the bug *cannot* survive.
+    ///    the assertion a sign error *cannot* survive.
     /// 2. **Cut actually drops.** Path P_10 with alternating ABAB
     ///    labels has cut = 9 and balanced optimum cut = 1. FM with
     ///    correct bookkeeping must reduce the cut.
@@ -312,7 +308,7 @@ mod tests {
 
         let after = refine_bisection(&g, &mut labels, 0.20, 32);
 
-        // I1 - the assertion that catches the sign bug directly.
+        // I1 - the assertion that catches a sign error directly.
         assert_eq!(
             after,
             cut_size(&g, &labels),
@@ -410,16 +406,15 @@ mod tests {
         assert_eq!(separator_weight(&g, &labels), 3);
     }
 
-    // Adversarial set A1-A10 from
-    // dev/research/metis-fm-sign-bug.md section 5. Standing regression tests
-    // enforcing I1 (bookkeeping consistency) and, where meaningful,
+    // Adversarial set A1-A10: standing regression tests enforcing
+    // I1 (bookkeeping consistency) and, where meaningful,
     // I2 (cut never grows), I4 (balance respected at exit),
     // I6 (determinism).
     //
     // A1 is covered by `fm_sign_invariant_on_alternating_path` above.
     // A2-A10 follow. Each constructs `initial cut` and (where
     // applicable) `optimum` by hand - never by running the solver
-    // under test - per CLAUDE.md's oracle-independence rule.
+    // under test.
 
     fn path(n: usize) -> Graph {
         let mut t: Vec<(usize, usize)> = (0..n).map(|i| (i, i)).collect();

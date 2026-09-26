@@ -1,5 +1,5 @@
-//! Small **dense** complex linear algebra for GCRO-DR harmonic-Ritz extraction
-//! (issue #5). These routines operate on tiny `(m+k)`-dimensional matrices
+//! Small **dense** complex linear algebra for GCRO-DR harmonic-Ritz
+//! extraction. These routines operate on tiny `(m+k)`-dimensional matrices
 //! (`m` = GMRES restart, typically <= 80) **once per restart cycle** - never in
 //! the Krylov hot loop - so they are written for clarity and robustness, not
 //! peak speed, and everything runs in `Complex<f64>` regardless of the outer

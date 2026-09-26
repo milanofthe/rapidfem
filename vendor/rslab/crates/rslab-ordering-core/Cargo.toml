@@ -1,6 +1,6 @@
 [package]
 name = "rslab-ordering-core"
-version = "0.2.2"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
 description = "Shared input/output types for RSLAB's fill-reducing ordering crates (rslab-amd, rslab-amf, rslab-metis). Defines the locked contract surface - CscPattern, OrderingStats, OrderingError."
@@ -16,4 +16,3 @@ name = "rslab_ordering_core"
 
 [dependencies]
 
-[dev-dependencies]

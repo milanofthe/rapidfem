@@ -302,7 +302,7 @@ mod tests {
         let g = grid(8, 8);
         let mut rng = SplitMix::new(5);
         let mut ctr = CoarsenCounters::default();
-        let cg = coarsen_level(&g, &mut rng, 0.85, &mut ctr);
+        let cg = coarsen_level(&g, &mut rng, 0.85, 200_000, &mut ctr);
         let total = total_weight(&cg.graph);
         let target = total / 2;
         let labels = initial_bisect_ggp(&cg.graph, &mut rng, target);

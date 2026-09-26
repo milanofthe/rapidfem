@@ -2,9 +2,9 @@
 
 Shared input/output types for RSLAB's fill-reducing ordering crates.
 
-This crate defines the locked contract surface that every sibling
-ordering crate in RSLAB (`rslab-amd`, `rslab-metis`, `rslab-scotch`,
-`rslab-kahip`) implements:
+This crate defines the contract surface that every sibling
+ordering crate in RSLAB (`rslab-amd`, `rslab-amf`, `rslab-metis`)
+implements:
 
 - `CscPattern<'_>` - borrowed, full-symmetric, 0-based, `i32`-indexed
   sparsity pattern.
@@ -14,8 +14,15 @@ ordering crate in RSLAB (`rslab-amd`, `rslab-metis`, `rslab-scotch`,
   escape hatch.
 - `CONTRACT_VERSION: u32` - bumped on breaking changes.
 
-Zero dependencies beyond `std`. The full design rationale lives in
-`dev/plans/ordering-crate-contract.md`.
+It also hosts the shared engines:
+
+- `quotient_graph` - the quotient-graph workspace, elimination loop
+  and assembly-tree postorder behind `rslab-amd` (minimum degree) and
+  `rslab-amf` (approximate minimum fill), selected by the `Metric`
+  trait.
+- `rcm` - Reverse Cuthill-McKee band/profile-reducing ordering.
+
+Zero dependencies beyond `std`.
 
 ## Per-crate contract function
 

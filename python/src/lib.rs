@@ -10,6 +10,7 @@
 //!
 //! Build via `maturin develop` (dev) or `maturin build --release` (wheel).
 
+mod geometry;
 mod model;
 
 use num_complex::Complex64;
@@ -23,6 +24,7 @@ use rapidfem_fd::eigenmode::Eigenmode;
 use rapidfem_fd::farfield::RadiationPattern;
 use rapidfem_fd::order::OrderPolicy;
 use rapidfem_fd::simulation::{FdSettings, Simulation, SweepResult};
+use geometry::{PyFemMesh, PyGeometry};
 use model::PyModel;
 
 /// A frequency-sweep simulation. Build once, run sweeps, inspect results.
@@ -80,6 +82,34 @@ impl PySimulation {
         };
         let settings = FdSettings { frequencies, order, eigenmode };
         let inner = Simulation::from_mesh_bytes(mesh_bytes, model.inner.clone(), settings)
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(PySimulation { inner })
+    }
+
+    /// Build a simulation on a solver mesh from `Geometry.fem_mesh`; the
+    /// other arguments as for the constructor.
+    #[staticmethod]
+    #[pyo3(signature = (mesh, model, frequencies, *, order=2, adaptive=false, eigenmode=None))]
+    fn from_fem_mesh(
+        mesh: &PyFemMesh,
+        model: &PyModel,
+        frequencies: Vec<f64>,
+        order: u8,
+        adaptive: bool,
+        eigenmode: Option<(f64, usize)>,
+    ) -> PyResult<Self> {
+        if !(1..=2).contains(&order) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "order must be 1 or 2, got {order}"
+            )));
+        }
+        let order = if adaptive {
+            OrderPolicy::Adaptive { theta: rapidfem_fd::order::DEFAULT_THETA }
+        } else {
+            OrderPolicy::Uniform(order)
+        };
+        let settings = FdSettings { frequencies, order, eigenmode };
+        let inner = Simulation::new(mesh.inner.clone(), model.inner.clone(), settings)
             .map_err(PyRuntimeError::new_err)?;
         Ok(PySimulation { inner })
     }
@@ -607,6 +637,23 @@ impl PyTdOperator {
         let mesh = rapidfem_core::mesh_io::parse_mesh_bytes(mesh_bytes)
             .map_err(PyRuntimeError::new_err)?;
         let op = rapidfem_td::build::operator_from_model(&mesh, &model.inner, order, flux_alpha, c)
+            .map_err(PyRuntimeError::new_err)?;
+        Ok(PyTdOperator {
+            op,
+            krylov: rapidfem_td::propagator::KrylovWorkspace::new(),
+            driven_b: Vec::new(),
+            lserk: rapidfem_td::explicit::LserkWorkspace::new(),
+            kcl: rapidfem_td::explicit_adaptive::KclWorkspace::new(),
+            gpu: None,
+        })
+    }
+
+    /// Build the operator of a `Model` on a solver mesh from
+    /// `Geometry.fem_mesh`; the other arguments as for `from_model`.
+    #[staticmethod]
+    #[pyo3(signature = (mesh, model, order, flux_alpha = 1.0, c = 299_792_458.0))]
+    fn from_fem_mesh(mesh: &PyFemMesh, model: &PyModel, order: usize, flux_alpha: f64, c: f64) -> PyResult<Self> {
+        let op = rapidfem_td::build::operator_from_model(&mesh.inner, &model.inner, order, flux_alpha, c)
             .map_err(PyRuntimeError::new_err)?;
         Ok(PyTdOperator {
             op,
@@ -1473,6 +1520,8 @@ impl PyTdOperator {
 #[pyo3(name = "_native")]
 fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
+    m.add_class::<PyGeometry>()?;
+    m.add_class::<PyFemMesh>()?;
     m.add_class::<PySimulation>()?;
     m.add_class::<PySweepResult>()?;
     m.add_class::<PyEigenmode>()?;

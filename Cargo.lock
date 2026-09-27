@@ -1411,7 +1411,9 @@ dependencies = [
  "pyo3",
  "rapidfem-core",
  "rapidfem-fd",
+ "rapidfem-geom",
  "rapidfem-td",
+ "rapidmesh",
 ]
 
 [[package]]

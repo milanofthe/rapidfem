@@ -44,6 +44,7 @@ pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [
     [1, 2, 3], // (2,3,4)
 ];
 
+#[derive(Clone)]
 pub struct Mesh {
     /// Node coordinates: nodes[i] = [x, y, z]
     pub nodes: Vec<[f64; 3]>,

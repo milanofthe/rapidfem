@@ -4,6 +4,7 @@ members = [
     "crates/rapidfem-core",
     "crates/rapidfem-fd",
     "crates/rapidfem-td",
+    "crates/rapidfem-geom",
     "python",
 ]
 # Vendored dependencies carry their own workspace (vendor/rslab).

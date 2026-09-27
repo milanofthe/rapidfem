@@ -571,6 +571,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "geometry-predicates"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dba84198cf199c11b83f1cb9243eaeb70dc50b719d2835ebf34bf2481bca010"
+
+[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -617,6 +623,50 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "i_float"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "775f9961a8d2f879725da8aff789bb20a3ddf297473e0c90af75e69313919490"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "i_key_sort"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "347c253b4748a1a28baf94c9ce133b6b166f08573157e05afe718812bc599fcd"
+
+[[package]]
+name = "i_overlay"
+version = "1.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efc99d863511ee3f7f8d7375c7f477314bd5a36bc409bb6c2ac2037939bb8391"
+dependencies = [
+ "i_float",
+ "i_key_sort",
+ "i_shape",
+ "i_tree",
+ "rayon",
+]
+
+[[package]]
+name = "i_shape"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27dbe9e5238d6b9c694c08415bf00fb370b089949bd818ab01f41f8927b8774c"
+dependencies = [
+ "i_float",
+ "serde",
+]
+
+[[package]]
+name = "i_tree"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "155181bc97d770181cf9477da51218a19ee92a8e5be642e796661aee2b601139"
 
 [[package]]
 name = "indoc"
@@ -915,16 +965,6 @@ dependencies = [
 
 [[package]]
 name = "num-complex"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6b19411a9719e753aff12e5187b74d60d3dc449ec3f4dc21e3989c3f554bc95"
-dependencies = [
- "autocfg",
- "num-traits",
-]
-
-[[package]]
-name = "num-complex"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "747d632c0c558b87dbabbe6a82f3b4ae03720d0646ac5b7b4dae89394be5f2c5"
@@ -1014,11 +1054,11 @@ checksum = "edb929bc0da91a4d85ed6c0a84deaa53d411abfb387fc271124f91bf6b89f14e"
 dependencies = [
  "libc",
  "ndarray",
- "num-complex 0.2.4",
+ "num-complex 0.4.6",
  "num-integer",
  "num-traits",
  "pyo3",
- "rustc-hash",
+ "rustc-hash 1.1.0",
 ]
 
 [[package]]
@@ -1354,6 +1394,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapidfem-geom"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "rapidfem-core",
+ "rapidmesh",
+]
+
+[[package]]
 name = "rapidfem-python"
 version = "0.22.1"
 dependencies = [
@@ -1373,6 +1422,84 @@ dependencies = [
  "opencl3",
  "rapidfem-core",
  "rayon",
+]
+
+[[package]]
+name = "rapidmesh"
+version = "0.6.0"
+dependencies = [
+ "rapidmesh-brep",
+ "rapidmesh-csg",
+ "rapidmesh-exact",
+ "rapidmesh-geom",
+ "rapidmesh-tet",
+ "rapidmesh-topo",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rapidmesh-brep"
+version = "0.6.0"
+dependencies = [
+ "rapidmesh-csg",
+ "rapidmesh-exact",
+ "rapidmesh-geom",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "rapidmesh-csg"
+version = "0.6.0"
+dependencies = [
+ "geometry-predicates",
+ "rapidmesh-exact",
+ "rayon",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "rapidmesh-exact"
+version = "0.6.0"
+dependencies = [
+ "geometry-predicates",
+ "num-bigint 0.4.6",
+ "num-traits",
+ "smallvec",
+]
+
+[[package]]
+name = "rapidmesh-geom"
+version = "0.6.0"
+dependencies = [
+ "rapidmesh-csg",
+ "rapidmesh-exact",
+ "rayon",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "rapidmesh-tet"
+version = "0.6.0"
+dependencies = [
+ "geometry-predicates",
+ "rapidmesh-brep",
+ "rapidmesh-csg",
+ "rapidmesh-exact",
+ "rapidmesh-geom",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "smallvec",
+]
+
+[[package]]
+name = "rapidmesh-topo"
+version = "0.6.0"
+dependencies = [
+ "i_overlay",
+ "rapidmesh-brep",
+ "rapidmesh-geom",
+ "rapidmesh-tet",
 ]
 
 [[package]]
@@ -1481,6 +1608,12 @@ name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
+
+[[package]]
+name = "rustc-hash"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustversion"

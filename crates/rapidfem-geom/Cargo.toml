@@ -1,0 +1,16 @@
+[package]
+name = "rapidfem-geom"
+version = "0.1.0"
+edition = "2024"
+
+# Geometry and meshing on the vendored rapidmesh: the rapidfem geometry
+# builder, and the mesh handed to the solvers straight from rapidmesh's
+# solver view (no mesh file in between).
+
+[lib]
+doctest = false
+
+[dependencies]
+rapidfem-core = { path = "../rapidfem-core" }
+rapidmesh = { path = "../../vendor/rapidmesh/crates/rapidmesh" }
+hashbrown = "0.16.1"

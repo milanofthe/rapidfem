@@ -1,0 +1,26 @@
+[package]
+name = "rapidmesh-topo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Analysis-ready cell-complex view of a mesh (incidence + element geometry), 2D and 3D, optimized for FEM/MoM embedding."
+
+[features]
+default = []
+# Source adapters for the rapidmesh mesher's own output types. Off by default so
+# the core (topology + geometry, std-only) builds standalone for external meshes.
+mesher = ["dep:rapidmesh-tet", "dep:rapidmesh-geom", "dep:rapidmesh-brep", "dep:i_overlay"]
+
+[dependencies]
+rapidmesh-tet = { workspace = true, optional = true }
+rapidmesh-geom = { workspace = true, optional = true }
+rapidmesh-brep = { workspace = true, optional = true }
+# Robust, fast 2D polygon boolean (MIT) — the 2D mesher unions overlapping/abutting input
+# regions into connected shapes before triangulating, so a conductor handed in as many
+# polygons meshes as ONE conforming, electrically-continuous region.
+i_overlay = { version = "1.9", optional = true }
+
+[lints]
+workspace = true
+

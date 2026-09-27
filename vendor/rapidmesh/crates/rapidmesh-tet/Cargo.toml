@@ -1,0 +1,19 @@
+[package]
+name = "rapidmesh-tet"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidmesh-exact.workspace = true
+rapidmesh-csg.workspace = true
+rapidmesh-geom.workspace = true
+rapidmesh-brep.workspace = true
+rayon.workspace = true
+geometry-predicates.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+
+[lints]
+workspace = true

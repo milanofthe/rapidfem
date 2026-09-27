@@ -1,0 +1,57 @@
+# Vendored copy of rapidmesh (milanofthe/rapidmesh-dev) at commit
+# b3c5a5a, written by rapidfem's scripts/vendor_rapidmesh.py: the
+# library crates behind the `rapidmesh` facade, without tests,
+# benches, examples, binaries or dev-dependencies. The own [workspace]
+# keeps the vendored tree out of the consuming workspace.
+[workspace]
+resolver = "2"
+members = [
+    "crates/rapidmesh",
+    "crates/rapidmesh-exact",
+    "crates/rapidmesh-geom",
+    "crates/rapidmesh-csg",
+    "crates/rapidmesh-brep",
+    "crates/rapidmesh-tet",
+    "crates/rapidmesh-topo",
+]
+
+[workspace.package]
+version = "0.6.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-only"
+
+# Deliberate house style, allowed workspace-wide:
+# - `!(x > 0.0)` guards treat NaN as "not valid" (a plain `x <= 0.0` flips the
+#   NaN semantics); the codebase uses that shape as the canonical validity gate.
+# - Numeric kernels index several parallel arrays per loop; iterator rewrites
+#   obscure the stride relationships without a measured win.
+[workspace.lints.clippy]
+neg_cmp_op_on_partial_ord = "allow"
+needless_range_loop = "allow"
+type_complexity = "allow"
+too_many_arguments = "allow"
+
+[workspace.dependencies]
+rapidmesh-exact = { path = "crates/rapidmesh-exact" }
+rapidmesh-geom = { path = "crates/rapidmesh-geom" }
+rapidmesh-csg = { path = "crates/rapidmesh-csg" }
+rapidmesh-brep = { path = "crates/rapidmesh-brep" }
+rapidmesh-tet = { path = "crates/rapidmesh-tet" }
+rapidmesh-topo = { path = "crates/rapidmesh-topo" }
+geometry-predicates = "0.3"
+rayon = "1"
+rustc-hash = "2"
+smallvec = { version = "1", features = ["union"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Numeric hot loops (quality kernels, projection oracles, predicates) gain
+# real throughput from cross-crate inlining; thin LTO + one codegen unit is
+# near fat-LTO speed at a fraction of the link time.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

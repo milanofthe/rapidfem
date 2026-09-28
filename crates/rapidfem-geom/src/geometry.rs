@@ -26,7 +26,7 @@
 use std::sync::OnceLock;
 
 use rapidmesh::shapes::{Shape, Sheet};
-use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, Scope, Solid, Topology};
+use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, Object as RmObject, Scope, Solid, Topology, Transform};
 
 /// Index of an object in its [`Geometry`].
 pub type ObjId = usize;
@@ -36,6 +36,9 @@ pub type ObjId = usize;
 pub enum Item {
     Solid(Shape),
     Sheet(Sheet),
+    /// The solid a sheet sweeps along `vector`; the sheet stays as its
+    /// bottom face.
+    Extrusion { sheet: Sheet, vector: [f64; 3] },
 }
 
 /// A solid or sheet of the scene with its attributes.
@@ -52,6 +55,8 @@ pub struct Object {
     /// Assembly order: a solid of higher priority (or equal priority and
     /// added later) carves its region out of the others.
     pub priority: u64,
+    /// Placement changes, applied in order after the object is added.
+    pub transforms: Vec<Transform>,
 }
 
 /// A chamfer or fillet on edges of a solid object, applied in order after
@@ -125,6 +130,8 @@ pub struct Geometry {
     /// Priority handed out by the last `bring_to_front`.
     top_priority: u64,
     edge_ops: Vec<EdgeOp>,
+    /// Targets reduced to what they share with their tools (used up).
+    intersects: Vec<(ObjId, Vec<ObjId>)>,
     /// Solid objects fused into one region (the first keeps its region).
     unions: Vec<Vec<ObjId>>,
     /// Target sizes on faces, by origin.
@@ -155,44 +162,6 @@ fn matches(solids: &[Option<Solid>], s: &FaceSel, f: &Face) -> bool {
     }
 }
 
-/// Moves a solid or sheet description by `d`.
-fn translate_item(item: &mut Item, d: [f64; 3]) -> Result<(), String> {
-    let add = |p: &mut [f64; 3]| {
-        for k in 0..3 {
-            p[k] += d[k];
-        }
-    };
-    match item {
-        Item::Solid(s) => match s {
-            Shape::Cuboid(x) => add(&mut x.position),
-            Shape::Cylinder(x) => add(&mut x.position),
-            Shape::Sphere(x) => add(&mut x.position),
-            Shape::Icosphere(x) => add(&mut x.position),
-            Shape::Naca0012(x) => add(&mut x.position),
-            Shape::Cone(x) => add(&mut x.position),
-            Shape::Prism(x) => add(&mut x.position),
-            Shape::Torus(x) => add(&mut x.position),
-            Shape::Wedge(x) => add(&mut x.position),
-            Shape::Helix(x) => add(&mut x.position),
-            Shape::Revolve(x) => add(&mut x.position),
-            Shape::Sweep(x) => x.path.iter_mut().for_each(add),
-            Shape::Loft(x) => {
-                x.profile_a.iter_mut().for_each(add);
-                x.profile_b.iter_mut().for_each(add);
-            }
-            Shape::Triangles(x) => x.verts.iter_mut().for_each(add),
-            Shape::Import(_) => return Err("translate: an imported solid cannot move yet".into()),
-        },
-        Item::Sheet(s) => match s {
-            Sheet::Rect { corner, .. } => add(corner),
-            Sheet::Disc { center, .. } => add(center),
-            Sheet::Polygon { position, .. } => add(position),
-            Sheet::Nurbs { .. } => return Err("translate: a NURBS sheet cannot move yet".into()),
-        },
-    }
-    Ok(())
-}
-
 /// Sheet face tags are the object index shifted by one (0 means untagged).
 fn sheet_tag(object: ObjId) -> u32 {
     object as u32 + 1
@@ -205,6 +174,7 @@ impl Geometry {
             objects: Vec::new(),
             top_priority: 0,
             edge_ops: Vec::new(),
+            intersects: Vec::new(),
             unions: Vec::new(),
             face_maxh: Vec::new(),
             maxh,
@@ -245,7 +215,15 @@ impl Geometry {
     }
 
     fn push(&mut self, item: Item, maxh: Option<f64>, void: bool) -> ObjId {
-        self.objects.push(Object { item, void, maxh, name: None, alive: true, priority: self.top_priority });
+        self.objects.push(Object {
+            item,
+            void,
+            maxh,
+            name: None,
+            alive: true,
+            priority: self.top_priority,
+            transforms: Vec::new(),
+        });
         self.changed();
         self.objects.len() - 1
     }
@@ -311,10 +289,38 @@ impl Geometry {
         self.changed();
     }
 
-    /// Moves an object by `d`.
-    pub fn translate(&mut self, id: ObjId, d: [f64; 3]) -> Result<(), String> {
-        translate_item(&mut self.objects[id].item, d)?;
+    /// Moves, turns, mirrors or stretches an object; its faces keep their
+    /// origin.
+    pub fn transform(&mut self, id: ObjId, t: Transform) {
+        self.objects[id].transforms.push(t);
         self.changed();
+    }
+
+    /// A copy of an object in the same place, with its own region.
+    pub fn copy(&mut self, id: ObjId) -> ObjId {
+        let mut o = self.objects[id].clone();
+        o.name = None;
+        o.priority = self.top_priority;
+        self.objects.push(o);
+        self.changed();
+        self.objects.len() - 1
+    }
+
+    /// `target` becomes what it shares with every tool; the tools are used
+    /// up.
+    pub fn intersect(&mut self, target: ObjId, tools: Vec<ObjId>) {
+        self.intersects.push((target, tools));
+        self.changed();
+    }
+
+    /// Turns a sheet into the solid it sweeps along `vector` (the object
+    /// keeps its id; the sheet stays as the bottom face).
+    pub fn extrude(&mut self, id: ObjId, vector: [f64; 3]) -> Result<(), String> {
+        let Item::Sheet(sheet) = &self.objects[id].item else {
+            return Err(format!("object {id} is not a sheet"));
+        };
+        let sheet = sheet.clone();
+        self.replace(id, Item::Extrusion { sheet, vector });
         Ok(())
     }
 
@@ -339,15 +345,35 @@ impl Geometry {
             if !o.alive {
                 continue;
             }
-            match &o.item {
+            let e = |e: rapidmesh::Error| e.to_string();
+            let placed: Vec<RmObject> = match &o.item {
                 Item::Solid(shape) => {
-                    let s = g.add_solid(shape.clone(), o.maxh, false).map_err(|e| e.to_string())?;
+                    let s = g.add_solid(shape.clone(), o.maxh, false).map_err(e)?;
                     solids[i] = Some(s);
+                    vec![s.into()]
                 }
-                Item::Sheet(sheet) => {
-                    g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(|e| e.to_string())?;
+                Item::Sheet(sheet) => vec![g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?.into()],
+                Item::Extrusion { sheet, vector } => {
+                    let r = g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?;
+                    let s = g.extrude(r, *vector, o.maxh).map_err(e)?;
+                    solids[i] = Some(s);
+                    vec![r.into(), s.into()]
+                }
+            };
+            for &tr in &o.transforms {
+                for &p in &placed {
+                    g.transform(p, tr).map_err(e)?;
                 }
             }
+        }
+        for (target, tools) in &self.intersects {
+            let (Some(t), tools) = (
+                solids.get(*target).copied().flatten(),
+                tools.iter().filter_map(|&i| solids.get(i).copied().flatten()).collect::<Vec<_>>(),
+            ) else {
+                return Err(format!("intersect: object {target} is not a solid"));
+            };
+            g.intersect(t, &tools).map_err(|e| e.to_string())?;
         }
         for op in &self.edge_ops {
             let solid = solids
@@ -373,23 +399,6 @@ impl Geometry {
             g.add_size_point(p, h);
         }
         let topology = g.topology().map_err(|e| e.to_string())?;
-        let model = g.model().map_err(|e| e.to_string())?;
-        // Face bounding boxes from the PLC facets of each B-rep face
-        // (topology face i is B-rep face i).
-        let bbox_of = |id: usize| {
-            let mut b = [f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
-            for &ti in &model.brep.faces[id].facets {
-                for &v in &model.plc.triangles[ti as usize] {
-                    let p = model.plc.vertices[v as usize];
-                    for k in 0..3 {
-                        b[k] = b[k].min(p[k]);
-                        b[k + 3] = b[k + 3].max(p[k]);
-                    }
-                }
-            }
-            b
-        };
-
         // solid index (insertion order, voids included) -> object
         let mut object_of_index = std::collections::HashMap::new();
         for (i, s) in solids.iter().enumerate() {
@@ -403,7 +412,12 @@ impl Geometry {
             .enumerate()
             .filter_map(|(id, f)| {
                 let origin = if f.face_tag != 0 {
-                    FaceOrigin::Sheet { object: (f.face_tag - 1) as ObjId }
+                    let object = (f.face_tag - 1) as ObjId;
+                    match self.objects[object].item {
+                        // the sheet under an extrusion is the solid's bottom
+                        Item::Extrusion { .. } => FaceOrigin::Solid { object, role: 0 },
+                        _ => FaceOrigin::Sheet { object },
+                    }
                 } else {
                     let &object = object_of_index.get(&f.owner)?;
                     FaceOrigin::Solid { object, role: f.role }
@@ -415,7 +429,7 @@ impl Geometry {
                     normal: f.normal,
                     area: f.area,
                     regions: f.regions,
-                    bbox: bbox_of(id),
+                    bbox: [f.bbox[0][0], f.bbox[0][1], f.bbox[0][2], f.bbox[1][0], f.bbox[1][1], f.bbox[1][2]],
                 })
             })
             .collect();
@@ -460,7 +474,7 @@ impl Geometry {
             (Item::Sheet(_), _) => {
                 vec![FaceSel { origin: FaceOrigin::Sheet { object: id }, side: None, across: None }]
             }
-            (Item::Solid(_), Some(s)) => r
+            (Item::Solid(_) | Item::Extrusion { .. }, Some(s)) => r
                 .faces
                 .iter()
                 .filter(|f| f.regions.contains(&s.region))
@@ -477,7 +491,7 @@ impl Geometry {
                     FaceSel { origin: f.origin, side: Some(id), across: Some(across) }
                 })
                 .collect(),
-            (Item::Solid(_), None) => Vec::new(),
+            (Item::Solid(_) | Item::Extrusion { .. }, None) => Vec::new(),
         };
         out.sort();
         out.dedup();
@@ -637,5 +651,59 @@ mod tests {
         g.bring_to_front(&[inner]);
         assert_eq!(g.faces_of(inner).unwrap().len(), 6);
         assert!(g.region(outer).unwrap().is_some());
+    }
+
+    #[test]
+    fn transforms_move_an_object_and_keep_its_origins() {
+        let mut g = Geometry::new(Some(1.0));
+        let air = g.add_solid(Cuboid::new([6.0, 6.0, 6.0]), None, false);
+        let b = g.add_solid(Cuboid::new([1.0, 1.0, 1.0]), None, false);
+        g.transform(b, Transform::Translate([2.0, 2.0, 2.0]));
+        g.transform(b, Transform::Rotate { angle: std::f64::consts::FRAC_PI_2, axis: [0.0, 0.0, 1.0], center: [2.5, 2.5, 2.5] });
+        let top = FaceSel { origin: FaceOrigin::Solid { object: b, role: 1 }, side: None, across: None };
+        let f = g.resolve(&[top]).unwrap();
+        assert_eq!(f.len(), 1);
+        assert!((f[0].centroid[2] - 3.0).abs() < 1e-9 && (f[0].area - 1.0).abs() < 1e-9);
+        assert_eq!(f[0].bbox, [2.0, 2.0, 3.0, 3.0, 3.0, 3.0]);
+        assert_ne!(g.region(air).unwrap(), g.region(b).unwrap());
+    }
+
+    #[test]
+    fn a_copy_gets_its_own_region() {
+        let mut g = Geometry::new(Some(1.0));
+        g.add_solid(Cuboid::new([6.0, 2.0, 2.0]), None, false);
+        let b = g.add_solid(Cuboid::new([1.0, 1.0, 1.0]).at([0.5, 0.5, 0.5]), None, false);
+        let c = g.copy(b);
+        g.transform(c, Transform::Translate([3.0, 0.0, 0.0]));
+        let (rb, rc) = (g.region(b).unwrap().unwrap(), g.region(c).unwrap().unwrap());
+        assert_ne!(rb, rc);
+        assert_eq!(g.faces_of(c).unwrap().len(), 6);
+    }
+
+    #[test]
+    fn intersect_keeps_the_common_part() {
+        let mut g = Geometry::new(Some(0.5));
+        let a = g.add_solid(Cuboid::new([2.0, 2.0, 2.0]), None, false);
+        let b = g.add_solid(Cuboid::new([2.0, 2.0, 2.0]).at([1.0, 1.0, 1.0]), None, false);
+        g.intersect(a, vec![b]);
+        let faces = g.resolve(&g.faces_of(a).unwrap()).unwrap();
+        let area: f64 = faces.iter().map(|f| f.area).sum();
+        assert!((area - 6.0).abs() < 1e-9, "area {area}");
+    }
+
+    #[test]
+    fn a_sheet_extrudes_along_a_vector() {
+        let mut g = Geometry::new(Some(0.5));
+        g.add_solid(Cuboid::new([4.0, 4.0, 4.0]), None, false);
+        let s = g.add_sheet(Sheet::xy(1.0, 1.0, [1.0, 1.0, 1.0]), None);
+        g.extrude(s, [0.5, 0.0, 1.0]).unwrap();
+        let faces = g.resolve(&g.faces_of(s).unwrap()).unwrap();
+        assert_eq!(faces.len(), 6);
+        let bottom = FaceSel { origin: FaceOrigin::Solid { object: s, role: 0 }, side: None, across: None };
+        assert_eq!(g.resolve(&[bottom]).unwrap().len(), 1);
+        let top = FaceSel { origin: FaceOrigin::Solid { object: s, role: 1 }, side: None, across: None };
+        let t = g.resolve(&[top]).unwrap();
+        assert_eq!(t.len(), 1);
+        assert!((t[0].centroid[0] - 2.0).abs() < 1e-9 && (t[0].centroid[2] - 2.0).abs() < 1e-9);
     }
 }

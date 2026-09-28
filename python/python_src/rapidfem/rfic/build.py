@@ -655,6 +655,9 @@ def build(
 
     if g._maxh is None:
         g._maxh = mesh.h(mesh.global_h)
+    # A process stack is a pile of layers far thinner than the element size:
+    # flat tets through each layer, not elements across every one of them.
+    g._mesh_defaults["cells_across"] = 0.0
 
     return BuiltModel(
         geometry=g, stack=stack, conductors=conductors, slabs=slabs,

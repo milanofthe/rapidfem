@@ -525,6 +525,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         self._physics_tags: dict = {}
         self._fem_mesh = None
         self._last_mesh = None
+        # Mesh options a builder (rfic.build) sets for the geometries it makes.
+        self._mesh_defaults: dict = {}
         self.mesh_stats: MeshStats | None = None
 
     # ── lifecycle ───────────────────────────────────────────────────────────
@@ -803,13 +805,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     # ── booleans ────────────────────────────────────────────────────────────
 
     def fragment(self, target: GeoObject, *tools: GeoObject) -> None:
-        """make ``target`` and ``tools`` conformal
+        """make ``target`` and ``tools`` conformal, the tools on top
 
-        Kept for compatibility: the scene is always assembled conformally
-        (every interface is shared by the mesh on both sides) and a solid
-        added later carves its region out of the ones added before it, which
-        is what fragmenting an inner object with its surrounding volume did.
-        Nothing to do.
+        The scene is always assembled conformally (every interface is shared
+        by the mesh on both sides); where solids overlap, the one on top owns
+        the overlap. ``fragment`` puts the ``tools`` above ``target`` and
+        everything else, in the given order (the last tool wins), which is
+        the usual intent of fragmenting inner objects with their surrounding
+        volume.
 
 
         Parameters
@@ -817,8 +820,11 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         target : GeoObject
             object to fragment
         *tools : GeoObject
-            objects to fragment with
+            objects to put on top, in order
         """
+        ids = [t._id for t in tools if t.dim == 3]
+        if ids:
+            self._native.bring_to_front(ids)
 
     def cut(self, target: GeoObject, *tools: GeoObject) -> None:
         """subtract ``tools``, leaving holes
@@ -1374,14 +1380,27 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         volume_groups: list = []
         self._material_tags = {}
         self._physics_tags = {}
+        # Group names for the stats and viewers: one counter per class, and
+        # every driven port in one shared "port_<n>" namespace.
+        self._group_names: dict[int, str] = {}
+        counts: dict[str, int] = {}
+        port_classes = {"RectWaveguidePort", "LumpedPort", "CoaxPort", "WavePort",
+                        "UserDefinedPort", "FloquetPort"}
+
+        def name(obj) -> str:
+            cls = type(obj).__name__
+            key = "port" if cls in port_classes else cls.lower()
+            counts[key] = counts.get(key, 0) + 1
+            return f"{key}_{counts[key]}"
         by_mat: dict[int, tuple] = {}
         for ent in self._entities:
             mat = ent.material
             if mat is None or isinstance(mat, str) or ent.dim != 3:
                 continue
             by_mat.setdefault(id(mat), (mat, []))[1].append(ent.obj)
-        for mat_id, (_, objs) in by_mat.items():
+        for mat_id, (mat, objs) in by_mat.items():
             self._material_tags[mat_id] = next_tag
+            self._group_names[next_tag] = name(mat)
             volume_groups.append((next_tag, objs))
             next_tag += 1
 
@@ -1397,6 +1416,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                 face_groups.append((next_tag, fa))
                 face_groups.append((next_tag + 1, fb))
                 self._physics_tags[id(phys)] = (next_tag, next_tag + 1)
+                base = name(phys)
+                self._group_names[next_tag] = f"{base}_a"
+                self._group_names[next_tag + 1] = f"{base}_b"
                 next_tag += 2
                 continue
             faces, vols = group(phys._entities)
@@ -1405,6 +1427,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             if faces:
                 face_groups.append((next_tag, faces))
             self._physics_tags[id(phys)] = next_tag
+            self._group_names[next_tag] = name(phys)
             next_tag += 1
         return face_groups, volume_groups
 
@@ -1427,7 +1450,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         algorithm: str = "hxt",
         optimize: bool | str = True,
         *,
-        cells_across: float = 1.0,
+        cells_across: float | None = None,
         target_elements: int | None = None,
     ):
         """tetrahedralize the scene and build the solver mesh
@@ -1448,9 +1471,11 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             there is one algorithm)
         optimize : bool
             run the quality optimizer after meshing
-        cells_across : float
+        cells_across : float, optional
             elements across the thickness of every region, so a thin layer
-            gets proper tets through it (0 turns it off)
+            gets proper tets through it (0 turns it off: a stack of layers far
+            thinner than the size takes flat tets through each layer, the
+            default of :func:`rapidfem.rfic.build` geometries); 1 by default
         target_elements : int, optional
             tet budget: the global size is scaled to land near it
 
@@ -1461,6 +1486,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             size and quality of the mesh
         """
         h = maxh if maxh is not None else self._maxh
+        if cells_across is None:
+            cells_across = self._mesh_defaults.get("cells_across", 1.0)
         n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
             maxh=h, grading=None if self._grading else 1e9,
             cells_across=float(cells_across), optimize=bool(optimize),
@@ -1478,8 +1505,10 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         stats.quality_min = float(min_dihedral)
         stats.n_slivers = int(n_slivers)
         vols, faces = fm.group_sizes()
-        stats.groups = {f"volume_{t}": n for t, n in vols}
-        stats.groups.update({f"face_{t}": n for t, n in faces})
+        stats.groups = {}
+        for t, n in [*vols, *faces]:
+            key = self._group_names.get(t, f"group_{t}")
+            stats.groups[key] = stats.groups.get(key, 0) + n
         self.mesh_stats = stats
         self._last_mesh = (self._fem_mesh, {})
         return stats

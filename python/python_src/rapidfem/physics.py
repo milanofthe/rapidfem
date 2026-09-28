@@ -870,6 +870,8 @@ class SurfaceImpedance(_Physics):
             for obj in getattr(self._geometry, "_objects", []):
                 if getattr(obj, "dim", None) != 3:
                     continue
+                if self._geometry._native.is_void(obj._id):
+                    continue            # a hole: its walls are the boundary
                 shell = obj.faces._entities
                 if shell and all(id(e) in ids for e in shell):
                     return True

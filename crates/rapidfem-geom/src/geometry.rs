@@ -7,7 +7,13 @@
 //!
 //! Keeping the scene on this side makes every edit a change of a list entry
 //! (an extrusion replaces its profile sheet by a prism, a cut turns a solid
-//! into a void) and leaves the realised model a pure function of the list.
+//! into a hole) and leaves the realised model a pure function of the list.
+//!
+//! A hole is meshed as a region of its own and dropped from the solver mesh
+//! ([`crate::fem_mesh`]): its walls are then simply the faces bounding its
+//! region. (A rapidmesh void would own only the walls no other solid claims;
+//! walls lying on another solid's faces, the norm in a layer stack, would be
+//! lost.)
 //! Solids overlap by priority, as in rapidmesh: a later solid carves its
 //! region out of the earlier ones, and the mesh is always conformal.
 //!
@@ -36,12 +42,16 @@ pub enum Item {
 #[derive(Clone, Debug)]
 pub struct Object {
     pub item: Item,
-    /// A void solid is cut out of every solid added before it.
+    /// A hole: meshed as its own region, then removed from the solver mesh,
+    /// so its walls become boundary faces.
     pub void: bool,
     pub maxh: Option<f64>,
     pub name: Option<String>,
     /// Removed objects keep their slot so ids stay valid.
     pub alive: bool,
+    /// Assembly order: a solid of higher priority (or equal priority and
+    /// added later) carves its region out of the others.
+    pub priority: u64,
 }
 
 /// A chamfer or fillet on edges of a solid object, applied in order after
@@ -112,6 +122,8 @@ pub struct Realized {
 /// The rapidfem geometry, see the module docs.
 pub struct Geometry {
     objects: Vec<Object>,
+    /// Priority handed out by the last `bring_to_front`.
+    top_priority: u64,
     edge_ops: Vec<EdgeOp>,
     /// Solid objects fused into one region (the first keeps its region).
     unions: Vec<Vec<ObjId>>,
@@ -123,12 +135,12 @@ pub struct Geometry {
 }
 
 /// Whether face `f` is a piece of selection `s`.
-fn matches(solids: &[Option<Solid>], objects: &[Object], s: &FaceSel, f: &Face) -> bool {
+fn matches(solids: &[Option<Solid>], s: &FaceSel, f: &Face) -> bool {
     if f.origin != s.origin {
         return false;
     }
     let region = |o: ObjId| match solids.get(o).copied().flatten() {
-        Some(sol) if !objects[o].void => Some(sol.region),
+        Some(sol) => Some(sol.region),
         _ => None,
     };
     let Some(side) = s.side.and_then(region) else { return true };
@@ -191,6 +203,7 @@ impl Geometry {
     pub fn new(maxh: Option<f64>) -> Self {
         Geometry {
             objects: Vec::new(),
+            top_priority: 0,
             edge_ops: Vec::new(),
             unions: Vec::new(),
             face_maxh: Vec::new(),
@@ -232,7 +245,7 @@ impl Geometry {
     }
 
     fn push(&mut self, item: Item, maxh: Option<f64>, void: bool) -> ObjId {
-        self.objects.push(Object { item, void, maxh, name: None, alive: true });
+        self.objects.push(Object { item, void, maxh, name: None, alive: true, priority: self.top_priority });
         self.changed();
         self.objects.len() - 1
     }
@@ -244,11 +257,22 @@ impl Geometry {
         self.changed();
     }
 
-    /// Turns solids into voids: they are cut out of every solid added
+    /// Turns solids into holes: they carve their region as before, and the
+    /// region is removed from the solver mesh, leaving its walls as boundary.
     /// before them and their walls become boundary faces.
     pub fn make_void(&mut self, ids: &[ObjId]) {
         for &i in ids {
             self.objects[i].void = true;
+        }
+        self.changed();
+    }
+
+    /// Puts objects above every other one, in the given order: each carves
+    /// its region out of everything below it, the last one wins.
+    pub fn bring_to_front(&mut self, ids: &[ObjId]) {
+        for &i in ids {
+            self.top_priority += 1;
+            self.objects[i].priority = self.top_priority;
         }
         self.changed();
     }
@@ -308,17 +332,16 @@ impl Geometry {
     fn realize(&self) -> Result<Realized, String> {
         let mut g = rapidmesh::Geometry::new(self.maxh);
         let mut solids = vec![None; self.objects.len()];
-        for (i, o) in self.objects.iter().enumerate() {
+        let mut order: Vec<ObjId> = (0..self.objects.len()).collect();
+        order.sort_by_key(|&i| (self.objects[i].priority, i));
+        for i in order {
+            let o = &self.objects[i];
             if !o.alive {
                 continue;
             }
             match &o.item {
                 Item::Solid(shape) => {
-                    let s = g.add_solid(shape.clone(), o.maxh, o.void).map_err(|e| e.to_string())?;
-                    // a void has no region to size: its maxh goes to its walls
-                    if let (true, Some(h)) = (o.void, o.maxh) {
-                        g.refine_surface(s, h);
-                    }
+                    let s = g.add_solid(shape.clone(), o.maxh, false).map_err(|e| e.to_string())?;
                     solids[i] = Some(s);
                 }
                 Item::Sheet(sheet) => {
@@ -335,7 +358,7 @@ impl Geometry {
             g.cut_edges(solid, &op.edges, op.cut, op.void).map_err(|e| e.to_string())?;
         }
         for ids in &self.unions {
-            // voids have no material region to merge
+            // holes have no material region to merge
             let s: Vec<Solid> = ids
                 .iter()
                 .filter(|&&i| !self.objects[i].void)
@@ -405,7 +428,7 @@ impl Geometry {
             let ids: Vec<u32> = realized
                 .faces
                 .iter()
-                .filter(|f| sels.iter().any(|s| matches(&realized.solids, &self.objects, s, f)))
+                .filter(|f| sels.iter().any(|s| matches(&realized.solids, s, f)))
                 .map(|f| f.id)
                 .collect();
             for id in ids {
@@ -421,9 +444,18 @@ impl Geometry {
         Ok(self.realized()?.solids[id].filter(|_| !self.objects[id].void).map(|s| s.region))
     }
 
+    /// The regions of the holes, to be removed from the solver mesh.
+    pub fn hole_regions(&self) -> Result<Vec<u32>, String> {
+        let r = self.realized()?;
+        Ok((0..self.objects.len())
+            .filter(|&i| self.objects[i].void && self.objects[i].alive)
+            .filter_map(|i| r.solids[i].map(|s| s.region))
+            .collect())
+    }
+
     /// The faces bounding an object: for a solid every face with its region
-    /// on one side (interfaces with later solids included), for a void its
-    /// walls, for a sheet the sheet itself. Solid faces carry the object as
+    /// on one side (interfaces with later solids included; for a hole, its
+    /// walls), for a sheet the sheet itself. Solid faces carry the object as
     /// their side.
     pub fn faces_of(&self, id: ObjId) -> Result<Vec<FaceSel>, String> {
         let r = self.realized()?;
@@ -432,7 +464,7 @@ impl Geometry {
             (Item::Sheet(_), _) => {
                 vec![FaceSel { origin: FaceOrigin::Sheet { object: id }, side: None, across: None }]
             }
-            (Item::Solid(_), Some(s)) if !o.void => r
+            (Item::Solid(_), Some(s)) => r
                 .faces
                 .iter()
                 .filter(|f| f.regions.contains(&s.region))
@@ -448,12 +480,6 @@ impl Geometry {
                     };
                     FaceSel { origin: f.origin, side: Some(id), across: Some(across) }
                 })
-                .collect(),
-            (Item::Solid(_), Some(_)) => r
-                .faces
-                .iter()
-                .filter(|f| matches!(f.origin, FaceOrigin::Solid { object, .. } if object == id))
-                .map(|f| FaceSel { origin: f.origin, side: None, across: None })
                 .collect(),
             (Item::Solid(_), None) => Vec::new(),
         };
@@ -515,14 +541,14 @@ impl Geometry {
     fn object_of_region(&self, region: u32) -> Option<ObjId> {
         let r = self.realized().ok()?;
         (0..self.objects.len()).find(|&i| {
-            !self.objects[i].void && r.solids.get(i).copied().flatten().is_some_and(|s| s.region == region)
+            r.solids.get(i).copied().flatten().is_some_and(|s| s.region == region)
         })
     }
 
     /// The current B-rep faces of a set of selections.
     pub fn resolve(&self, sels: &[FaceSel]) -> Result<Vec<&Face>, String> {
         let r = self.realized()?;
-        Ok(r.faces.iter().filter(|f| sels.iter().any(|s| matches(&r.solids, &self.objects, s, f))).collect())
+        Ok(r.faces.iter().filter(|f| sels.iter().any(|s| matches(&r.solids, s, f))).collect())
     }
 
     /// Meshes the realised scene.
@@ -578,11 +604,13 @@ mod tests {
         let hole = g.add_solid(Cuboid::new([1.0, 1.0, 1.0]).at([1.5, 1.5, 1.5]), None, false);
         g.make_void(&[hole]);
         assert_eq!(g.region(hole).unwrap(), None);
+        let rh = g.hole_regions().unwrap();
+        assert_eq!(rh.len(), 1);
         let walls = g.faces_of(hole).unwrap();
         assert_eq!(walls.len(), 6);
         let ra = g.region(air).unwrap().unwrap();
         for f in g.resolve(&walls).unwrap() {
-            assert!(f.regions.contains(&ra) && f.regions.contains(&0), "{:?}", f.regions);
+            assert!(f.regions.contains(&ra) && f.regions.contains(&rh[0]), "{:?}", f.regions);
         }
     }
 
@@ -601,5 +629,17 @@ mod tests {
             void: false,
         });
         assert_eq!(g.faces_of(b).unwrap().len(), before + 1);
+    }
+
+    #[test]
+    fn bring_to_front_reverses_the_carving() {
+        let mut g = Geometry::new(Some(1.0));
+        let inner = g.add_solid(Cuboid::new([1.0, 1.0, 1.0]).at([1.0, 1.0, 1.0]), None, false);
+        let outer = g.add_solid(Cuboid::new([3.0, 3.0, 3.0]), None, false);
+        // added later, the outer box swallows the inner one
+        assert!(g.faces_of(inner).unwrap().is_empty());
+        g.bring_to_front(&[inner]);
+        assert_eq!(g.faces_of(inner).unwrap().len(), 6);
+        assert!(g.region(outer).unwrap().is_some());
     }
 }

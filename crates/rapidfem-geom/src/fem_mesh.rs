@@ -31,15 +31,30 @@ fn signed_volume(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
 }
 
 /// The solver mesh of `mesh`, with `ftag_to_tri` from `face_groups` (B-rep
-/// face ids) and `vtag_to_tet` from `volume_groups` (region ids).
-pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[Group]) -> Mesh {
-    let nodes = mesh.points.clone();
+/// face ids) and `vtag_to_tet` from `volume_groups` (region ids). The tets of
+/// `holes` (region ids) are left out, so their walls become boundary faces;
+/// the nodes are renumbered over the tets that remain.
+pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[Group], holes: &[u32]) -> Mesh {
     let p = &mesh.points;
-    let tets: Vec<[usize; 4]> = mesh
-        .tets
-        .iter()
-        .map(|&[a, b, c, d]| if signed_volume(p[a], p[b], p[c], p[d]) < 0.0 { [a, c, b, d] } else { [a, b, c, d] })
-        .collect();
+    let keep: Vec<usize> = (0..mesh.tets.len()).filter(|&t| !holes.contains(&mesh.tet_regions[t].0)).collect();
+    let mut node_of = vec![usize::MAX; p.len()];
+    let mut nodes = Vec::new();
+    let mut tets: Vec<[usize; 4]> = Vec::with_capacity(keep.len());
+    for &t in &keep {
+        let mut q = mesh.tets[t];
+        if signed_volume(p[q[0]], p[q[1]], p[q[2]], p[q[3]]) < 0.0 {
+            q.swap(1, 2);
+        }
+        let mut local = [0usize; 4];
+        for (k, &v) in q.iter().enumerate() {
+            if node_of[v] == usize::MAX {
+                node_of[v] = nodes.len();
+                nodes.push(p[v]);
+            }
+            local[k] = node_of[v];
+        }
+        tets.push(local);
+    }
     let mut out = Mesh::from_tets(nodes, tets);
 
     // B-rep face -> solver triangles, through the classified topology faces.
@@ -50,7 +65,13 @@ pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[
             continue;
         }
         let [a, b, c] = view.topo.faces[f];
-        let key = (a as usize, b as usize, c as usize);
+        let (a, b, c) = (node_of[a as usize], node_of[b as usize], node_of[c as usize]);
+        if a == usize::MAX || b == usize::MAX || c == usize::MAX {
+            continue; // a face inside a hole
+        }
+        let mut k = [a, b, c];
+        k.sort_unstable();
+        let key = (k[0], k[1], k[2]);
         if let Some(&tri) = out.inv_tris.get(&key) {
             by_patch.entry(patch).or_default().push(tri);
         }
@@ -64,9 +85,9 @@ pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[
 
     for g in volume_groups {
         let tets = out.vtag_to_tet.entry(g.tag).or_default();
-        for (t, r) in mesh.tet_regions.iter().enumerate() {
-            if g.ids.contains(&r.0) {
-                tets.push(t);
+        for (new, &t) in keep.iter().enumerate() {
+            if g.ids.contains(&mesh.tet_regions[t].0) {
+                tets.push(new);
             }
         }
     }
@@ -95,7 +116,7 @@ mod tests {
             Group { tag: 2, ids: vec![diel.region] },
         ];
         let faces = [Group { tag: 10, ids: bottom.clone() }];
-        let fm = fem_mesh(&m, &faces, &groups);
+        let fm = fem_mesh(&m, &faces, &groups, &[]);
         assert_eq!(fm.n_tets(), m.tets.len());
         for t in &fm.tets {
             let p = |i: usize| fm.nodes[t[i]];

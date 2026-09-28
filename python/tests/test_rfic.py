@@ -346,7 +346,8 @@ def test_build_conductor_model_follows_band(mini_gds, band, expected):
         tm2_volumes = [e for e in g._entities if e.dim == 3 and e.name == "TopMetal2"]
         sibcs = [p for p in g._physics if isinstance(p, SurfaceImpedance)]
         if expected == "sibc":
-            assert not tm2_volumes, "SIBC metal must be a hole, not a meshed volume"
+            assert all(g._native.is_void(e.obj) for e in tm2_volumes), (
+                "SIBC metal must be a hole, not a meshed volume")
             # 20 um x 10 um patch of thickness t: 2V/S = 2 A t / (2 A + P t)
             area, perim = 20 * um * 10 * um, 2 * (20 * um + 10 * um)
             t_eff = 2 * area * tm2.thickness / (2 * area + perim * tm2.thickness)

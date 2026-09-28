@@ -231,6 +231,11 @@ impl PyGeometry {
         self.inner.add_solid(i, maxh, false)
     }
 
+    /// Puts objects above every other one, in order (the last wins).
+    fn bring_to_front(&mut self, ids: Vec<ObjId>) {
+        self.inner.bring_to_front(&ids);
+    }
+
     fn make_void(&mut self, ids: Vec<ObjId>) {
         self.inner.make_void(&ids);
     }
@@ -352,7 +357,8 @@ impl PyGeometry {
             }
             volumes.push(Group { tag, ids });
         }
-        Ok(PyFemMesh { inner: fem_mesh(m, &faces, &volumes) })
+        let holes = self.inner.hole_regions().map_err(err)?;
+        Ok(PyFemMesh { inner: fem_mesh(m, &faces, &volumes, &holes) })
     }
 }
 

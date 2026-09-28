@@ -26,6 +26,7 @@
 use std::sync::OnceLock;
 
 use rapidmesh::shapes::{Shape, Sheet};
+use crate::fem_mesh::Group;
 use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, Object as RmObject, Scope, Solid, Topology, Transform};
 
 /// Index of an object in its [`Geometry`].
@@ -37,8 +38,9 @@ pub enum Item {
     Solid(Shape),
     Sheet(Sheet),
     /// The solid a sheet sweeps along `vector`; the sheet stays as its
-    /// bottom face.
-    Extrusion { sheet: Sheet, vector: [f64; 3] },
+    /// bottom face. The object's first `placed` transforms move the sheet
+    /// before the sweep, the rest move both after it.
+    Extrusion { sheet: Sheet, vector: [f64; 3], placed: usize },
 }
 
 /// A solid or sheet of the scene with its attributes.
@@ -320,7 +322,8 @@ impl Geometry {
             return Err(format!("object {id} is not a sheet"));
         };
         let sheet = sheet.clone();
-        self.replace(id, Item::Extrusion { sheet, vector });
+        let placed = self.objects[id].transforms.len();
+        self.replace(id, Item::Extrusion { sheet, vector, placed });
         Ok(())
     }
 
@@ -346,21 +349,24 @@ impl Geometry {
                 continue;
             }
             let e = |e: rapidmesh::Error| e.to_string();
-            let placed: Vec<RmObject> = match &o.item {
+            let (placed, done): (Vec<RmObject>, usize) = match &o.item {
                 Item::Solid(shape) => {
                     let s = g.add_solid(shape.clone(), o.maxh, false).map_err(e)?;
                     solids[i] = Some(s);
-                    vec![s.into()]
+                    (vec![s.into()], 0)
                 }
-                Item::Sheet(sheet) => vec![g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?.into()],
-                Item::Extrusion { sheet, vector } => {
+                Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?.into()], 0),
+                Item::Extrusion { sheet, vector, placed } => {
                     let r = g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?;
+                    for &tr in &o.transforms[..*placed] {
+                        g.transform(r, tr).map_err(e)?;
+                    }
                     let s = g.extrude(r, *vector, o.maxh).map_err(e)?;
                     solids[i] = Some(s);
-                    vec![r.into(), s.into()]
+                    (vec![r.into(), s.into()], *placed)
                 }
             };
-            for &tr in &o.transforms {
+            for &tr in &o.transforms[done..] {
                 for &p in &placed {
                     g.transform(p, tr).map_err(e)?;
                 }
@@ -520,7 +526,8 @@ impl Geometry {
     }
 
     /// The volume enclosed by a solid object's own shape (before other
-    /// solids carve it), for the primitives with a closed form.
+    /// solids carve it), for the primitives with a closed form, scaled by
+    /// its stretches.
     pub fn solid_volume(&self, id: ObjId) -> Result<f64, String> {
         use std::f64::consts::PI;
         let area2 = |pts: &[[f64; 2]]| -> f64 {
@@ -530,10 +537,22 @@ impl Geometry {
                 .sum::<f64>()
                 .abs()
         };
-        let Item::Solid(shape) = &self.objects[id].item else {
-            return Err(format!("object {id} is a sheet"));
+        let o = &self.objects[id];
+        let Item::Solid(shape) = &o.item else {
+            return Err(format!("object {id}: no closed-form volume (not a primitive solid)"));
         };
-        Ok(match shape {
+        if self.intersects.iter().any(|(t, _)| *t == id) {
+            return Err(format!("object {id}: no closed-form volume (intersected)"));
+        }
+        let scale: f64 = o
+            .transforms
+            .iter()
+            .map(|t| match t {
+                Transform::Stretch { factors: f, .. } => (f[0] * f[1] * f[2]).abs(),
+                _ => 1.0,
+            })
+            .product();
+        Ok(scale * match shape {
             Shape::Cuboid(c) => c.size[0] * c.size[1] * c.size[2],
             Shape::Prism(p) => {
                 (area2(&p.points) - p.holes.iter().map(|h| area2(h)).sum::<f64>()) * p.height
@@ -559,6 +578,28 @@ impl Geometry {
     pub fn resolve(&self, sels: &[FaceSel]) -> Result<Vec<&Face>, String> {
         let r = self.realized()?;
         Ok(r.faces.iter().filter(|f| sels.iter().any(|s| matches(&r.solids, s, f))).collect())
+    }
+
+    /// Tagged face groups (selections) and volume groups (objects) as the
+    /// B-rep faces and regions they currently hold.
+    pub fn groups(
+        &self,
+        faces: &[(i32, Vec<FaceSel>)],
+        volumes: &[(i32, Vec<ObjId>)],
+    ) -> Result<(Vec<Group>, Vec<Group>), String> {
+        let mut fg = Vec::with_capacity(faces.len());
+        for (tag, sels) in faces {
+            fg.push(Group { tag: *tag, ids: self.resolve(sels)?.iter().map(|f| f.id).collect() });
+        }
+        let mut vg = Vec::with_capacity(volumes.len());
+        for (tag, objs) in volumes {
+            let mut ids = Vec::new();
+            for &o in objs {
+                ids.extend(self.region(o)?);
+            }
+            vg.push(Group { tag: *tag, ids });
+        }
+        Ok((fg, vg))
     }
 
     /// Meshes the realised scene.
@@ -705,5 +746,21 @@ mod tests {
         let t = g.resolve(&[top]).unwrap();
         assert_eq!(t.len(), 1);
         assert!((t[0].centroid[0] - 2.0).abs() < 1e-9 && (t[0].centroid[2] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_sheet_moved_before_extrusion_sweeps_in_world_axes() {
+        let mut g = Geometry::new(Some(0.5));
+        g.add_solid(Cuboid::new([4.0, 4.0, 4.0]), None, false);
+        let s = g.add_sheet(Sheet::xy(1.0, 1.0, [1.0, 1.0, 1.0]), None);
+        // stood up into the xz-plane, then swept along +y
+        g.transform(s, Transform::Rotate { angle: std::f64::consts::FRAC_PI_2, axis: [1.0, 0.0, 0.0], center: [1.0, 1.0, 1.0] });
+        g.extrude(s, [0.0, 1.0, 0.0]).unwrap();
+        g.transform(s, Transform::Translate([0.0, 0.0, 0.5]));
+        let top = FaceSel { origin: FaceOrigin::Solid { object: s, role: 1 }, side: None, across: None };
+        let t = g.resolve(&[top]).unwrap();
+        assert_eq!(t.len(), 1);
+        assert!((t[0].normal[1].abs() - 1.0).abs() < 1e-9, "{:?}", t[0].normal);
+        assert_eq!(t[0].bbox, [1.0, 2.0, 1.5, 2.0, 2.0, 2.5]);
     }
 }

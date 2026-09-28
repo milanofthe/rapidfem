@@ -3,10 +3,13 @@
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 """External geometry import via ``Geometry.load``.
 
-STL (and OBJ) surfaces load as meshable solids. STEP, IGES, BREP and ``.msh``
-import are not available on the rapidmesh backend yet
-(milanofthe/rapidmesh-dev#37, #140); their tests are strict expected failures
-that flip to passing, and fail the suite as a reminder, once the backend can.
+STL (and OBJ) surfaces load as meshable solids, placed by unit, scale,
+rotation and position. A ``.msh`` volume mesh loads in mesh mode (its groups
+the handles for materials and physics, no remeshing); the fixture is written
+by ``save_mesh``, so the round trip is tested too. STEP, IGES and BREP import
+is not available on the rapidmesh backend yet (milanofthe/rapidmesh-dev#37);
+its test is a strict expected failure that flips to passing, and fails the
+suite as a reminder, once the backend can.
 """
 from __future__ import annotations
 
@@ -62,16 +65,30 @@ def test_stl_loads_as_meshable_solid(stl):
     assert len(air.faces.outer) == 6
 
 
-def test_stl_placement_is_not_available_yet(stl):
-    g = rf.Geometry()
-    with pytest.raises(NotImplementedError, match="identity placement"):
-        g.load(str(stl), position=(1 * MM, 0, 0))
+def test_stl_placement(stl):
+    # the file in millimetres, turned about z and moved
+    path = stl.parent / "ico_mm.stl"
+    lines = []
+    for line in stl.read_text().splitlines():
+        if line.startswith("vertex"):
+            x, y, z = (float(v) / MM for v in line.split()[1:])
+            line = f"vertex {x:e} {y:e} {z:e}"
+        lines.append(line)
+    path.write_text("\n".join(lines))
+    g = rf.Geometry(maxh=2 * MM)
+    g.box(40 * MM, 40 * MM, 40 * MM, position=(-20 * MM,) * 3, material=rf.Air())
+    part = g.load(str(path), unit="MM", rotation=(np.pi / 2, (0, 0, 1)),
+                  position=(3 * MM, 0, 0))
+    b = np.array([f.bbox for f in part.faces])
+    lo, hi = b[:, :3].min(axis=0), b[:, 3:].max(axis=0)
+    np.testing.assert_allclose((lo + hi) / 2, [3 * MM, 0, 0], atol=1e-9)
+    assert hi[2] - lo[2] == pytest.approx(10 * MM * 0.85065, rel=1e-3)
 
 
 def test_unsupported_extension(tmp_path):
     p = tmp_path / "part.xyz"
     p.write_text("")
-    with pytest.raises(ValueError, match="xyz"):
+    with pytest.raises(ValueError, match="unsupported extension"):
         rf.Geometry().load(str(p))
 
 
@@ -89,9 +106,80 @@ def test_cad_import(tmp_path, ext):
     rf.Geometry().load(str(p))
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True,
-                   reason=".msh import: milanofthe/rapidmesh-dev#140")
-def test_msh_import(tmp_path):
-    p = tmp_path / "mesh.msh"
-    p.write_text("")
-    rf.Geometry().load(str(p))
+# ── MSH: mesh mode ──────────────────────────────────────────────────────────
+
+A, B, L = 22.86 * MM, 10.16 * MM, 30 * MM  # WR-90
+
+
+def _waveguide(g):
+    air = g.box(A, B, L, material=rf.Air())
+    rf.RectWaveguidePort(air.faces.min(axis="z"))
+    rf.RectWaveguidePort(air.faces.max(axis="z"))
+    rf.PEC(*air.faces.unassigned)
+    return air
+
+
+@pytest.fixture(scope="module")
+def wg_msh(tmp_path_factory):
+    g = rf.Geometry(maxh=4 * MM)
+    _waveguide(g)
+    g.mesh()
+    path = tmp_path_factory.mktemp("import_fixtures") / "wg.msh"
+    assert g.save_mesh(str(path)) == str(path)
+    return path, g.mesh_stats.n_tets
+
+
+def test_msh_exposes_named_groups(wg_msh):
+    path, n_tets = wg_msh
+    g = rf.Geometry()
+    scene = g.load(str(path))
+    assert {"air_1", "port_1", "port_2", "pec_1"} <= set(scene.groups)
+    assert scene.group("air_1").material is None  # not yet bound
+    np.testing.assert_allclose(scene.group("port_2")[0].bbox, [0, 0, L, A, B, L], atol=1e-12)
+    with pytest.raises(KeyError, match="available"):
+        scene.group("nope")
+
+
+def test_msh_mode_blocks_primitives(wg_msh):
+    g = rf.Geometry()
+    g.load(str(wg_msh[0]))
+    with pytest.raises(RuntimeError, match="mesh mode"):
+        g.box(1 * MM, 1 * MM, 1 * MM)
+
+
+def test_msh_mode_requires_bindings(wg_msh):
+    g = rf.Geometry()
+    g.load(str(wg_msh[0]))
+    with pytest.raises(RuntimeError, match="no materials or physics"):
+        g.mesh()
+
+
+def test_msh_placement_rejected(wg_msh):
+    with pytest.raises(ValueError, match="position/rotation"):
+        rf.Geometry().load(str(wg_msh[0]), position=(1.0, 0.0, 0.0))
+
+
+def test_msh_bake_and_solve(wg_msh):
+    """The loaded mesh solves like the one it was saved from."""
+    path, n_tets = wg_msh
+    f = np.linspace(8e9, 12e9, 3)
+    g = rf.Geometry()
+    scene = g.load(str(path))
+    scene.group("air_1").material = rf.Air()
+    rf.RectWaveguidePort(scene.group("port_1"))
+    rf.RectWaveguidePort(scene.group("port_2"))
+    rf.PEC(scene.group("pec_1"))
+    stats = g.mesh()
+    assert stats.n_tets == n_tets
+    assert len(g._material_tags) == 1
+    assert len(g._physics_tags) == 3  # two ports + the PEC walls
+    res = rf.Problem(g).sweep(f)
+    assert res.sparams.shape == (3, 2, 2)
+
+    ref = rf.Geometry(maxh=4 * MM)
+    _waveguide(ref)
+    ref.mesh()
+    res_ref = rf.Problem(ref).sweep(f)
+    np.testing.assert_allclose(res.sparams, res_ref.sparams, atol=1e-9)
+    # matched air-filled guide: low reflection in band
+    assert np.all(20 * np.log10(np.abs(res.sparams[:, 0, 0])) < -20)

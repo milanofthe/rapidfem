@@ -9,12 +9,13 @@
 //! `(object, role)` (role -1 for a sheet). The Python `rapidfem.Geometry`
 //! is a thin layer over these calls.
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, Group};
+use rapidfem_geom::msh::{write_msh, MeshScene};
 use rapidfem_geom::geometry::{Across, EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
-use rapidmesh::{EdgeCut, EdgePick, MeshOptions};
+use rapidmesh::{EdgeCut, EdgePick, MeshOptions, Transform};
 
 type P3 = [f64; 3];
 
@@ -129,43 +130,43 @@ impl PyGeometry {
         self.inner.add_sheet(Sheet::Polygon { points, holes, position: [0.0, 0.0, z] }, maxh)
     }
 
-    /// Extrudes an xy-plane sheet (polygon or axis-aligned rectangle) along
-    /// +z by `height` into a prism, in place: the object keeps its id.
-    fn extrude(&mut self, id: ObjId, height: f64) -> PyResult<()> {
-        let prism = match &self.inner.object(id).item {
-            Item::Sheet(Sheet::Polygon { points, holes, position }) => Prism {
+    /// Extrudes a sheet along `vector` into a solid, in place: the object
+    /// keeps its id and the sheet becomes its bottom face (role 0, top 1,
+    /// then the walls). An xy polygon or rectangle swept along z becomes a
+    /// prism.
+    fn extrude(&mut self, id: ObjId, vector: P3) -> PyResult<()> {
+        let [vx, vy, h] = vector;
+        let o = self.inner.object(id);
+        let prism = match &o.item {
+            _ if vx != 0.0 || vy != 0.0 || !o.transforms.is_empty() => None,
+            Item::Sheet(Sheet::Polygon { points, holes, position }) => Some(Prism {
                 points: points.clone(),
                 holes: holes.clone(),
-                height,
+                height: h,
                 position: *position,
-            },
-            Item::Sheet(Sheet::Rect { corner, u, v }) if u[2] == 0.0 && v[2] == 0.0 => Prism {
-                points: vec![
-                    [0.0, 0.0],
-                    [u[0], u[1]],
-                    [u[0] + v[0], u[1] + v[1]],
-                    [v[0], v[1]],
-                ],
+            }),
+            Item::Sheet(Sheet::Rect { corner, u, v }) if u[2] == 0.0 && v[2] == 0.0 => Some(Prism {
+                points: vec![[0.0, 0.0], [u[0], u[1]], [u[0] + v[0], u[1] + v[1]], [v[0], v[1]]],
                 holes: Vec::new(),
-                height,
+                height: h,
                 position: *corner,
-            },
-            _ => {
-                return Err(PyValueError::new_err(
-                    "extrude: only xy-plane polygons and rectangles extrude along z so far \
-                     (general directions: milanofthe/rapidmesh-dev#140)",
-                ))
+            }),
+            _ => None,
+        };
+        match prism {
+            // a negative height extrudes downwards: the same prism, shifted
+            Some(p) if h < 0.0 => {
+                let q = p.position;
+                let p = Prism { height: -h, position: [q[0], q[1], q[2] + h], ..p };
+                self.inner.replace(id, Item::Solid(p.into()));
+                Ok(())
             }
-        };
-        // a negative height extrudes downwards: the same prism, shifted
-        let prism = if height < 0.0 {
-            let p = prism.position;
-            Prism { height: -height, position: [p[0], p[1], p[2] + height], ..prism }
-        } else {
-            prism
-        };
-        self.inner.replace(id, Item::Solid(prism.into()));
-        Ok(())
+            Some(p) => {
+                self.inner.replace(id, Item::Solid(p.into()));
+                Ok(())
+            }
+            None => self.inner.extrude(id, vector).map_err(PyValueError::new_err),
+        }
     }
 
     /// Ruled loft between two planar profiles with the same vertex count.
@@ -209,8 +210,34 @@ impl PyGeometry {
         self.inner.solid_volume(id).map_err(PyValueError::new_err)
     }
 
-    fn translate(&mut self, id: ObjId, d: P3) -> PyResult<()> {
-        self.inner.translate(id, d).map_err(PyValueError::new_err)
+    fn translate(&mut self, id: ObjId, d: P3) {
+        self.inner.transform(id, Transform::Translate(d));
+    }
+
+    /// Turns an object by `angle` radians about the axis along `axis`
+    /// through `center` (right-handed).
+    fn rotate(&mut self, id: ObjId, angle: f64, axis: P3, center: P3) {
+        self.inner.transform(id, Transform::Rotate { angle, axis, center });
+    }
+
+    /// Mirrors an object across the plane through `point` with `normal`.
+    fn mirror(&mut self, id: ObjId, normal: P3, point: P3) {
+        self.inner.transform(id, Transform::Mirror { normal, point });
+    }
+
+    /// Stretches an object by `factors` along x, y and z about `center`.
+    fn stretch(&mut self, id: ObjId, factors: P3, center: P3) {
+        self.inner.transform(id, Transform::Stretch { factors, center });
+    }
+
+    /// A copy of an object in the same place (its own region); returns its id.
+    fn copy(&mut self, id: ObjId) -> ObjId {
+        self.inner.copy(id)
+    }
+
+    /// `target` becomes what it shares with every tool; the tools are used up.
+    fn intersect(&mut self, target: ObjId, tools: Vec<ObjId>) {
+        self.inner.intersect(target, tools);
     }
 
     /// Fuses solid objects into the first one's material region.
@@ -333,6 +360,29 @@ impl PyGeometry {
         Ok(stats)
     }
 
+    /// Writes the last `mesh()` (holes left out) as gmsh MSH 4.1, the face
+    /// and volume groups named by `names[tag]` its physical groups; returns
+    /// the volume groups that found no region of their own.
+    fn save_msh(
+        &self,
+        path: String,
+        face_groups: Vec<(i32, Vec<PySel>)>,
+        volume_groups: Vec<(i32, Vec<ObjId>)>,
+        names: std::collections::HashMap<i32, String>,
+    ) -> PyResult<Vec<String>> {
+        let m = self.mesh.as_ref().ok_or_else(|| PyRuntimeError::new_err("mesh() first"))?;
+        let (faces, volumes) = self.groups(face_groups, volume_groups)?;
+        let named = |gs: Vec<Group>| -> Vec<(String, Vec<u32>)> {
+            gs.into_iter().map(|g| (names.get(&g.tag).cloned().unwrap_or(format!("group_{}", g.tag)), g.ids)).collect()
+        };
+        let holes = self.inner.hole_regions().map_err(err)?;
+        let io = |e: std::io::Error| PyRuntimeError::new_err(format!("{path}: {e}"));
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&path).map_err(io)?);
+        let dropped = write_msh(m, &named(volumes), &named(faces), &holes, &mut w).map_err(io)?;
+        std::io::Write::flush(&mut w).map_err(io)?;
+        Ok(dropped)
+    }
+
     /// The solver mesh of the last `mesh()`, with face groups `(tag,
     /// [origin])` and volume groups `(tag, [object])` for the model's tags.
     fn fem_mesh(
@@ -341,24 +391,60 @@ impl PyGeometry {
         volume_groups: Vec<(i32, Vec<ObjId>)>,
     ) -> PyResult<PyFemMesh> {
         let m = self.mesh.as_ref().ok_or_else(|| PyRuntimeError::new_err("mesh() first"))?;
-        let mut faces = Vec::with_capacity(face_groups.len());
-        for (tag, origins) in face_groups {
-            let origins: Vec<FaceSel> = origins.into_iter().map(sel_of).collect();
-            let ids = self.inner.resolve(&origins).map_err(err)?.iter().map(|f| f.id).collect();
-            faces.push(Group { tag, ids });
-        }
-        let mut volumes = Vec::with_capacity(volume_groups.len());
-        for (tag, objs) in volume_groups {
-            let mut ids = Vec::new();
-            for o in objs {
-                if let Some(r) = self.inner.region(o).map_err(err)? {
-                    ids.push(r);
-                }
-            }
-            volumes.push(Group { tag, ids });
-        }
+        let (faces, volumes) = self.groups(face_groups, volume_groups)?;
         let holes = self.inner.hole_regions().map_err(err)?;
         Ok(PyFemMesh { inner: fem_mesh(m, &faces, &volumes, &holes) })
+    }
+}
+
+impl PyGeometry {
+    fn groups(
+        &self,
+        face_groups: Vec<(i32, Vec<PySel>)>,
+        volume_groups: Vec<(i32, Vec<ObjId>)>,
+    ) -> PyResult<(Vec<Group>, Vec<Group>)> {
+        let faces: Vec<(i32, Vec<FaceSel>)> =
+            face_groups.into_iter().map(|(t, s)| (t, s.into_iter().map(sel_of).collect())).collect();
+        self.inner.groups(&faces, &volume_groups).map_err(err)
+    }
+}
+
+/// A pre-built MSH volume mesh (no remeshing) with its named physical
+/// groups.
+#[pyclass(name = "MeshScene", module = "rapidfem._native")]
+pub struct PyMeshScene {
+    inner: MeshScene,
+}
+
+#[pymethods]
+impl PyMeshScene {
+    #[new]
+    fn new(path: String) -> PyResult<Self> {
+        Ok(PyMeshScene { inner: MeshScene::load(&path).map_err(PyValueError::new_err)? })
+    }
+
+    /// `(name, dim)` of every named group, in file order.
+    fn groups(&self) -> Vec<(String, u8)> {
+        self.inner.groups.iter().map(|g| (g.name.clone(), g.dim)).collect()
+    }
+
+    fn bbox(&self, name: &str) -> PyResult<[f64; 6]> {
+        self.inner.bbox(name).map_err(PyKeyError::new_err)
+    }
+
+    /// `(n_points, n_tets, min_dihedral, n_slivers)`.
+    fn stats(&self) -> (usize, usize, f64, usize) {
+        let m = &self.inner.mesh;
+        (m.points.len(), m.tets.len(), m.quality.min_dihedral_deg, m.quality.n_slivers)
+    }
+
+    /// The solver mesh, face and volume groups `(tag, [group name])`.
+    fn fem_mesh(
+        &self,
+        face_groups: Vec<(i32, Vec<String>)>,
+        volume_groups: Vec<(i32, Vec<String>)>,
+    ) -> PyResult<PyFemMesh> {
+        Ok(PyFemMesh { inner: self.inner.fem_mesh(&face_groups, &volume_groups).map_err(PyValueError::new_err)? })
     }
 }
 

@@ -1522,6 +1522,7 @@ fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
     m.add_class::<PyGeometry>()?;
     m.add_class::<PyFemMesh>()?;
+    m.add_class::<geometry::PyMeshScene>()?;
     m.add_class::<PySimulation>()?;
     m.add_class::<PySweepResult>()?;
     m.add_class::<PyEigenmode>()?;

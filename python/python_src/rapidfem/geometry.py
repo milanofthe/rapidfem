@@ -49,20 +49,38 @@ class _Entity:
     """
 
     def __init__(self, geometry: "Geometry", dim: int, *, obj: int | None = None,
-                 origin: tuple[int, int, int, int] | None = None):
+                 origin: tuple[int, int, int, int] | None = None,
+                 group: str | None = None):
         self._geometry = geometry
         self.dim = dim
         self.obj = obj
         self.origin = origin
+        # a named group of a loaded mesh (mesh mode)
+        self.group = group
         self.material = None
         self.name: str | None = None
         self.maxh: float | None = None
 
     def __repr__(self) -> str:
-        what = f"object {self.obj}" if self.dim == 3 else f"face {self.origin}"
+        if self.group is not None:
+            what = f"group {self.group!r}"
+        else:
+            what = f"object {self.obj}" if self.dim == 3 else f"face {self.origin}"
         return f"_Entity({what})"
 
+    @property
+    def _key(self):
+        """What the native groups take: the group name of a loaded mesh,
+        else the object (solid) or face selection."""
+        if self.group is not None:
+            return self.group
+        return self.obj if self.dim == 3 else self.origin
+
     def _info(self):
+        if self.group is not None:
+            b = tuple(self._geometry._scene.bbox(self.group))
+            c = tuple((np.array(b[:3]) + np.array(b[3:])) / 2)
+            return (c, (0.0,) * 3, 0.0, [], b)
         if self.dim == 3:
             return self._geometry._object_info(self.obj)
         return self._geometry._face_info([self.origin])[0]
@@ -299,7 +317,7 @@ class EntityCollection:
         """axis-aligned faces lying on *this collection's own* bounding box
 
         Like :attr:`outer`, but the reference box is the bounding box of
-        the entities in *this* collection, not the whole gmsh model. A
+        the entities in *this* collection, not the whole model. A
         face is kept iff one of its axes is degenerate and its coordinate
         along that axis matches this collection's extremum.
 
@@ -525,6 +543,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         self._physics_tags: dict = {}
         self._fem_mesh = None
         self._last_mesh = None
+        self._last_groups = None
+        # The native MeshScene when a .msh file was loaded (mesh mode).
+        self._scene = None
         # Mesh options a builder (rfic.build) sets for the geometries it makes.
         self._mesh_defaults: dict = {}
         self.mesh_stats: MeshStats | None = None
@@ -545,6 +566,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
     def _wrap(self, obj_id: int, *, sheet: bool, material=None,
               maxh: float | None = None) -> GeoObject:
+        self._require_geometry_mode()
         ent = _Entity(self, 2 if sheet else 3, obj=None if sheet else obj_id,
                       origin=(obj_id, -1, -1, -1) if sheet else None)
         ent.material = material
@@ -557,9 +579,15 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         self._entities.append(ent)
         return obj
 
+    def _require_geometry_mode(self) -> None:
+        if self._scene is not None:
+            raise RuntimeError(
+                "the geometry is in mesh mode (a .msh file was loaded): it takes "
+                "materials and physics on the file's groups, not new objects")
+
     def _sync_maxh(self, ent: _Entity) -> None:
         """A solid's mesh size: its own ``maxh``, else its material's."""
-        if ent.dim != 3:
+        if ent.dim != 3 or ent.group is not None:
             return
         h = ent.maxh if ent.maxh is not None else getattr(ent.material, "maxh", None)
         self._native.set_object_maxh(ent.obj, h)
@@ -600,6 +628,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         return max(b[3] - b[0], b[4] - b[1], b[5] - b[2], 1e-300)
 
     def _apply_maxh(self, entities, h: float) -> None:
+        entities = [e for e in entities if e.group is None]  # a loaded mesh is not remeshed
         faces = [e.origin for e in entities if e.dim == 2]
         for e in entities:
             if e.dim == 3:
@@ -663,13 +692,13 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         """
         ax = np.asarray(axis, dtype=float)
         n = np.linalg.norm(ax)
-        if n == 0 or abs(abs(ax[2]) / n - 1.0) > 1e-12:
-            raise NotImplementedError(
-                "extrude: only along z so far (general directions: "
-                "milanofthe/rapidmesh-dev#140)")
-        h = float(height) * (1.0 if ax[2] > 0 else -1.0)
+        if n == 0:
+            raise ValueError("extrude: axis must be a nonzero vector")
         oid = face._id
-        self._native.extrude(oid, h)
+        try:
+            self._native.extrude(oid, [float(c) for c in ax * (float(height) / n)])
+        except ValueError as e:
+            raise ValueError(f"extrude: {e}") from None
         ent = face._entity
         self._faces.pop((oid, -1, -1, -1), None)
         ent.dim, ent.obj, ent.origin = 3, oid, None
@@ -854,8 +883,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         Note
         ----
         Face names on the operands are **not** preserved (faces merge
-        and centroids shift). Top-level volume names survive via the
-        gmsh ``out_map``, but set face names AFTER ``fuse``, or use
+        and centroids shift). Top-level volume names survive, but set
+        face names AFTER ``fuse``, or use
         :meth:`fragment` if you need the interfaces themselves to
         survive as named entities.
 
@@ -899,18 +928,29 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to intersect with (consumed)
         """
-        raise NotImplementedError("intersect: not available yet (milanofthe/rapidmesh-dev#140)")
+        ids = self._solid_ids((target, *tools))
+        self._native.intersect(ids[0], ids[1:])
+        for tool in tools:
+            tool._entity.material = None
 
     # ── transforms ──────────────────────────────────────────────────────────
+
+    def _move_profile(self, obj: GeoObject, f) -> None:
+        """Moves the vertex loop kept for a planar profile (see
+        :meth:`_outline`) with its sheet."""
+        pts = getattr(self, "_profiles", {}).get(obj._id)
+        if pts is not None:
+            self._profiles[obj._id] = [tuple(float(v) for v in f(np.asarray(p, dtype=float)))
+                                       for p in pts]
 
     def translate(self, obj: GeoObject,
                   dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> None:
         """move ``obj`` (and all its child faces / edges) in place by ``(dx, dy, dz)``
 
-        Like :meth:`rotate`, gmsh dimtags survive the transform, only
-        the geometric attributes (COG, bbox) of every tracked entity
-        descending from ``obj`` are refreshed, so named selectors keep
-        resolving to the moved entities.
+        Like :meth:`rotate`, every face keeps its identity through the
+        transform; only the geometric attributes (COG, bbox) change, so
+        selections and names made before keep resolving to the moved
+        faces.
 
 
         Example
@@ -929,19 +969,17 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         dx, dy, dz : float
             translation along each axis in metres (default 0 = no move)
         """
-        self._native.translate(obj._id, [float(dx), float(dy), float(dz)])
-        if hasattr(self, "_profiles") and obj._id in self._profiles:
-            self._profiles[obj._id] = [(x + dx, y + dy, z + dz)
-                                       for x, y, z in self._profiles[obj._id]]
+        d = np.array([dx, dy, dz], dtype=float)
+        self._native.translate(obj._id, list(d))
+        self._move_profile(obj, lambda p: p + d)
 
     def rotate(self, obj: GeoObject, angle: float,
                axis: tuple[float, float, float] = (0, 0, 1),
                center: tuple[float, float, float] = (0, 0, 0)) -> None:
         """rotate ``obj`` (and all its child faces / edges) in place
 
-        gmsh dimtags survive the transform unchanged; only the
-        geometric attributes (COG, bbox) of every tracked entity
-        descending from ``obj`` are refreshed. Named selectors keep
+        Every face keeps its identity through the transform; only the
+        geometric attributes (COG, bbox) change. Named selectors keep
         working, the resolver sees the new positions.
 
 
@@ -965,7 +1003,16 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             a point on the rotation axis (defaults to origin)
         """
-        raise NotImplementedError("rotate: not available yet (milanofthe/rapidmesh-dev#140)")
+        a = np.asarray(axis, dtype=float)
+        a = a / np.linalg.norm(a)
+        c = np.asarray(center, dtype=float)
+        self._native.rotate(obj._id, float(angle), list(a), list(c))
+        cos, sin = math.cos(angle), math.sin(angle)
+
+        def turn(p):
+            v = p - c
+            return c + v * cos + np.cross(a, v) * sin + a * (a @ v) * (1 - cos)
+        self._move_profile(obj, turn)
 
     def stretch(self, obj: GeoObject,
                 fx: float = 1.0, fy: float = 1.0, fz: float = 1.0,
@@ -994,7 +1041,10 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             scaling centre (defaults to origin)
         """
-        raise NotImplementedError("stretch: not available yet (milanofthe/rapidmesh-dev#140)")
+        f = np.array([fx, fy, fz], dtype=float)
+        c = np.asarray(center, dtype=float)
+        self._native.stretch(obj._id, list(f), list(c))
+        self._move_profile(obj, lambda p: c + f * (p - c))
 
     def mirror(self, obj: GeoObject,
                normal: tuple[float, float, float] = (1, 0, 0),
@@ -1003,8 +1053,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
         Useful for building symmetric structures (one half plus its
         mirror image) without re-deriving coordinates. The reflection is
-        in place: dimtags survive, COG/bbox of every descendant are
-        refreshed, so named selectors keep working.
+        in place: faces keep their identity, only COG/bbox change, so
+        named selectors keep working.
 
 
         Note
@@ -1034,7 +1084,11 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         point : tuple[float, float, float]
             a point the plane passes through (defaults to origin)
         """
-        raise NotImplementedError("mirror: not available yet (milanofthe/rapidmesh-dev#140)")
+        n = np.asarray(normal, dtype=float)
+        n = n / np.linalg.norm(n)
+        q = np.asarray(point, dtype=float)
+        self._native.mirror(obj._id, list(n), list(q))
+        self._move_profile(obj, lambda p: p - 2.0 * ((p - q) @ n) * n)
 
     def copy(self, obj: GeoObject, *, material=None,
              maxh: float | None = None) -> GeoObject:
@@ -1077,7 +1131,13 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             the new, independent duplicate
         """
-        raise NotImplementedError("copy: not available yet (milanofthe/rapidmesh-dev#140)")
+        src = obj._entity
+        oid = self._native.copy(obj._id)
+        if getattr(self, "_profiles", {}).get(obj._id) is not None:
+            self._profiles[oid] = list(self._profiles[obj._id])
+        return self._wrap(oid, sheet=obj.dim == 2,
+                          material=src.material if material is None else material,
+                          maxh=src.maxh if maxh is None else maxh)
 
     def array(self, obj: GeoObject, count: int, *,
               spacing: tuple[float, float, float] | None = None,
@@ -1132,7 +1192,19 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ValueError
             if ``count < 1`` or not exactly one of ``spacing`` / ``rotation``
         """
-        raise NotImplementedError("array: not available yet (milanofthe/rapidmesh-dev#140)")
+        if count < 1:
+            raise ValueError(f"array: count must be >= 1, got {count}")
+        if (spacing is None) == (rotation is None):
+            raise ValueError("array: pass exactly one of spacing or rotation")
+        out = [obj]
+        for k in range(1, count):
+            c = self.copy(obj)
+            if spacing is not None:
+                self.translate(c, *(k * float(s) for s in spacing))
+            else:
+                self.rotate(c, k * float(rotation), axis=axis, center=center)
+            out.append(c)
+        return out
 
     # ── edge features ───────────────────────────────────────────────────────
 
@@ -1397,7 +1469,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             mat = ent.material
             if mat is None or isinstance(mat, str) or ent.dim != 3:
                 continue
-            by_mat.setdefault(id(mat), (mat, []))[1].append(ent.obj)
+            by_mat.setdefault(id(mat), (mat, []))[1].append(ent._key)
         for mat_id, (mat, objs) in by_mat.items():
             self._material_tags[mat_id] = next_tag
             self._group_names[next_tag] = name(mat)
@@ -1405,8 +1477,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             next_tag += 1
 
         def group(ents):
-            faces = [e.origin for e in ents if e.dim == 2]
-            vols = [e.obj for e in ents if e.dim == 3]
+            faces = [e._key for e in ents if e.dim == 2]
+            vols = [e._key for e in ents if e.dim == 3]
             return faces, vols
 
         for phys in self._physics:
@@ -1439,9 +1511,22 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         :meth:`load` and is directly consumable by external gmsh-format
         solvers such as Palace, same mesh, different solver.
 
-        Requires a prior :meth:`mesh` call; raises otherwise.
+        Requires a prior :meth:`mesh` call; raises otherwise. A region
+        carries one volume group: a volume group over regions an earlier
+        group (a material) already holds is left out, with a warning.
         """
-        raise NotImplementedError("save_mesh: not available yet")
+        if self._scene is not None:
+            raise RuntimeError("save_mesh: the geometry is a loaded mesh; save its file instead")
+        if self._last_groups is None:
+            raise RuntimeError("save_mesh: call mesh() first")
+        face_groups, volume_groups = self._last_groups
+        dropped = self._native.save_msh(str(path), face_groups, volume_groups,
+                                        dict(self._group_names))
+        if dropped:
+            import warnings
+            warnings.warn(f"save_mesh: volume groups without regions of their own "
+                          f"are not in the file: {', '.join(dropped)}", stacklevel=2)
+        return str(path)
 
     def mesh(
         self,
@@ -1485,15 +1570,25 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         MeshStats
             size and quality of the mesh
         """
-        h = maxh if maxh is not None else self._maxh
-        if cells_across is None:
-            cells_across = self._mesh_defaults.get("cells_across", 1.0)
-        n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
-            maxh=h, grading=None if self._grading else 1e9,
-            cells_across=float(cells_across), optimize=bool(optimize),
-            target_elements=target_elements)
-        face_groups, volume_groups = self._assign_groups()
-        self._fem_mesh = self._native.fem_mesh(face_groups, volume_groups)
+        if self._scene is not None:
+            # mesh mode: the file's mesh as it is, the bindings baked in
+            n_points, n_tets, min_dihedral, n_slivers = self._scene.stats()
+            face_groups, volume_groups = self._assign_groups()
+            if not face_groups and not volume_groups:
+                raise RuntimeError(
+                    "mesh(): no materials or physics are bound to the loaded mesh's groups")
+            self._fem_mesh = self._scene.fem_mesh(face_groups, volume_groups)
+        else:
+            h = maxh if maxh is not None else self._maxh
+            if cells_across is None:
+                cells_across = self._mesh_defaults.get("cells_across", 1.0)
+            n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
+                maxh=h, grading=None if self._grading else 1e9,
+                cells_across=float(cells_across), optimize=bool(optimize),
+                target_elements=target_elements)
+            face_groups, volume_groups = self._assign_groups()
+            self._fem_mesh = self._native.fem_mesh(face_groups, volume_groups)
+        self._last_groups = (face_groups, volume_groups)
         fm = self._fem_mesh
         stats = MeshStats()
         stats.n_nodes = fm.n_nodes

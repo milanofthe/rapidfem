@@ -12,24 +12,30 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, Group};
-use rapidfem_geom::geometry::{EdgeOp, FaceOrigin, Geometry, Item, ObjId};
+use rapidfem_geom::geometry::{EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
 use rapidmesh::{EdgeCut, EdgePick, MeshOptions};
 
 type P3 = [f64; 3];
 
-fn origin_of((object, role): (usize, i64)) -> FaceOrigin {
-    if role < 0 {
+/// A face selection from Python: `(object, role, side)`, role -1 for a
+/// sheet, side -1 for none.
+type PySel = (usize, i64, i64);
+
+fn sel_of((object, role, side): PySel) -> FaceSel {
+    let origin = if role < 0 {
         FaceOrigin::Sheet { object }
     } else {
         FaceOrigin::Solid { object, role: role as u32 }
-    }
+    };
+    FaceSel { origin, side: (side >= 0).then_some(side as usize) }
 }
 
-fn origin_tuple(o: FaceOrigin) -> (usize, i64) {
-    match o {
-        FaceOrigin::Solid { object, role } => (object, role as i64),
-        FaceOrigin::Sheet { object } => (object, -1),
+fn sel_tuple(s: FaceSel) -> PySel {
+    let side = s.side.map_or(-1, |o| o as i64);
+    match s.origin {
+        FaceOrigin::Solid { object, role } => (object, role as i64, side),
+        FaceOrigin::Sheet { object } => (object, -1, side),
     }
 }
 
@@ -197,8 +203,8 @@ impl PyGeometry {
         self.inner.fuse(ids);
     }
 
-    fn set_face_maxh(&mut self, origins: Vec<(usize, i64)>, h: f64) {
-        self.inner.set_face_maxh(origins.into_iter().map(origin_of).collect(), h);
+    fn set_face_maxh(&mut self, origins: Vec<PySel>, h: f64) {
+        self.inner.set_face_maxh(origins.into_iter().map(sel_of).collect(), h);
     }
 
     /// A closed STL or OBJ surface as a solid, split into smooth surfaces
@@ -245,27 +251,27 @@ impl PyGeometry {
     }
 
     /// Face origins `(object, role)` bounding an object.
-    fn faces_of(&self, id: ObjId) -> PyResult<Vec<(usize, i64)>> {
-        Ok(self.inner.faces_of(id).map_err(err)?.into_iter().map(origin_tuple).collect())
+    fn faces_of(&self, id: ObjId) -> PyResult<Vec<PySel>> {
+        Ok(self.inner.faces_of(id).map_err(err)?.into_iter().map(sel_tuple).collect())
     }
 
     /// Every face origin of the realised model.
-    fn all_faces(&self) -> PyResult<Vec<(usize, i64)>> {
+    fn all_faces(&self) -> PyResult<Vec<PySel>> {
         let r = self.inner.realized().map_err(err)?;
-        let mut o: Vec<FaceOrigin> = r.faces.iter().map(|f| f.origin).collect();
+        let mut o: Vec<FaceSel> = r.faces.iter().map(|f| FaceSel { origin: f.origin, side: None }).collect();
         o.sort();
         o.dedup();
-        Ok(o.into_iter().map(origin_tuple).collect())
+        Ok(o.into_iter().map(sel_tuple).collect())
     }
 
     /// Per origin: area-weighted centroid, mean normal, total area, the
     /// regions on either side (0 outside or in a void) and the bounding box
     /// `(xmin, ymin, zmin, xmax, ymax, zmax)`, over the faces it currently
     /// resolves to.
-    fn face_info(&self, origins: Vec<(usize, i64)>) -> PyResult<Vec<(P3, P3, f64, Vec<u32>, [f64; 6])>> {
+    fn face_info(&self, origins: Vec<PySel>) -> PyResult<Vec<(P3, P3, f64, Vec<u32>, [f64; 6])>> {
         let mut out = Vec::with_capacity(origins.len());
         for o in origins {
-            let faces = self.inner.resolve(&[origin_of(o)]).map_err(err)?;
+            let faces = self.inner.resolve(&[sel_of(o)]).map_err(err)?;
             let area: f64 = faces.iter().map(|f| f.area).sum();
             let mut c = [0.0; 3];
             let mut n = [0.0; 3];
@@ -311,13 +317,13 @@ impl PyGeometry {
     /// [origin])` and volume groups `(tag, [object])` for the model's tags.
     fn fem_mesh(
         &self,
-        face_groups: Vec<(i32, Vec<(usize, i64)>)>,
+        face_groups: Vec<(i32, Vec<PySel>)>,
         volume_groups: Vec<(i32, Vec<ObjId>)>,
     ) -> PyResult<PyFemMesh> {
         let m = self.mesh.as_ref().ok_or_else(|| PyRuntimeError::new_err("mesh() first"))?;
         let mut faces = Vec::with_capacity(face_groups.len());
         for (tag, origins) in face_groups {
-            let origins: Vec<FaceOrigin> = origins.into_iter().map(origin_of).collect();
+            let origins: Vec<FaceSel> = origins.into_iter().map(sel_of).collect();
             let ids = self.inner.resolve(&origins).map_err(err)?.iter().map(|f| f.id).collect();
             faces.push(Group { tag, ids });
         }

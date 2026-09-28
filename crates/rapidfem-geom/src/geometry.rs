@@ -64,6 +64,16 @@ pub enum FaceOrigin {
     Sheet { object: ObjId },
 }
 
+/// A face selection: the pieces of a face origin, optionally only those
+/// bounding the solid `side` (a face split by a later solid keeps its origin
+/// on every piece; `side` keeps the pieces that face the solid it was
+/// selected through, as a gmsh fragment did).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FaceSel {
+    pub origin: FaceOrigin,
+    pub side: Option<ObjId>,
+}
+
 /// A B-rep face of the realised model.
 #[derive(Clone, Debug)]
 pub struct Face {
@@ -94,10 +104,24 @@ pub struct Geometry {
     /// Solid objects fused into one region (the first keeps its region).
     unions: Vec<Vec<ObjId>>,
     /// Target sizes on faces, by origin.
-    face_maxh: Vec<(Vec<FaceOrigin>, f64)>,
+    face_maxh: Vec<(Vec<FaceSel>, f64)>,
     maxh: Option<f64>,
     size_points: Vec<([f64; 3], f64)>,
     realized: OnceLock<Result<Realized, String>>,
+}
+
+/// Whether face `f` is a piece of selection `s`.
+fn matches(solids: &[Option<Solid>], objects: &[Object], s: &FaceSel, f: &Face) -> bool {
+    if f.origin != s.origin {
+        return false;
+    }
+    match s.side {
+        None => true,
+        Some(o) => match solids.get(o).copied().flatten() {
+            Some(sol) if !objects[o].void => f.regions.contains(&sol.region),
+            _ => true,
+        },
+    }
 }
 
 /// Moves a solid or sheet description by `d`.
@@ -239,7 +263,7 @@ impl Geometry {
     }
 
     /// A target size `h` on the faces of `origins`.
-    pub fn set_face_maxh(&mut self, origins: Vec<FaceOrigin>, h: f64) {
+    pub fn set_face_maxh(&mut self, origins: Vec<FaceSel>, h: f64) {
         self.face_maxh.push((origins, h));
         self.changed();
     }
@@ -354,9 +378,13 @@ impl Geometry {
             })
             .collect();
         let mut realized = Realized { geometry: g, solids, topology, faces };
-        for (origins, h) in &self.face_maxh {
-            let ids: Vec<u32> =
-                realized.faces.iter().filter(|f| origins.contains(&f.origin)).map(|f| f.id).collect();
+        for (sels, h) in &self.face_maxh {
+            let ids: Vec<u32> = realized
+                .faces
+                .iter()
+                .filter(|f| sels.iter().any(|s| matches(&realized.solids, &self.objects, s, f)))
+                .map(|f| f.id)
+                .collect();
             for id in ids {
                 let filter = FaceFilter { id: Some(id), ..FaceFilter::default() };
                 realized.geometry.set_maxh_on(&Scope::surf(Some(filter)), *h).map_err(|e| e.to_string())?;
@@ -372,23 +400,24 @@ impl Geometry {
 
     /// The faces bounding an object: for a solid every face with its region
     /// on one side (interfaces with later solids included), for a void its
-    /// walls, for a sheet the sheet itself.
-    pub fn faces_of(&self, id: ObjId) -> Result<Vec<FaceOrigin>, String> {
+    /// walls, for a sheet the sheet itself. Solid faces carry the object as
+    /// their side.
+    pub fn faces_of(&self, id: ObjId) -> Result<Vec<FaceSel>, String> {
         let r = self.realized()?;
         let o = &self.objects[id];
-        let mut out: Vec<FaceOrigin> = match (&o.item, r.solids[id]) {
-            (Item::Sheet(_), _) => vec![FaceOrigin::Sheet { object: id }],
+        let mut out: Vec<FaceSel> = match (&o.item, r.solids[id]) {
+            (Item::Sheet(_), _) => vec![FaceSel { origin: FaceOrigin::Sheet { object: id }, side: None }],
             (Item::Solid(_), Some(s)) if !o.void => r
                 .faces
                 .iter()
                 .filter(|f| f.regions.contains(&s.region))
-                .map(|f| f.origin)
+                .map(|f| FaceSel { origin: f.origin, side: Some(id) })
                 .collect(),
             (Item::Solid(_), Some(_)) => r
                 .faces
                 .iter()
                 .filter(|f| matches!(f.origin, FaceOrigin::Solid { object, .. } if object == id))
-                .map(|f| f.origin)
+                .map(|f| FaceSel { origin: f.origin, side: None })
                 .collect(),
             (Item::Solid(_), None) => Vec::new(),
         };
@@ -418,10 +447,10 @@ impl Geometry {
         Ok(out)
     }
 
-    /// The current B-rep faces of a set of origins.
-    pub fn resolve(&self, origins: &[FaceOrigin]) -> Result<Vec<&Face>, String> {
+    /// The current B-rep faces of a set of selections.
+    pub fn resolve(&self, sels: &[FaceSel]) -> Result<Vec<&Face>, String> {
         let r = self.realized()?;
-        Ok(r.faces.iter().filter(|f| origins.contains(&f.origin)).collect())
+        Ok(r.faces.iter().filter(|f| sels.iter().any(|s| matches(&r.solids, &self.objects, s, f))).collect())
     }
 
     /// Meshes the realised scene.
@@ -450,13 +479,17 @@ mod tests {
         // the substrate/air interface bounds both
         let fa = g.faces_of(air).unwrap();
         let fs = g.faces_of(sub).unwrap();
-        assert!(fa.iter().any(|o| fs.contains(o)), "no shared interface face");
+        assert!(fa.iter().any(|a| fs.iter().any(|s| s.origin == a.origin)), "no shared interface face");
+        // the air's floor lies under the substrate, which carves it: selected
+        // through the air, the floor has no piece left
+        let floor = FaceSel { origin: FaceOrigin::Solid { object: air, role: 0 }, side: Some(air) };
+        assert!(g.resolve(&[floor]).unwrap().is_empty());
     }
 
     #[test]
     fn origins_survive_a_later_change() {
         let (mut g, air, _) = substrate_in_air();
-        let top = FaceOrigin::Solid { object: air, role: 1 }; // +z of the air box
+        let top = FaceSel { origin: FaceOrigin::Solid { object: air, role: 1 }, side: None }; // +z of the air box
         let before: Vec<u32> = g.resolve(&[top]).unwrap().iter().map(|f| f.id).collect();
         assert_eq!(before.len(), 1);
         // a sheet added later renumbers the model; the origin still finds +z

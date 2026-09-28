@@ -1480,6 +1480,68 @@ fn solve_vector_modes_core(
     // A − σB is symmetric indefinite and keeps one sparsity pattern for every
     // shift (the union of A and B), so the rslab LDLᵀ analyses it once and
     // only refactors the numeric values per σ.
+    // Start vector: the L2 projection of a uniform transverse field along a
+    // fixed global direction (x, or y on a face normal to x) onto the Eₜ
+    // space, zero Ez. A degenerate pair (the TE11 of a round guide) then
+    // converges to the member polarised along that direction on every port
+    // mesh, instead of a mixture set by the mesh: two ports of one guide
+    // agree on the polarisation.
+    // Eₜ mass (the Et-Et block of B), for the polarisation projections.
+    let dtt: Vec<(usize, usize, f64)> =
+        b_trip.iter().copied().filter(|&(i, j, _)| i < n_et && j < n_et).collect();
+    let dtt_matvec = |v: &[f64]| -> Vec<f64> {
+        let mut y = vec![0.0f64; n_et];
+        for &(i, j, val) in &dtt {
+            y[i] += val * v[j];
+        }
+        y
+    };
+    // ∫ φ_i · ê dA over the Eₜ DOFs, ê the reference polarisation.
+    let mut polar_rhs: Option<Vec<f64>> = None;
+    let polarised_start: Option<Vec<f64>> = (|| {
+        let n3 = [
+            mesh.u_hat[1] * mesh.v_hat[2] - mesh.u_hat[2] * mesh.v_hat[1],
+            mesh.u_hat[2] * mesh.v_hat[0] - mesh.u_hat[0] * mesh.v_hat[2],
+            mesh.u_hat[0] * mesh.v_hat[1] - mesh.u_hat[1] * mesh.v_hat[0],
+        ];
+        let r3 = if n3[0].abs() > 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+        let mut e0 = [dot3(r3, mesh.u_hat), dot3(r3, mesh.v_hat)];
+        let ne0 = (e0[0] * e0[0] + e0[1] * e0[1]).sqrt();
+        if ne0 < 1e-9 {
+            return None;
+        }
+        e0 = [e0[0] / ne0, e0[1] / ne0];
+        let mut rhs = vec![0.0f64; n_et];
+        for (ti, &tri) in mesh.tris.iter().enumerate() {
+            let (area, g) = mesh.tri_geom(tri);
+            let te = &tri_edges[ti];
+            for &(w, l1, l2, l3) in NED2_QPTS_DEG5.iter() {
+                let l = [l1, l2, l3];
+                for kk in 0..6 {
+                    let r = edge_red[te.gidx[kk / 2]];
+                    if r != usize::MAX {
+                        let phi = ned2_edge_basis(kk / 2, kk % 2, te, &g, l);
+                        rhs[off_et_edge + 2 * r + kk % 2] += w * area * (phi[0] * e0[0] + phi[1] * e0[1]);
+                    }
+                }
+                for m in 0..2 {
+                    let phi = ned2_face_basis(m, te, &g, l);
+                    rhs[off_et_face + 2 * ti + m] += w * area * (phi[0] * e0[0] + phi[1] * e0[1]);
+                }
+            }
+        }
+        let rr: Vec<usize> = dtt.iter().map(|t| t.0).collect();
+        let cc: Vec<usize> = dtt.iter().map(|t| t.1).collect();
+        let vv: Vec<f64> = dtt.iter().map(|t| t.2).collect();
+        let mut mass = crate::linalg::SymmetricSolver::<f64>::new();
+        mass.factorize(n_et, &rr, &cc, &vv).ok()?;
+        let mut v0 = mass.solve(&rhs).ok()?;
+        polar_rhs = Some(rhs);
+        v0.resize(ndof, 0.0);
+        let n = v0.iter().map(|x| x * x).sum::<f64>().sqrt();
+        (n > 0.0).then(|| v0.into_iter().map(|x| x / n).collect())
+    })();
+
     let m_kry = ndof.min(80);
     let c_rows: Vec<usize> = a_trip.iter().chain(b_trip.iter()).map(|t| t.0).collect();
     let c_cols: Vec<usize> = a_trip.iter().chain(b_trip.iter()).map(|t| t.1).collect();
@@ -1499,12 +1561,19 @@ fn solve_vector_modes_core(
         }
         analysed = true;
         let solve = |bv: &[f64]| -> Option<Vec<f64>> { solver.solve(bv).ok() };
-        // Deterministic start vector (no RNG: keeps resume/CI reproducible).
-        let mut v0: Vec<f64> =
-            (0..ndof).map(|i| (((i * 7 + 13) % 97) as f64 / 97.0) - 0.5).collect();
-        let n0 = v0.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if n0 == 0.0 { return Vec::new(); }
-        for x in &mut v0 { *x /= n0; }
+        // Polarised start vector (see above); a deterministic fallback when
+        // the projection is unavailable (no RNG: keeps CI reproducible).
+        let v0: Vec<f64> = match &polarised_start {
+            Some(v) => v.clone(),
+            None => {
+                let mut v: Vec<f64> =
+                    (0..ndof).map(|i| (((i * 7 + 13) % 97) as f64 / 97.0) - 0.5).collect();
+                let n0 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if n0 == 0.0 { return Vec::new(); }
+                for x in &mut v { *x /= n0; }
+                v
+            }
+        };
         let mut vs: Vec<Vec<f64>> = vec![v0];
         let mut hmat = vec![vec![0.0f64; m_kry]; m_kry + 1];
         let mut m_act = m_kry;
@@ -1562,7 +1631,10 @@ fn solve_vector_modes_core(
     // spurious cluster) and accumulate the distinct genuine (curl-bearing)
     // modes. One σ near the fundamental resolves it cleanly; the sweep makes
     // the search robust to where the mode actually sits.
-    let mut genuine: Vec<(f64, Vec<f64>)> = Vec::new();
+    // Distinct modes, each a cluster of the Ritz vectors found for it: a
+    // (near-)degenerate pair, split slightly by the mesh, lands in one
+    // cluster and is resolved below.
+    let mut genuine: Vec<(f64, Vec<Vec<f64>>)> = Vec::new();
     let sweep_fracs = [0.90, 0.80, 0.68, 0.56, 0.45, 0.35, 0.27];
     for &frac in sweep_fracs.iter() {
         let neff2_t = (frac * eps_max).max(0.05);
@@ -1582,14 +1654,54 @@ fn solve_vector_modes_core(
             // homogeneous multi-conductor TEM line, whose curl-free
             // fundamental at n_eff² = ε_max is physical.
             if !allow_curl_free && kt2 < kt2_floor { continue; }
-            // De-duplicate against modes already found (relative n_eff²).
-            if genuine.iter().any(|(n, _)| (n - neff2).abs() < 1e-3 * neff2.max(1.0)) {
-                continue;
+            // Group with a mode already found (relative n_eff²).
+            match genuine.iter_mut().find(|(n, _)| (*n - neff2).abs() < 1e-3 * neff2.max(1.0)) {
+                Some((_, xs)) => xs.push(x),
+                None => genuine.push((neff2, vec![x])),
             }
-            genuine.push((neff2, x));
         }
     }
     genuine.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    // One vector per mode. A degenerate cluster spans a plane of equally
+    // valid modes whose orientation the mesh would pick; take the member
+    // polarised along the reference direction, the combination with the
+    // largest ∫Eₜ·ê dA, so that every port of a guide agrees.
+    let genuine: Vec<(f64, Vec<f64>)> = genuine
+        .into_iter()
+        .map(|(neff2, xs)| {
+            let Some(rhs) = &polar_rhs else { return (neff2, xs[0].clone()) };
+            let mut basis: Vec<Vec<f64>> = Vec::new();
+            for x in &xs {
+                let mut v = x.clone();
+                for q in &basis {
+                    let mq = dtt_matvec(&q[..n_et]);
+                    let c: f64 = v[..n_et].iter().zip(&mq).map(|(a, b)| a * b).sum();
+                    for (vi, qi) in v.iter_mut().zip(q) {
+                        *vi -= c * qi;
+                    }
+                }
+                let mv = dtt_matvec(&v[..n_et]);
+                let n2: f64 = v[..n_et].iter().zip(&mv).map(|(a, b)| a * b).sum();
+                let mx = dtt_matvec(&x[..n_et]);
+                let x2: f64 = x[..n_et].iter().zip(&mx).map(|(a, b)| a * b).sum();
+                if n2 > 1e-6 * x2 && n2 > 0.0 {
+                    let s = 1.0 / n2.sqrt();
+                    basis.push(v.into_iter().map(|a| a * s).collect());
+                }
+            }
+            if basis.len() < 2 {
+                return (neff2, xs[0].clone());
+            }
+            let mut y = vec![0.0f64; ndof];
+            for q in &basis {
+                let c: f64 = rhs.iter().zip(&q[..n_et]).map(|(a, b)| a * b).sum();
+                for (yi, qi) in y.iter_mut().zip(q) {
+                    *yi += c * qi;
+                }
+            }
+            (neff2, y)
+        })
+        .collect();
 
     genuine
         .into_iter()

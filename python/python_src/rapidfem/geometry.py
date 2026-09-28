@@ -1245,10 +1245,16 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             return []
         self._native.make_void(ids)
         walls = sorted({tuple(f) for i in ids for f in self._native.faces_of(i)})
-        area = sum(info[2] for info in self._face_info(walls))
-        volume = sum(getattr(self, "_prisms", {}).get(i, 0.0) for i in ids)
+        infos = self._face_info(walls)
+        area = sum(info[2] for info in infos)
+        # Volume of the voids by the divergence theorem over their walls:
+        # V = |sum A (c . n)| / 3, exact for planar walls.
+        volume = sum(abs(sum(info[2] * float(np.dot(info[0], info[1]))
+                             for info in self._face_info(
+                                 [tuple(f) for f in self._native.faces_of(i)])))
+                     for i in ids) / 3.0
         if volume <= 0.0 or area <= 0.0:
-            raise ValueError(f"_hollow: no prism volume known for {name!r}")
+            raise ValueError(f"_hollow: {name!r} encloses no volume")
         faces = EntityCollection(self, [self._face(f) for f in walls])
         return [(faces, 2.0 * volume / area)]
 

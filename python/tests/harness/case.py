@@ -32,8 +32,10 @@ import pytest
 import rapidfem as rf
 
 #: Maximum DOF count any test geometry may produce. Keeps the whole suite on a
-#: 16 GB laptop and forces authors to mesh sensibly.
-DOF_BUDGET = 100_000
+#: 16 GB laptop and forces authors to mesh sensibly. rapidmesh honours the
+#: requested sizes inside every region (gmsh let thin regions coarsen), which
+#: puts the same test meshes 10-35 % above their former counts.
+DOF_BUDGET = 150_000
 
 
 class DofBudgetExceeded(AssertionError):

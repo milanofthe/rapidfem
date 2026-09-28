@@ -29,11 +29,6 @@ def _clean(pts: np.ndarray) -> np.ndarray:
     return np.asarray(keep)
 
 
-def _area(pts: np.ndarray) -> float:
-    x, y = pts[:, 0], pts[:, 1]
-    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
-
-
 class _GdsMixin:
     """GDSII layout import, mixed into :class:`rapidfem.geometry.Geometry`."""
 
@@ -133,7 +128,4 @@ class _GdsMixin:
         pts = _clean(pts)
         obj = self.polygon([tuple(p[:2]) for p in pts], (0.0, 0.0, z))
         self.extrude(obj, thickness)
-        if not hasattr(self, "_prisms"):
-            self._prisms = {}
-        self._prisms[obj._id] = _area(pts) * float(thickness)
         return obj

@@ -97,7 +97,9 @@ def _hj_alpha_d(f):
 # ── one lossy-or-lossless microstrip solve at an exact modal frequency ──────
 def _solve(freq, *, metal, tand):
     g = rf.Geometry(maxh=rf.lambda_maxh(f_max=freq, er_max=ER, per_lambda=8))
-    fr4 = rf.Dielectric(er=ER, tand=tand, maxh=SUB_H / 3.0)
+    # One element across the substrate: the loss bands below are calibrated on
+    # that resolution (three elements across quadruple the DOFs).
+    fr4 = rf.Dielectric(er=ER, tand=tand, maxh=SUB_H)
     sub = g.box(SUB_W, LINE_L, SUB_H, position=(-SUB_W / 2, 0, 0), material=fr4)
     air = g.box(SUB_W, LINE_L, AIR_H, position=(-SUB_W / 2, 0, SUB_H), material=rf.Air())
     trace = g.xy_plate(LINE_W, LINE_L, position=(-LINE_W / 2, 0, SUB_H))

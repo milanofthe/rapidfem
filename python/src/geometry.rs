@@ -12,9 +12,9 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, Group};
-use rapidfem_geom::geometry::{FaceOrigin, Geometry, Item, ObjId};
-use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Loft, Prism, Sheet, Sphere, Torus, Wedge};
-use rapidmesh::MeshOptions;
+use rapidfem_geom::geometry::{EdgeOp, FaceOrigin, Geometry, Item, ObjId};
+use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
+use rapidmesh::{EdgeCut, EdgePick, MeshOptions};
 
 type P3 = [f64; 3];
 
@@ -158,6 +158,49 @@ impl PyGeometry {
         self.inner.add_solid(Loft { profile_a, profile_b }, maxh, false)
     }
 
+    /// Solid of revolution of the closed profile `points` (`(r, z)` in the
+    /// frame of the axis through `position` along `axis`), by `angle`
+    /// degrees.
+    #[pyo3(signature = (points, position, axis, angle=360.0, maxh=None))]
+    fn add_revolve(&mut self, points: Vec<[f64; 2]>, position: P3, axis: P3, angle: f64, maxh: Option<f64>) -> ObjId {
+        let mut r = Revolve::new(points);
+        r.position = position;
+        r.axis = axis;
+        r.angle = angle;
+        self.inner.add_solid(r, maxh, false)
+    }
+
+    /// Chamfers (`fillet=false`, `size` = distance) or fillets (`size` =
+    /// radius) edges of a solid, picked by the roles of the two faces
+    /// meeting there; `None` cuts every edge.
+    #[pyo3(signature = (id, size, fillet, edges=None, void=false))]
+    fn cut_edges(&mut self, id: ObjId, size: f64, fillet: bool, edges: Option<Vec<(u32, u32)>>, void: bool) {
+        let edges = match edges {
+            None => vec![EdgePick::All],
+            Some(e) => e.into_iter().map(|(a, b)| EdgePick::Between(a, b)).collect(),
+        };
+        let cut = if fillet { EdgeCut::Fillet(size) } else { EdgeCut::Chamfer(size) };
+        self.inner.cut_edges(EdgeOp { object: id, edges, cut, void });
+    }
+
+    /// Edges of a solid object: `((role_a, role_b), midpoint)`.
+    fn edges_of(&self, id: ObjId) -> PyResult<Vec<((u32, u32), P3)>> {
+        Ok(self.inner.edges_of(id).map_err(err)?.into_iter().map(|(r, m)| ((r[0], r[1]), m)).collect())
+    }
+
+    fn translate(&mut self, id: ObjId, d: P3) -> PyResult<()> {
+        self.inner.translate(id, d).map_err(PyValueError::new_err)
+    }
+
+    /// Fuses solid objects into the first one's material region.
+    fn fuse(&mut self, ids: Vec<ObjId>) {
+        self.inner.fuse(ids);
+    }
+
+    fn set_face_maxh(&mut self, origins: Vec<(usize, i64)>, h: f64) {
+        self.inner.set_face_maxh(origins.into_iter().map(origin_of).collect(), h);
+    }
+
     fn make_void(&mut self, ids: Vec<ObjId>) {
         self.inner.make_void(&ids);
     }
@@ -206,10 +249,11 @@ impl PyGeometry {
         Ok(o.into_iter().map(origin_tuple).collect())
     }
 
-    /// Per origin: area-weighted centroid, mean normal, total area and the
-    /// regions on either side (0 outside or in a void), over the faces it
-    /// currently resolves to.
-    fn face_info(&self, origins: Vec<(usize, i64)>) -> PyResult<Vec<(P3, P3, f64, Vec<u32>)>> {
+    /// Per origin: area-weighted centroid, mean normal, total area, the
+    /// regions on either side (0 outside or in a void) and the bounding box
+    /// `(xmin, ymin, zmin, xmax, ymax, zmax)`, over the faces it currently
+    /// resolves to.
+    fn face_info(&self, origins: Vec<(usize, i64)>) -> PyResult<Vec<(P3, P3, f64, Vec<u32>, [f64; 6])>> {
         let mut out = Vec::with_capacity(origins.len());
         for o in origins {
             let faces = self.inner.resolve(&[origin_of(o)]).map_err(err)?;
@@ -217,7 +261,12 @@ impl PyGeometry {
             let mut c = [0.0; 3];
             let mut n = [0.0; 3];
             let mut regions = Vec::new();
+            let mut bbox = [f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
             for f in &faces {
+                for k in 0..3 {
+                    bbox[k] = bbox[k].min(f.bbox[k]);
+                    bbox[k + 3] = bbox[k + 3].max(f.bbox[k + 3]);
+                }
                 for k in 0..3 {
                     c[k] += f.centroid[k] * f.area / area.max(f64::MIN_POSITIVE);
                     n[k] += f.normal[k] * f.area / area.max(f64::MIN_POSITIVE);
@@ -226,7 +275,7 @@ impl PyGeometry {
             }
             regions.sort();
             regions.dedup();
-            out.push((c, n, area, regions));
+            out.push((c, n, area, regions, bbox));
         }
         Ok(out)
     }

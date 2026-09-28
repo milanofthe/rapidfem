@@ -271,6 +271,65 @@ impl Faceted {
 
     /// The bare triangle soup as a CSG solid operand. Only meaningful for
     /// shapes built as closed, outward-oriented solids.
+    /// This shape with `cutter` taken away, by the exact boolean.
+    pub fn minus(&self, cutter: &Faceted) -> Result<Faceted, rapidmesh_csg::ArrangeError> {
+        self.boolean(cutter, rapidmesh_csg::BoolOp::Difference)
+    }
+
+    /// What this shape and `other` have in common, by the exact boolean.
+    pub fn common(&self, other: &Faceted) -> Result<Faceted, rapidmesh_csg::ArrangeError> {
+        self.boolean(other, rapidmesh_csg::BoolOp::Intersection)
+    }
+
+    /// The exact boolean `op` of this shape and `other`. Every face keeps
+    /// its carrier: this shape's faces theirs, `other`'s faces theirs,
+    /// appended after this shape's surfaces (so a role past the shape's own
+    /// names a face that came from `other`). The result is given as single
+    /// triangles, with this shape's frame, corners and features.
+    pub fn boolean(
+        &self,
+        other: &Faceted,
+        op: rapidmesh_csg::BoolOp,
+    ) -> Result<Faceted, rapidmesh_csg::ArrangeError> {
+        let cutter = other;
+        let out = rapidmesh_csg::boolean(&self.to_solid(), &cutter.to_solid(), op)?;
+        let pts: Vec<[f64; 3]> = out
+            .vertices
+            .iter()
+            .map(|p| p.approx().expect("boolean vertices are valid points"))
+            .collect();
+        let own = self.tris.len();
+        let base = self.surfaces.len() as u32;
+        let mut f = Faceted {
+            frame: self.frame,
+            corners: self.corners.clone(),
+            tris: Vec::new(),
+            face_surface: Vec::new(),
+            surfaces: self
+                .surfaces
+                .iter()
+                .chain(&cutter.surfaces)
+                .cloned()
+                .collect(),
+            flats: Vec::new(),
+            features: self.features.clone(),
+        };
+        for (t, &src) in out.triangles.iter().zip(&out.source_facet) {
+            let v = t.map(|i| pts[i]);
+            let tri = Tri::new(v[0], v[1], v[2]);
+            if tri.is_degenerate() {
+                continue; // collapsed to a line by the rounding
+            }
+            let surface = if src < own {
+                self.face_surface[src]
+            } else {
+                base + cutter.face_surface[src - own]
+            };
+            f.push_tri(tri, surface);
+        }
+        Ok(f)
+    }
+
     pub fn to_solid(&self) -> Solid {
         Solid {
             tris: self.tris.clone(),
@@ -309,11 +368,12 @@ impl Faceted {
         let mut new_index = vec![usize::MAX; self.tris.len()];
         for (i, t) in self.tris.iter().enumerate() {
             let v = t.v.map(&map);
-            if v[0] == v[1] || v[1] == v[2] || v[2] == v[0] {
-                continue;
+            let tri = Tri::new(v[0], v[1], v[2]);
+            if tri.is_degenerate() {
+                continue; // collapsed to a line by the map
             }
             new_index[i] = out.tris.len();
-            out.tris.push(Tri::new(v[0], v[1], v[2]));
+            out.tris.push(tri);
             out.face_surface.push(self.face_surface[i]);
         }
         let dedup = |l: &[[f64; 3]]| -> Vec<[f64; 3]> {

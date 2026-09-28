@@ -12,7 +12,7 @@
 //! standalone mesh-boolean API (`Faceted::to_solid` feeds it) and doubles as
 //! the end-to-end watertightness exercise of the arrangement machinery.
 
-use crate::arrange::arrange;
+use crate::arrange::{arrange, ArrangeError};
 use crate::classify::{classify, Placement, TriBoxes};
 use crate::pool::VertexPool;
 use crate::tri::Tri;
@@ -69,12 +69,14 @@ fn keep(op: BoolOp, from_a: bool, placement: Placement) -> Option<bool> {
 }
 
 /// Regularized boolean of two closed solids. The result boundary is exact;
-/// shared/coincident surface regions are handled by the keep table.
-pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> BooleanResult {
+/// shared/coincident surface regions are handled by the keep table. A facet
+/// the arrangement cannot triangulate is an error naming it (`a`'s facets
+/// first, then `b`'s).
+pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> Result<BooleanResult, ArrangeError> {
     let mut all: Vec<Tri> = a.tris.clone();
     all.extend(b.tris.iter().cloned());
     let na = a.tris.len();
-    let arr = arrange(&all);
+    let arr = arrange(&all)?;
 
     // Scene bounding box for ray targets.
     let mut lo = [f64::MAX; 3];
@@ -123,9 +125,9 @@ pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> BooleanResult {
             source_facet.push(fi);
         }
     }
-    BooleanResult {
+    Ok(BooleanResult {
         vertices: pool.verts,
         triangles,
         source_facet,
-    }
+    })
 }

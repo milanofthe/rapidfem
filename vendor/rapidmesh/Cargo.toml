@@ -1,5 +1,5 @@
 # Vendored copy of rapidmesh (milanofthe/rapidmesh-dev) at commit
-# b3c5a5a, written by rapidfem's scripts/vendor_rapidmesh.py: the
+# d33a35d, written by rapidfem's scripts/vendor_rapidmesh.py: the
 # library crates behind the `rapidmesh` facade, without tests,
 # benches, examples, binaries or dev-dependencies. The own [workspace]
 # keeps the vendored tree out of the consuming workspace.

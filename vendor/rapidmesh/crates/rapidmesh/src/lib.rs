@@ -29,11 +29,13 @@
 //! regions for MoM.
 
 pub mod export;
+mod features;
 mod geometry;
 mod mesh;
 pub mod scenes;
 pub mod shapes;
 
+pub use features::{EdgeCut, EdgePick};
 pub use geometry::{
     Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions, DEFAULT_CELLS_ACROSS,
 };

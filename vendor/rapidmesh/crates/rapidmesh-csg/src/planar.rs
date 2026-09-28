@@ -18,6 +18,7 @@
 //! a no-op (one helper triangle, one sub-segment per pair) and the result is
 //! identical to the triangle-soup arrangement.
 
+use crate::arrange::ArrangeError;
 use crate::arrange::{
     adjacency_skip, build_bvh, clip_coplanar_edge, self_pairs, Aabb, Arrangement,
 };
@@ -63,7 +64,7 @@ struct CutSeg {
 
 /// Conformal arrangement of planar facets. The result is indexed per facet
 /// (NOT per triangle): `facets[k]` is the triangulation of `input[k]`.
-pub fn arrange_facets(input: &[PlanarInput]) -> Arrangement {
+pub fn arrange_facets(input: &[PlanarInput]) -> Result<Arrangement, ArrangeError> {
     let n = input.len();
 
     // Flatten to member triangles tagged with their owning facet, for the
@@ -227,7 +228,7 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Arrangement {
     let (out_facets, out_constraints): (Vec<_>, Vec<_>) = cop
         .into_par_iter()
         .enumerate()
-        .map(|(f, mut constraints)| {
+        .map(|(f, mut constraints)| -> Result<_, ArrangeError> {
             for segs in cut[f].values() {
                 for group in collinear_groups(segs) {
                     let raw: Vec<(Point3, Point3)> =
@@ -255,15 +256,18 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Arrangement {
                 &points[f],
                 &constraints,
                 canonical[f],
-            );
-            (ft, constraints)
+            )
+            .map_err(|message| ArrangeError { facet: f, message })?;
+            Ok((ft, constraints))
         })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .unzip();
 
-    Arrangement {
+    Ok(Arrangement {
         facets: out_facets,
         constraints: out_constraints,
-    }
+    })
 }
 
 /// Boundary edges of a facet (outer loop then each hole loop), as explicit

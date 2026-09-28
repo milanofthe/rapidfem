@@ -88,44 +88,14 @@ impl<'a> BrepOracle<'a> {
             })
             .collect();
 
-        // Incidence from the PLC itself: a point lies on every face with a
-        // facet at that vertex, a curve on every face with a facet along its
-        // chain. The B-rep co-edges miss faces a curve only runs across (a
-        // baffle's attachment line on a wall).
-        let vid: rustc_hash::FxHashMap<[u64; 3], u32> = plc
+        let mut corners: Vec<P3> = brep.vertices.iter().map(|v| v.pos).collect();
+        // Incidence from the B-rep: a corner lies on every face at its
+        // vertex, a curve on every face with a co-edge along it.
+        let mut corner_patches: Vec<Vec<u32>> = brep
             .vertices
             .iter()
-            .enumerate()
-            .map(|(i, p)| (p.map(f64::to_bits), i as u32))
+            .map(|v| v.faces.iter().map(|f| f.0).collect())
             .collect();
-        let mut vert_faces: rustc_hash::FxHashMap<u32, Vec<u32>> = Default::default();
-        let mut edge_faces: rustc_hash::FxHashMap<(u32, u32), Vec<u32>> = Default::default();
-        for (fi, t) in plc.triangles.iter().enumerate() {
-            let f = facet_face[fi];
-            if f == u32::MAX {
-                continue;
-            }
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                let e = edge_faces.entry((a.min(b), a.max(b))).or_default();
-                if !e.contains(&f) {
-                    e.push(f);
-                }
-                let v = vert_faces.entry(a).or_default();
-                if !v.contains(&f) {
-                    v.push(f);
-                }
-            }
-        }
-        let faces_at = |p: P3| -> Vec<u32> {
-            vid.get(&p.map(f64::to_bits))
-                .and_then(|v| vert_faces.get(v))
-                .cloned()
-                .unwrap_or_default()
-        };
-
-        let mut corners: Vec<P3> = brep.vertices.iter().map(|v| v.pos).collect();
-        let mut corner_patches: Vec<Vec<u32>> = corners.iter().map(|&p| faces_at(p)).collect();
         // A singular point inside a face (a cone apex) is a corner too: the
         // refinement only approaches it, so it must be pinned. It counts when
         // the face's PLC has a vertex there.
@@ -161,17 +131,6 @@ impl<'a> BrepOracle<'a> {
                 continue;
             };
             let mut fs: Vec<u32> = e.coedges.iter().map(|&c| brep.coedge(c).face.0).collect();
-            for w in e.chain.windows(2) {
-                let ids = (
-                    vid.get(&w[0].map(f64::to_bits)),
-                    vid.get(&w[1].map(f64::to_bits)),
-                );
-                if let (Some(&a), Some(&b)) = ids {
-                    if let Some(f) = edge_faces.get(&(a.min(b), a.max(b))) {
-                        fs.extend_from_slice(f);
-                    }
-                }
-            }
             fs.sort_unstable();
             fs.dedup();
             curves.push(FeatureCurve {
@@ -342,7 +301,7 @@ impl DomainOracle for BrepOracle<'_> {
         if face.facets.is_empty() {
             return Vec::new();
         }
-        let has_edge = face.loops.iter().any(|l| !l.coedges.is_empty());
+        let has_edge = self.brep.coedges.iter().any(|c| c.face.0 == patch);
         let cents: Vec<P3> = face
             .facets
             .iter()

@@ -139,6 +139,9 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
     // A face's boundary edge is used by exactly one of its triangles (interior
     // edges by two). The set of faces sharing a boundary edge is its radial set.
     let mut bedge_faces: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+    // Faces an edge runs across (two of their triangles on it): no boundary
+    // of theirs, yet the edge lies on them.
+    let mut across: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
     {
         // count (face, edge) uses
         let mut fe_count: HashMap<(usize, (usize, usize)), usize> = HashMap::default();
@@ -152,6 +155,8 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
         for ((f, e), cnt) in fe_count {
             if cnt == 1 {
                 bedge_faces.entry(e).or_default().push(f);
+            } else {
+                across.entry(e).or_default().push(f);
             }
         }
     }
@@ -283,7 +288,10 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
                      vertices: &mut Vec<Vertex>|
      -> VertexId {
         *vid.entry(plc_v).or_insert_with(|| {
-            vertices.push(Vertex { pos: pos[plc_v] });
+            vertices.push(Vertex {
+                pos: pos[plc_v],
+                faces: Vec::new(),
+            });
             VertexId((vertices.len() - 1) as u32)
         })
     };
@@ -401,12 +409,29 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
         }
         faces[fid].loops = loops_out;
     }
-    // Inner edges: one co-edge per face around them, outside every loop.
-    for (ei, ef) in edge_faces.iter().enumerate() {
-        if !is_inner[ei] {
-            continue;
+    // Inner edges, and faces an edge runs across: one co-edge per face
+    // around them, outside every loop.
+    for (ei, ch) in chains.iter().enumerate() {
+        let mut inside: Vec<FaceId> = if is_inner[ei] {
+            edge_faces[ei].clone()
+        } else {
+            Vec::new()
+        };
+        for w in ch.windows(2) {
+            if let Some(fs) = across.get(&key2(w[0], w[1])) {
+                inside.extend(fs.iter().map(|&f| FaceId(f as u32)));
+            }
         }
-        for &f in ef {
+        inside.sort_unstable();
+        inside.dedup();
+        for f in inside {
+            if edges[ei]
+                .coedges
+                .iter()
+                .any(|c| coedges[c.0 as usize].face == f)
+            {
+                continue;
+            }
             let cid = CoEdgeId(coedges.len() as u32);
             coedges.push(CoEdge {
                 edge: EdgeId(ei as u32),
@@ -414,6 +439,18 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
                 forward: true,
             });
             edges[ei].coedges.push(cid);
+        }
+    }
+    // Every face with a triangle at a corner.
+    for t in 0..n_tri {
+        for v in tri(t) {
+            if let Some(&id) = vid.get(&v) {
+                let f = FaceId(tri_face[t] as u32);
+                let fs = &mut vertices[id.0 as usize].faces;
+                if !fs.contains(&f) {
+                    fs.push(f);
+                }
+            }
         }
     }
 
@@ -606,7 +643,17 @@ fn canonicalize(b: &mut Brep, plc: &TaggedPlc) {
             }
         })
         .collect();
-    let vertices: Vec<Vertex> = vorder.iter().map(|&v| b.vertices[v].clone()).collect();
+    let vertices: Vec<Vertex> = vorder
+        .iter()
+        .map(|&v| {
+            let mut vx = b.vertices[v].clone();
+            for f in &mut vx.faces {
+                *f = FaceId(fnew[f.0 as usize]);
+            }
+            vx.faces.sort_unstable_by_key(|f| f.0);
+            vx
+        })
+        .collect();
     *b = Brep {
         vertices,
         edges,

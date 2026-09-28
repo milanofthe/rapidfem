@@ -323,7 +323,7 @@ pub struct Arrangement {
 
 /// Computes the arrangement of `tris`: each facet triangulated so that all
 /// pairwise intersections appear as triangulation edges/vertices, exactly.
-pub fn arrange(tris: &[Tri]) -> Arrangement {
+pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
     let boxes: Vec<Aabb> = tris.iter().map(Aabb::of_tri).collect();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     if !tris.is_empty() {
@@ -428,13 +428,32 @@ pub fn arrange(tris: &[Tri]) -> Arrangement {
     let facets = tris
         .par_iter()
         .enumerate()
-        .map(|(i, t)| triangulate_facet(t, &points[i], &constraints[i]))
-        .collect();
+        .map(|(i, t)| {
+            triangulate_facet(t, &points[i], &constraints[i])
+                .map_err(|message| ArrangeError { facet: i, message })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if trace {
         eprintln!("arrange: triangulate {:.1?}", t_tri.elapsed());
     }
-    Arrangement {
+    Ok(Arrangement {
         facets,
         constraints,
+    })
+}
+
+/// An input facet the arrangement could not triangulate: its index and
+/// what failed there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrangeError {
+    pub facet: usize,
+    pub message: String,
+}
+
+impl std::fmt::Display for ArrangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "facet {}: {}", self.facet, self.message)
     }
 }
+
+impl std::error::Error for ArrangeError {}

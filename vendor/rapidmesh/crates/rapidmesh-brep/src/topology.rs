@@ -346,9 +346,18 @@ impl Topology {
 pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
     let vtx = |i: u32| plc.vertices[i as usize];
 
-    // Faces: geometry from the PLC facets, edges from the loops.
+    // Faces: geometry from the PLC facets, edges from every co-edge.
     let mut faces: Vec<FaceTopo> = Vec::with_capacity(brep.faces.len());
-    for f in &brep.faces {
+    // Every edge on each face: of its loops and inside it.
+    let mut face_edges: Vec<Vec<u32>> = vec![Vec::new(); brep.faces.len()];
+    for c in &brep.coedges {
+        face_edges[c.face.0 as usize].push(c.edge.0);
+    }
+    for es in &mut face_edges {
+        es.sort_unstable();
+        es.dedup();
+    }
+    for (fi, f) in brep.faces.iter().enumerate() {
         let (mut area, mut cen, mut nrm) = (0.0f64, [0.0; 3], [0.0; 3]);
         for &ti in &f.facets {
             let t = plc.triangles[ti as usize];
@@ -373,15 +382,7 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
         }
         let a = area.max(1e-300);
         let normal = [nrm[0] / a, nrm[1] / a, nrm[2] / a];
-        // Edges from the boundary loops.
-        let mut edges: Vec<u32> = Vec::new();
-        for lp in &f.loops {
-            for &ce in &lp.coedges {
-                edges.push(brep.coedge(ce).edge.0);
-            }
-        }
-        edges.sort_unstable();
-        edges.dedup();
+        let edges: Vec<u32> = face_edges[fi].clone();
         faces.push(FaceTopo {
             centroid: cen,
             normal,

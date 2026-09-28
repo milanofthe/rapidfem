@@ -72,7 +72,7 @@ mod tests {
         let mut g = Geometry::new(Some(0.5));
         let air = g.add(Cuboid::new([4.0, 4.0, 2.0])).unwrap();
         let diel = g.add_solid(Cuboid::new([2.0, 2.0, 1.0]).at([1.0, 1.0, 0.5]), Some(0.3), false).unwrap();
-        let bottom = g.resolve(&Scope::surf(Some(FaceFilter::normal([0.0, 0.0, -1.0]))));
+        let bottom = g.resolve(&Scope::surf(Some(FaceFilter::normal([0.0, 0.0, -1.0])))).unwrap();
         let m = g.mesh(&MeshOptions::default()).unwrap();
 
         let groups = [

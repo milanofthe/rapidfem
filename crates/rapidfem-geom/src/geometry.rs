@@ -20,7 +20,7 @@
 use std::sync::OnceLock;
 
 use rapidmesh::shapes::{Shape, Sheet};
-use rapidmesh::{MeshOptions, Solid, Topology};
+use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, Scope, Solid, Topology};
 
 /// Index of an object in its [`Geometry`].
 pub type ObjId = usize;
@@ -44,6 +44,17 @@ pub struct Object {
     pub alive: bool,
 }
 
+/// A chamfer or fillet on edges of a solid object, applied in order after
+/// the scene is assembled. The new faces become faces of the object with
+/// roles after its own (with `void` they belong to the carved voids).
+#[derive(Clone, Debug)]
+pub struct EdgeOp {
+    pub object: ObjId,
+    pub edges: Vec<EdgePick>,
+    pub cut: EdgeCut,
+    pub void: bool,
+}
+
 /// Where a B-rep face comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum FaceOrigin {
@@ -63,6 +74,8 @@ pub struct Face {
     pub area: f64,
     /// Regions on the front and back (0: outside, or a void).
     pub regions: [u32; 2],
+    /// Axis-aligned bounding box `[xmin, ymin, zmin, xmax, ymax, zmax]`.
+    pub bbox: [f64; 6],
 }
 
 /// The scene realised in rapidmesh.
@@ -77,9 +90,52 @@ pub struct Realized {
 /// The rapidfem geometry, see the module docs.
 pub struct Geometry {
     objects: Vec<Object>,
+    edge_ops: Vec<EdgeOp>,
+    /// Solid objects fused into one region (the first keeps its region).
+    unions: Vec<Vec<ObjId>>,
+    /// Target sizes on faces, by origin.
+    face_maxh: Vec<(Vec<FaceOrigin>, f64)>,
     maxh: Option<f64>,
     size_points: Vec<([f64; 3], f64)>,
     realized: OnceLock<Result<Realized, String>>,
+}
+
+/// Moves a solid or sheet description by `d`.
+fn translate_item(item: &mut Item, d: [f64; 3]) -> Result<(), String> {
+    let add = |p: &mut [f64; 3]| {
+        for k in 0..3 {
+            p[k] += d[k];
+        }
+    };
+    match item {
+        Item::Solid(s) => match s {
+            Shape::Cuboid(x) => add(&mut x.position),
+            Shape::Cylinder(x) => add(&mut x.position),
+            Shape::Sphere(x) => add(&mut x.position),
+            Shape::Icosphere(x) => add(&mut x.position),
+            Shape::Naca0012(x) => add(&mut x.position),
+            Shape::Cone(x) => add(&mut x.position),
+            Shape::Prism(x) => add(&mut x.position),
+            Shape::Torus(x) => add(&mut x.position),
+            Shape::Wedge(x) => add(&mut x.position),
+            Shape::Helix(x) => add(&mut x.position),
+            Shape::Revolve(x) => add(&mut x.position),
+            Shape::Sweep(x) => x.path.iter_mut().for_each(add),
+            Shape::Loft(x) => {
+                x.profile_a.iter_mut().for_each(add);
+                x.profile_b.iter_mut().for_each(add);
+            }
+            Shape::Triangles(x) => x.verts.iter_mut().for_each(add),
+            Shape::Import(_) => return Err("translate: an imported solid cannot move yet".into()),
+        },
+        Item::Sheet(s) => match s {
+            Sheet::Rect { corner, .. } => add(corner),
+            Sheet::Disc { center, .. } => add(center),
+            Sheet::Polygon { position, .. } => add(position),
+            Sheet::Nurbs { .. } => return Err("translate: a NURBS sheet cannot move yet".into()),
+        },
+    }
+    Ok(())
 }
 
 /// Sheet face tags are the object index shifted by one (0 means untagged).
@@ -90,7 +146,15 @@ fn sheet_tag(object: ObjId) -> u32 {
 impl Geometry {
     /// An empty geometry with global target size `maxh`.
     pub fn new(maxh: Option<f64>) -> Self {
-        Geometry { objects: Vec::new(), maxh, size_points: Vec::new(), realized: OnceLock::new() }
+        Geometry {
+            objects: Vec::new(),
+            edge_ops: Vec::new(),
+            unions: Vec::new(),
+            face_maxh: Vec::new(),
+            maxh,
+            size_points: Vec::new(),
+            realized: OnceLock::new(),
+        }
     }
 
     fn changed(&mut self) {
@@ -161,6 +225,32 @@ impl Geometry {
         self.changed();
     }
 
+    /// Chamfers (`EdgeCut::Chamfer`) or fillets edges of a solid object.
+    pub fn cut_edges(&mut self, op: EdgeOp) {
+        self.edge_ops.push(op);
+        self.changed();
+    }
+
+    /// Fuses solid objects into one material region: the faces between
+    /// them go, the first object's region takes them all.
+    pub fn fuse(&mut self, ids: Vec<ObjId>) {
+        self.unions.push(ids);
+        self.changed();
+    }
+
+    /// A target size `h` on the faces of `origins`.
+    pub fn set_face_maxh(&mut self, origins: Vec<FaceOrigin>, h: f64) {
+        self.face_maxh.push((origins, h));
+        self.changed();
+    }
+
+    /// Moves an object by `d`.
+    pub fn translate(&mut self, id: ObjId, d: [f64; 3]) -> Result<(), String> {
+        translate_item(&mut self.objects[id].item, d)?;
+        self.changed();
+        Ok(())
+    }
+
     /// A target size `h` at the point `p`, recovering along the grading.
     pub fn add_size_point(&mut self, p: [f64; 3], h: f64) {
         self.size_points.push((p, h));
@@ -189,10 +279,45 @@ impl Geometry {
                 }
             }
         }
+        for op in &self.edge_ops {
+            let solid = solids
+                .get(op.object)
+                .copied()
+                .flatten()
+                .ok_or_else(|| format!("edge cut on object {}, which is not a solid", op.object))?;
+            g.cut_edges(solid, &op.edges, op.cut, op.void).map_err(|e| e.to_string())?;
+        }
+        for ids in &self.unions {
+            let s: Vec<Solid> = ids.iter().filter_map(|&i| solids.get(i).copied().flatten()).collect();
+            if s.len() > 1 {
+                let keep = g.union(&s).map_err(|e| e.to_string())?;
+                for &i in ids {
+                    if let Some(slot) = solids.get_mut(i).and_then(|o| o.as_mut()) {
+                        slot.region = keep.region;
+                    }
+                }
+            }
+        }
         for &(p, h) in &self.size_points {
             g.add_size_point(p, h);
         }
-        let topology = g.topology();
+        let topology = g.topology().map_err(|e| e.to_string())?;
+        let model = g.model().map_err(|e| e.to_string())?;
+        // Face bounding boxes from the PLC facets of each B-rep face
+        // (topology face i is B-rep face i).
+        let bbox_of = |id: usize| {
+            let mut b = [f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+            for &ti in &model.brep.faces[id].facets {
+                for &v in &model.plc.triangles[ti as usize] {
+                    let p = model.plc.vertices[v as usize];
+                    for k in 0..3 {
+                        b[k] = b[k].min(p[k]);
+                        b[k + 3] = b[k + 3].max(p[k]);
+                    }
+                }
+            }
+            b
+        };
 
         // solid index (insertion order, voids included) -> object
         let mut object_of_index = std::collections::HashMap::new();
@@ -219,10 +344,20 @@ impl Geometry {
                     normal: f.normal,
                     area: f.area,
                     regions: f.regions,
+                    bbox: bbox_of(id),
                 })
             })
             .collect();
-        Ok(Realized { geometry: g, solids, topology, faces })
+        let mut realized = Realized { geometry: g, solids, topology, faces };
+        for (origins, h) in &self.face_maxh {
+            let ids: Vec<u32> =
+                realized.faces.iter().filter(|f| origins.contains(&f.origin)).map(|f| f.id).collect();
+            for id in ids {
+                let filter = FaceFilter { id: Some(id), ..FaceFilter::default() };
+                realized.geometry.set_maxh_on(&Scope::surf(Some(filter)), *h).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(realized)
     }
 
     /// The region of a solid object in the realised model.
@@ -254,6 +389,27 @@ impl Geometry {
         };
         out.sort();
         out.dedup();
+        Ok(out)
+    }
+
+    /// The edges of a solid object, each named by the roles of the two of
+    /// its faces meeting there (the `EdgePick::Between` selector), with the
+    /// edge midpoint.
+    pub fn edges_of(&self, id: ObjId) -> Result<Vec<([u32; 2], [f64; 3])>, String> {
+        let r = self.realized()?;
+        let role_of = |face: u32| match r.faces.iter().find(|f| f.id == face)?.origin {
+            FaceOrigin::Solid { object, role } if object == id => Some(role),
+            _ => None,
+        };
+        let mut out = Vec::new();
+        for e in &r.topology.edges {
+            let roles: Vec<u32> = e.faces.iter().filter_map(|&f| role_of(f)).collect();
+            if let [a, b] = roles[..] {
+                out.push(([a.min(b), a.max(b)], e.midpoint));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
         Ok(out)
     }
 
@@ -318,5 +474,22 @@ mod tests {
         for f in g.resolve(&walls).unwrap() {
             assert!(f.regions.contains(&ra) && f.regions.contains(&0), "{:?}", f.regions);
         }
+    }
+
+    #[test]
+    fn a_fillet_adds_a_face_to_the_solid() {
+        let mut g = Geometry::new(Some(0.5));
+        let b = g.add_solid(Cuboid::new([2.0, 2.0, 2.0]), None, false);
+        let before = g.faces_of(b).unwrap().len();
+        // the edge between +z (role 1) and +x (role 5)
+        let edges = g.edges_of(b).unwrap();
+        assert!(edges.iter().any(|(r, _)| *r == [1, 5]), "{edges:?}");
+        g.cut_edges(EdgeOp {
+            object: b,
+            edges: vec![EdgePick::Between(1, 5)],
+            cut: EdgeCut::Fillet(0.3),
+            void: false,
+        });
+        assert_eq!(g.faces_of(b).unwrap().len(), before + 1);
     }
 }

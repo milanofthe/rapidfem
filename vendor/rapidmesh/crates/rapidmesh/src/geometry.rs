@@ -6,6 +6,7 @@
 //! the earlier ones. Sheets are zero-thickness faces embedded into the
 //! volume mesh with an integer tag (PEC traces, ports).
 
+use crate::features::{EdgeCut, EdgePick};
 use crate::mesh::{Labels, Mesh, Run, SolidInfo, SurfaceMesh};
 use crate::shapes::{Shape, Sheet};
 use crate::{Error, Result};
@@ -238,7 +239,7 @@ pub struct Geometry {
     /// The model of `scene`, built on first use and shared by the
     /// selectors and both meshing calls, so an entity id means the same
     /// everywhere. Every change of the scene drops it.
-    model: OnceLock<Arc<Model>>,
+    model: OnceLock<std::result::Result<Arc<Model>, String>>,
     maxh: Option<f64>,
     grading: f64,
     /// Target size per region, as given with the solid.
@@ -288,17 +289,23 @@ impl Geometry {
         &mut self.scene
     }
 
-    /// The model of the current scene (PLC and B-rep), built on first use.
-    pub fn model(&self) -> Arc<Model> {
+    /// The model of the current scene (PLC and B-rep), built on first use,
+    /// or the input the scene cannot be assembled from.
+    pub fn model(&self) -> Result<Arc<Model>> {
         self.model
-            .get_or_init(|| Arc::new(Model::of_scene(&self.scene)))
+            .get_or_init(|| {
+                Model::try_of_scene(&self.scene)
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
             .clone()
+            .map_err(Error::Invalid)
     }
 
     /// The regions, faces and edges of the model, by the ids the scopes,
     /// named sets and periodic pairs use.
-    pub fn topology(&self) -> Topology {
-        self.model().topology()
+    pub fn topology(&self) -> Result<Topology> {
+        Ok(self.model()?.topology())
     }
 
     pub fn maxh(&self) -> Option<f64> {
@@ -325,10 +332,10 @@ impl Geometry {
 
     /// The solids with their labels, sheet labels and named entities, the
     /// names resolved on the current model.
-    pub fn labels(&self) -> Labels {
+    pub fn labels(&self) -> Result<Labels> {
         let mut labels = self.labels.clone();
         for (name, scope) in &self.named {
-            let ids = self.resolve(scope);
+            let ids = self.resolve(scope)?;
             let list = match scope.level {
                 Level::Surf => &mut labels.face_names,
                 _ => &mut labels.edge_names,
@@ -346,7 +353,7 @@ impl Geometry {
                 }
             }
         }
-        labels
+        Ok(labels)
     }
 
     // ---- solids and sheets ----------------------------------------------
@@ -387,6 +394,89 @@ impl Geometry {
             label: None,
         });
         Ok(Solid { region, index })
+    }
+
+    /// Chamfers or fillets (`cut`) the `edges` of `solid`. The material
+    /// comes off that solid alone, and what lies under it fills the cut;
+    /// the new faces (plane or cone, cylinder or torus) become faces of the
+    /// solid, with roles after its own. With `void` the solid stays and the
+    /// material is carved out as voids instead, which leaves the cut empty
+    /// (a countersink or a round in the rim of a hole); the new faces are
+    /// then the voids'. Straight edges between planes and circles between a
+    /// plane square to their axis, a cylinder or a cone take one. Returns
+    /// the origin (solid, role) of every new face, one per edge cut.
+    pub fn cut_edges(
+        &mut self,
+        solid: Solid,
+        edges: &[EdgePick],
+        cut: EdgeCut,
+        void: bool,
+    ) -> Result<Vec<(Solid, u32)>> {
+        let i = solid.index as usize;
+        let f = self
+            .scene
+            .solid(i)
+            .ok_or_else(|| Error::Invalid(format!("no solid {i}")))?
+            .clone();
+        if solid.region == 0 {
+            return Err(Error::Invalid("a void has no edges to cut".into()));
+        }
+        let maxh = self
+            .solid_maxh
+            .iter()
+            .find(|(r, _)| *r == solid.region)
+            .map(|&(_, h)| h)
+            .or(self.maxh);
+        let model = self.model()?;
+        let done =
+            crate::features::cut_edges(&model, solid.index, solid.region, &f, edges, cut, maxh)?;
+        if void {
+            // The solid stays; the material it would lose is carved out as
+            // a void, which also empties what lies under it (a second copy
+            // of the new faces on the solid would only coincide with the
+            // void's).
+            // A piece is the solid's shape with one cutter's surfaces after
+            // it: the new face follows the solid's own surfaces.
+            let role = f.surfaces.len() as u32;
+            let mut faces = Vec::with_capacity(done.removed.len());
+            for piece in done.removed {
+                let carved = Solid {
+                    region: 0,
+                    index: self.labels.solids.len() as u32,
+                };
+                self.scene_mut().add_void(piece);
+                self.labels.solids.push(SolidInfo {
+                    region: 0,
+                    label: None,
+                });
+                faces.push((carved, role));
+            }
+            return Ok(faces);
+        }
+        self.scene_mut().replace_solid(i, done.shape);
+        Ok(done.roles.into_iter().map(|r| (solid, r)).collect())
+    }
+
+    /// [`Geometry::cut_edges`] with a chamfer `distance` into both faces.
+    pub fn chamfer(
+        &mut self,
+        solid: Solid,
+        edges: &[EdgePick],
+        distance: f64,
+        void: bool,
+    ) -> Result<Vec<(Solid, u32)>> {
+        self.cut_edges(solid, edges, EdgeCut::Chamfer(distance), void)
+    }
+
+    /// [`Geometry::cut_edges`] with a fillet of `radius`.
+    pub fn fillet(
+        &mut self,
+        solid: Solid,
+        edges: &[EdgePick],
+        radius: f64,
+        void: bool,
+    ) -> Result<Vec<(Solid, u32)>> {
+        self.cut_edges(solid, edges, EdgeCut::Fillet(radius), void)
     }
 
     /// Embeds `sheet` with face tag `tag` and (the smallest given) target
@@ -453,9 +543,9 @@ impl Geometry {
     }
 
     /// The ids `scope` selects in the current model.
-    pub fn resolve(&self, scope: &Scope) -> Vec<u32> {
-        let topo = self.topology();
-        match scope.level {
+    pub fn resolve(&self, scope: &Scope) -> Result<Vec<u32>> {
+        let topo = self.topology()?;
+        Ok(match scope.level {
             Level::Region => topo.resolve_regions(scope.region),
             Level::Surf => topo.resolve_faces(
                 scope.region,
@@ -466,7 +556,7 @@ impl Geometry {
                 scope.face.as_ref(),
                 scope.edge.as_ref().unwrap_or(&EdgeFilter::default()),
             ),
-        }
+        })
     }
 
     /// Target size on what `scope` selects; unfiltered, the default of its
@@ -518,7 +608,7 @@ impl Geometry {
             Level::Surf => "surf",
             Level::Edge => "edge",
         };
-        if self.resolve(scope).is_empty() {
+        if self.resolve(scope)?.is_empty() {
             return Err(Error::Invalid(format!(
                 "the selection for {name:?} matches no {names}"
             )));
@@ -552,13 +642,13 @@ impl Geometry {
                 "periodic takes two face selections (surf scopes)".into(),
             ));
         }
-        let (a, b) = (self.resolve(master), self.resolve(slave));
+        let (a, b) = (self.resolve(master)?, self.resolve(slave)?);
         if a.is_empty() || b.is_empty() {
             return Err(Error::Invalid(
                 "a periodic selection matches no face".into(),
             ));
         }
-        let faces = self.topology().faces;
+        let faces = self.topology()?.faces;
         let cen = |i: u32| faces[i as usize].centroid;
         let area = |i: u32| faces[i as usize].area;
         let centroid = |ids: &[u32]| {
@@ -641,7 +731,7 @@ impl Geometry {
 
     /// The per-entity sizes and tolerances on the current model, in the
     /// order they were given (a later one wins).
-    fn resolve_sizing(&self) -> Resolved {
+    fn resolve_sizing(&self) -> Result<Resolved> {
         let mut r = Resolved::default();
         for (scope, knob, v) in &self.sizing.scoped {
             let map = match (knob, scope.level) {
@@ -651,9 +741,9 @@ impl Geometry {
                 (Knob::Tol, Level::Edge) => &mut r.edge_tol,
                 (Knob::Tol, _) => &mut r.surf_tol,
             };
-            map.extend(self.resolve(scope).into_iter().map(|i| (i, *v)));
+            map.extend(self.resolve(scope)?.into_iter().map(|i| (i, *v)));
         }
-        r
+        Ok(r)
     }
 
     /// The per-region sizes: the ones given with the solids, overridden by
@@ -678,11 +768,11 @@ impl Geometry {
         grading: Option<f64>,
         tol: [Option<f64>; 2],
         caps: [Option<f64>; 3],
-    ) -> MeshParams {
+    ) -> Result<MeshParams> {
         let s = &self.sizing;
-        let r = self.resolve_sizing();
+        let r = self.resolve_sizing()?;
         let list = |m: &BTreeMap<u32, f64>| m.iter().map(|(&k, &v)| (k, v)).collect();
-        MeshParams {
+        Ok(MeshParams {
             maxh: maxh.or(self.maxh).unwrap_or(f64::INFINITY),
             region_maxh: self.region_maxh(&r),
             radius_edge_bound: 0.0,
@@ -706,7 +796,7 @@ impl Geometry {
             surf_tol: list(&r.surf_tol),
             periodic: Vec::new(),
             cells_across: 0.0,
-        }
+        })
     }
 
     /// Assembles every solid and sheet exactly, meshes the arrangement with
@@ -720,7 +810,7 @@ impl Geometry {
         let t0 = Instant::now();
         rapidmesh_exact::log::clear();
         let ta = Instant::now();
-        let model = self.model();
+        let model = self.model()?;
         let t_assemble = ta.elapsed();
         rapidmesh_exact::log::stage("assemble.total", t_assemble.as_secs_f64());
         let params = MeshParams {
@@ -735,7 +825,7 @@ impl Geometry {
                 opts.grading,
                 [opts.tol_edge, opts.tol_surf],
                 [opts.maxh_edge, opts.maxh_surf, opts.maxh_vol],
-            )
+            )?
         };
         let passes = opts.optimize.then(|| {
             opts.optimize_passes
@@ -758,7 +848,7 @@ impl Geometry {
         Ok(Mesh::new(
             mesh,
             quality,
-            self.labels(),
+            self.labels()?,
             Run::finish(t0),
             Some(model),
         ))
@@ -769,7 +859,7 @@ impl Geometry {
     pub fn surface_mesh(&self, opts: &SurfaceOptions) -> Result<SurfaceMesh> {
         let t0 = Instant::now();
         rapidmesh_exact::log::clear();
-        let model = self.model();
+        let model = self.model()?;
         let params = MeshParams {
             surf_min_angle: 20.0,
             surf_target_count: opts.target_triangles.unwrap_or(0),
@@ -778,10 +868,10 @@ impl Geometry {
                 opts.grading,
                 [opts.tol_edge, opts.tol_surf],
                 [opts.maxh_edge, opts.maxh_surf, opts.maxh_vol],
-            )
+            )?
         };
         let mesh = surface_mesh(&model, &params);
         rapidmesh_tet::log_surface_metrics(&mesh);
-        Ok(SurfaceMesh::new(mesh, self.labels(), Run::finish(t0)))
+        Ok(SurfaceMesh::new(mesh, self.labels()?, Run::finish(t0)))
     }
 }

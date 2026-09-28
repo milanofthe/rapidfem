@@ -1201,6 +1201,194 @@ pub enum ProfileEdge {
     Spline(Vec<[f64; 2]>),
 }
 
+/// What an edge of a profile is, sampled: the line between its ends, a
+/// circle (centre, radius) or a spline.
+enum Piece {
+    Line([f64; 2], [f64; 2]),
+    Arc([f64; 2], f64),
+    Spline(Arc<NurbsCurve>),
+}
+
+/// The closed profile `verts` / `edges` sampled: per edge its samples (its
+/// start vertex first, not its end) and what it is. Arcs take the facet
+/// count of their radius at `maxh` and `tol`, splines 8 samples per point.
+fn profile_pieces(
+    verts: &[[f64; 2]],
+    edges: &[ProfileEdge],
+    maxh: Option<f64>,
+    tol: f64,
+) -> Result<(Vec<Vec<[f64; 2]>>, Vec<Piece>), String> {
+    use std::f64::consts::TAU;
+    let n = verts.len();
+    let mut samples = Vec::with_capacity(n);
+    let mut pieces = Vec::with_capacity(n);
+    for (i, e) in edges.iter().enumerate() {
+        let (p, q) = (verts[i], verts[(i + 1) % n]);
+        if p == q {
+            return Err(format!("profile edge {i} has no length"));
+        }
+        match e {
+            ProfileEdge::Line | ProfileEdge::Arc(0.0) => {
+                samples.push(vec![p]);
+                pieces.push(Piece::Line(p, q));
+            }
+            ProfileEdge::Arc(b) => {
+                if !(b.abs() < 1e6) {
+                    return Err(format!("profile edge {i}: bulge {b} is not finite"));
+                }
+                let (dr, dz) = (q[0] - p[0], q[1] - p[1]);
+                let chord = dr.hypot(dz);
+                let sweep = 4.0 * b.atan();
+                let rho = 0.5 * chord / (0.5 * sweep).sin().abs();
+                let h = 0.5 * chord / (0.5 * sweep).tan();
+                let c = [
+                    0.5 * (p[0] + q[0]) - dz / chord * h,
+                    0.5 * (p[1] + q[1]) + dr / chord * h,
+                ];
+                let a0 = (p[1] - c[1]).atan2(p[0] - c[0]);
+                let m = ((facet_count(rho, maxh, tol) as f64 * sweep.abs() / TAU).ceil() as usize)
+                    .max(1);
+                samples.push(
+                    (0..m)
+                        .map(|k| {
+                            let t = a0 + sweep * k as f64 / m as f64;
+                            if k == 0 {
+                                p
+                            } else {
+                                [c[0] + rho * t.cos(), c[1] + rho * t.sin()]
+                            }
+                        })
+                        .collect(),
+                );
+                pieces.push(Piece::Arc(c, rho));
+            }
+            ProfileEdge::Spline(inner) => {
+                if inner.len() < 2 {
+                    return Err(format!(
+                        "profile edge {i}: a spline needs at least 2 interior points"
+                    ));
+                }
+                let pts: Vec<[f64; 2]> = std::iter::once(p)
+                    .chain(inner.iter().copied())
+                    .chain(std::iter::once(q))
+                    .collect();
+                let curve = NurbsCurve::interpolate(&pts);
+                let (lo, hi) = curve.domain();
+                let m = (8 * (inner.len() + 1)).clamp(8, 256);
+                samples.push(
+                    (0..m)
+                        .map(|k| {
+                            if k == 0 {
+                                p
+                            } else {
+                                curve.eval(lo + (hi - lo) * k as f64 / m as f64)
+                            }
+                        })
+                        .collect(),
+                );
+                pieces.push(Piece::Spline(Arc::new(curve)));
+            }
+        }
+    }
+    Ok((samples, pieces))
+}
+
+/// Prism of the closed profile `verts` / `edges` in the orthonormal frame
+/// `(base; u, v)`, swept along `h` (square to the frame, `(u x v) . h > 0`).
+/// Every edge is a wall with its exact carrier: a plane for a line, a
+/// cylinder for an arc, an [`SurfaceKind::Extruded`] for a spline; then the
+/// bottom and top caps, in that order after the walls.
+#[allow(clippy::too_many_arguments)]
+pub fn extrude_profile(
+    verts: &[[f64; 2]],
+    edges: &[ProfileEdge],
+    base: [f64; 3],
+    u: [f64; 3],
+    v: [f64; 3],
+    h: [f64; 3],
+    maxh: Option<f64>,
+    tol: f64,
+) -> Result<Faceted, String> {
+    let n = verts.len();
+    if n < 2 || edges.len() != n {
+        return Err("a profile needs at least 2 vertices, one edge each".into());
+    }
+    let hl = dot3(h, h).sqrt();
+    let unit = |w: [f64; 3]| (dot3(w, w) - 1.0).abs() < 1e-12;
+    let square = |a: [f64; 3], b: [f64; 3]| dot3(a, b).abs() < 1e-12 * hl.max(1.0);
+    if !(unit(u) && unit(v) && square(u, v) && square(u, h) && square(v, h) && hl > 0.0)
+        || dot3(cross3(u, v), h) <= 0.0
+    {
+        return Err("an extrusion needs an orthonormal frame and a sweep along u x v".into());
+    }
+    let axis = scale(h, 1.0 / hl);
+    let (samples, pieces) = profile_pieces(verts, edges, maxh, tol)?;
+    let ring: Vec<[f64; 2]> = samples.concat();
+    let ccw = match polygon_orientation(&ring) {
+        Sign::Positive => true,
+        Sign::Negative => false,
+        Sign::Zero => return Err("the profile encloses no area".into()),
+    };
+    let at = |p: [f64; 2]| embed(base, u, v, p);
+    let mut f = Faceted::new();
+    for (i, piece) in pieces.into_iter().enumerate() {
+        let kind = match piece {
+            Piece::Line(..) => SurfaceKind::Plane,
+            Piece::Arc(c, rho) => SurfaceKind::Cylinder {
+                center: at(c),
+                axis,
+                radius: rho,
+            },
+            Piece::Spline(curve) => SurfaceKind::Extruded {
+                profile: curve,
+                base,
+                udir: u,
+                vdir: v,
+                axis,
+            },
+        };
+        let s = f.add_surface(kind);
+        let next = samples[(i + 1) % n][0];
+        let pts: Vec<[f64; 2]> = samples[i].iter().copied().chain([next]).collect();
+        for w in pts.windows(2) {
+            // Counterclockwise, (a, b, b + h, a + h) faces out.
+            let (a, b) = (at(w[0]), at(w[1]));
+            let (ah, bh) = (add(a, h), add(b, h));
+            for t in [[a, b, bh], [a, bh, ah]] {
+                let t = if ccw { t } else { [t[0], t[2], t[1]] };
+                f.push_tri(Tri::new(t[0], t[1], t[2]), s);
+            }
+        }
+    }
+    let loop2: Vec<[f64; 2]> = if ccw {
+        ring.clone()
+    } else {
+        ring.iter().rev().copied().collect()
+    };
+    let tris = triangulate_polygon(&loop2, &[]);
+    // The bottom faces against h, the top along it.
+    for (shift, up) in [([0.0; 3], false), (h, true)] {
+        let s = f.add_surface(SurfaceKind::Plane);
+        let mut lp: Vec<[f64; 3]> = loop2.iter().map(|&p| add(at(p), shift)).collect();
+        let ts: Vec<Tri> = tris
+            .iter()
+            .map(|t| {
+                let [p0, p1, p2] = t.map(|q| add(at(q), shift));
+                if up {
+                    Tri::new(p0, p1, p2)
+                } else {
+                    Tri::new(p0, p2, p1)
+                }
+            })
+            .collect();
+        if !up {
+            lp.reverse();
+        }
+        f.push_flat(PlanarFacet::new(lp), &ts, s);
+    }
+    Ok(f)
+}
+
 /// Solid of revolution: the closed profile `verts` in the half-plane
 /// `(r, z)` of the axis through `origin` along `axis`, edge `i` running from
 /// vertex `i` to the next, turned by `angle` radians (a full turn at `TAU`).
@@ -1246,6 +1434,46 @@ pub fn revolve(
         let c = cross3(a, pick);
         scale(c, 1.0 / dot3(c, c).sqrt())
     };
+    // As many turns as the widest radius needs at the target size.
+    let rmax = profile_pieces(verts, edges, maxh, tol)?
+        .0
+        .concat()
+        .iter()
+        .map(|v| v[0])
+        .fold(0.0, f64::max);
+    let full = angle >= TAU;
+    let turns = ((facet_count(rmax, maxh, tol).max(min_segments) as f64 * angle / TAU).ceil()
+        as usize)
+        .max(if full { 3 } else { 1 });
+    let angles: Vec<f64> = (0..turns + usize::from(!full))
+        .map(|k| angle * k as f64 / turns as f64)
+        .collect();
+    revolve_at(verts, edges, origin, a, x, &angles, full, maxh, tol)
+}
+
+/// [`revolve`] at the given `angles` (ascending radians from the unit
+/// direction `x`, square to the unit `axis`): a full turn through them all
+/// (`full`, the last back to the first), else from the first to the last,
+/// capped there.
+#[allow(clippy::too_many_arguments)]
+pub fn revolve_at(
+    verts: &[[f64; 2]],
+    edges: &[ProfileEdge],
+    origin: [f64; 3],
+    a: [f64; 3],
+    x: [f64; 3],
+    angles: &[f64],
+    full: bool,
+    maxh: Option<f64>,
+    tol: f64,
+) -> Result<Faceted, String> {
+    let n = verts.len();
+    if n < 2 || edges.len() != n {
+        return Err("a revolve profile needs at least 2 vertices, one edge each".into());
+    }
+    if angles.len() < if full { 3 } else { 2 } || angles.windows(2).any(|w| !(w[0] < w[1])) {
+        return Err("revolve angles must ascend, at least 3 for a full turn".into());
+    }
     let y = cross3(a, x);
     let size = verts
         .iter()
@@ -1253,126 +1481,56 @@ pub fn revolve(
         .fold(0.0, f64::max);
 
     // The samples of every edge (its start vertex, not its end) and carrier.
-    let mut samples: Vec<Vec<[f64; 2]>> = Vec::with_capacity(n);
-    let mut kinds: Vec<Option<SurfaceKind>> = Vec::with_capacity(n);
+    let (samples, pieces) = profile_pieces(verts, edges, maxh, tol)?;
     let on_axis = |z: f64| add(origin, scale(a, z));
-    for (i, e) in edges.iter().enumerate() {
-        let (p, q) = (verts[i], verts[(i + 1) % n]);
-        if p == q {
-            return Err(format!("profile edge {i} has no length"));
-        }
-        let line = |kinds: &mut Vec<Option<SurfaceKind>>| {
-            let kind = if p[0] == 0.0 && q[0] == 0.0 {
-                None
-            } else if p[1] == q[1] {
-                Some(SurfaceKind::Plane)
-            } else if p[0] == q[0] {
-                Some(SurfaceKind::Cylinder {
-                    center: origin,
-                    axis: a,
-                    radius: p[0],
-                })
-            } else {
-                // The apex where the line meets the axis; the cone opens
-                // the way r grows.
-                let slope = (q[0] - p[0]) / (q[1] - p[1]);
-                Some(SurfaceKind::Cone {
-                    apex: on_axis(p[1] - p[0] / slope),
-                    axis: scale(a, slope.signum()),
-                    tan_half_angle: slope.abs(),
-                })
-            };
-            kinds.push(kind);
-        };
-        match e {
-            ProfileEdge::Line => {
-                line(&mut kinds);
-                samples.push(vec![p]);
-            }
-            ProfileEdge::Arc(b) if *b == 0.0 => {
-                line(&mut kinds);
-                samples.push(vec![p]);
-            }
-            ProfileEdge::Arc(b) => {
-                if !(b.abs() < 1e6) {
-                    return Err(format!("profile edge {i}: bulge {b} is not finite"));
-                }
-                let (dr, dz) = (q[0] - p[0], q[1] - p[1]);
-                let chord = dr.hypot(dz);
-                let sweep = 4.0 * b.atan();
-                let rho = 0.5 * chord / (0.5 * sweep).sin().abs();
-                let h = 0.5 * chord / (0.5 * sweep).tan();
-                let c = [
-                    0.5 * (p[0] + q[0]) - dz / chord * h,
-                    0.5 * (p[1] + q[1]) + dr / chord * h,
-                ];
-                let a0 = (p[1] - c[1]).atan2(p[0] - c[0]);
-                let m = ((facet_count(rho, maxh, tol) as f64 * sweep.abs() / TAU).ceil() as usize)
-                    .max(1);
-                samples.push(
-                    (0..m)
-                        .map(|k| {
-                            let t = a0 + sweep * k as f64 / m as f64;
-                            if k == 0 {
-                                p
-                            } else {
-                                [c[0] + rho * t.cos(), c[1] + rho * t.sin()]
-                            }
-                        })
-                        .collect(),
-                );
-                // A circle about a point of the axis turns into a sphere;
-                // off the axis into a torus (the same about -r as about r).
-                kinds.push(Some(if c[0].abs() <= 1e-12 * size {
-                    SurfaceKind::Sphere {
-                        center: on_axis(c[1]),
-                        radius: rho,
-                    }
-                } else {
-                    SurfaceKind::Torus {
-                        center: on_axis(c[1]),
+    let kinds: Vec<Option<SurfaceKind>> = pieces
+        .into_iter()
+        .map(|piece| match piece {
+            Piece::Line(p, q) => {
+                if p[0] == 0.0 && q[0] == 0.0 {
+                    None
+                } else if p[1] == q[1] {
+                    Some(SurfaceKind::Plane)
+                } else if p[0] == q[0] {
+                    Some(SurfaceKind::Cylinder {
+                        center: origin,
                         axis: a,
-                        major_radius: c[0].abs(),
-                        minor_radius: rho,
-                    }
-                }));
+                        radius: p[0],
+                    })
+                } else {
+                    // The apex where the line meets the axis; the cone
+                    // opens the way r grows.
+                    let slope = (q[0] - p[0]) / (q[1] - p[1]);
+                    Some(SurfaceKind::Cone {
+                        apex: on_axis(p[1] - p[0] / slope),
+                        axis: scale(a, slope.signum()),
+                        tan_half_angle: slope.abs(),
+                    })
+                }
             }
-            ProfileEdge::Spline(inner) => {
-                if inner.len() < 2 {
-                    return Err(format!(
-                        "profile edge {i}: a spline needs at least 2 interior points"
-                    ));
+            // A circle about a point of the axis turns into a sphere; off
+            // the axis into a torus (the same about -r as about r).
+            Piece::Arc(c, rho) => Some(if c[0].abs() <= 1e-12 * size {
+                SurfaceKind::Sphere {
+                    center: on_axis(c[1]),
+                    radius: rho,
                 }
-                if inner.iter().any(|v| !(v[0] >= 0.0)) {
-                    return Err("a revolve profile must stay in r >= 0".into());
-                }
-                let pts: Vec<[f64; 2]> = std::iter::once(p)
-                    .chain(inner.iter().copied())
-                    .chain(std::iter::once(q))
-                    .collect();
-                let curve = NurbsCurve::interpolate(&pts);
-                let (lo, hi) = curve.domain();
-                let m = (8 * (inner.len() + 1)).clamp(8, 256);
-                samples.push(
-                    (0..m)
-                        .map(|k| {
-                            if k == 0 {
-                                p
-                            } else {
-                                curve.eval(lo + (hi - lo) * k as f64 / m as f64)
-                            }
-                        })
-                        .collect(),
-                );
-                kinds.push(Some(SurfaceKind::Revolved {
-                    profile: Arc::new(curve),
-                    origin,
+            } else {
+                SurfaceKind::Torus {
+                    center: on_axis(c[1]),
                     axis: a,
-                    x,
-                }));
-            }
-        }
-    }
+                    major_radius: c[0].abs(),
+                    minor_radius: rho,
+                }
+            }),
+            Piece::Spline(curve) => Some(SurfaceKind::Revolved {
+                profile: curve,
+                origin,
+                axis: a,
+                x,
+            }),
+        })
+        .collect();
     let ring: Vec<[f64; 2]> = samples.concat();
     if ring.iter().any(|v| v[0] < 0.0) {
         return Err("a revolve profile must stay in r >= 0".into());
@@ -1387,16 +1545,12 @@ pub fn revolve(
         Sign::Negative => false,
         Sign::Zero => return Err("the revolve profile encloses no area".into()),
     };
-    let full = angle >= TAU;
-    let turns = ((facet_count(rmax, maxh, tol).max(min_segments) as f64 * angle / TAU).ceil()
-        as usize)
-        .max(if full { 3 } else { 1 });
+    let turns = if full { angles.len() } else { angles.len() - 1 };
     let point = |v: [f64; 2], k: usize| -> [f64; 3] {
         if v[0] == 0.0 {
             return on_axis(v[1]);
         }
-        let k = if full { k % turns } else { k };
-        let t = angle * k as f64 / turns as f64;
+        let t = angles[if full { k % turns } else { k }];
         let dir = add(scale(x, t.cos()), scale(y, t.sin()));
         add(on_axis(v[1]), scale(dir, v[0]))
     };

@@ -18,6 +18,14 @@ impl Tri {
         Tri { v: [a, b, c] }
     }
 
+    /// Whether the triangle has exactly zero area (its corners on one
+    /// line), the case [`Tri::projection_axis`] rejects.
+    pub fn is_degenerate(&self) -> bool {
+        [Axis::X, Axis::Y, Axis::Z].into_iter().all(|axis| {
+            orient2d(&self.point(0), &self.point(1), &self.point(2), axis) == Some(Sign::Zero)
+        })
+    }
+
     /// Vertex as a [`Point3`].
     pub fn point(&self, i: usize) -> Point3 {
         Point3::Explicit(self.v[i])

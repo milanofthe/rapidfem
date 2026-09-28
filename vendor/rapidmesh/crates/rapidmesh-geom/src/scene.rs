@@ -107,6 +107,27 @@ fn exactly_planar(helpers: &[Tri], facet: &rapidmesh_csg::PlanarFacet) -> bool {
         && helpers.iter().flat_map(|t| t.v.iter()).all(on)
 }
 
+/// An input the scene could not assemble: the solid (by index, in the order
+/// added) or the sheet (by face tag) whose facet the arrangement could not
+/// triangulate, and what failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembleError {
+    pub solid: Option<usize>,
+    pub tag: u32,
+    pub message: String,
+}
+
+impl std::fmt::Display for AssembleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.solid {
+            Some(k) => write!(f, "solid {k} does not assemble: {}", self.message),
+            None => write!(f, "sheet {} does not assemble: {}", self.tag, self.message),
+        }
+    }
+}
+
+impl std::error::Error for AssembleError {}
+
 /// A scene of material solids and embedded sheets.
 #[derive(Default)]
 pub struct Scene {
@@ -154,6 +175,17 @@ impl Scene {
         self.solid_regions.push(0);
     }
 
+    /// The shape of solid (or void) `i`, in the order they were added.
+    pub fn solid(&self, i: usize) -> Option<&Faceted> {
+        self.solids.get(i)
+    }
+
+    /// Replaces the shape of solid (or void) `i`, keeping its region and
+    /// priority.
+    pub fn replace_solid(&mut self, i: usize, f: Faceted) {
+        self.solids[i] = f;
+    }
+
     /// Adds an embedded sheet with a face tag (use a nonzero tag).
     pub fn add_sheet(&mut self, f: Faceted, tag: FaceTag) {
         self.sheets.push((f, tag));
@@ -170,9 +202,44 @@ impl Scene {
         }
     }
 
-    /// Assembles the conforming tagged PLC.
+    /// Assembles the conforming tagged PLC; panics where
+    /// [`Scene::try_assemble`] reports an error.
     pub fn assemble(&self) -> TaggedPlc {
-        self.snapped().assemble_exact()
+        self.try_assemble().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Assembles the conforming tagged PLC, or names the input the
+    /// arrangement could not triangulate (a solid or a sheet, and what
+    /// failed).
+    pub fn try_assemble(&self) -> Result<TaggedPlc, AssembleError> {
+        let mut plc = self.snapped().assemble_exact()?;
+        // The rounded PLC, checked exactly: rounding and welding must not
+        // have made triangles cross, fold or touch.
+        let t = rapidmesh_exact::clock::Instant::now();
+        plc.crossings = rapidmesh_csg::improper_pairs(&plc.vertices, &plc.triangles);
+        rapidmesh_exact::log::stage("assemble.check", t.elapsed().as_secs_f64());
+        if !plc.crossings.is_empty() {
+            let name = |t: u32| {
+                let s = plc.surface_refs[t as usize].0 as usize;
+                let r = plc.region_tags[t as usize].map(|r| r.0);
+                format!(
+                    "triangle {t} (solid {}, role {}, regions {r:?})",
+                    plc.surface_owners.get(s).copied().unwrap_or(u32::MAX),
+                    plc.surface_roles.get(s).copied().unwrap_or(u32::MAX),
+                )
+            };
+            let [a, b] = plc.crossings[0];
+            rapidmesh_exact::log::warn(
+                "assemble",
+                format!(
+                    "{} pairs of PLC triangles meet improperly, first {} and {}",
+                    plc.crossings.len(),
+                    name(a),
+                    name(b)
+                ),
+            );
+        }
+        Ok(plc)
     }
 
     /// The scene with its axis-aligned planes snapped: coordinate values
@@ -273,7 +340,7 @@ impl Scene {
     }
 
     /// [`Scene::assemble`] on exactly the input coordinates.
-    fn assemble_exact(&self) -> TaggedPlc {
+    fn assemble_exact(&self) -> Result<TaggedPlc, AssembleError> {
         // ------------------------------------------------------- flatten
         // Each input shape becomes a list of planar facets for the conformal
         // arrangement: every flat face (FlatFacet) is one boundary-polygon
@@ -350,7 +417,11 @@ impl Scene {
 
         let trace = std::env::var_os("RAPIDMESH_TRACE").is_some();
         let t0 = rapidmesh_exact::clock::Instant::now();
-        let arr = arrange_facets(&facets);
+        let arr = arrange_facets(&facets).map_err(|e| AssembleError {
+            solid: src[e.facet].solid,
+            tag: src[e.facet].tag.0,
+            message: e.message,
+        })?;
         rapidmesh_exact::log::stage("assemble.arrange", t0.elapsed().as_secs_f64());
         rapidmesh_exact::log::stat("assemble.input_facets", facets.len() as f64);
         if trace {
@@ -701,7 +772,7 @@ impl Scene {
         rapidmesh_exact::log::stat("plc.triangles", out_triangles.len() as f64);
         rapidmesh_exact::log::stat("plc.features", features.len() as f64);
 
-        TaggedPlc {
+        Ok(TaggedPlc {
             vertices,
             triangles: out_triangles,
             face_tags: out_face_tags,
@@ -713,7 +784,8 @@ impl Scene {
             owner_frames,
             features,
             corners,
-        }
+            crossings: Vec::new(),
+        })
     }
 }
 

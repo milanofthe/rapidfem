@@ -113,7 +113,8 @@ pub fn triangulate_polygon(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[
         })
         .collect();
 
-    let ft = triangulate_facet(&container, &[], &constraints);
+    let ft = triangulate_facet(&container, &[], &constraints)
+        .expect("a polygon's edges triangulate inside its container");
 
     // Keep sub-triangles whose barycenter is inside by even-odd parity.
     let mut out = Vec::new();

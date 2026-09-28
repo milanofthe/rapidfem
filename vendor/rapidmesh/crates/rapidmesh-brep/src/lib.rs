@@ -108,6 +108,9 @@ pub enum Curve {
 #[derive(Debug, Clone)]
 pub struct Vertex {
     pub pos: V3,
+    /// Every face the point lies on: those of its edges and any it only
+    /// touches (a sheet's corner on a wall).
+    pub faces: Vec<FaceId>,
 }
 
 /// A B-rep edge: a maximal chain of PLC boundary edges between two corners, with
@@ -128,7 +131,8 @@ pub struct Edge {
 }
 
 /// A directed use of an edge by one face (a "co-edge"): by a loop of the face,
-/// or by the face around an edge inside it.
+/// or by the face around an edge inside it (a crease of an import, the line
+/// where a sheet meets a wall). Every face the edge lies on has one.
 #[derive(Debug, Clone)]
 pub struct CoEdge {
     pub edge: EdgeId,
@@ -246,6 +250,11 @@ impl Model {
     /// Assembles `scene` and builds its model.
     pub fn of_scene(scene: &Scene) -> Model {
         Model::new(scene.assemble())
+    }
+
+    /// [`Model::of_scene`], or the input the scene could not assemble.
+    pub fn try_of_scene(scene: &Scene) -> Result<Model, rapidmesh_geom::AssembleError> {
+        Ok(Model::new(scene.try_assemble()?))
     }
 
     /// The region, face and edge read model (ids are this model's).

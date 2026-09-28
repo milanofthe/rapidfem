@@ -59,6 +59,10 @@ pub struct TaggedPlc {
     /// Vertices the input shapes declare as corners (see
     /// `Faceted::corners`), sorted.
     pub corners: Vec<u32>,
+    /// Pairs of triangles that meet other than in the vertices and edges
+    /// they share (`[t, t]` for a triangle of zero area), by the exact check
+    /// of the rounded PLC; empty for a valid one.
+    pub crossings: Vec<[u32; 2]>,
 }
 
 /// Owner value in [TaggedPlc::surface_owners] for surfaces that belong to an

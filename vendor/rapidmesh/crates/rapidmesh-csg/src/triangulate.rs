@@ -134,12 +134,13 @@ impl Pool {
 /// Exact constrained triangulation of `facet` with the given points and
 /// constraint segments. All points and constraint endpoints must lie on the
 /// (closed) facet; constraint crossing points are constructed exactly from
-/// constraint provenance.
+/// constraint provenance. An input that breaks this (a point off the facet,
+/// a constraint leaving it) is an error that says what failed.
 pub fn triangulate_facet(
     facet: &Tri,
     points: &[Point3],
     constraints: &[Constraint],
-) -> FacetTriangulation {
+) -> Result<FacetTriangulation, String> {
     let (axis, orientation) = facet.projection_axis();
     let seed_pool: Vec<Point3> = (0..3).map(|i| facet.point(i)).collect();
     let seed_tris = vec![[0usize, 1, 2]];
@@ -179,7 +180,7 @@ pub fn triangulate_seeded(
     points: &[Point3],
     constraints: &[Constraint],
     canonical: bool,
-) -> FacetTriangulation {
+) -> Result<FacetTriangulation, String> {
     let tri_trace = std::env::var_os("RAPIDMESH_TRI_TRACE").is_some();
     let t_pool = rapidmesh_exact::clock::Instant::now();
     // ------------------------------------------------------ vertex pool
@@ -259,7 +260,7 @@ pub fn triangulate_seeded(
     // ------------------------------------------------- point insertion
     let mut tris = Tris::new(seed_tris);
     for k in seed_len..pool.len() {
-        insert_vertex(&mut tris, &pool, orientation, k);
+        insert_vertex(&mut tris, &pool, orientation, k)?;
     }
     let d_insert = t_insert.elapsed();
     let t_recover = rapidmesh_exact::clock::Instant::now();
@@ -313,15 +314,14 @@ pub fn triangulate_seeded(
         }
     }
     for &(u, v) in &chain_edges {
-        recover_edge(&mut tris, &pool, u, v);
+        recover_edge(&mut tris, &pool, u, v)?;
     }
     // Every chain edge must now be present (recovery of one constraint can
     // never flip away another: constraints are non-crossing after pre-split).
     for &(u, v) in &chain_edges {
-        assert!(
-            tris.edge(u, v).is_some() || tris.edge(v, u).is_some(),
-            "constraint edge {u}-{v} missing after recovery"
-        );
+        if tris.edge(u, v).is_none() && tris.edge(v, u).is_none() {
+            return Err(format!("constraint edge {u}-{v} is missing after recovery"));
+        }
     }
 
     // Canonical (constrained Delaunay) pass: makes the triangulation a pure
@@ -334,7 +334,7 @@ pub fn triangulate_seeded(
         .iter()
         .map(|&(u, v)| (u.min(v), u.max(v)))
         .collect();
-    delaunay_pass(&mut tris, &pool, orientation, &constrained, canonical);
+    delaunay_pass(&mut tris, &pool, orientation, &constrained, canonical)?;
     if tri_trace {
         let total = t_pool.elapsed();
         if total.as_millis() > 50 {
@@ -346,12 +346,12 @@ pub fn triangulate_seeded(
         }
     }
 
-    FacetTriangulation {
+    Ok(FacetTriangulation {
         vertices: pool.points,
         triangles: tris.t,
         axis,
         orientation,
-    }
+    })
 }
 
 /// No neighbour (a boundary edge of the seed) or no triangle.
@@ -556,7 +556,7 @@ impl Tris {
 /// Inserts pool vertex `k` into the triangulation (interior 1→3 split or
 /// on-edge 2→4 split), located by a walk. Panics if the vertex lies outside
 /// the facet.
-fn insert_vertex(tris: &mut Tris, pool: &Pool, orientation: Sign, k: usize) {
+fn insert_vertex(tris: &mut Tris, pool: &Pool, orientation: Sign, k: usize) -> Result<(), String> {
     let outside = orientation.flip();
     let located = locate(tris, pool, outside, k);
     let Some((ti, s)) = located else {
@@ -567,11 +567,11 @@ fn insert_vertex(tris: &mut Tris, pool: &Pool, orientation: Sign, k: usize) {
                 .map(|p| format!("{p:?}"))
                 .unwrap_or_default()
         };
-        panic!(
+        return Err(format!(
             "vertex {k} lies outside the facet\n  vertex: {} axis {axis:?} orientation {orientation:?}\n  \
              seed corners: {} | {} | {} ({} tris)",
             dump(k), dump(0), dump(1), dump(2), tris.len(),
-        );
+        ));
     };
     match s.iter().filter(|&&x| x == Sign::Zero).count() {
         0 => tris.split_face(ti, k),
@@ -579,9 +579,10 @@ fn insert_vertex(tris: &mut Tris, pool: &Pool, orientation: Sign, k: usize) {
             let e = (0..3).find(|&e| s[e] == Sign::Zero).expect("one zero");
             tris.split_edge(ti, e, k);
         }
-        _ => unreachable!("vertex {k} coincides with a corner; dedup failed"),
+        _ => return Err(format!("vertex {k} coincides with a corner")),
     }
     tris.last = ti;
+    Ok(())
 }
 
 /// The triangle containing `k` (closed), with the signs of `k` against its
@@ -627,7 +628,7 @@ fn delaunay_pass(
     orientation: Sign,
     constrained: &rustc_hash::FxHashSet<(usize, usize)>,
     canonical: bool,
-) {
+) -> Result<(), String> {
     let o2d = |a: usize, b: usize, c: usize| pool.orient(a, b, c);
     let mut queue: std::collections::VecDeque<(usize, usize)> = tris
         .t
@@ -639,7 +640,9 @@ fn delaunay_pass(
     let mut steps = 0usize;
     while let Some((x, y)) = queue.pop_front() {
         steps += 1;
-        assert!(steps <= cap, "Delaunay pass did not converge");
+        if steps > cap {
+            return Err("the Delaunay pass did not converge".into());
+        }
         if constrained.contains(&(x.min(y), x.max(y))) {
             continue;
         }
@@ -687,6 +690,7 @@ fn delaunay_pass(
             queue.push_back((p.min(q), p.max(q)));
         }
     }
+    Ok(())
 }
 
 /// Restores the edge {u, v} (whose open interior contains no vertices) by
@@ -698,14 +702,14 @@ fn delaunay_pass(
 /// flip's new diagonal is re-enqueued only if it still crosses the segment.
 /// Always flipping the first flippable edge found by rescanning would
 /// instead oscillate: a valid flip's inverse is immediately valid again.
-fn recover_edge(tris: &mut Tris, pool: &Pool, u: usize, v: usize) {
+fn recover_edge(tris: &mut Tris, pool: &Pool, u: usize, v: usize) -> Result<(), String> {
     let o2d = |a: usize, b: usize, c: usize| pool.orient(a, b, c);
     let crosses = |x: usize, y: usize| -> bool {
         o2d(u, v, x).combine(o2d(u, v, y)) == Sign::Negative
             && o2d(x, y, u).combine(o2d(x, y, v)) == Sign::Negative
     };
     if tris.edge(u, v).is_some() || tris.edge(v, u).is_some() {
-        return;
+        return Ok(());
     }
     // The first crossed edge: the one opposite `u` in some triangle of its
     // star; then from triangle to triangle across the crossed edges.
@@ -721,7 +725,9 @@ fn recover_edge(tris: &mut Tris, pool: &Pool, u: usize, v: usize) {
             .find(|&e| tris.t[ti][e] == a && tris.t[ti][(e + 1) % 3] == b)
             .expect("edge of the triangle");
         let n = tris.nb[ti][e];
-        assert!(n != NO, "constraint {u}-{v} leaves the facet");
+        if n == NO {
+            return Err(format!("constraint {u}-{v} leaves the facet"));
+        }
         let w = (0..3)
             .map(|i| tris.t[n][i])
             .find(|&w| w != a && w != b)
@@ -752,10 +758,9 @@ fn recover_edge(tris: &mut Tris, pool: &Pool, u: usize, v: usize) {
         if o2d(c, d, x).combine(o2d(c, d, y)) != Sign::Negative {
             // Quad not strictly convex: defer.
             deferred_in_a_row += 1;
-            assert!(
-                deferred_in_a_row <= queue.len(),
-                "edge recovery stalled for constraint {u}-{v}"
-            );
+            if deferred_in_a_row > queue.len() {
+                return Err(format!("edge recovery stalled for constraint {u}-{v}"));
+            }
             queue.push_back((x, y));
             continue;
         }
@@ -766,8 +771,8 @@ fn recover_edge(tris: &mut Tris, pool: &Pool, u: usize, v: usize) {
         }
     }
 
-    assert!(
-        tris.edge(u, v).is_some() || tris.edge(v, u).is_some(),
-        "constraint edge {u}-{v} absent after crossing queue drained"
-    );
+    if tris.edge(u, v).is_none() && tris.edge(v, u).is_none() {
+        return Err(format!("constraint edge {u}-{v} is absent after recovery"));
+    }
+    Ok(())
 }

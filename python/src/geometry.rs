@@ -12,30 +12,40 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, Group};
-use rapidfem_geom::geometry::{EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
+use rapidfem_geom::geometry::{Across, EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
 use rapidmesh::{EdgeCut, EdgePick, MeshOptions};
 
 type P3 = [f64; 3];
 
-/// A face selection from Python: `(object, role, side)`, role -1 for a
-/// sheet, side -1 for none.
-type PySel = (usize, i64, i64);
+/// A face selection from Python: `(object, role, side, across)`, role -1
+/// for a sheet, side -1 for none, across -1 for any, -2 for outside.
+type PySel = (usize, i64, i64, i64);
 
-fn sel_of((object, role, side): PySel) -> FaceSel {
+fn sel_of((object, role, side, across): PySel) -> FaceSel {
     let origin = if role < 0 {
         FaceOrigin::Sheet { object }
     } else {
         FaceOrigin::Solid { object, role: role as u32 }
     };
-    FaceSel { origin, side: (side >= 0).then_some(side as usize) }
+    let across = match across {
+        -1 => None,
+        -2 => Some(Across::Outside),
+        o => Some(Across::Object(o as usize)),
+    };
+    FaceSel { origin, side: (side >= 0).then_some(side as usize), across }
 }
 
 fn sel_tuple(s: FaceSel) -> PySel {
     let side = s.side.map_or(-1, |o| o as i64);
+    let across = match s.across {
+        None => -1,
+        Some(Across::Outside) => -2,
+        Some(Across::Object(o)) => o as i64,
+    };
     match s.origin {
-        FaceOrigin::Solid { object, role } => (object, role as i64, side),
-        FaceOrigin::Sheet { object } => (object, -1, side),
+        FaceOrigin::Solid { object, role } => (object, role as i64, side, across),
+        FaceOrigin::Sheet { object } => (object, -1, side, across),
     }
 }
 
@@ -258,7 +268,7 @@ impl PyGeometry {
     /// Every face origin of the realised model.
     fn all_faces(&self) -> PyResult<Vec<PySel>> {
         let r = self.inner.realized().map_err(err)?;
-        let mut o: Vec<FaceSel> = r.faces.iter().map(|f| FaceSel { origin: f.origin, side: None }).collect();
+        let mut o: Vec<FaceSel> = r.faces.iter().map(|f| FaceSel { origin: f.origin, side: None, across: None }).collect();
         o.sort();
         o.dedup();
         Ok(o.into_iter().map(sel_tuple).collect())

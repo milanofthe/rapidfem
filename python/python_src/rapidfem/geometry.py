@@ -36,10 +36,12 @@ _HULL_TOL_REL = 1e-9
 
 class _Entity:
     """A selectable piece of the scene: a solid object (``dim == 3``) or a
-    face, named by its selection ``(object, role, side)`` (``dim == 2``;
-    role -1 is a sheet; ``side`` is the solid the face was selected through,
-    -1 for none, so a face split by a later solid keeps only the pieces
-    bounding that solid).
+    face, named by its selection ``(object, role, side, across)``
+    (``dim == 2``; role -1 is a sheet; ``side`` is the solid the face was
+    selected through, -1 for none, and ``across`` what lies on the other
+    side, an object, -2 for outside or -1 for anything: a face split by a
+    later solid keeps its origin on every piece, these two single the pieces
+    out).
 
     ``material``, ``name`` and ``maxh`` are the attributes the physics and
     mesh layers read; geometric properties (``cog``, ``bbox``) are looked up
@@ -47,7 +49,7 @@ class _Entity:
     """
 
     def __init__(self, geometry: "Geometry", dim: int, *, obj: int | None = None,
-                 origin: tuple[int, int, int] | None = None):
+                 origin: tuple[int, int, int, int] | None = None):
         self._geometry = geometry
         self.dim = dim
         self.obj = obj
@@ -235,6 +237,7 @@ class EntityCollection:
     def material(self, value) -> None:
         for e in self._entities:
             e.material = value
+            self._geometry._sync_maxh(e)
 
     @property
     def unassigned(self) -> "EntityCollection":
@@ -418,6 +421,7 @@ class GeoObject:
     @material.setter
     def material(self, value) -> None:
         self._entity.material = value
+        self._geometry._sync_maxh(self._entity)
 
     @property
     def maxh(self) -> float | None:
@@ -540,20 +544,28 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     def _wrap(self, obj_id: int, *, sheet: bool, material=None,
               maxh: float | None = None) -> GeoObject:
         ent = _Entity(self, 2 if sheet else 3, obj=None if sheet else obj_id,
-                      origin=(obj_id, -1, -1) if sheet else None)
+                      origin=(obj_id, -1, -1, -1) if sheet else None)
         ent.material = material
         ent.maxh = maxh
+        self._sync_maxh(ent)
         if sheet:
-            self._faces[(obj_id, -1, -1)] = ent
+            self._faces[(obj_id, -1, -1, -1)] = ent
         obj = GeoObject(self, ent)
         self._objects.append(obj)
         self._entities.append(ent)
         return obj
 
+    def _sync_maxh(self, ent: _Entity) -> None:
+        """A solid's mesh size: its own ``maxh``, else its material's."""
+        if ent.dim != 3:
+            return
+        h = ent.maxh if ent.maxh is not None else getattr(ent.material, "maxh", None)
+        self._native.set_object_maxh(ent.obj, h)
+
     def _face(self, origin) -> _Entity:
         """The face entity of an origin, one per origin (so attributes set
         on it persist)."""
-        origin = (int(origin[0]), int(origin[1]), int(origin[2]))
+        origin = tuple(int(v) for v in origin)
         ent = self._faces.get(origin)
         if ent is None:
             ent = _Entity(self, 2, origin=origin)
@@ -657,12 +669,12 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         oid = face._id
         self._native.extrude(oid, h)
         ent = face._entity
-        self._faces.pop((oid, -1, -1), None)
+        self._faces.pop((oid, -1, -1, -1), None)
         ent.dim, ent.obj, ent.origin = 3, oid, None
         ent.material = material
         if maxh is not None:
             ent.maxh = maxh
-            self._native.set_object_maxh(oid, maxh)
+        self._sync_maxh(ent)
         return face
 
     def loft(self, face_a: GeoObject, face_b: GeoObject, ruled: bool = True,

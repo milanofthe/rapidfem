@@ -4,8 +4,11 @@
 
 //! The solver mesh of a rapidmesh mesh.
 //!
-//! Nodes and (positively oriented) tets come over as they are; the solver's
-//! own edge and face numbering is derived from them by [`Mesh::from_tets`].
+//! Nodes come over as they are. rapidmesh orients its tets negatively
+//! (`(b-a)·((c-a)×(d-a)) < 0`), the solver's element expects the gmsh
+//! convention, positive, so two vertices of every tet are swapped. The
+//! solver's own edge and face numbering is derived from them by
+//! [`Mesh::from_tets`].
 //! The groups that the model's tags refer to are unions of rapidmesh entities:
 //! a face group is a set of B-rep faces (every mesh face classified onto one
 //! of them joins the group), a volume group a set of regions. That is the role
@@ -20,11 +23,23 @@ pub struct Group {
     pub ids: Vec<u32>,
 }
 
+fn signed_volume(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+    u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0]) + u[2] * (v[0] * w[1] - v[1] * w[0])
+}
+
 /// The solver mesh of `mesh`, with `ftag_to_tri` from `face_groups` (B-rep
 /// face ids) and `vtag_to_tet` from `volume_groups` (region ids).
 pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[Group]) -> Mesh {
     let nodes = mesh.points.clone();
-    let tets = mesh.tets.clone();
+    let p = &mesh.points;
+    let tets: Vec<[usize; 4]> = mesh
+        .tets
+        .iter()
+        .map(|&[a, b, c, d]| if signed_volume(p[a], p[b], p[c], p[d]) < 0.0 { [a, c, b, d] } else { [a, b, c, d] })
+        .collect();
     let mut out = Mesh::from_tets(nodes, tets);
 
     // B-rep face -> solver triangles, through the classified topology faces.
@@ -82,6 +97,10 @@ mod tests {
         let faces = [Group { tag: 10, ids: bottom.clone() }];
         let fm = fem_mesh(&m, &faces, &groups);
         assert_eq!(fm.n_tets(), m.tets.len());
+        for t in &fm.tets {
+            let p = |i: usize| fm.nodes[t[i]];
+            assert!(signed_volume(p(0), p(1), p(2), p(3)) > 0.0, "tet not positively oriented");
+        }
         let n1 = fm.vtag_to_tet[&1].len();
         let n2 = fm.vtag_to_tet[&2].len();
         assert!(n1 > 0 && n2 > 0);
@@ -99,3 +118,5 @@ mod tests {
         assert!(boundary > 0);
     }
 }
+
+

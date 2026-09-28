@@ -591,19 +591,24 @@ pub fn detect_rect_port(
     let nodes = &mesh.nodes;
     let tris = &mesh.tris;
 
-    // 1. Compute centroid (origin)
-    let mut center = [0.0f64; 3];
-    let mut count = 0.0;
+    // 1. Origin: the centre of the face's bounding box. Exact for a
+    // rectangular face whatever its triangulation; the mean of the vertex
+    // positions is not (a mesh graded towards the rim pulls it off centre,
+    // shifting the analytic mode across the port).
     let mut all_verts = std::collections::HashSet::new();
+    let mut min_c = [f64::INFINITY; 3];
+    let mut max_c = [f64::NEG_INFINITY; 3];
     for &ti in tri_ids {
         for &vi in &tris[ti] {
             if all_verts.insert(vi) {
-                for k in 0..3 { center[k] += nodes[vi][k]; }
-                count += 1.0;
+                for k in 0..3 {
+                    min_c[k] = min_c[k].min(nodes[vi][k]);
+                    max_c[k] = max_c[k].max(nodes[vi][k]);
+                }
             }
         }
     }
-    for k in 0..3 { center[k] /= count; }
+    let center = [0.5 * (min_c[0] + max_c[0]), 0.5 * (min_c[1] + max_c[1]), 0.5 * (min_c[2] + max_c[2])];
 
     // 2. Compute face normal from first triangle
     let first_tri = tris[tri_ids[0]];
@@ -629,15 +634,7 @@ pub fn detect_rect_port(
         normal = [-normal[0], -normal[1], -normal[2]];
     }
 
-    // 4. Find face extents along each axis
-    let mut min_c = [f64::INFINITY; 3];
-    let mut max_c = [f64::NEG_INFINITY; 3];
-    for &vi in &all_verts {
-        for k in 0..3 {
-            min_c[k] = min_c[k].min(nodes[vi][k]);
-            max_c[k] = max_c[k].max(nodes[vi][k]);
-        }
-    }
+    // 4. Face extents along each axis
     let ext = [max_c[0]-min_c[0], max_c[1]-min_c[1], max_c[2]-min_c[2]];
 
     // 5. Determine axes: normal axis has smallest extent, xhat = largest extent, yhat = remaining

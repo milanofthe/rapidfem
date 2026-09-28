@@ -1400,6 +1400,9 @@ dependencies = [
  "hashbrown",
  "rapidfem-core",
  "rapidmesh",
+ "rapidmesh-geom",
+ "rapidmesh-tet",
+ "rapidmesh-topo",
 ]
 
 [[package]]

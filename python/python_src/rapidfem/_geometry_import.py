@@ -49,10 +49,17 @@ class _ImportMixin:
             the imported solid
         """
         ext = Path(path).suffix.lower()
-        if ext not in (".stl", ".obj"):
+        if ext in (".step", ".stp", ".iges", ".igs", ".brep"):
             raise NotImplementedError(
-                f"load: {ext} import is not available yet (STL and OBJ are; "
-                f"STEP/IGES/BREP: milanofthe/rapidmesh-dev#37)")
+                f"load: {ext} import is not available yet "
+                f"(milanofthe/rapidmesh-dev#37); STL and OBJ are")
+        if ext == ".msh":
+            raise NotImplementedError(
+                "load: .msh import is not available yet (milanofthe/rapidmesh-dev#140)")
+        if ext not in (".stl", ".obj"):
+            raise ValueError(f"load: unsupported file type {ext!r}")
+        if not Path(path).is_file():
+            raise FileNotFoundError(path)
         if (scale != 1.0 or tuple(position) != (0.0, 0.0, 0.0) or rotation is not None
                 or unit.upper() != "M"):
             raise NotImplementedError(

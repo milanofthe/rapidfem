@@ -187,7 +187,7 @@ class ProblemFD:
             raise ValueError(
                 "geometry not meshed yet, call g.mesh() before constructing a ProblemFD")
         self._geometry = geometry
-        self._mesh_bytes, _ = geometry._last_mesh
+        self._fem_mesh = geometry._fem_mesh
         self._native: _NativeSimulation | None = None  # cached after first analysis
 
     # ── Analyses ──────────────────────────────────────────────────────────
@@ -251,8 +251,8 @@ class ProblemFD:
         if adaptive is not None:
             warnings.warn("adaptive refinement is not wired yet (issue #43), "
                           "the sweep runs on the given mesh", stacklevel=2)
-        self._native = _NativeSimulation(
-            self._mesh_bytes, build_model(self._geometry), freqs,
+        self._native = _NativeSimulation.from_fem_mesh(
+            self._fem_mesh, build_model(self._geometry), freqs,
             **_order_kwargs(order))
         # The native callback is (freq_idx, freq, s_matrix). Compose an optional
         # user `on_frequency` with the UI's per-frequency streaming callback.
@@ -344,8 +344,8 @@ class ProblemFD:
             n_modes solver results, sorted by proximity to
             ``target_frequency``
         """
-        self._native = _NativeSimulation(
-            self._mesh_bytes, build_model(self._geometry), [float(target_frequency)],
+        self._native = _NativeSimulation.from_fem_mesh(
+            self._fem_mesh, build_model(self._geometry), [float(target_frequency)],
             eigenmode=(float(target_frequency), int(n_modes)))
         return self._native.run_eigenmode()
 

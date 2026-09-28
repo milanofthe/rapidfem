@@ -419,8 +419,8 @@ class ProblemTD:
                 "no effect on a ProblemTD analysis.",
                 stacklevel=2,
             )
-        self._op = TdOperator.from_model(
-            bytes(geometry._last_mesh[0]), model, order, _FLUX[flux], self.c)
+        self._op = TdOperator.from_fem_mesh(
+            geometry._fem_mesh, model, order, _FLUX[flux], self.c)
         self._geometry = geometry
         self.order = order
         self.flux = flux

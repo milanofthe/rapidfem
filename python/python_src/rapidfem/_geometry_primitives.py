@@ -1,44 +1,42 @@
-"""Primitive solid and surface builders for :class:`rapidfem.geometry.Geometry`.
-
-Split out of ``geometry.py`` as a mixin: the ``box`` / ``cylinder`` /
-``sphere`` / ... constructors form a cohesive group that only needs the
-scale helper and the wrap helpers (which stay on ``Geometry``). ``Geometry``
-inherits :class:`_PrimitivesMixin`, so every builder below is a normal
-``Geometry`` method at runtime.
-"""
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+"""Primitive solids and sheets of :class:`rapidfem.Geometry`, on the native
+rapidmesh scene. Mixed into ``Geometry``; kept apart to keep geometry.py
+navigable."""
 from __future__ import annotations
 
 import math
-import warnings
+from typing import TYPE_CHECKING, Iterable
 
-import gmsh
+import numpy as np
+
+if TYPE_CHECKING:
+    from .geometry import GeoObject
+
+_FULL_TURN = 2 * math.pi
 
 
-def _position_with_center_alias(position, center, *, what):
-    """Back-compat shim: accept the legacy ``center=`` keyword for ``position=``.
-
-    ``sphere`` and ``torus`` historically took ``center=``; every other
-    primitive takes ``position=``. ``position`` is now canonical, ``center``
-    stays as a deprecated alias.
-    """
-    if center is not None:
-        warnings.warn(
-            f"{what}: 'center' is deprecated, use 'position' instead",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-        return center
-    return position
+def _full_turn(angle: float, what: str) -> None:
+    if abs(angle - _FULL_TURN) > 1e-12:
+        raise NotImplementedError(
+            f"{what}: partial sweeps are not available yet (build the solid "
+            f"with Geometry.revolve from a profile instead)")
 
 
 class _PrimitivesMixin:
-    """Primitive builders, mixed into :class:`rapidfem.geometry.Geometry`."""
+    """Primitive factory methods of :class:`rapidfem.Geometry`."""
+
+    def _profile(self, obj_id: int, pts) -> None:
+        if not hasattr(self, "_profiles"):
+            self._profiles = {}
+        self._profiles[obj_id] = [tuple(float(v) for v in p) for p in pts]
 
     def box(self, width: float, depth: float, height: float,
             position: tuple[float, float, float] = (0, 0, 0),
             *,
             material=None,
-            maxh: float | None = None) -> GeoObject:
+            maxh: float | None = None) -> "GeoObject":
         """add an axis-aligned box primitive
 
         The workhorse volume primitive, used for substrates, air
@@ -73,10 +71,8 @@ class _PrimitivesMixin:
         GeoObject
             volume with 6 ``.faces`` and 12 ``.edges``
         """
-        x, y, z = position
-        s = self._s
-        tag = gmsh.model.occ.addBox(s(x), s(y), s(z), s(width), s(depth), s(height))
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        oid = self._native.add_box([width, depth, height], list(position), maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     def cylinder(self, radius: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
@@ -84,7 +80,7 @@ class _PrimitivesMixin:
                  angle: float = 2 * math.pi,
                  *,
                  material=None,
-                 maxh: float | None = None) -> GeoObject:
+                 maxh: float | None = None) -> "GeoObject":
         """add a (partial-sweep) cylinder primitive
 
         Curved surfaces honour ``Mesh.MeshSizeFromCurvature`` so the
@@ -126,18 +122,16 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        x, y, z = position
-        ax, ay, az = (axis[0] * height, axis[1] * height, axis[2] * height)
-        s = self._s
-        tag = gmsh.model.occ.addCylinder(s(x), s(y), s(z),
-                                         s(ax), s(ay), s(az), s(radius), angle=angle)
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        _full_turn(angle, "cylinder")
+        oid = self._native.add_cylinder(radius, height, list(position), list(axis), maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
-    def sphere(self, radius: float, position: tuple[float, float, float] = (0, 0, 0),
+    def sphere(self, radius: float,
+               position: tuple[float, float, float] = (0, 0, 0),
                *,
                material=None,
                maxh: float | None = None,
-               center: tuple[float, float, float] | None = None) -> GeoObject:
+               center: tuple[float, float, float] | None = None) -> "GeoObject":
         """add a sphere primitive
 
         Parameters
@@ -158,11 +152,9 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        position = _position_with_center_alias(position, center, what="sphere()")
-        cx, cy, cz = position
-        s = self._s
-        tag = gmsh.model.occ.addSphere(s(cx), s(cy), s(cz), s(radius))
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        c = center if center is not None else position
+        oid = self._native.add_sphere(radius, list(c), maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     def cone(self, r1: float, r2: float, height: float,
              position: tuple[float, float, float] = (0, 0, 0),
@@ -170,7 +162,7 @@ class _PrimitivesMixin:
              angle: float = 2 * math.pi,
              *,
              material=None,
-             maxh: float | None = None) -> GeoObject:
+             maxh: float | None = None) -> "GeoObject":
         """add a truncated cone (or cylinder if ``r1 == r2``)
 
         Parameters
@@ -195,19 +187,16 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        x, y, z = position
-        ax, ay, az = (axis[0] * height, axis[1] * height, axis[2] * height)
-        s = self._s
-        tag = gmsh.model.occ.addCone(s(x), s(y), s(z),
-                                     s(ax), s(ay), s(az), s(r1), s(r2), angle=angle)
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        _full_turn(angle, "cone")
+        oid = self._native.add_cone(r1, r2, height, list(position), list(axis), maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     def wedge(self, dx: float, dy: float, dz: float,
               top_x: float = 0.0,
               position: tuple[float, float, float] = (0, 0, 0),
               *,
               material=None,
-              maxh: float | None = None) -> GeoObject:
+              maxh: float | None = None) -> "GeoObject":
         """add a rectangular-base prism (wedge)
 
         The base is ``dx × dy`` at z = 0; the top edge runs from x = 0
@@ -234,10 +223,8 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        x, y, z = position
-        s = self._s
-        tag = gmsh.model.occ.addWedge(s(x), s(y), s(z), s(dx), s(dy), s(dz), ltx=s(top_x))
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        oid = self._native.add_wedge([dx, dy, dz], top_x, list(position), maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     def torus(self, major_radius: float, minor_radius: float,
               position: tuple[float, float, float] = (0, 0, 0),
@@ -245,7 +232,7 @@ class _PrimitivesMixin:
               *,
               material=None,
               maxh: float | None = None,
-              center: tuple[float, float, float] | None = None) -> GeoObject:
+              center: tuple[float, float, float] | None = None) -> "GeoObject":
         """add a torus primitive
 
         Parameters
@@ -270,17 +257,23 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        position = _position_with_center_alias(position, center, what="torus()")
-        cx, cy, cz = position
-        s = self._s
-        tag = gmsh.model.occ.addTorus(s(cx), s(cy), s(cz), s(major_radius), s(minor_radius),
-                                      angle=angle)
-        return self._wrap_volume(tag, material=material, maxh=maxh)
+        _full_turn(angle, "torus")
+        c = center if center is not None else position
+        oid = self._native.add_torus(major_radius, minor_radius, list(c), [0.0, 0.0, 1.0], maxh)
+        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+
+    # ── sheets ──────────────────────────────────────────────────────────────
+
+    def _sheet(self, corner, u, v, maxh):
+        oid = self._native.add_plate(list(corner), list(u), list(v), maxh)
+        c, u, v = (np.asarray(x, dtype=float) for x in (corner, u, v))
+        self._profile(oid, [c, c + u, c + u + v, c + v])
+        return self._wrap(oid, sheet=True, maxh=maxh)
 
     def xy_plate(self, width: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
                  *,
-                 maxh: float | None = None) -> GeoObject:
+                 maxh: float | None = None) -> "GeoObject":
         """add a thin rectangular plate in the xy-plane
 
         2-D primitive, used for thin conductors like patch antennas,
@@ -323,17 +316,12 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        x, y, z = position
-        s = self._s
-        tag = gmsh.model.occ.addRectangle(
-            s(x), s(y), s(z), s(width), s(height)
-        )
-        return self._wrap_face(tag, maxh=maxh)
+        return self._sheet(position, (width, 0, 0), (0, height, 0), maxh)
 
     def xz_plate(self, width: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
                  *,
-                 maxh: float | None = None) -> GeoObject:
+                 maxh: float | None = None) -> "GeoObject":
         """add a thin rectangular plate in the xz-plane
 
         Convenience wrapper around :meth:`plate` for the most common
@@ -357,12 +345,12 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        return self.plate(p0=position, width=(width, 0, 0), height=(0, 0, height), maxh=maxh)
+        return self._sheet(position, (width, 0, 0), (0, 0, height), maxh)
 
     def yz_plate(self, width: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
                  *,
-                 maxh: float | None = None) -> GeoObject:
+                 maxh: float | None = None) -> "GeoObject":
         """add a thin rectangular plate in the yz-plane
 
         Convenience wrapper around :meth:`plate` for the most common
@@ -386,13 +374,13 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        return self.plate(p0=position, width=(0, width, 0), height=(0, 0, height), maxh=maxh)
+        return self._sheet(position, (0, width, 0), (0, 0, height), maxh)
 
     def plate(self, p0: tuple[float, float, float],
               width: tuple[float, float, float],
               height: tuple[float, float, float],
               *,
-              maxh: float | None = None) -> GeoObject:
+              maxh: float | None = None) -> "GeoObject":
         """add a thin rectangular plate at arbitrary orientation
 
         Used for vertical lumped-port sheets, oblique feed plates, and
@@ -436,27 +424,13 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        x0, y0, z0 = p0
-        wx, wy, wz = width
-        hx, hy, hz = height
-        s = self._s
-        v1 = gmsh.model.occ.addPoint(s(x0), s(y0), s(z0))
-        v2 = gmsh.model.occ.addPoint(s(x0 + wx), s(y0 + wy), s(z0 + wz))
-        v3 = gmsh.model.occ.addPoint(s(x0 + wx + hx), s(y0 + wy + hy), s(z0 + wz + hz))
-        v4 = gmsh.model.occ.addPoint(s(x0 + hx), s(y0 + hy), s(z0 + hz))
-        l1 = gmsh.model.occ.addLine(v1, v2)
-        l2 = gmsh.model.occ.addLine(v2, v3)
-        l3 = gmsh.model.occ.addLine(v3, v4)
-        l4 = gmsh.model.occ.addLine(v4, v1)
-        loop = gmsh.model.occ.addCurveLoop([l1, l2, l3, l4])
-        tag = gmsh.model.occ.addPlaneSurface([loop])
-        return self._wrap_face(tag, maxh=maxh)
+        return self._sheet(p0, width, height, maxh)
 
     def polygon(self, points: Iterable[tuple[float, ...]],
                 position: tuple[float, float, float] = (0, 0, 0),
                 *,
                 holes: "list[list[tuple]] | None" = None,
-                maxh: float | None = None) -> GeoObject:
+                maxh: float | None = None) -> "GeoObject":
         """add a planar polygon face
 
         2-D primitive for arbitrary outlines, combine with
@@ -499,64 +473,33 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        pts = list(points)
+        pts = [tuple(float(v) for v in p) for p in points]
         if len(pts) < 3:
             raise ValueError("polygon needs at least 3 vertices")
-        x0, y0, z0 = position
-        s = self._s
-
-        def _build_loop(loop_pts):
-            vtags = []
-            for p in loop_pts:
-                if len(p) == 2:
-                    vtags.append(gmsh.model.occ.addPoint(
-                        s(p[0] + x0), s(p[1] + y0), s(z0)))
-                elif len(p) == 3:
-                    vtags.append(gmsh.model.occ.addPoint(
-                        s(p[0] + x0), s(p[1] + y0), s(p[2] + z0)))
-                else:
-                    raise ValueError(
-                        f"polygon point must be (x,y) or (x,y,z), got {p!r}")
-            n = len(vtags)
-            lt = [gmsh.model.occ.addLine(vtags[i], vtags[(i + 1) % n])
-                  for i in range(n)]
-            return gmsh.model.occ.addCurveLoop(lt)
-
-        outer_loop = _build_loop(pts)
-        if not holes:
-            tag = gmsh.model.occ.addPlaneSurface([outer_loop])
-            return self._wrap_face(tag, maxh=maxh)
-
-        # For polygon-with-holes we go through Boolean cut: build the outer
-        # disc and each hole as separate plane surfaces, then subtract.
-        # gmsh's multi-loop addPlaneSurface form is brittle when followed by
-        # extrude (PLC errors at facet intersections); cut delivers a clean
-        # BREP that meshes reliably.
-        outer_surf = gmsh.model.occ.addPlaneSurface([outer_loop])
-        hole_surfs = []
-        for h in holes:
-            hp = list(h)
-            if len(hp) < 3:
-                continue
-            hl = _build_loop(hp)
-            hole_surfs.append(gmsh.model.occ.addPlaneSurface([hl]))
-        if not hole_surfs:
-            return self._wrap_face(outer_surf, maxh=maxh)
-        out, _ = gmsh.model.occ.cut(
-            [(2, outer_surf)],
-            [(2, hs) for hs in hole_surfs],
-        )
-        gmsh.model.occ.synchronize()
-        result_tag = next((t for d_, t in out if d_ == 2), None)
-        if result_tag is None:
-            raise RuntimeError("polygon-with-holes cut produced no surface")
-        return self._wrap_face(result_tag, maxh=maxh)
+        x0, y0, z0 = (float(v) for v in position)
+        p3 = np.array([(p[0] + x0, p[1] + y0, (p[2] if len(p) == 3 else 0.0) + z0)
+                       for p in pts])
+        hole3 = [np.array([(h[0] + x0, h[1] + y0, (h[2] if len(h) == 3 else 0.0) + z0)
+                           for h in hole]) for hole in (holes or [])]
+        z = p3[:, 2]
+        if np.ptp(z) <= 1e-12 * max(1.0, np.abs(p3).max()):
+            oid = self._native.add_polygon(
+                [list(p[:2]) for p in p3], float(z[0]),
+                [[list(p[:2]) for p in h] for h in hole3], maxh)
+            self._profile(oid, p3)
+            return self._wrap(oid, sheet=True, maxh=maxh)
+        # Off the xy plane: a parallelogram is a plate.
+        if len(p3) == 4 and not hole3 and np.allclose(p3[0] + p3[2], p3[1] + p3[3]):
+            return self._sheet(p3[0], p3[1] - p3[0], p3[3] - p3[0], maxh)
+        raise NotImplementedError(
+            "polygon: a general polygon off the xy plane is not available yet "
+            "(milanofthe/rapidmesh-dev#140); parallelograms work in any plane")
 
     def disc(self, radius: float,
              position: tuple[float, float, float] = (0, 0, 0),
              *,
              axis: tuple[float, float, float] = (0, 0, 1),
-             maxh: float | None = None) -> GeoObject:
+             maxh: float | None = None) -> "GeoObject":
         """add a circular face with an arbitrary normal
 
         Smooth NURBS circle (gmsh OCC ``addDisk``), meshes into curved
@@ -583,12 +526,5 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        x, y, z = position
-        s = self._s
-        # gmsh treats an empty zAxis as the default +z (xy-plane); only pass a
-        # normal when it actually differs, to avoid disturbing existing calls.
-        z_axis = ([float(axis[0]), float(axis[1]), float(axis[2])]
-                  if tuple(axis) != (0, 0, 1) else [])
-        tag = gmsh.model.occ.addDisk(s(x), s(y), s(z), s(radius), s(radius),
-                                     zAxis=z_axis)
-        return self._wrap_face(tag, maxh=maxh)
+        oid = self._native.add_disc(radius, list(position), list(axis), maxh)
+        return self._wrap(oid, sheet=True, maxh=maxh)

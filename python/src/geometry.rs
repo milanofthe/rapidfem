@@ -13,7 +13,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, Group};
 use rapidfem_geom::geometry::{EdgeOp, FaceOrigin, Geometry, Item, ObjId};
-use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
+use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
 use rapidmesh::{EdgeCut, EdgePick, MeshOptions};
 
 type P3 = [f64; 3];
@@ -199,6 +199,15 @@ impl PyGeometry {
 
     fn set_face_maxh(&mut self, origins: Vec<(usize, i64)>, h: f64) {
         self.inner.set_face_maxh(origins.into_iter().map(origin_of).collect(), h);
+    }
+
+    /// A closed STL or OBJ surface as a solid, split into smooth surfaces
+    /// at creases sharper than `crease_deg`.
+    #[pyo3(signature = (path, crease_deg=40.0, maxh=None))]
+    fn add_import(&mut self, path: String, crease_deg: f64, maxh: Option<f64>) -> ObjId {
+        let mut i = Import::new(path);
+        i.crease_deg = crease_deg;
+        self.inner.add_solid(i, maxh, false)
     }
 
     fn make_void(&mut self, ids: Vec<ObjId>) {

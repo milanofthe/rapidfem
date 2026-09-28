@@ -94,6 +94,41 @@ pub fn fem_mesh(mesh: &rapidmesh::Mesh, face_groups: &[Group], volume_groups: &[
     out
 }
 
+/// What a viewer draws of a solver mesh: the triangles on the boundary or
+/// in a face group, each with its first face group's tag (0 for none), and
+/// every tet with its first volume group's tag. Groups are taken in tag
+/// order.
+pub struct ViewerMesh {
+    pub tris: Vec<[usize; 3]>,
+    pub tri_tags: Vec<i32>,
+    pub tet_tags: Vec<i32>,
+}
+
+pub fn viewer_mesh(m: &Mesh) -> ViewerMesh {
+    let first = |groups: &hashbrown::HashMap<i32, Vec<usize>>, n: usize| {
+        let mut tag = vec![0i32; n];
+        let mut tags: Vec<&i32> = groups.keys().collect();
+        tags.sort_unstable();
+        for t in tags {
+            for &i in &groups[t] {
+                if tag[i] == 0 {
+                    tag[i] = *t;
+                }
+            }
+        }
+        tag
+    };
+    let tri_tag = first(&m.ftag_to_tri, m.tris.len());
+    let (mut tris, mut tri_tags) = (Vec::new(), Vec::new());
+    for (i, tri) in m.tris.iter().enumerate() {
+        if tri_tag[i] != 0 || m.tri_to_tet[i][1] == usize::MAX {
+            tris.push(*tri);
+            tri_tags.push(tri_tag[i]);
+        }
+    }
+    ViewerMesh { tris, tri_tags, tet_tags: first(&m.vtag_to_tet, m.tets.len()) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,7 +11,7 @@
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use rapidfem_geom::fem_mesh::{fem_mesh, Group};
+use rapidfem_geom::fem_mesh::{fem_mesh, viewer_mesh, Group};
 use rapidfem_geom::msh::{write_msh, MeshScene};
 use rapidfem_geom::geometry::{Across, EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
@@ -360,6 +360,24 @@ impl PyGeometry {
         Ok(stats)
     }
 
+    /// Bounding box `(xmin, ymin, zmin, xmax, ymax, zmax)` of the scene.
+    fn bbox(&self) -> PyResult<[f64; 6]> {
+        self.inner.bbox().map_err(err)
+    }
+
+    /// The B-rep face ids the selections currently resolve to.
+    fn face_ids(&self, origins: Vec<PySel>) -> PyResult<Vec<u32>> {
+        let sels: Vec<FaceSel> = origins.into_iter().map(sel_of).collect();
+        Ok(self.inner.resolve(&sels).map_err(err)?.iter().map(|f| f.id).collect())
+    }
+
+    /// Coarse per-face triangulation for previews: `(face id, corners,
+    /// normals)`, nine values per triangle each.
+    #[pyo3(signature = (target_triangles=4000))]
+    fn preview(&self, target_triangles: usize) -> PyResult<Vec<(u32, Vec<f64>, Vec<f64>)>> {
+        Ok(self.inner.preview(target_triangles).map_err(err)?.into_iter().map(|(id, (p, n))| (id, p, n)).collect())
+    }
+
     /// Writes the last `mesh()` (holes left out) as gmsh MSH 4.1, the face
     /// and volume groups named by `names[tag]` its physical groups; returns
     /// the volume groups that found no region of their own.
@@ -478,6 +496,21 @@ impl PyFemMesh {
     }
 
     /// Tets and faces per tag, `(tag -> n_tets, tag -> n_tris)`.
+    /// What a viewer draws: `(nodes, tris, tri_tags, tets, tet_tags)`,
+    /// flat; the triangles on the boundary or in a face group, each with
+    /// its group's tag (0 for none), every tet with its volume group's tag.
+    fn viewer(&self) -> (Vec<f64>, Vec<usize>, Vec<i32>, Vec<usize>, Vec<i32>) {
+        let m = &self.inner;
+        let v = viewer_mesh(m);
+        (
+            m.nodes.iter().flatten().copied().collect(),
+            v.tris.iter().flatten().copied().collect(),
+            v.tri_tags,
+            m.tets.iter().flatten().copied().collect(),
+            v.tet_tags,
+        )
+    }
+
     fn group_sizes(&self) -> (Vec<(i32, usize)>, Vec<(i32, usize)>) {
         let mut v: Vec<(i32, usize)> = self.inner.vtag_to_tet.iter().map(|(&t, s)| (t, s.len())).collect();
         let mut f: Vec<(i32, usize)> = self.inner.ftag_to_tri.iter().map(|(&t, s)| (t, s.len())).collect();

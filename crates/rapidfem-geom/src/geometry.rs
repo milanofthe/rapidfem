@@ -26,8 +26,10 @@
 use std::sync::OnceLock;
 
 use rapidmesh::shapes::{Shape, Sheet};
+use std::collections::BTreeMap;
+
 use crate::fem_mesh::Group;
-use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, Object as RmObject, Scope, Solid, Topology, Transform};
+use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, SurfaceOptions, Object as RmObject, Scope, Solid, Topology, Transform};
 
 /// Index of an object in its [`Geometry`].
 pub type ObjId = usize;
@@ -600,6 +602,48 @@ impl Geometry {
             vg.push(Group { tag: *tag, ids });
         }
         Ok((fg, vg))
+    }
+
+    /// The bounding box `(xmin, ymin, zmin, xmax, ymax, zmax)` of every
+    /// face of the realised scene.
+    pub fn bbox(&self) -> Result<[f64; 6], String> {
+        let r = self.realized()?;
+        let mut b = [f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for f in &r.faces {
+            for k in 0..3 {
+                b[k] = b[k].min(f.bbox[k]);
+                b[k + 3] = b[k + 3].max(f.bbox[k + 3]);
+            }
+        }
+        Ok(b)
+    }
+
+    /// A coarse triangulation of every B-rep face, for previews: per face
+    /// id its triangles' corners (nine values each) and flat normals (one
+    /// per corner), about `target_triangles` in all.
+    pub fn preview(&self, target_triangles: usize) -> Result<BTreeMap<u32, (Vec<f64>, Vec<f64>)>, String> {
+        let b = self.bbox()?;
+        let diag = ((b[3] - b[0]).powi(2) + (b[4] - b[1]).powi(2) + (b[5] - b[2]).powi(2)).sqrt();
+        let opts = SurfaceOptions {
+            maxh: Some((diag / 10.0).max(1e-9)),
+            target_triangles: Some(target_triangles),
+            ..SurfaceOptions::default()
+        };
+        let m = self.realized()?.geometry.surface_mesh(&opts).map_err(|e| e.to_string())?;
+        let mut out: BTreeMap<u32, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+        for f in m.faces.iter().filter(|f| f.patch != rapidmesh::NONE) {
+            let [a, b, c] = f.tri.map(|v| m.points[v]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(f64::MIN_POSITIVE);
+            let (pos, nor) = out.entry(f.patch).or_default();
+            for p in [a, b, c] {
+                pos.extend(p);
+                nor.extend(n.map(|x| x / l));
+            }
+        }
+        Ok(out)
     }
 
     /// Meshes the realised scene.

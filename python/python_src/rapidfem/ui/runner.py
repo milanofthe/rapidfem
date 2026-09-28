@@ -3,7 +3,7 @@
 Replaces the old in-process kernel + WebSocket protocol (which suffered
 from os.dup2 / Werkzeug-WS / wsproto-deflate / sendall races). Each open
 notebook file gets a long-lived worker subprocess that owns its own
-Python namespace and gmsh state. The Flask server brokers JSON messages
+Python namespace. The Flask server brokers JSON messages
 in and queue-buffered events out, exposed via plain HTTP endpoints.
 
 HTTP API:
@@ -18,7 +18,7 @@ HTTP API:
 
     POST /api/cell/reset  {"file": str}
                           -> {"ok": true}
-                          Wipe namespace + gmsh state (sync).
+                          Wipe the namespace (sync).
 
     DELETE /api/kernel    {"file": str}
                           -> {"ok": true}
@@ -45,7 +45,7 @@ from flask import Flask, Response, jsonify, request
 # without burning CPU on empty polls.
 POLL_TIMEOUT_S = 0.1
 
-# Worker init must complete within this, covers rapidfem import + gmsh init.
+# Worker init must complete within this, covers the rapidfem import.
 INIT_TIMEOUT_S = 30.0
 
 # The UI workdir every worker runs in, so a cell's relative paths (GDS,
@@ -93,7 +93,7 @@ class Session:
         )
         self._reader_thread.start()
         # A separate thread to drain stderr, anything the worker writes there
-        # is library noise (gmsh, native panics); surface it as a stream event.
+        # is library noise (native panics); surface it as a stream event.
         self._stderr_thread = threading.Thread(
             target=self._read_stderr, daemon=True,
         )
@@ -135,7 +135,7 @@ class Session:
             self._queue.put({"type": "worker-exit"})
 
     def _read_stderr(self) -> None:
-        """Forward worker stderr (native panics, gmsh log) as stream events."""
+        """Forward worker stderr (native panics) as stream events."""
         try:
             while self._reader_alive:
                 line = self.process.stderr.readline()
@@ -236,7 +236,7 @@ class Session:
         after the call returns, so it isn't interrupted mid-solve there
         either). On Windows there is no reliable signal path to a non-console
         child, so we hard-stop the worker. Either way a long native solve
-        (rslab / gmsh) can only be stopped by terminating the process, so the
+        (rslab, rapidmesh) can only be stopped by terminating the process, so the
         Windows path is also the robust "stop a runaway solve" path: the worker
         dies, the running cell ends (`worker-exit`), and `_get_or_create`
         spawns a fresh kernel on the next run (state is reset, like Restart).

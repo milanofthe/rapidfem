@@ -37,7 +37,7 @@ if _WIN:
 
 @contextmanager
 def _capture_streams(on_line, stage: str = "cell"):
-    """OS-level fd capture so Rust eprintln! and gmsh output reach the UI.
+    """OS-level fd capture so Rust eprintln! output reaches the UI.
 
     ``on_line(kind, text)`` is called per line as soon as the pipe delivers
     it. ``stage`` is accepted for call-site clarity. Used by the notebook

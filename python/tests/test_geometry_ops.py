@@ -101,3 +101,23 @@ def test_extrude_after_a_rotation_sweeps_in_world_axes():
     g.rotate(p, math.pi / 2, axis=(1, 0, 0))  # into the xz-plane
     v = g.extrude(p, 1 * MM, axis=(0, -1, 0))
     np.testing.assert_allclose(_box_of(v), np.array([0, -1, 0, 2, 0, 2]) * MM, atol=1e-12)
+
+
+def test_sweep_along_path_and_helix():
+    from rapidfem import structures as st
+    g = rf.Geometry(maxh=1 * MM)
+    _air(g)
+    pts = [(0, 0, 0), (2 * MM, 0, 2 * MM), (4 * MM, 0, 0)]
+    prof = g.disc(0.3 * MM, position=pts[0], axis=(1, 0, 1))
+    wire = st.sweep_along_path(g, prof, pts, material=rf.Conductor(conductivity=5.8e7))
+    b = _box_of(wire)
+    assert b[0] < 0 and b[3] > 4 * MM and 2 * MM < b[5] < 2.4 * MM
+    coil = st.helix(g, radius=3 * MM, pitch=1.5 * MM, turns=2, wire_radius=0.2 * MM,
+                    position=(0, 0, -6 * MM))
+    c = _box_of(coil)
+    assert c[3] == pytest.approx(3.2 * MM, rel=0.02)
+    assert c[5] - c[2] == pytest.approx(3.4 * MM, rel=0.02)
+    g.mesh()
+    assert g.mesh_stats.n_tets > 0
+    with pytest.raises(ValueError, match="disc"):
+        st.sweep_along_path(g, g.xy_plate(1 * MM, 1 * MM), pts)

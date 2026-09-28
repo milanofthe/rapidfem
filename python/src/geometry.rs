@@ -13,8 +13,9 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_geom::fem_mesh::{fem_mesh, viewer_mesh, Group};
 use rapidfem_geom::msh::{write_msh, MeshScene};
+use rapidfem_geom::path::spline;
 use rapidfem_geom::geometry::{Across, EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
-use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Import, Loft, Prism, Revolve, Sheet, Sphere, Torus, Wedge};
+use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Helix, Import, Loft, Prism, Revolve, Sheet, Sphere, Sweep, Torus, Wedge};
 use rapidmesh::{EdgeCut, EdgePick, MeshOptions, Transform};
 
 type P3 = [f64; 3];
@@ -185,6 +186,48 @@ impl PyGeometry {
         r.axis = axis;
         r.angle = angle;
         self.inner.add_solid(r, maxh, false)
+    }
+
+    /// A round tube of `radius` along the Catmull-Rom spline through
+    /// `points` (`samples` points per span; a straight tube for two
+    /// points), its cross-section a `segments`-gon.
+    #[pyo3(signature = (points, radius, samples=8, segments=16, maxh=None))]
+    fn add_sweep(&mut self, points: Vec<P3>, radius: f64, samples: usize, segments: usize, maxh: Option<f64>) -> ObjId {
+        let mut s = Sweep::new(spline(&points, samples), radius);
+        s.segments = segments;
+        self.inner.add_solid(s, maxh, false)
+    }
+
+    /// A helical coil of round wire about +z through `position`.
+    #[pyo3(signature = (radius, pitch, turns, wire_radius, position=[0.0; 3], points_per_turn=24, segments=12, maxh=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn add_helix(
+        &mut self,
+        radius: f64,
+        pitch: f64,
+        turns: f64,
+        wire_radius: f64,
+        position: P3,
+        points_per_turn: usize,
+        segments: usize,
+        maxh: Option<f64>,
+    ) -> ObjId {
+        let mut h = Helix::new(radius, pitch, turns, wire_radius);
+        h.position = position;
+        h.points_per_turn = points_per_turn;
+        h.segments = segments;
+        self.inner.add_solid(h, maxh, false)
+    }
+
+    /// `(radius, center, axis)` of an untransformed disc sheet.
+    fn disc_of(&self, id: ObjId) -> Option<(f64, P3, P3)> {
+        let o = self.inner.object(id);
+        match &o.item {
+            Item::Sheet(Sheet::Disc { radius, center, axis, .. }) if o.transforms.is_empty() => {
+                Some((*radius, *center, *axis))
+            }
+            _ => None,
+        }
     }
 
     /// Chamfers (`fillet=false`, `size` = distance) or fillets (`size` =

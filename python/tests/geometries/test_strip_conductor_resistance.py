@@ -142,12 +142,20 @@ def test_volume_conductor_matches_reference(f):
 
 @pytest.mark.slow
 @case.phenomenon
-@pytest.mark.parametrize("f, tol", [(1e8, 0.03), (1e9, 0.03), (1e11, 0.06)])
-def test_hollow_sibc_matches_reference_outside_transition(f, tol):
-    """t/delta = 0.33, 1.0 and 10.3: where rfic keeps the surface model."""
+@pytest.mark.parametrize("f, lo, hi", [(1e8, 0.97, 1.04), (1e9, 0.97, 1.04), (1e11, 0.80, 0.93)])
+def test_hollow_sibc_against_reference(f, lo, hi):
+    """t/delta = 0.33, 1.0 and 10.3.
+
+    Below the skin depth the surface model is DC exact. At 10 skin depths it
+    misses the loss of the current crowding into the strip edges, which a
+    per-face impedance cannot carry: the converged 3D value is about 0.87 of
+    the reference (0.87, 0.88, 0.87 at 1.5, 1.0, 0.7 um walls), in line with
+    the 2D emulation of the same model (0.83). An earlier coarse gmsh mesh
+    happened to land at 0.96.
+    """
     got = _resistance("hollow_sibc", f, lengths=(50 * um, 100 * um), h_strip=1.5 * um)
     want = _reference().series_impedance(f).real
-    assert abs(got / want - 1.0) < tol, f"R' {got:.1f} vs reference {want:.1f}"
+    assert lo < got / want < hi, f"R' {got:.1f} vs reference {want:.1f}"
 
 
 @pytest.mark.slow

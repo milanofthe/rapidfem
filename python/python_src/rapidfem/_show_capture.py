@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Capture-slot for rapidfem.show().
 
 When the UI server runs user code, it calls `start_capture()` first, exec's

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """One-call RFIC model builder: GDS + Stack in, solve-ready geometry out.
 
 ``build()`` reproduces the gds2palace modelling conventions that the SG13G2
@@ -227,7 +231,7 @@ def _conformal_regions(gds_path: str, gds_layer: int, datatype: int,
     offset outward by ``t_side`` (merged), and ``rings`` maps each expanded
     polygon to the original metal polygons it contains (its holes). All
     polygons are (N, 2) float arrays. The decomposition is done entirely in
-    2D so every extruded volume is disjoint by construction, no OCC
+    2D so every extruded volume is disjoint by construction, no 3D
     booleans needed.
     """
     import gdstk
@@ -416,12 +420,10 @@ def build(
     if mesh_preset is not None:
         mesh = MeshSpec.derive(stack, conductors.keys(), preset=mesh_preset)
 
-    # Layout bbox from the extruded conductors (gmsh coords are scaled;
-    # entity bboxes are tracked in scaled space, dilate back via g._scale).
+    # Layout bbox from the extruded conductors.
     bbs = np.array([o._entity.bbox for o in g._objects if o.name in layer_names])
-    sc = g._scale
-    x_min, y_min = bbs[:, 0].min() * sc, bbs[:, 1].min() * sc
-    x_max, y_max = bbs[:, 3].max() * sc, bbs[:, 4].max() * sc
+    x_min, y_min = bbs[:, 0].min(), bbs[:, 1].min()
+    x_max, y_max = bbs[:, 3].max(), bbs[:, 4].max()
     x0, y0 = x_min - margin, y_min - margin
     x1, y1 = x_max + margin, y_max + margin
     wx, wy = x1 - x0, y1 - y0
@@ -514,8 +516,8 @@ def build(
         # metal outline; everything above it is one plain box. Running the
         # polygon prisms all the way to z_top instead would stamp the metal
         # outline through the full air region — vertical interfaces between
-        # air and air, metres of aspect ratio, and gmsh resolving the trace
-        # width over the whole height (minSICN ~0.004 on the 2 nH octagon).
+        # air and air, metres of aspect ratio, and the mesher resolving the
+        # trace width over the whole height.
         z_shell_top = zm_hi + pass_t_top
         air_boxes_low = [
             _prism(foot, expanded, zm_lo + pass_t_top,

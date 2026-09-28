@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 #########################################################################################
 ##
 ##                            PORTS AND BOUNDARY CONDITIONS
@@ -104,8 +108,8 @@ class _Physics:
 
     The physics object is purely declarative, it holds no state about
     the mesh. The geometry's :meth:`Geometry.mesh` step turns it into a
-    gmsh physical group, and :class:`rapidfem.Problem` reads that group
-    tag back when it builds the model.
+    tagged group of mesh faces or tets, and :class:`rapidfem.Problem`
+    reads that group tag back when it builds the model.
     """
     _expected_dim: int = 2
 

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Serialize rapidfem objects into JSON payloads the viewer can consume.
 
 The bundled canvas3d viewer expects per-entity buffers in the form

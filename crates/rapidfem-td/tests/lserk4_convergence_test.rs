@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
+
 // Analytical convergence pin for the explicit LSERK4 integrator
 // (explicit.rs). The semi-discrete DG system is the linear ODE
 // dy/dt = A*y, whose exact flow over time T is the matrix exponential:

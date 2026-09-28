@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! GPU scaling benchmark for the time-domain backend.
 //!
 //! Sweeps structured-box grids from a few hundred thousand to ~10M state

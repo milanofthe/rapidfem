@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! TD backend performance benchmark, production-plan WP6.3.
 //!
 //! Reports the three quantities the roadmap calls for: matrix-free `apply`

@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Physics-phenomenon geometry tests — one module per phenomenon.
 
 Each module builds a parametric geometry, solves via `harness.case`, and

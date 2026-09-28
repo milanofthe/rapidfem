@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """rapidfem, frequency- and time-domain electromagnetic FEM solver in Rust.
 
 Quick start::
@@ -115,7 +119,7 @@ def show(obj, name: str = "default"):
     -------
     .. code-block:: python
 
-        rf.show(g)                  # OCC preview pre-mesh, tet mesh post-mesh
+        rf.show(g)                  # face preview pre-mesh, tet mesh post-mesh
         rf.show(prob)               # E-field point cloud (after .sweep())
         rf.show(result)             # |S-params| plot
         rf.show(ptd.transient(...)) # 3-D time-domain field animation
@@ -126,7 +130,7 @@ def show(obj, name: str = "default"):
     obj : Geometry, Problem, SweepResult, list[Eigenmode], or a \
         time-domain result
         anything renderable by the UI; pre-mesh geometries render a
-        coarse OCC surface preview, post-mesh ones render the FEM tet
+        coarse face preview, post-mesh ones render the FEM tet
         mesh; Problem + SweepResult render :math:`|\\mathbf{E}(t, r)|^2`
         point clouds plus an S-parameter plot. The :class:`ProblemTD`
         verb results render too, a :meth:`~rapidfem.ProblemTD.transient`

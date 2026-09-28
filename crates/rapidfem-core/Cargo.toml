@@ -2,6 +2,7 @@
 name = "rapidfem-core"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 # Solver-agnostic substrate: mesh, quadrature, material data model.
 # Shared by the frequency-domain (rapidfem-fd) and time-domain
@@ -17,5 +18,4 @@ rslab = { path = "../../vendor/rslab", features = ["tuning"] }
 # eigenmode and port-mode solvers); every sparse solve goes through rslab.
 faer = { version = "0.24", default-features = false, features = ["std"] }
 hashbrown = "0.16.1"
-mshio = "0.4.2"
 num-complex = "0.4.6"

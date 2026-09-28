@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Skin effect in a finite-conductivity VOLUME conductor — exponential decay.
 
 A TE10 wave travelling down a rectangular guide is incident on a slab of good

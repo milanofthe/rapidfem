@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Driven RLC lumped port — the reactive port termination reflects on cue.
 
 A short 50 Ω stripline is driven by ``rf.LumpedPort(z0=50)`` at one end and

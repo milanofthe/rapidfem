@@ -1,7 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-#
+
 # Clean-room symbolic derivation. Independent of any third-party source:
 # the simplex integration identity is derived here from scratch by direct
 # symbolic integration over the reference simplices, then matched against

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """FEM-JSON bridge, consume rapidpassives' exportForFEM() JSON."""
 from __future__ import annotations
 
@@ -13,8 +17,8 @@ FEM_JSON_SCHEMA_VERSIONS = (1,)
 
 # Polygons coming out of mergeLayers may carry sliver edges (sub-nm jogs at
 # rectangle-to-rectangle joins). Drop any vertex closer than this to its
-# predecessor in xy, well below the geometric tolerance that gmsh OCC
-# rejects on `addLine`, but large enough to wipe merge slivers.
+# predecessor in xy, well below any feature of a layout, but large enough to
+# wipe merge slivers.
 _FEM_JSON_VERTEX_TOL_UM = 0.01
 
 
@@ -22,10 +26,10 @@ def _clean_polygon_um(poly_um: list) -> list:
     """Drop consecutive vertices closer than `_FEM_JSON_VERTEX_TOL_UM` in xy.
 
     rapidpassives' mergeLayers occasionally emits near-duplicate vertices at
-    polygon joins (sub-nm slivers); gmsh's OCC kernel refuses to build a
-    line for those. Closing-vertex duplicates are also stripped, gmsh's
-    polygon helper closes the loop itself, an explicit trailing copy of
-    the first vertex would produce a zero-length segment.
+    polygon joins (sub-nm slivers), edges far below any feature that would
+    only force tiny elements. Closing-vertex duplicates are also stripped:
+    polygons close themselves, an explicit trailing copy of the first
+    vertex would be a zero-length edge.
     """
     if not poly_um:
         return []
@@ -214,12 +218,7 @@ def from_fem_json(
 
     # Build the enclosure. Global maxh = ~10% of the smaller in-plane span,
     # finer-than-bulk meshing of conductors is set per-volume via maxh.
-    # scale=1e-6: gmsh OCC stores coords in µm internally (dilated back to
-    # metres before meshing) so the kernel's relative tolerances apply to
-    # µm-scale features. Without normalisation, tight RFIC structures
-    # (mom_cap fingers, fine spacings) trip OCC's "segment/facet intersect"
-    # error during mesh.generate.
-    g = _Geometry(maxh=min(foot_w, foot_h) / 10, scale=1e-6)
+    g = _Geometry(maxh=min(foot_w, foot_h) / 10)
 
     substrate = g.box(foot_w, foot_h, sub_thickness_um * 1e-6,
                       position=(cx_m - foot_w / 2, cy_m - foot_h / 2,

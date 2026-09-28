@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Flask server for `rapidfem serve`.
 
 Exposes the bundled SvelteKit frontend on `/` and a small JSON API on

@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Regression tests for the rapidfem.rfic package.
 
 The bundled ``*.fem.json`` example exports double as fixtures: every layout

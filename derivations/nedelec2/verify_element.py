@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Basis-independent equivalence check of the derived Nedelec-2 element.
 
 Two bases span the same finite-element space iff the generalized eigenvalues

@@ -389,10 +389,9 @@ class _PrimitivesMixin:
 
         Note
         ----
-        gmsh OCC has no direct arbitrary-rectangle API; we build a
-        four-vertex wire and plane surface internally. The four edge
-        vectors ``width`` and ``height`` should be orthogonal, if
-        they are not, you get a planar parallelogram, not a rectangle.
+        The plate is the parallelogram spanned by the two edge vectors
+        ``width`` and ``height``; they should be orthogonal, if they are
+        not, you get a planar parallelogram, not a rectangle.
 
 
         Example
@@ -443,7 +442,7 @@ class _PrimitivesMixin:
         ----
         2-tuple vertices are placed in the xy-plane at ``z = 0`` plus
         the ``position`` offset; 3-tuple vertices must all be coplanar,
-        gmsh OCC errors on non-planar input.
+        non-planar input raises.
 
 
         Example
@@ -502,8 +501,8 @@ class _PrimitivesMixin:
              maxh: float | None = None) -> "GeoObject":
         """add a circular face with an arbitrary normal
 
-        Smooth NURBS circle (gmsh OCC ``addDisk``), meshes into curved
-        triangles when ``MeshSizeFromCurvature`` is active. Pair with
+        An exact circle: the mesh follows the curved rim at the size the
+        rim's curvature asks for. Pair with
         :meth:`extrude` for a circular post or :meth:`revolve` for a
         spherical cap.
 
@@ -517,7 +516,7 @@ class _PrimitivesMixin:
         axis : tuple[float, float, float]
             disc normal (defaults to +z, i.e. the xy-plane). Any direction
             is allowed, e.g. ``(1, 0, 0)`` puts the disc in the yz-plane.
-            Need not be unit length; gmsh normalises it.
+            Need not be unit length.
         maxh : float, optional
             per-face mesh size override
 

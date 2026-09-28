@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Centralised numerical constants for the time-domain backend.
 //!
@@ -214,7 +211,7 @@ pub const APPLY_TASKS_PER_THREAD: usize = 4;
 /// centroids agree (after translation) to within `PERIODIC_MATCH_REL_TOL`
 /// times the period magnitude. A meshing-symmetric pair lines up to
 /// machine precision; this loose-ish tolerance keeps the matcher robust to
-/// gmsh's floating-point round-off without ever wandering onto a wrong
+/// floating-point round-off without ever wandering onto a wrong
 /// partner (the next nearest triangle on a structured face is one cell
 /// size away, orders of magnitude beyond this).
 pub const PERIODIC_MATCH_REL_TOL: Field = 1e-9;

@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Port boundary conditions and their analytic modal fields.
 //!
@@ -335,7 +332,7 @@ impl CoaxPort {
 
     pub fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, _exc: &Excitation) -> (f64, f64, f64) {
         // Local cylindrical: rho = sqrt(xl² + yl²), phi = atan2(yl, xl).
-        // The mode formula is mathematically valid for any ρ>0; the gmsh-meshed annulus
+        // The mode formula is mathematically valid for any ρ>0; the meshed annulus
         // confines us to ρ ∈ [Ri, Ro], so we don't gate on the radii (mesh-imperfect quadrature
         // points slightly outside the geometric bounds would otherwise be cut, costing power).
         let (xl, yl, _) = self.cs.in_local_cs(x, y, z);
@@ -734,7 +731,7 @@ pub fn lumped_port_dims(
 /// Single quadrature point on a triangle: (weight, L1, L2, L3) in barycentric.
 type Tri4Tuple = (f64, f64, f64, f64);
 
-/// Sum a function over the triangle surface mesh using gmsh-style P1 quadrature.
+/// Sum a function over the triangle surface mesh using P1 quadrature.
 /// Inline replica of `sparam::surface_integral` for real-valued scalars, we
 /// only need this at port construction to integrate |e_t^unit|^2, which is
 /// real, so importing the complex version would be churn.

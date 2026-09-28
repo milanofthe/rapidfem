@@ -92,8 +92,7 @@ def _aperture(obj, x_plane):
     """The boxed-port sub-face of ``obj`` at ``x_plane``: degenerate in x,
     on the end plane, and bounded by the aperture in y (the flanking side
     strips run out to +-sub_W/2, so they fail the y-bounds test)."""
-    # 1e-6 m tolerance absorbs gmsh getBoundingBox inflation (~1e-7 m/side),
-    # the same slack rf.ABC(*faces.outer) relies on.
+    # 1e-6 m tolerance, the same slack rf.ABC(*faces.outer) relies on.
     return obj.faces.where(
         lambda c, b: abs(b[3] - b[0]) < 1e-6
         and abs(b[0] - x_plane) < 1e-6

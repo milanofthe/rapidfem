@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Cell-runner backend for rapidfem serve, one worker subprocess per file.
 
 Replaces the old in-process kernel + WebSocket protocol (which suffered

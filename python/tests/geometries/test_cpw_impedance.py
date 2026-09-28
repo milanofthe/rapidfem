@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Coplanar-waveguide characteristic impedance — from a 50 Ω reflection.
 
 A centre signal strip flanked by two coplanar ground strips on the same

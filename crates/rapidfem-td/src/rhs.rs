@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! DG Maxwell RHS operator.
 //!
@@ -137,7 +134,7 @@ pub(crate) struct FaceInfo {
 
 /// A port, a set of mesh boundary faces carrying a waveguide mode.
 ///
-/// Identified by the mesh triangle indices on the port plane (a gmsh face
+/// Identified by the mesh triangle indices on the port plane (a face group
 /// tag resolves to exactly such a set via `Mesh::ftag_to_tri`). With
 /// `mode = None` the port is a pure characteristic absorbing boundary;
 /// `Some` attaches a waveguide mode (rectangular `TE_mn` or coaxial TEM)
@@ -151,7 +148,7 @@ pub struct PortSpec {
 }
 
 impl PortSpec {
-    /// Build a waveguide port from a gmsh face tag, collecting the port
+    /// Build a waveguide port from a face group tag, collecting the port
     /// triangles and fitting the rectangular-waveguide `TE_mn` mode to the
     /// face.
     ///
@@ -253,7 +250,7 @@ impl PortSpec {
         Some(PortSpec { tris, mode: Some(PortMode::Rect(rect)) })
     }
 
-    /// Build a *pure absorbing* boundary from a gmsh face tag, no
+    /// Build a *pure absorbing* boundary from a face group tag, no
     /// waveguide mode attached, just the characteristic non-reflecting
     /// flux at the face. This is the DG analogue of the FD backend's
     /// first-order ABC (Silver-Mueller): the upwind flux with a zero
@@ -276,7 +273,7 @@ impl PortSpec {
         Some(PortSpec { tris, mode: None })
     }
 
-    /// Build a coaxial TEM port from a gmsh face tag, collecting the port
+    /// Build a coaxial TEM port from a face group tag, collecting the port
     /// triangles and fitting the coaxial annulus to the face.
     ///
     /// The coax center defaults to the port-face centroid; `center` supplies
@@ -347,7 +344,7 @@ impl PortSpec {
         Some(PortSpec { tris, mode: Some(PortMode::Coax(coax)) })
     }
 
-    /// Build a numerically-solved **wave port** from a gmsh face tag, a
+    /// Build a numerically-solved **wave port** from a face group tag, a
     /// 2D cross-section eigensolve on the port face produces the mode
     /// profile, for cross-sections with no closed-form mode.
     ///
@@ -451,7 +448,7 @@ impl PortSpec {
         Some(PortSpec { tris, mode: Some(PortMode::Numerical(nm)) })
     }
 
-    /// Build a Floquet plane-wave port from a gmsh face tag, collecting
+    /// Build a Floquet plane-wave port from a face group tag, collecting
     /// the port triangles and fitting the rectangular unit-cell face.
     ///
     /// `polarisation` picks TE (`s`-pol) or TM (`p`-pol). The scan angles
@@ -578,7 +575,7 @@ pub struct PecSpec {
 }
 
 impl PecSpec {
-    /// Build an internal-PEC plate spec from a gmsh face tag. Returns
+    /// Build an internal-PEC plate spec from a face group tag. Returns
     /// `None` if the tag carries no triangles.
     pub fn from_mesh_tag(mesh: &Mesh, face_tag: i32) -> Option<PecSpec> {
         let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
@@ -590,7 +587,7 @@ impl PecSpec {
 }
 
 impl PeriodicSpec {
-    /// Build a periodic pair from two gmsh face tags, the periodic
+    /// Build a periodic pair from two face group tags, the periodic
     /// counterpart of [`PortSpec::from_mesh_tag`]. Returns `None` if
     /// either tag carries no triangles.
     pub fn from_mesh_tags(

@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! High-level Simulation API: owns a mesh, the model placed on it and the
 //! analysis settings, and exposes sweep, eigenmode and far-field. The entry
@@ -84,12 +81,6 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// Build a `Simulation` from in-memory gmsh mesh bytes (no std::fs use).
-    pub fn from_mesh_bytes(mesh_bytes: &[u8], model: Model, settings: FdSettings) -> Result<Self, String> {
-        let mesh = crate::mesh_io::parse_mesh_bytes(mesh_bytes)?;
-        Self::new(mesh, model, settings)
-    }
-
     /// Build a `Simulation` from an owned mesh, its model and the settings.
     /// All BC objects (ports, PEC, materials, PML, lumped integration lines)
     /// are constructed up-front.

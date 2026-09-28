@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Is the existing kernel's element the canonical Nedelec first-kind order 2?
 
 The canonical R2 space (Nedelec 1980) is

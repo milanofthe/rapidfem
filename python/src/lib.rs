@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! PyO3 bindings for rapidfem: the typed `Model`, the frequency-domain
 //! `Simulation` with its results, and the time-domain `TdOperator`.
@@ -56,41 +53,14 @@ struct PyRadiationPattern {
 
 #[pymethods]
 impl PySimulation {
-    /// Build a simulation from in-memory gmsh mesh bytes and a `Model`.
+    /// Build a simulation on a solver mesh (`Geometry.fem_mesh`) and a
+    /// `Model`.
     ///
     /// `order` is the uniform element order (1 or 2); `adaptive` selects the
     /// wavelength order policy instead. `eigenmode` is `(target_hz, n_modes)`.
     #[new]
-    #[pyo3(signature = (mesh_bytes, model, frequencies, *, order=2, adaptive=false, eigenmode=None))]
-    fn new(
-        mesh_bytes: &[u8],
-        model: &PyModel,
-        frequencies: Vec<f64>,
-        order: u8,
-        adaptive: bool,
-        eigenmode: Option<(f64, usize)>,
-    ) -> PyResult<Self> {
-        if !(1..=2).contains(&order) {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "order must be 1 or 2, got {order}"
-            )));
-        }
-        let order = if adaptive {
-            OrderPolicy::Adaptive { theta: rapidfem_fd::order::DEFAULT_THETA }
-        } else {
-            OrderPolicy::Uniform(order)
-        };
-        let settings = FdSettings { frequencies, order, eigenmode };
-        let inner = Simulation::from_mesh_bytes(mesh_bytes, model.inner.clone(), settings)
-            .map_err(PyRuntimeError::new_err)?;
-        Ok(PySimulation { inner })
-    }
-
-    /// Build a simulation on a solver mesh from `Geometry.fem_mesh`; the
-    /// other arguments as for the constructor.
-    #[staticmethod]
     #[pyo3(signature = (mesh, model, frequencies, *, order=2, adaptive=false, eigenmode=None))]
-    fn from_fem_mesh(
+    fn new(
         mesh: &PyFemMesh,
         model: &PyModel,
         frequencies: Vec<f64>,
@@ -628,31 +598,12 @@ impl PyTdOperator {
         }
     }
 
-    /// Build the operator of a `Model` on in-memory gmsh mesh bytes: DG
-    /// order `order`, flux blend `flux_alpha` (1 upwind, 0 central), `c` the
-    /// speed of light in the mesh's length unit.
-    #[staticmethod]
-    #[pyo3(signature = (mesh_bytes, model, order, flux_alpha = 1.0, c = 299_792_458.0))]
-    fn from_model(mesh_bytes: &[u8], model: &PyModel, order: usize, flux_alpha: f64, c: f64) -> PyResult<Self> {
-        let mesh = rapidfem_core::mesh_io::parse_mesh_bytes(mesh_bytes)
-            .map_err(PyRuntimeError::new_err)?;
-        let op = rapidfem_td::build::operator_from_model(&mesh, &model.inner, order, flux_alpha, c)
-            .map_err(PyRuntimeError::new_err)?;
-        Ok(PyTdOperator {
-            op,
-            krylov: rapidfem_td::propagator::KrylovWorkspace::new(),
-            driven_b: Vec::new(),
-            lserk: rapidfem_td::explicit::LserkWorkspace::new(),
-            kcl: rapidfem_td::explicit_adaptive::KclWorkspace::new(),
-            gpu: None,
-        })
-    }
-
-    /// Build the operator of a `Model` on a solver mesh from
-    /// `Geometry.fem_mesh`; the other arguments as for `from_model`.
+    /// Build the operator of a `Model` on a solver mesh
+    /// (`Geometry.fem_mesh`): DG order `order`, flux blend `flux_alpha` (1
+    /// upwind, 0 central), `c` the speed of light in the mesh's length unit.
     #[staticmethod]
     #[pyo3(signature = (mesh, model, order, flux_alpha = 1.0, c = 299_792_458.0))]
-    fn from_fem_mesh(mesh: &PyFemMesh, model: &PyModel, order: usize, flux_alpha: f64, c: f64) -> PyResult<Self> {
+    fn from_model(mesh: &PyFemMesh, model: &PyModel, order: usize, flux_alpha: f64, c: f64) -> PyResult<Self> {
         let op = rapidfem_td::build::operator_from_model(&mesh.inner, &model.inner, order, flux_alpha, c)
             .map_err(PyRuntimeError::new_err)?;
         Ok(PyTdOperator {

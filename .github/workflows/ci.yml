@@ -29,9 +29,10 @@ jobs:
         run: cargo build -p rapidfem-td --features gpu
 
       # core/fd unit + sympy golden tests (element, coefficients, tri-mass,
-      # waveguide-modal, port_eigen cutoffs, Debye, material tensors, interp).
-      - name: Test core + fd
-        run: cargo test --release -p rapidfem-core -p rapidfem-fd
+      # waveguide-modal, port_eigen cutoffs, Debye, material tensors, interp),
+      # geometry on rapidmesh (scene ops, solver mesh groups, MSH round trip).
+      - name: Test core + fd + geom
+        run: cargo test --release -p rapidfem-core -p rapidfem-fd -p rapidfem-geom
 
       # TD sympy/analytical kernel goldens (fast). The full DGTD transient
       # validation suite is slow (real meshes) — run it locally with
@@ -54,9 +55,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # gmsh (a runtime dep) needs these shared libs on headless Linux.
-      - name: System deps for gmsh
-        run: sudo apt-get update && sudo apt-get install -y libglu1-mesa libxcursor1 libxft2 libxinerama1 libxrender1
       - name: Build + install rapidfem (with test extras)
         run: pip install "./python[test]"
       - name: Fast tests (renormalization math, no FEM solves)

@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """The time-domain operator built from the native model (no FD solve).
 
 A coarse WR-90 section with two TE10 ports and PEC walls: the operator is

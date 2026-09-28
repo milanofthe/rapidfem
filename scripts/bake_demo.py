@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Pre-bake bundled examples for the static web demo.
 
 Reads each `python/python_src/rapidfem/examples/*.py`, splits it into
@@ -11,7 +15,7 @@ Run from the repo root:
     python scripts/bake_demo.py
 
 Reused machinery (single source of truth for runtime behaviour):
-- gmsh / capture lifecycle    → rapidfem.ui.kernel
+- capture lifecycle           → rapidfem.ui.kernel
 - show() collector            → rapidfem._show_capture
 - serializer (display events) → rapidfem.ui.serialize / api._serialize_captures_for_protocol
 """
@@ -29,8 +33,7 @@ from pathlib import Path
 from typing import Iterable
 
 # Each example is baked in its own subprocess (see `_bake_subprocess`) so a
-# hang — most often gmsh's OpenCASCADE boolean kernel deadlocking on a dense
-# geometry — takes down only its own attempt, not the whole bake.
+# hang or crash takes down only its own attempt, not the whole bake.
 # Per-example overrides live in <name>.bake.json (see `_bake_config`).
 BAKE_TIMEOUT_S = 600   # kill + retry an example that runs longer than this
 BAKE_ATTEMPTS = 3      # attempts per example before it is skipped
@@ -43,10 +46,8 @@ META_SCHEMA = 2
 # per-example meta files. Version is independent of the meta schema.
 MANIFEST_SCHEMA = 2
 
-# Bake subprocesses pin OpenMP to one thread to avoid the gmsh-OCC
-# boolean-kernel deadlock on dense fragmented geometries (RFIC layouts
-# trigger it most often). The Rust solvers use their own rayon pools, so
-# gmsh stays serial and everything else stays parallel.
+# Bake subprocesses pin OpenMP and BLAS to one thread; the Rust mesher and
+# solvers use their own rayon pools, so they stay parallel.
 _BAKE_ENV = {
     **os.environ,
     "OMP_NUM_THREADS": "1",
@@ -262,17 +263,6 @@ def _extract_payloads_to_bin(record: dict, bin_dir: Path) -> list[Path]:
     return written
 
 
-def _reset_gmsh() -> None:
-    """Wipe gmsh state between examples so OCC geometry from one file
-    doesn't leak into the next. Same call the WS kernel uses on reset."""
-    try:
-        import gmsh
-        if gmsh.isInitialized():
-            gmsh.clear()
-    except Exception:
-        pass
-
-
 def bake_example(path: Path) -> dict:
     """Bake one example file end-to-end.
 
@@ -289,7 +279,6 @@ def bake_example(path: Path) -> dict:
     source = path.read_text(encoding="utf-8")
     cells = split_cells(source)
 
-    _reset_gmsh()
 
     class _Kernel:
         file_path = path.name
@@ -563,8 +552,8 @@ class BakeOutcome:
 
 def _bake_subprocess(name: str, log: Path) -> BakeOutcome:
     """Bake one example in a fresh ``--bake-one`` subprocess. Each attempt
-    gets its own subprocess so a hang (gmsh OCC boolean deadlock, the most
-    common transient failure) takes down only its own attempt.
+    gets its own subprocess so a hang or crash takes down only its own
+    attempt.
 
     Retries and timeout come from the per-example config in
     `<name>.bake.json` if present, falling back to `BAKE_ATTEMPTS` and

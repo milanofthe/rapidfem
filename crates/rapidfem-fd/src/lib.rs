@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! rapidfem-fd, frequency-domain Nédélec-FEM backend.
 //!
@@ -11,7 +8,7 @@
 //! `rapidfem-core` and is re-exported here, so existing `crate::mesh`-style
 //! paths inside this crate keep resolving unchanged.
 
-pub use rapidfem_core::{constants, linalg, materials, mesh, mesh_io, model, quadrature};
+pub use rapidfem_core::{constants, linalg, materials, mesh, model, quadrature};
 
 mod dump;
 pub mod excitation;

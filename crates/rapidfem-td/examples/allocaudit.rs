@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Allocation audit, counts heap allocations on the TD hot paths.
 //!
 //! A counting global allocator wraps the system allocator; the audit then

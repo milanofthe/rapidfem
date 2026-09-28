@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Binary packing for display-event payloads.
 
 A baked example, or a live display event, carries bulk numeric arrays:
@@ -92,7 +96,7 @@ def _pack_mesh(geo: _Buffer, payload: dict) -> None:
 
 
 def _pack_geometry(geo: _Buffer, payload: dict) -> None:
-    """OCC geometry-preview payload, per-entity triangulation / wireframe."""
+    """Geometry-preview payload, per-entity triangulation / wireframe."""
     for ent in payload.get("entities", []):
         if not isinstance(ent, dict):
             continue

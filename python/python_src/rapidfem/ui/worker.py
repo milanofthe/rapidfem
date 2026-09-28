@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """rapidfem worker subprocess.
 
 Per-file kernel that runs notebook cells in a clean, isolated Python process.

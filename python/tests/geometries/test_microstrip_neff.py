@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Microstrip line — quasi-TEM effective index from the S21 phase slope.
 
 A signal trace on an FR4-like substrate (er = 4.4) over a ground plane, air

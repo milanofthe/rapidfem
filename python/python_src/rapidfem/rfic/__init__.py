@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """
 RFIC builder for rapidfem, PDK-grade stack definitions, GDS-driven extrusion
 helpers, and hand-coded primitives (microstrip, via, GSG port).

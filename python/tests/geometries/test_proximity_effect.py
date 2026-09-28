@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Proximity effect — opposing currents crowd onto the FACING surfaces.
 
 Two nearby conductors carrying *opposing* currents (the odd / differential mode

@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Mesh data structure: nodes, edges, tris, tets, and connectivity.
 //!
@@ -52,7 +49,7 @@ pub struct Mesh {
     pub edges: Vec<[usize; 2]>,
     /// Triangles: tris[t] = [n1, n2, n3] sorted
     pub tris: Vec<[usize; 3]>,
-    /// Tetrahedra: tets[t] = [n1, n2, n3, n4] in gmsh node order (sorted)
+    /// Tetrahedra: tets[t] = [n1, n2, n3, n4], positively oriented
     pub tets: Vec<[usize; 4]>,
 
     /// Per-tet: 6 edge indices in TET_EDGE_LOCAL order
@@ -71,9 +68,9 @@ pub struct Mesh {
     pub inv_edges: HashMap<(usize, usize), usize>,
     pub inv_tris: HashMap<(usize, usize, usize), usize>,
 
-    /// Gmsh face tag → list of triangle indices
+    /// Face group tag → list of triangle indices
     pub ftag_to_tri: HashMap<i32, Vec<usize>>,
-    /// Gmsh volume tag → list of tet indices
+    /// Volume group tag → list of tet indices
     pub vtag_to_tet: HashMap<i32, Vec<usize>>,
 
     /// Characteristic length L₀ (m) the node coordinates were divided by to

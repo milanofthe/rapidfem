@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Strip resistance R'(f) of a finite-thickness RFIC trace vs a 2D reference.
 
 A 10 um x 3 um strip (sigma = 3.03e7, TopMetal-like) runs 10 um above ground
@@ -79,7 +80,7 @@ def _attenuation(model, f, *, lossy_len, h_strip, t=TS):
     g.fragment(air, s1, s2, mid)
     g.cut(air, s1, s2)                              # PEC stubs are holes
 
-    eps = 0.2 * um                                  # gmsh bbox padding
+    eps = 0.2 * um                                  # bbox tolerance
     def in_strip(b):
         return (b[0] > X0 - eps and b[3] < X0 + WS + eps
                 and b[2] > Z0 - eps and b[5] < Z0 + TS + eps)

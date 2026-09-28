@@ -18,8 +18,9 @@ pip install rapidfem[ui]        # solver + local UI
 ```
 
 Wheels for Windows, Linux, and macOS are built in CI; the Rust core is compiled ahead of time, so no
-Rust toolchain is needed on the user's machine. Gmsh (the `gmsh` Python wheel) is pulled in
-automatically and provides the OpenCASCADE geometry kernel and mesher used by `rapidfem.Geometry`.
+Rust toolchain is needed on the user's machine. Geometry and meshing run on the built-in
+[rapidmesh](https://github.com/milanofthe/rapidmesh) mesher, the sparse solves on the built-in
+rslab solver; there are no other native dependencies.
 
 ## Quick start (Python API)
 
@@ -53,39 +54,31 @@ stepped-impedance filters, patch / Vivaldi / inverted-F antennas (PML + far-fiel
 dielectric resonators, and the `fd_rfic_*` on-chip passives. RFIC geometry comes from a process stack
 and layout via `rapidfem.rfic` (`rfic.Stack`, `Geometry.from_gds`).
 
-## Importing external CAD and meshes
+## Importing external geometry and meshes
 
 `g.load(path)` brings external geometry into the scene; the action is chosen from the file extension.
 
 ```python
 g = rf.Geometry(maxh=rf.lambda_maxh(f_max=20e9))
 
-# STEP / IGES / BREP land in the same OpenCASCADE kernel as the primitives,
-# so the result is a normal GeoObject: boolean it, transform it, select its
-# faces, attach materials and physics, exactly like a g.box(...).
-part = g.load("horn.step", material=rf.Air())   # mm STEP -> metres by default
+# A closed STL or OBJ surface becomes a solid, split into smooth faces at its
+# creases: a normal GeoObject, so boolean it, transform it, select its faces,
+# attach materials and physics, exactly like a g.box(...). unit= reads the
+# file's coordinates, rotation= and position= place the part.
+part = g.load("horn.stl", unit="MM", material=rf.Air(),
+              rotation=(math.pi, (0, 0, 1)), position=(0, 0, 5e-3))
 post = g.cylinder(radius=0.5e-3, height=5e-3)
-g.cut(part, post)                                # compose CAD with primitives
+g.cut(part, post)                                # compose with primitives
 g.rotate(part, math.pi / 2, axis=(0, 1, 0))      # full transform API applies
 rf.RectWaveguidePort(part.faces.max(axis="z"))
 rf.PEC(*part.faces.unassigned)
 g.mesh()
 
-# Place/orient any import at load time, like a primitive's position= kwarg:
-part = g.load("horn.step", position=(0, 0, 5e-3), rotation=(math.pi, (0, 0, 1)))
-
-# STL is a surface triangulation, healed into a meshable solid. It is a discrete
-# body (its geometry is the mesh), so it stays standalone: it takes a material,
-# physics, placement and meshing, but it cannot be combined with OCC primitives
-# or boolean ops (export STEP/IGES/BREP for that). STL is unit-less; pass scale=
-# (metres per file unit) for a model authored in mm.
-g = rf.Geometry(maxh=0.5e-3)
-blob = g.load("antenna.stl", material=rf.Air(), scale=1e-3, position=(0, 0, 1e-3))
-
-# A pre-built .msh volume mesh is already tessellated, so loading one switches
-# the geometry into mesh mode: its named physical groups become selectable
-# handles for materials and physics. g.mesh() bakes the bindings (no remeshing)
-# and the usual Problem/sweep pipeline runs unchanged.
+# A pre-built .msh volume mesh (gmsh MSH 4.1 or 2.2) is already tessellated, so
+# loading one switches the geometry into mesh mode: its named physical groups
+# become selectable handles for materials and physics. g.mesh() bakes the
+# bindings (no remeshing) and the usual Problem/sweep pipeline runs unchanged.
+# g.save_mesh(path) writes such a file, the groups named as the solver sees them.
 g = rf.Geometry()
 scene = g.load("waveguide.msh")
 scene.group("air").material = rf.Air()
@@ -96,9 +89,8 @@ g.mesh()
 result = rf.Problem(g).sweep(np.linspace(8e9, 12e9, 21))
 ```
 
-`unit=` sets the target unit OpenCASCADE converts a STEP/IGES file into (default `"M"`, so a
-millimetre file arrives at metre coordinates); `scale=` is an extra metres-per-file-unit factor for
-unit-less STL or a mis-declared CAD unit. `examples/fd_step_import.py` is a full STEP-driven sweep.
+STEP, IGES and BREP import is not available yet (milanofthe/rapidmesh-dev#37).
+`examples/fd_stl_import.py` is a full STL-driven sweep.
 
 ## Local UI
 
@@ -197,5 +189,5 @@ derivations and cross-checks are in [`derivations/`](derivations/).
 
 ## License
 
-GPL-3.0-or-later with the Gmsh additional permission; see [LICENSE](LICENSE). Copyright (C) Milan
+AGPL-3.0-only; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright (C) Milan
 Rother and rapidfem contributors; commercial terms available.

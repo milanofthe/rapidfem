@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Quasi-static reference for a rectangular conductor in a rectangular PEC shield.
 
 Solves the 2D magnetic diffusion problem of a straight line, independent of the

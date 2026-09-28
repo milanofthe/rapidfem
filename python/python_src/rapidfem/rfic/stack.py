@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Process-stack data model: `PdkLayer` + `DielectricLayer` + `Stack`.
 
 The `Stack` describes the complete vertical cross-section of a process:

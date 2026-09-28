@@ -19,8 +19,8 @@ example scripts:
 
 The GPU path is the explicit LSERK4 transient, state device-resident;
 for a fair comparison the CPU run uses the same explicit integrator
-(``method="explicit"``), which the GPU path mirrors. gmsh meshing is
-the practical limiter, so the resolutions are sized so the finest mesh
+(``method="explicit"``), which the GPU path mirrors. Meshing is the
+practical limiter, so the resolutions are sized so the finest mesh
 lands in the 1-4M state-DOF range, not beyond.
 
 Run after ``maturin develop --release``:
@@ -166,7 +166,7 @@ def run_cavity(ptd, device, steps):
 
 # %% Resolution sweeps
 # Three maxh values per geometry, coarse to fine, sized so the finest
-# mesh lands in the 1-4M state-DOF range. gmsh meshing is the limiter, so
+# mesh lands in the 1-4M state-DOF range. Meshing is the limiter, so
 # these are deliberately short of the 10M-DOF regime where complex-
 # geometry meshing turns prohibitive. The actual n_dof reached is
 # printed in the table below.

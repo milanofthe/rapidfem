@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Local conditioning of the canonical R2 element under sliver degeneration,
 and the solution-preserving remedies (diagonal equilibration + iterative
 refinement). Grounds the implementation in `crates/rapidfem-fd`.

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """
 Optional Python-side exporters for `SweepResult`. Each function lazily imports
 its backend dep so users without it still get `import rapidfem` for free.

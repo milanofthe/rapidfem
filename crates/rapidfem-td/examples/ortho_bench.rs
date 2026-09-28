@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Arnoldi orthogonalisation benchmark, MGS vs CGS2, on realistic meshes.
 //!
 //! The production Krylov stepper (`propagator::expmv_into`) orthogonalises

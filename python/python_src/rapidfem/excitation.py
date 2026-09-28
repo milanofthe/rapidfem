@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Time-domain excitation waveforms.
 
 An excitation is any callable ``g(t) -> float``; :class:`GaussianPulse` is the

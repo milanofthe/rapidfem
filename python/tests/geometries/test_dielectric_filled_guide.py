@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Dielectric-filled rectangular waveguide — TE10 dispersion shift.
 
 Filling a rectangular guide with a lossless dielectric (εr) lowers the TE10

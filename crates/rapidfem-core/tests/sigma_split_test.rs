@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
+
 // The σ-split used by the cached frequency sweep must reproduce the full
 // lossy-dielectric form exactly:
 //   εr*(ω) = [εr·(1 − j·tanδ)]  +  (−j/(ω·ε₀))·σ

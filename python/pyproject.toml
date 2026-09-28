@@ -7,7 +7,7 @@ name = "rapidfem"
 version = "0.22.1"
 description = "Frequency-domain electromagnetic FEM solver in Rust, with a Python API and an optional local web UI."
 readme = { file = "../README.md", content-type = "text/markdown" }
-license = { text = "GPL-3.0-or-later" }
+license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.10"
 authors = [
     { name = "Milan Rother", email = "sporkhomat@gmail.com" },
@@ -16,7 +16,7 @@ keywords = ["fem", "electromagnetic", "microwave", "antenna", "simulation", "max
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -30,7 +30,6 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.26",
-    "gmsh>=4.11",
 ]
 
 [project.optional-dependencies]

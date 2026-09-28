@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Clean-room derivation: robust quasi-TEM wave-port mode solve.
 
 INDEPENDENT DERIVATION (nothing transcribed from any other solver). The 2-D

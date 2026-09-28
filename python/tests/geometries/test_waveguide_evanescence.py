@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Below-cutoff waveguide attenuator — evanescent decay rate α.
 
 A wave squeezed through a guide section whose TE10 cutoff lies *above* the
@@ -56,8 +57,7 @@ def _is_throat_interface(_cog, bbox) -> bool:
     shared with the narrow throat plus two metal step shoulders. The shared
     interface must stay un-tagged (the solver carries field continuity across
     it); every other face is a metal wall. The interface is the only z-normal
-    face whose footprint matches the throat (x≈A_NARROW, y≈B). gmsh inflates a
-    degenerate face's bbox by ~1e-7 m, hence the 1e-6 m flatness tolerance.
+    face whose footprint matches the throat (x≈A_NARROW, y≈B), flat to 1e-6 m.
     """
     x_ext, y_ext, z_ext = bbox[3] - bbox[0], bbox[4] - bbox[1], bbox[5] - bbox[2]
     return (z_ext < 1e-6                                   # z-normal (flat in z)

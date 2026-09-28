@@ -12,7 +12,7 @@
 //! The groups that the model's tags refer to are unions of rapidmesh entities:
 //! a face group is a set of B-rep faces (every mesh face classified onto one
 //! of them joins the group), a volume group a set of regions. That is the role
-//! gmsh physical groups played.
+//! gmsh physical groups played in the MSH format.
 
 use rapidfem_core::mesh::Mesh;
 

@@ -18,12 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
-name = "arrayvec"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23b62fc65de8e4e7f52534fb52b0f3ed04746ae267519eef2a83941e8085068b"
-
-[[package]]
 name = "atomic-wait"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -38,12 +32,6 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
-
-[[package]]
-name = "bitflags"
-version = "1.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -356,7 +344,7 @@ dependencies = [
  "libm",
  "nano-gemm",
  "npyz",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "private-gemm-x86",
  "pulp",
@@ -377,7 +365,7 @@ dependencies = [
  "dyn-stack",
  "generativity",
  "libm",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "pulp",
  "qd",
@@ -433,7 +421,7 @@ dependencies = [
  "gemm-f16",
  "gemm-f32",
  "gemm-f64",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -448,7 +436,7 @@ checksum = "086936dbdcb99e37aad81d320f98f670e53c1e55a98bee70573e83f95beb128c"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -463,7 +451,7 @@ checksum = "20c8aeeeec425959bda4d9827664029ba1501a90a0d1e6228e48bef741db3a3f"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -480,7 +468,7 @@ dependencies = [
  "dyn-stack",
  "half",
  "libm",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "once_cell",
  "paste",
@@ -501,7 +489,7 @@ dependencies = [
  "gemm-common",
  "gemm-f32",
  "half",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -517,7 +505,7 @@ checksum = "02e0b8c9da1fbec6e3e3ab2ce6bc259ef18eb5f6f0d3e4edf54b75f9fd41a81c"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -532,7 +520,7 @@ checksum = "056131e8f2a521bfab322f804ccd652520c79700d81209e9d9275bbdecaadc6a"
 dependencies = [
  "dyn-stack",
  "gemm-common",
- "num-complex 0.4.6",
+ "num-complex",
  "num-traits",
  "paste",
  "raw-cpuid",
@@ -713,19 +701,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
-name = "lexical-core"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6607c62aa161d23d17a9072cc5da0be67cdfc89d3afb1e8d9c842bebc2525ffe"
-dependencies = [
- "arrayvec",
- "bitflags 1.3.2",
- "cfg-if",
- "ryu",
- "static_assertions",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.184"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,19 +766,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mshio"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01f3aa844a89eb69a2f58cea74055711d77356e20490cdd0a3670117a96a8e2e"
-dependencies = [
- "nom",
- "num",
- "num-derive",
- "num-traits",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "nano-gemm"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -816,7 +778,7 @@ dependencies = [
  "nano-gemm-core",
  "nano-gemm-f32",
  "nano-gemm-f64",
- "num-complex 0.4.6",
+ "num-complex",
 ]
 
 [[package]]
@@ -827,7 +789,7 @@ checksum = "0775b1e2520e64deee8fc78b7732e3091fb7585017c0b0f9f4b451757bbbc562"
 dependencies = [
  "nano-gemm-codegen",
  "nano-gemm-core",
- "num-complex 0.4.6",
+ "num-complex",
 ]
 
 [[package]]
@@ -838,7 +800,7 @@ checksum = "9af49a20d58816e6b5ee65f64142e50edb5eba152678d4bb7377fcbf63f8437a"
 dependencies = [
  "nano-gemm-codegen",
  "nano-gemm-core",
- "num-complex 0.4.6",
+ "num-complex",
 ]
 
 [[package]]
@@ -880,23 +842,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
 dependencies = [
  "matrixmultiply",
- "num-complex 0.4.6",
+ "num-complex",
  "num-integer",
  "num-traits",
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
-]
-
-[[package]]
-name = "nom"
-version = "5.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08959a387a676302eebf4ddbcbc611da04285579f76f88ee0506c63b1a61dd4b"
-dependencies = [
- "lexical-core",
- "memchr",
- "version_check",
 ]
 
 [[package]]
@@ -906,7 +857,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f0e759e014e630f90af745101b614f761306ddc541681e546649068e25ec1b9"
 dependencies = [
  "byteorder",
- "num-bigint 0.4.6",
+ "num-bigint",
  "py_literal",
 ]
 
@@ -929,46 +880,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "num"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b7a8e9be5e039e2ff869df49155f1c06bd01ade2117ec783e56ab0932b67a8f"
-dependencies = [
- "num-bigint 0.3.3",
- "num-complex 0.3.1",
- "num-integer",
- "num-iter",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
-name = "num-bigint"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f6f7833f2cbf2360a6cfd58cd41a53aa7a90bd4c202f5b1c7dd2ed73c57b2c3"
-dependencies = [
- "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-complex"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "747d632c0c558b87dbabbe6a82f3b4ae03720d0646ac5b7b4dae89394be5f2c5"
-dependencies = [
  "num-traits",
 ]
 
@@ -984,45 +901,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-derive"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "876a53fff98e03a936a674b29568b0e605f06b29372c2489ff4de23f1949743d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "num-integer"
 version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7969661fd2958a5cb096e56c8e1ad0444ac2bbcd0061bd28660485a44879858f"
 dependencies = [
- "num-traits",
-]
-
-[[package]]
-name = "num-iter"
-version = "0.1.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
-dependencies = [
- "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-rational"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12ac428b1cb17fce6f731001d307d351ec70a6d202fc2e60f7d4c5e42d8f4f07"
-dependencies = [
- "autocfg",
- "num-bigint 0.3.3",
- "num-integer",
  "num-traits",
 ]
 
@@ -1054,7 +937,7 @@ checksum = "edb929bc0da91a4d85ed6c0a84deaa53d411abfb387fc271124f91bf6b89f14e"
 dependencies = [
  "libc",
  "ndarray",
- "num-complex 0.4.6",
+ "num-complex",
  "num-integer",
  "num-traits",
  "pyo3",
@@ -1199,7 +1082,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "libm",
- "num-complex 0.4.6",
+ "num-complex",
  "paste",
  "pulp-wasm-simd-flag",
  "raw-cpuid",
@@ -1219,8 +1102,8 @@ version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "102df7a3d46db9d3891f178dcc826dc270a6746277a9ae6436f8d29fd490a8e1"
 dependencies = [
- "num-bigint 0.4.6",
- "num-complex 0.4.6",
+ "num-bigint",
+ "num-complex",
  "num-traits",
  "pest",
  "pest_derive",
@@ -1376,8 +1259,7 @@ version = "0.1.0"
 dependencies = [
  "faer",
  "hashbrown",
- "mshio",
- "num-complex 0.4.6",
+ "num-complex",
  "rslab",
 ]
 
@@ -1387,7 +1269,7 @@ version = "0.1.0"
 dependencies = [
  "faer",
  "hashbrown",
- "num-complex 0.4.6",
+ "num-complex",
  "rapidfem-core",
  "rayon",
  "web-time",
@@ -1409,7 +1291,7 @@ dependencies = [
 name = "rapidfem-python"
 version = "0.22.1"
 dependencies = [
- "num-complex 0.4.6",
+ "num-complex",
  "numpy",
  "pyo3",
  "rapidfem-core",
@@ -1468,7 +1350,7 @@ name = "rapidmesh-exact"
 version = "0.6.0"
 dependencies = [
  "geometry-predicates",
- "num-bigint 0.4.6",
+ "num-bigint",
  "num-traits",
  "smallvec",
 ]
@@ -1513,7 +1395,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags",
 ]
 
 [[package]]
@@ -1570,7 +1452,7 @@ name = "rslab"
 version = "1.0.0"
 dependencies = [
  "gemm",
- "num-complex 0.4.6",
+ "num-complex",
  "rayon",
  "rslab-amd",
  "rslab-amf",
@@ -1625,12 +1507,6 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "same-file"
@@ -1748,12 +1624,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1781,7 +1651,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01198a2debb237c62b6826ec7081082d951f46dbb64b0e8c7649a452230d1dfc"
 dependencies = [
- "bitflags 2.11.0",
+ "bitflags",
  "byteorder",
  "enum-as-inner",
  "libc",

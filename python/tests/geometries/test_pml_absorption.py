@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """PML termination — a matched absorber reflects almost nothing.
 
 A WR-90 (X-band) section is driven by a single RectWaveguidePort at z=min.

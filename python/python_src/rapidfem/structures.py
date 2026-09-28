@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Composite RF structure builders for :class:`rapidfem.geometry.Geometry`.
 
 Module-level functions (in the spirit of :meth:`Geometry.from_gds`) that

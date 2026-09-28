@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Time-domain DGTD problem, :class:`ProblemTD`.
 
 `ProblemTD` is the time-domain counterpart of :class:`ProblemFD`. Where
@@ -419,7 +423,7 @@ class ProblemTD:
                 "no effect on a ProblemTD analysis.",
                 stacklevel=2,
             )
-        self._op = TdOperator.from_fem_mesh(
+        self._op = TdOperator.from_model(
             geometry._fem_mesh, model, order, _FLUX[flux], self.c)
         self._geometry = geometry
         self.order = order

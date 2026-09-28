@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Edge-fed microstrip patch antenna — broadside far-field radiation.
 
 PHENOMENON: a rectangular patch on a grounded FR-4 substrate is a *broadside*

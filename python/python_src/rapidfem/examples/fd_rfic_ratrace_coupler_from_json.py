@@ -7,8 +7,8 @@ a difference at port 4 (port 3 isolated), and vice-versa for port 3.
 
 The geometry hits the polygon-with-holes pipeline in rapidfem, the ring
 is exported as a single annular polygon whose inner boundary is a hole,
-and the FEM bridge round-trips it through gmsh's Boolean cut so the
-inside of the ring stays oxide, not metal.
+and the FEM bridge keeps the hole in the extruded prism, so the inside
+of the ring stays oxide, not metal.
 
 At the chosen 10 GHz operating point the on-chip ring is too small for
 the design wavelength (this PDK + dimensions land deep below the

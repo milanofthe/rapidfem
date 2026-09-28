@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Build → mesh → solve helpers with a hard DOF budget for phenomenon tests.
 
 Every geometry test follows the same shape: build a parametric geometry, attach

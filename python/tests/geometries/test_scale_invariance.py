@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Scale invariance — the same electrical problem gives the same S-parameters.
 
 rapidfem non-dimensionalizes geometry by a characteristic length L0 before

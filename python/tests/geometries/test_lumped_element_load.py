@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Lumped R/L/C load termination — the textbook lumped-load reflection.
 
 A uniform line driven by a single ``rf.LumpedPort(z0=50)`` and terminated by an

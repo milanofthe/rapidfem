@@ -7,7 +7,7 @@ name: Deploy site
 # The notebook example outputs in
 # `python/python_src/rapidfem/ui/frontend-src/static/demo/` are pre-baked
 # LOCALLY by `python scripts/bake_demo.py` and checked into git, so CI never
-# runs gmsh + the FEM solver.
+# runs the mesher + the FEM solver.
 #
 # The API reference is extracted fresh in CI by `scripts/api_ref/build.py`
 # (griffe static analysis — RapidFEM itself is not installed).

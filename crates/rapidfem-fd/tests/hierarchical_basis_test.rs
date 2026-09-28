@@ -1,10 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
-//
+
 // Properties of the hierarchical basis — the only basis, once the interpolatory
 // one was removed.
 //

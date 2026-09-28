@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """WR-90 rectangular waveguide — S-parameters of a matched straight section.
 
 EXEMPLAR for the phenomenon suite: a matched, lossless WR-90 (X-band) section

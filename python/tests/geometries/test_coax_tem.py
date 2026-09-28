@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Coaxial line — S-parameters of a matched air-filled TEM section.
 
 A matched, lossless coax carries a pure TEM mode (no cutoff): it transmits

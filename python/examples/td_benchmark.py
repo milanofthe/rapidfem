@@ -3,9 +3,9 @@
 Where the Rust `bench` example measures the DGTD hot path on a structured
 box, this measures it on the geometry a production run actually sees: the
 dielectric ring resonator of ``td_ring_resonator.py``, a torus embedded
-in an air cavity, meshed unstructured by gmsh. That matters for the flux
+in an air cavity, meshed unstructured. That matters for the flux
 term's neighbour gather: on a structured box neighbouring elements sit
-close in memory, on a real gmsh mesh the element numbering scatters them,
+close in memory, on an unstructured mesh the element numbering scatters them,
 which is the access pattern the operator hits in practice.
 
 Two questions are measured, per mesh resolution:

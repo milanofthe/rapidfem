@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """A HIERARCHICAL basis for the same R2 space, and the proof that it is the same.
 
 The interpolatory basis in `element.py` gives every edge two degree-2 functions,

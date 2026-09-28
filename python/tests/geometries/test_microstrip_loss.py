@@ -97,8 +97,8 @@ def _hj_alpha_d(f):
 # ── one lossy-or-lossless microstrip solve at an exact modal frequency ──────
 def _solve(freq, *, metal, tand):
     g = rf.Geometry(maxh=rf.lambda_maxh(f_max=freq, er_max=ER, per_lambda=8))
-    # One element across the substrate: the loss bands below are calibrated on
-    # that resolution (three elements across quadruple the DOFs).
+    # One element across the substrate in the volume, the resolution the loss
+    # bands below are calibrated on; the port cross-sections get finer below.
     fr4 = rf.Dielectric(er=ER, tand=tand, maxh=SUB_H)
     sub = g.box(SUB_W, LINE_L, SUB_H, position=(-SUB_W / 2, 0, 0), material=fr4)
     air = g.box(SUB_W, LINE_L, AIR_H, position=(-SUB_W / 2, 0, SUB_H), material=rf.Air())
@@ -113,8 +113,14 @@ def _solve(freq, *, metal, tand):
     # (lossless) 2-D port mode via pec=[cond]; in 3-D they stay lossy SIBC (they
     # are NOT forced to 3-D PEC — build_pec_tris only excludes them from the
     # implicit exterior-PEC fill).
-    rf.WavePort(sub.faces.min(axis="y"), air.faces.min(axis="y"), f0=freq, mode_kind="auto", pec=[cond])
-    rf.WavePort(sub.faces.max(axis="y"), air.faces.max(axis="y"), f0=freq, mode_kind="auto", pec=[cond])
+    ports = [(sub.faces.min(axis="y"), air.faces.min(axis="y")),
+             (sub.faces.max(axis="y"), air.faces.max(axis="y"))]
+    # The 2-D port mode needs a finer cross-section than the volume.
+    for faces in ports:
+        for f in faces:
+            f.maxh = SUB_H / 3.0
+    for faces in ports:
+        rf.WavePort(*faces, f0=freq, mode_kind="auto", pec=[cond])
     # Closed metal shield: the y-ends are the ports, the other five faces PEC.
     rf.PEC(sub.faces.min(axis="x"), sub.faces.max(axis="x"),
            air.faces.min(axis="x"), air.faces.max(axis="x"), air.faces.max(axis="z"))

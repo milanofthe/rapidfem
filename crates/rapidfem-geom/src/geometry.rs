@@ -315,6 +315,10 @@ impl Geometry {
             match &o.item {
                 Item::Solid(shape) => {
                     let s = g.add_solid(shape.clone(), o.maxh, o.void).map_err(|e| e.to_string())?;
+                    // a void has no region to size: its maxh goes to its walls
+                    if let (true, Some(h)) = (o.void, o.maxh) {
+                        g.refine_surface(s, h);
+                    }
                     solids[i] = Some(s);
                 }
                 Item::Sheet(sheet) => {
@@ -477,6 +481,34 @@ impl Geometry {
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out.dedup_by(|a, b| a.0 == b.0);
         Ok(out)
+    }
+
+    /// The volume enclosed by a solid object's own shape (before other
+    /// solids carve it), for the primitives with a closed form.
+    pub fn solid_volume(&self, id: ObjId) -> Result<f64, String> {
+        use std::f64::consts::PI;
+        let area2 = |pts: &[[f64; 2]]| -> f64 {
+            let n = pts.len();
+            0.5 * (0..n)
+                .map(|i| pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1])
+                .sum::<f64>()
+                .abs()
+        };
+        let Item::Solid(shape) = &self.objects[id].item else {
+            return Err(format!("object {id} is a sheet"));
+        };
+        Ok(match shape {
+            Shape::Cuboid(c) => c.size[0] * c.size[1] * c.size[2],
+            Shape::Prism(p) => {
+                (area2(&p.points) - p.holes.iter().map(|h| area2(h)).sum::<f64>()) * p.height
+            }
+            Shape::Cylinder(c) => PI * c.radius * c.radius * c.height,
+            Shape::Cone(c) => PI * c.height * (c.r1 * c.r1 + c.r1 * c.r2 + c.r2 * c.r2) / 3.0,
+            Shape::Sphere(s) => 4.0 / 3.0 * PI * s.radius.powi(3),
+            Shape::Torus(t) => 2.0 * PI * PI * t.major_radius * t.minor_radius * t.minor_radius,
+            Shape::Wedge(w) => 0.5 * (w.size[0] + w.top_x) * w.size[1] * w.size[2],
+            _ => return Err(format!("object {id}: no closed-form volume for this shape")),
+        })
     }
 
     /// The first object whose solid holds `region`.

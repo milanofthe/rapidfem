@@ -1247,12 +1247,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         walls = sorted({tuple(f) for i in ids for f in self._native.faces_of(i)})
         infos = self._face_info(walls)
         area = sum(info[2] for info in infos)
-        # Volume of the voids by the divergence theorem over their walls:
-        # V = |sum A (c . n)| / 3, exact for planar walls.
-        volume = sum(abs(sum(info[2] * float(np.dot(info[0], info[1]))
-                             for info in self._face_info(
-                                 [tuple(f) for f in self._native.faces_of(i)])))
-                     for i in ids) / 3.0
+        # Volume from the shapes themselves: walls shared with another void
+        # (a contact) are not in the model, so the walls do not close.
+        volume = sum(self._native.volume(i) for i in ids)
         if volume <= 0.0 or area <= 0.0:
             raise ValueError(f"_hollow: {name!r} encloses no volume")
         faces = EntityCollection(self, [self._face(f) for f in walls])

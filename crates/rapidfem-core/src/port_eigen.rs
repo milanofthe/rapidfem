@@ -1480,12 +1480,12 @@ fn solve_vector_modes_core(
     // A − σB is symmetric indefinite and keeps one sparsity pattern for every
     // shift (the union of A and B), so the rslab LDLᵀ analyses it once and
     // only refactors the numeric values per σ.
-    // Start vector: the L2 projection of a uniform transverse field along a
-    // fixed global direction (x, or y on a face normal to x) onto the Eₜ
-    // space, zero Ez. A degenerate pair (the TE11 of a round guide) then
-    // converges to the member polarised along that direction on every port
-    // mesh, instead of a mixture set by the mesh: two ports of one guide
-    // agree on the polarisation.
+    // Reference polarisation: a uniform transverse field along a fixed global
+    // direction (x, or y on a face normal to x), as `∫ φ_i · ê dA` over the
+    // Eₜ DOFs. It picks the member of a degenerate pair below (the TE11 of a
+    // round guide), so the ports of one guide agree on the polarisation.
+    // (Not a start vector: a uniform field is a gradient and would seed the
+    // Krylov space with the discrete gradient null space.)
     // Eₜ mass (the Et-Et block of B), for the polarisation projections.
     let dtt: Vec<(usize, usize, f64)> =
         b_trip.iter().copied().filter(|&(i, j, _)| i < n_et && j < n_et).collect();
@@ -1498,7 +1498,7 @@ fn solve_vector_modes_core(
     };
     // ∫ φ_i · ê dA over the Eₜ DOFs, ê the reference polarisation.
     let mut polar_rhs: Option<Vec<f64>> = None;
-    let polarised_start: Option<Vec<f64>> = (|| {
+    let _: Option<()> = (|| {
         let n3 = [
             mesh.u_hat[1] * mesh.v_hat[2] - mesh.u_hat[2] * mesh.v_hat[1],
             mesh.u_hat[2] * mesh.v_hat[0] - mesh.u_hat[0] * mesh.v_hat[2],
@@ -1530,16 +1530,8 @@ fn solve_vector_modes_core(
                 }
             }
         }
-        let rr: Vec<usize> = dtt.iter().map(|t| t.0).collect();
-        let cc: Vec<usize> = dtt.iter().map(|t| t.1).collect();
-        let vv: Vec<f64> = dtt.iter().map(|t| t.2).collect();
-        let mut mass = crate::linalg::SymmetricSolver::<f64>::new();
-        mass.factorize(n_et, &rr, &cc, &vv).ok()?;
-        let mut v0 = mass.solve(&rhs).ok()?;
         polar_rhs = Some(rhs);
-        v0.resize(ndof, 0.0);
-        let n = v0.iter().map(|x| x * x).sum::<f64>().sqrt();
-        (n > 0.0).then(|| v0.into_iter().map(|x| x / n).collect())
+        Some(())
     })();
 
     let m_kry = ndof.min(80);
@@ -1561,19 +1553,12 @@ fn solve_vector_modes_core(
         }
         analysed = true;
         let solve = |bv: &[f64]| -> Option<Vec<f64>> { solver.solve(bv).ok() };
-        // Polarised start vector (see above); a deterministic fallback when
-        // the projection is unavailable (no RNG: keeps CI reproducible).
-        let v0: Vec<f64> = match &polarised_start {
-            Some(v) => v.clone(),
-            None => {
-                let mut v: Vec<f64> =
-                    (0..ndof).map(|i| (((i * 7 + 13) % 97) as f64 / 97.0) - 0.5).collect();
-                let n0 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if n0 == 0.0 { return Vec::new(); }
-                for x in &mut v { *x /= n0; }
-                v
-            }
-        };
+        // Deterministic start vector (no RNG: keeps CI reproducible).
+        let mut v0: Vec<f64> =
+            (0..ndof).map(|i| (((i * 7 + 13) % 97) as f64 / 97.0) - 0.5).collect();
+        let n0 = v0.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if n0 == 0.0 { return Vec::new(); }
+        for x in &mut v0 { *x /= n0; }
         let mut vs: Vec<Vec<f64>> = vec![v0];
         let mut hmat = vec![vec![0.0f64; m_kry]; m_kry + 1];
         let mut m_act = m_kry;
@@ -1614,7 +1599,12 @@ fn solve_vector_modes_core(
                 + evecs[(m_act - 1, k)].im.powi(2)).sqrt();
             let resid = beta_resid * y_last;
             let lambda = sigma + 1.0 / mu_re;
-            if resid > 1e-4 * mu_re.abs() { continue; }
+            if resid > 1e-4 * mu_re.abs() {
+                if debug {
+                    eprintln!("    σ={sigma:.4e}: Ritz λ={lambda:.4e} rejected, residual {:.2e}", resid / mu_re.abs());
+                }
+                continue;
+            }
             // Ritz vector x = V · y_k (real part).
             let mut x = vec![0.0f64; ndof];
             for jj in 0..m_act {

@@ -204,6 +204,11 @@ impl PyGeometry {
         Ok(self.inner.edges_of(id).map_err(err)?.into_iter().map(|(r, m)| ((r[0], r[1]), m)).collect())
     }
 
+    /// Volume of a solid object's own shape (before other solids carve it).
+    fn volume(&self, id: ObjId) -> PyResult<f64> {
+        self.inner.solid_volume(id).map_err(PyValueError::new_err)
+    }
+
     fn translate(&mut self, id: ObjId, d: P3) -> PyResult<()> {
         self.inner.translate(id, d).map_err(PyValueError::new_err)
     }

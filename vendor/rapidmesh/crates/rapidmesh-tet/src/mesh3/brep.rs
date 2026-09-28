@@ -19,7 +19,7 @@ use crate::curve::{closest_arc, Curve, PolylineCurve};
 use crate::domain::DomainTree;
 use geometry_predicates::orient3d;
 use rapidmesh_brep::index::FacetBvh;
-use rapidmesh_brep::Brep;
+use rapidmesh_brep::{Brep, Curve as BCurve, Surface};
 use rapidmesh_csg::Tri;
 use rapidmesh_geom::{RegionTag, TaggedPlc};
 use std::sync::Arc;
@@ -330,6 +330,8 @@ pub(crate) struct BrepShape<'a> {
     brep: &'a Brep,
     /// Per oracle curve: the analytic edge curve and a dense sample of it.
     curves: Vec<Option<(Box<dyn Curve>, Vec<(f64, P3)>)>>,
+    /// Per oracle curve: whether it is smooth (not a polyline).
+    smooth_curve: Vec<bool>,
 }
 
 impl<'a> BrepShape<'a> {
@@ -350,11 +352,30 @@ impl<'a> BrepShape<'a> {
                 Some((c, samples))
             })
             .collect();
-        BrepShape { brep, curves }
+        let smooth_curve = oracle
+            .curve_edge
+            .iter()
+            .map(|&ei| !matches!(brep.edges[ei as usize].curve, BCurve::Polyline))
+            .collect();
+        BrepShape {
+            brep,
+            curves,
+            smooth_curve,
+        }
     }
 }
 
 impl Shape for BrepShape<'_> {
+    fn smooth(&self, kind: VertexKind) -> bool {
+        match kind {
+            VertexKind::Patch(f) => self.brep.faces.get(f as usize).is_some_and(|face| {
+                !matches!(self.brep.surface(face.surface), Surface::Discrete(_))
+            }),
+            VertexKind::Curve(c) => self.smooth_curve.get(c as usize).copied().unwrap_or(false),
+            _ => false,
+        }
+    }
+
     fn project(&self, kind: VertexKind, p: P3) -> Option<P3> {
         match kind {
             VertexKind::Patch(f) => {

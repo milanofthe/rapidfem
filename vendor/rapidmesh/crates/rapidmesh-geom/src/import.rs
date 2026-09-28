@@ -54,8 +54,10 @@ pub const CREASE_DEG: f64 = 40.0;
 
 /// Builds a [`Faceted`] from raw triangles: drops exactly degenerate facets,
 /// groups the rest into smooth regions at crease edges (`crease_deg`), and
-/// gives every region ONE [`SurfaceKind::Discrete`] carrier.
-fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
+/// gives every region ONE carrier: a plane where its facets lie in one (to
+/// the tolerance the B-rep checks planes with), else a
+/// [`SurfaceKind::Discrete`] patch.
+pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
     let tris: Vec<Tri> = tris
         .into_iter()
         .filter(|t| collinear(&t.point(0), &t.point(1), &t.point(2)) != Some(true))
@@ -227,7 +229,36 @@ fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
             f.features.push([points[a as usize], points[b as usize]]);
         }
     }
+    // The tolerance of a plane: as the B-rep's, relative to the extent.
+    let (lo, hi) = points
+        .iter()
+        .fold(([f64::MAX; 3], [f64::MIN; 3]), |(lo, hi), p| {
+            (
+                std::array::from_fn(|k| lo[k].min(p[k])),
+                std::array::from_fn(|k| hi[k].max(p[k])),
+            )
+        });
+    let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+    let flat_tol = 1e-9 * diag.max(1.0);
     for members in regions {
+        // Flat: every vertex on the plane of the region's first facet.
+        let first = conn[members[0] as usize];
+        let o = points[first[0] as usize];
+        let n = normals[members[0] as usize];
+        let flat = members.iter().all(|&fi| {
+            conn[fi as usize].iter().all(|&v| {
+                let p = points[v as usize];
+                ((p[0] - o[0]) * n[0] + (p[1] - o[1]) * n[1] + (p[2] - o[2]) * n[2]).abs()
+                    <= flat_tol
+            })
+        });
+        if flat {
+            let s = f.add_surface(SurfaceKind::Plane);
+            for &fi in &members {
+                f.push_tri(tris[fi as usize], s);
+            }
+            continue;
+        }
         let mut l_vid: HashMap<u32, u32> = HashMap::new();
         let mut l_pts: Vec<[f64; 3]> = Vec::new();
         let mut l_tris: Vec<[u32; 3]> = Vec::new();

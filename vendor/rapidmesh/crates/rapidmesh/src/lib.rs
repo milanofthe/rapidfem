@@ -32,6 +32,7 @@ pub mod export;
 mod features;
 mod geometry;
 mod mesh;
+mod msh;
 pub mod scenes;
 pub mod shapes;
 
@@ -39,7 +40,9 @@ pub use features::{EdgeCut, EdgePick};
 pub use geometry::{
     Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions, DEFAULT_CELLS_ACROSS,
 };
+pub use geometry::{Object, SheetRef, Transform};
 pub use mesh::{Diagnostics, Labels, Mesh, Run, Sets, SolidInfo, SurfaceMesh, TetView, TriView};
+pub use msh::{load_msh, read_msh};
 pub use rapidmesh_brep::{EdgeFilter, EdgeKind, FaceFilter, Topology};
 pub use rapidmesh_exact::log::{Event, Level as LogLevel};
 pub use rapidmesh_geom::TaggedPlc;

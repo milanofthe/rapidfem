@@ -186,6 +186,16 @@ impl Scene {
         self.solids[i] = f;
     }
 
+    /// The shape of sheet `i`, in the order they were added.
+    pub fn sheet(&self, i: usize) -> Option<&Faceted> {
+        self.sheets.get(i).map(|(f, _)| f)
+    }
+
+    /// Replaces the shape of sheet `i`, keeping its face tag.
+    pub fn replace_sheet(&mut self, i: usize, f: Faceted) {
+        self.sheets[i].0 = f;
+    }
+
     /// Adds an embedded sheet with a face tag (use a nonzero tag).
     pub fn add_sheet(&mut self, f: Faceted, tag: FaceTag) {
         self.sheets.push((f, tag));

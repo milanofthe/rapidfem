@@ -47,8 +47,11 @@ pub struct FaceTopo {
     /// The role of its surface in the shape it came from (the order each
     /// primitive documents; a box: -z, +z, -y, +y, -x, +x).
     pub role: u32,
-    /// Edge ids on this face's boundary loops (sorted, deduplicated).
+    /// Edge ids on this face: of its loops and inside it (sorted,
+    /// deduplicated).
     pub edges: Vec<u32>,
+    /// Axis-aligned bounding box `[min, max]` of its facets.
+    pub bbox: [V3; 2],
 }
 
 /// One edge of the boundary, with its sizing-relevant geometry and incidence.
@@ -65,6 +68,8 @@ pub struct EdgeTopo {
     pub kind: EdgeKind,
     /// Face ids meeting along this edge (the radial cycle), sorted, deduplicated.
     pub faces: Vec<u32>,
+    /// Axis-aligned bounding box `[min, max]` of its chain.
+    pub bbox: [V3; 2],
 }
 
 /// The region / face / edge read model. Face and edge ids are indices into
@@ -73,6 +78,9 @@ pub struct EdgeTopo {
 pub struct Topology {
     /// Distinct meshed region tags (`> 0`), ascending.
     pub regions: Vec<u32>,
+    /// Axis-aligned bounding box `[min, max]` of each region (of the faces
+    /// bounding it), parallel to `regions`.
+    pub region_bbox: Vec<[V3; 2]>,
     pub faces: Vec<FaceTopo>,
     pub edges: Vec<EdgeTopo>,
 }
@@ -359,9 +367,13 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
     }
     for (fi, f) in brep.faces.iter().enumerate() {
         let (mut area, mut cen, mut nrm) = (0.0f64, [0.0; 3], [0.0; 3]);
+        let mut bbox = EMPTY;
         for &ti in &f.facets {
             let t = plc.triangles[ti as usize];
             let (a, b, c) = (vtx(t[0]), vtx(t[1]), vtx(t[2]));
+            for p in [a, b, c] {
+                grow(&mut bbox, p);
+            }
             let n = cross(sub(b, a), sub(c, a));
             let ar = 0.5 * norm(n);
             area += ar;
@@ -393,6 +405,7 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
             owner: f.owner,
             role: f.role,
             edges,
+            bbox,
         });
     }
 
@@ -432,6 +445,10 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
         let mut faces_of: Vec<u32> = e.coedges.iter().map(|&c| brep.coedge(c).face.0).collect();
         faces_of.sort_unstable();
         faces_of.dedup();
+        let mut bbox = EMPTY;
+        for &p in &e.chain {
+            grow(&mut bbox, p);
+        }
         edges.push(EdgeTopo {
             p0,
             p1,
@@ -439,6 +456,7 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
             length,
             kind,
             faces: faces_of,
+            bbox,
         });
     }
 
@@ -450,11 +468,33 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
         .collect();
     regions.sort_unstable();
     regions.dedup();
+    let region_bbox = regions
+        .iter()
+        .map(|&r| {
+            let mut bbox = EMPTY;
+            for f in faces.iter().filter(|f| f.regions.contains(&r)) {
+                grow(&mut bbox, f.bbox[0]);
+                grow(&mut bbox, f.bbox[1]);
+            }
+            bbox
+        })
+        .collect();
 
     Topology {
         regions,
+        region_bbox,
         faces,
         edges,
+    }
+}
+
+/// The empty box, which the first point grows to itself.
+const EMPTY: [V3; 2] = [[f64::INFINITY; 3], [f64::NEG_INFINITY; 3]];
+
+fn grow(b: &mut [V3; 2], p: V3) {
+    for k in 0..3 {
+        b[0][k] = b[0][k].min(p[k]);
+        b[1][k] = b[1][k].max(p[k]);
     }
 }
 

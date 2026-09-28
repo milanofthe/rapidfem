@@ -25,6 +25,13 @@ pub trait Shape: Sync {
     /// The point of the shape a vertex of `kind` at `p` belongs at: on its
     /// patch's carrier or its curve. `None` leaves the vertex where it is.
     fn project(&self, kind: VertexKind, p: P3) -> Option<P3>;
+
+    /// Whether a vertex of `kind` may slide on its carrier or curve for
+    /// quality: a smooth one, not a faceted patch or a polyline, whose
+    /// facets and kinks a moved vertex would cut.
+    fn smooth(&self, _kind: VertexKind) -> bool {
+        true
+    }
 }
 
 /// What [`snap`] did.

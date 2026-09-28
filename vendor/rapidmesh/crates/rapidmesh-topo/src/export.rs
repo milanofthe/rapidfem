@@ -143,12 +143,15 @@ fn write_parts(mesh: &Parts<'_>, names: &Names, w: &mut impl Write) -> io::Resul
                 .push(sf.tri.to_vec());
         }
     }
+    // gmsh counts a tet positive when its fourth corner lies on the side
+    // the first three turn counterclockwise toward, the mirror of the
+    // mesher's orientation: two corners swap.
     for (t, tet) in mesh.tets.iter().enumerate() {
         blocks
             .entry((3, mesh.tet_regions[t].0))
             .or_insert((4, Vec::new()))
             .1
-            .push(tet.to_vec());
+            .push(vec![tet[0], tet[1], tet[3], tet[2]]);
     }
 
     // Nodes per entity.
@@ -330,8 +333,10 @@ fn write_vtu_parts(mesh: &Parts<'_>, w: &mut impl Write) -> io::Result<()> {
         w,
         "<DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">"
     )?;
+    // VTK, like gmsh, wants the first three corners to turn toward the
+    // fourth: the mirror of the mesher's orientation.
     for t in mesh.tets {
-        writeln!(w, "{} {} {} {}", t[0], t[1], t[2], t[3])?;
+        writeln!(w, "{} {} {} {}", t[0], t[1], t[3], t[2])?;
     }
     for f in mesh.faces {
         writeln!(w, "{} {} {}", f.tri[0], f.tri[1], f.tri[2])?;

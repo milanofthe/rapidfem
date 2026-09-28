@@ -80,6 +80,10 @@ def main() -> None:
     paths = [f"crates/{c}" for c in CRATES] + ["LICENSE", "Cargo.lock"]
     tar = tarfile.open(fileobj=io.BytesIO(git(repo, "archive", ref, *paths)))
     tar.extractall(DEST, filter="data")
+    # git archive stamps files with the commit time, which can predate the
+    # last build; fresh mtimes make cargo see the new sources.
+    for f in DEST.rglob("*"):
+        f.touch()
 
     for crate in CRATES:
         base = DEST / "crates" / crate

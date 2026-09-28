@@ -9,8 +9,16 @@
 //! face move freely, vertices on one patch move along its carrier without
 //! turning a face; the rest stay. With a shape, a flat tet on a boundary
 //! may also be peeled off (or across an interface), which flips a surface
-//! edge. Work is
-//! proportional to the bad tets, not to the mesh.
+//! edge. Work is proportional to the bad tets, not to the mesh.
+//!
+//! Last comes a relaxation of the surface for its triangles, whose shape
+//! the tets on the boundary follow (gmsh's lead in the mean dihedral came
+//! from there): vertices on one smooth patch go toward the centroid of
+//! their faces, vertices inside a smooth curve toward the midpoint of
+//! their neighbours, where the smallest angle around them rises, their
+//! faces stray no further from the carriers, no tet at the target falls
+//! below it, none below gets worse and the mean of their star does not
+//! fall.
 
 use super::oracle::P3;
 use super::refine::tet_min_dihedral;
@@ -40,6 +48,10 @@ pub struct ImproveStats {
 
 /// A change must raise the local worst dihedral by at least this (degrees).
 const GAIN: f64 = 1e-3;
+
+/// Sweeps of the surface relaxation after the repair (a third gains next
+/// to nothing on the gmsh compare pairs).
+const RELAX_SWEEPS: usize = 2;
 
 /// Vertex move candidates: these directions (icosahedron vertices) at these
 /// fractions of the vertex's shortest edge.
@@ -784,6 +796,28 @@ impl Improver<'_> {
         Some(worst)
     }
 
+    /// Whether `v` may go to `x`: every tet of its star stays positive, none
+    /// at or above `target` drops below it and none below gets worse, their
+    /// dihedrals sum to at least what they did (the mean does not fall), and
+    /// no face through `v` turns.
+    fn star_accepts(&self, v: u32, star: &[u32], x: P3, target: f64) -> bool {
+        let (mut sum, mut sum0) = (0.0, 0.0);
+        for &t in star {
+            let tv = self.c.tets[t as usize];
+            let pts = tv.map(|w| if w == v { x } else { self.p(w) });
+            if !(orient3d(pts[0], pts[1], pts[2], pts[3]) > 0.0) {
+                return false;
+            }
+            let (q, q0) = (tet_min_dihedral(pts), self.q[t as usize]);
+            if q < q0.min(target) {
+                return false;
+            }
+            sum += q;
+            sum0 += q0;
+        }
+        sum >= sum0 && self.star_quality(v, &[], x, 0.0).is_some()
+    }
+
     fn commit_move(&mut self, v: u32, star: &[u32], x: P3) {
         self.c.points[v as usize] = x;
         self.touch(v);
@@ -1031,6 +1065,169 @@ impl<'a> Improver<'a> {
         }
     }
 
+    /// Where vertex `v` would go when relaxed: on one patch toward the
+    /// area-weighted centroid of its faces, inside a curve toward the
+    /// midpoint of its two neighbours along it (`along`), onto the carrier
+    /// or the curve; taken where the smallest angle of the faces around it
+    /// rises and its star accepts (see [`Improver::star_accepts`]). The full
+    /// step, else a half or a quarter of it.
+    fn plan_relax(
+        &self,
+        v: u32,
+        along: &FxHashMap<u32, SmallVec<[u32; 2]>>,
+        target: f64,
+    ) -> Option<P3> {
+        let shape = self.shape?;
+        let kind = self.c.kinds[v as usize];
+        let faces: SmallVec<[[u32; 3]; 8]> = self.vfaces[v as usize]
+            .iter()
+            .filter(|&&f| self.face_alive[f as usize])
+            .map(|&f| self.c.faces[f as usize].tri)
+            .collect();
+        let on_frozen = self.vfaces[v as usize]
+            .iter()
+            .any(|&f| self.frozen.contains(&self.c.faces[f as usize].patch));
+        if faces.len() < 3 || on_frozen || !shape.smooth(kind) {
+            return None;
+        }
+        let p0 = self.p(v);
+        let goal: P3 = match (self.mobility[v as usize], kind) {
+            (Mobility::Surface, _) => {
+                let (mut sum, mut area) = ([0.0; 3], 0.0);
+                for t in &faces {
+                    let [a, b, c] = t.map(|w| self.p(w));
+                    let (u, w) = (sub3(b, a), sub3(c, a));
+                    let n = [
+                        u[1] * w[2] - u[2] * w[1],
+                        u[2] * w[0] - u[0] * w[2],
+                        u[0] * w[1] - u[1] * w[0],
+                    ];
+                    let ar = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    for k in 0..3 {
+                        sum[k] += ar * (a[k] + b[k] + c[k]) / 3.0;
+                    }
+                    area += ar;
+                }
+                if !(area > 0.0) {
+                    return None;
+                }
+                sum.map(|c| c / area)
+            }
+            (_, VertexKind::Curve(_)) => match along.get(&v).map(|n| n.as_slice()) {
+                Some(&[a, b]) => {
+                    let (pa, pb) = (self.p(a), self.p(b));
+                    std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let angle = |x: P3| -> f64 {
+            faces
+                .iter()
+                .map(|t| {
+                    let at = |w: u32| if w == v { x } else { self.p(w) };
+                    super::surfopt::min_angle([at(t[0]), at(t[1]), at(t[2])])
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        // How far the faces around v stray from their carriers: their
+        // centroids' distance to them. A move may not raise it (a chord
+        // across a thin part, a bridge).
+        let patches: SmallVec<[u32; 8]> = self.vfaces[v as usize]
+            .iter()
+            .filter(|&&f| self.face_alive[f as usize])
+            .map(|&f| self.c.faces[f as usize].patch)
+            .collect();
+        let stray = |x: P3| -> f64 {
+            faces
+                .iter()
+                .zip(&patches)
+                .map(|(t, &p)| {
+                    let at = |w: u32| if w == v { x } else { self.p(w) };
+                    let c: P3 =
+                        std::array::from_fn(|k| (at(t[0])[k] + at(t[1])[k] + at(t[2])[k]) / 3.0);
+                    shape
+                        .project(VertexKind::Patch(p), c)
+                        .map_or(0.0, |q| dist(c, q))
+                })
+                .fold(0.0, f64::max)
+        };
+        let before = angle(p0);
+        let stray0 = stray(p0);
+        let star: SmallVec<[u32; 32]> = self.live(v).collect();
+        for frac in [1.0, 0.5, 0.25] {
+            let x0: P3 = std::array::from_fn(|k| p0[k] + frac * (goal[k] - p0[k]));
+            let x = shape.project(kind, x0)?;
+            if angle(x) > before + GAIN
+                && stray(x) <= stray0
+                && self.star_accepts(v, &star, x, target)
+            {
+                return Some(x);
+            }
+        }
+        None
+    }
+
+    /// Relaxes the surface over at most `sweeps` sweeps (see
+    /// [`Improver::plan_relax`]): each sweep plans every vertex in parallel
+    /// and applies the plans in order, planning again a vertex whose star
+    /// changed meanwhile; stops when a sweep moves nothing.
+    fn relax_surface(&mut self, sweeps: usize, target: f64) -> usize {
+        use rayon::prelude::*;
+        if self.shape.is_none() {
+            return 0;
+        }
+        // The neighbours of each vertex along its curve.
+        let mut along: FxHashMap<u32, SmallVec<[u32; 2]>> = FxHashMap::default();
+        for &([a, b], curve) in &self.c.feature_edges {
+            for (u, w) in [(a, b), (b, a)] {
+                if self.c.kinds[u as usize] == VertexKind::Curve(curve) {
+                    along.entry(u).or_default().push(w);
+                }
+            }
+        }
+        let candidates: Vec<u32> = (0..self.c.points.len() as u32)
+            .filter(|&v| !self.vfaces[v as usize].is_empty())
+            .collect();
+        let mut moved = 0;
+        let mut stamp = vec![0u32; self.c.points.len()];
+        for sweep in 1..=sweeps as u32 {
+            let plans: Vec<(u32, Option<P3>)> = candidates
+                .par_iter()
+                .map(|&v| (v, self.plan_relax(v, &along, target)))
+                .collect();
+            let mut any = false;
+            for (v, plan) in plans {
+                let Some(mut x) = plan else { continue };
+                let star: Vec<u32> = self.live(v).collect();
+                let stale = star.iter().any(|&t| {
+                    self.c.tets[t as usize]
+                        .iter()
+                        .any(|&w| stamp[w as usize] == sweep)
+                });
+                if stale {
+                    match self.plan_relax(v, &along, target) {
+                        Some(y) => x = y,
+                        None => continue,
+                    }
+                }
+                self.commit_move(v, &star, x);
+                for &t in &star {
+                    for w in self.c.tets[t as usize] {
+                        stamp[w as usize] = sweep;
+                    }
+                }
+                moved += 1;
+                any = true;
+            }
+            if !any {
+                break;
+            }
+        }
+        moved
+    }
+
     /// Moves the given vertices onto `shape`, curve vertices before patch
     /// vertices, as far as every tet of the star stays positive and none
     /// drops below `FLOOR_DEG` (or below where its star already was): the
@@ -1202,6 +1399,12 @@ pub fn finish(
             break;
         }
     }
+    // Last, so nothing after it undoes what it keeps: the surface relaxed
+    // for its triangles, no tet made worse than the target allows.
+    let t = rapidmesh_exact::clock::Instant::now();
+    let n = im.relax_surface(RELAX_SWEEPS, target_deg);
+    rapidmesh_exact::log::stage("mesh3.relax", t.elapsed().as_secs_f64());
+    rapidmesh_exact::log::stat("mesh3.relaxed", n as f64);
     let mut st = im.compact(target_deg);
     st.bad_before = before;
     (ss, st, short.len())
@@ -1284,6 +1487,47 @@ mod tests {
         assert!(r.ok(), "{r:?} {st:?}");
         assert!(st.bad_after <= st.bad_before, "{st:?}");
         // Surface moves and peels change the volumes only slightly.
+        for ((reg, v0), (_, v1)) in before.volumes.iter().zip(&r.volumes) {
+            assert!((v0 - v1).abs() < 5e-3 * v0, "region {reg}: {v0} -> {v1}");
+        }
+    }
+
+    #[test]
+    fn surface_relaxation_lifts_the_triangles_and_keeps_the_tets() {
+        let radii = [0.5, 1.0];
+        let (mut c, _) = mesh(
+            &Balls::new([0.0; 3], &radii),
+            &Uniform(0.2),
+            &Params::default(),
+        );
+        let shape = Spheres(radii.to_vec());
+        super::super::snap::snap(&mut c, &shape);
+        improve(&mut c, Some(&shape), 25.0, 4);
+        let tri_mean = |c: &Complex| {
+            let angles: Vec<f64> = c
+                .faces
+                .iter()
+                .map(|f| super::super::surfopt::min_angle(f.tri.map(|v| c.points[v as usize])))
+                .collect();
+            angles.iter().sum::<f64>() / angles.len() as f64
+        };
+        let worst = |c: &Complex| {
+            c.tets
+                .iter()
+                .map(|t| tet_min_dihedral(t.map(|v| c.points[v as usize])))
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (a0, w0) = (tri_mean(&c), worst(&c));
+        let before = check(&c);
+        let mut im = Improver::new(&mut c, Some(&shape), &[]);
+        let moved = im.relax_surface(RELAX_SWEEPS, 25.0);
+        im.compact(25.0);
+        let r = check(&c);
+        assert!(r.ok(), "{r:?}");
+        assert!(moved > 0);
+        let (a1, w1) = (tri_mean(&c), worst(&c));
+        assert!(a1 > a0 + 1.0, "triangles {a0} -> {a1}");
+        assert!(w1 >= w0.min(25.0), "worst tet {w0} -> {w1}");
         for ((reg, v0), (_, v1)) in before.volumes.iter().zip(&r.volumes) {
             assert!((v0 - v1).abs() < 5e-3 * v0, "region {reg}: {v0} -> {v1}");
         }

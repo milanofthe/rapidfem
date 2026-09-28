@@ -30,10 +30,10 @@ pub use nurbs_surface::NurbsSurface;
 pub use plc::{FaceTag, RegionTag, SurfaceRef, TaggedPlc};
 pub use polygon::{polygon_orientation, triangulate_polygon};
 pub use prim::{
-    cylinder, cylinder_iso, extrude_polygon, extrude_profile, extrude_spline_profile, facet_count,
-    facet_subdivisions, frustum, frustum_iso, helix, icosphere, loft, mesh_solid, naca0012_profile,
-    pipe, revolve, revolve_at, sheet_disk, sheet_nurbs, sheet_polygon, sheet_rect, solid_box,
-    sphere, torus, wedge, ProfileEdge,
+    cylinder, cylinder_iso, extrude_polygon, extrude_profile, extrude_sheet,
+    extrude_spline_profile, facet_count, facet_subdivisions, frustum, frustum_iso, helix,
+    icosphere, loft, mesh_solid, naca0012_profile, pipe, revolve, revolve_at, sheet_disk,
+    sheet_nurbs, sheet_polygon, sheet_rect, solid_box, sphere, torus, wedge, ProfileEdge,
 };
 pub use scene::{AssembleError, Scene};
 pub use tube::TubePath;

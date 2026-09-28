@@ -6,6 +6,10 @@
 //! the earlier ones. Sheets are zero-thickness faces embedded into the
 //! volume mesh with an integer tag (PEC traces, ports).
 
+mod ops;
+
+pub use ops::{Object, SheetRef, Transform};
+
 use crate::features::{EdgeCut, EdgePick};
 use crate::mesh::{Labels, Mesh, Run, SolidInfo, SurfaceMesh};
 use crate::shapes::{Shape, Sheet};
@@ -256,6 +260,9 @@ pub struct Geometry {
     /// Named faces and edges as given, resolved when a mesh is made.
     named: Vec<(String, Scope)>,
     labels: Labels,
+    /// Per sheet, parallel to the scene's: how it was given and the
+    /// transforms applied to it since, in order.
+    sheets: Vec<(Sheet, Vec<Transform>)>,
 }
 
 impl Default for Geometry {
@@ -280,6 +287,7 @@ impl Geometry {
             periodic: Vec::new(),
             named: Vec::new(),
             labels: Labels::default(),
+            sheets: Vec::new(),
         }
     }
 
@@ -481,14 +489,18 @@ impl Geometry {
 
     /// Embeds `sheet` with face tag `tag` and (the smallest given) target
     /// size `maxh` on the tag.
-    pub fn add_sheet(&mut self, sheet: &Sheet, tag: u32, maxh: Option<f64>) -> Result<()> {
+    pub fn add_sheet(&mut self, sheet: &Sheet, tag: u32, maxh: Option<f64>) -> Result<SheetRef> {
         let f = sheet.faceted()?;
         if let Some(h) = maxh {
             let e = self.face_maxh.entry(tag).or_insert(h);
             *e = e.min(h);
         }
         self.scene_mut().add_sheet(f, FaceTag(tag));
-        Ok(())
+        self.sheets.push((sheet.clone(), Vec::new()));
+        Ok(SheetRef {
+            index: self.sheets.len() as u32 - 1,
+            tag,
+        })
     }
 
     /// Fuses overlapping solids into one material: the faces between them

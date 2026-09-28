@@ -583,31 +583,33 @@ fn signed_volume(f: &Faceted) -> f64 {
 /// Solid from an externally supplied triangle soup (an imported STL surface,
 /// a marching-cubes iso-surface, etc.). The input must describe a closed,
 /// non-self-intersecting surface; the winding is normalized to outward via the
-/// signed volume (every triangle flips together when the soup is inward). Each
-/// triangle is its own first-class facet on a single shared [`SurfaceKind::Plane`]
-/// surface (no `FlatFacet` grouping, so the conformal arrangement treats the
-/// many small facets independently rather than as one coplanar face). Fidelity
-/// snapping is off, as for any faceted import: the triangles are the surface.
+/// signed volume (every triangle flips together when the soup is inward). The
+/// triangles are grouped as an import is, at creases of
+/// [`crate::import::CREASE_DEG`]: a flat group gets a plane carrier, a curved
+/// one its own facets as a discrete carrier, and the creases become edges.
 pub fn mesh_solid(verts: &[[f64; 3]], tris: &[[u32; 3]]) -> Faceted {
     assert!(!tris.is_empty(), "mesh_solid needs at least one triangle");
-    let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Plane);
-    for t in tris {
-        let (a, b, c) = (
-            verts[t[0] as usize],
-            verts[t[1] as usize],
-            verts[t[2] as usize],
-        );
-        f.push_tri(Tri::new(a, b, c), s);
-    }
-    let vol = signed_volume(&f);
+    // Outward first, so the carriers see the right side.
+    let vol: f64 = tris
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|v| verts[v as usize]);
+            dot3(a, cross3(b, c))
+        })
+        .sum();
     assert!(vol.abs() > 0.0, "degenerate mesh_solid (zero volume)");
-    if vol < 0.0 {
-        for t in &mut f.tris {
-            t.v.swap(1, 2);
-        }
-    }
-    f
+    let soup: Vec<Tri> = tris
+        .iter()
+        .map(|t| {
+            let [a, b, c] = t.map(|v| verts[v as usize]);
+            if vol < 0.0 {
+                Tri::new(a, c, b)
+            } else {
+                Tri::new(a, b, c)
+            }
+        })
+        .collect();
+    crate::import::faceted_from_tris_creased(soup, crate::import::CREASE_DEG)
 }
 
 /// Cylinder with an isotropic barrel: instead of [`cylinder`]'s single ring of
@@ -1185,6 +1187,102 @@ pub fn sheet_nurbs(surface: &NurbsSurface, segments: [usize; 2]) -> Faceted {
     }
     f.corners = corners;
     f
+}
+
+/// The solid a flat sheet sweeps along `w` (not parallel to it): the sheet's
+/// own faces as the bottom (its vertices kept exactly), the same moved by
+/// `w` as the top, and a wall along every boundary edge. The walls of a
+/// loop get one carrier each, a plane per edge, unless `rim` gives the
+/// carrier all outer walls share (the cylinder under a disc). Surfaces:
+/// bottom, top, then the walls; the sheet's corners are corners at both
+/// ends.
+pub fn extrude_sheet(
+    sheet: &Faceted,
+    w: [f64; 3],
+    rim: Option<SurfaceKind>,
+) -> Result<Faceted, String> {
+    if sheet.flats.is_empty()
+        || sheet.tris.len() != sheet.flats.iter().map(|f| f.tris.len()).sum::<usize>()
+    {
+        return Err("only a flat sheet extrudes".into());
+    }
+    let wl = dot3(w, w).sqrt();
+    if !(wl > 0.0 && wl.is_finite()) {
+        return Err("an extrusion needs a nonzero vector".into());
+    }
+    let mut f = Faceted::new();
+    f.frame = sheet.frame;
+    let bottom = f.add_surface(SurfaceKind::Plane);
+    let top = f.add_surface(SurfaceKind::Plane);
+    let rim_surface = rim.map(|k| f.add_surface(k));
+    let up = |p: [f64; 3]| add(p, w);
+    for fl in &sheet.flats {
+        let tris = &sheet.tris[fl.tris.clone()];
+        let n = tris.iter().fold([0.0; 3], |acc, t| {
+            add(
+                acc,
+                cross3(
+                    crate::vec3::sub(t.v[1], t.v[0]),
+                    crate::vec3::sub(t.v[2], t.v[0]),
+                ),
+            )
+        });
+        let along = dot3(n, w);
+        if !(along.abs() > 1e-9 * dot3(n, n).sqrt() * wl) {
+            return Err("an extrusion vector must leave the sheet's plane".into());
+        }
+        // The loops wind about n; the sweep goes with n or against it.
+        let with = along > 0.0;
+        let flip = |t: [[f64; 3]; 3], out: bool| if out { t } else { [t[0], t[2], t[1]] };
+        let cap = |pts: &[[f64; 3]]| pts.to_vec();
+        let down: Vec<Tri> = tris
+            .iter()
+            .map(|t| {
+                let v = flip(t.v, !with);
+                Tri::new(v[0], v[1], v[2])
+            })
+            .collect();
+        let raised: Vec<Tri> = tris
+            .iter()
+            .map(|t| {
+                let v = flip(t.v.map(up), with);
+                Tri::new(v[0], v[1], v[2])
+            })
+            .collect();
+        let lower = PlanarFacet::with_holes(cap(&fl.facet.outer), fl.facet.holes.clone());
+        let upper = PlanarFacet::with_holes(
+            fl.facet.outer.iter().map(|&p| up(p)).collect(),
+            fl.facet
+                .holes
+                .iter()
+                .map(|h| h.iter().map(|&p| up(p)).collect())
+                .collect(),
+        );
+        f.push_flat(lower, &down, bottom);
+        f.push_flat(upper, &raised, top);
+        let loops = std::iter::once((&fl.facet.outer, true))
+            .chain(fl.facet.holes.iter().map(|h| (h, false)));
+        for (lp, outer) in loops {
+            for k in 0..lp.len() {
+                let (a, b) = (lp[k], lp[(k + 1) % lp.len()]);
+                let (ah, bh) = (up(a), up(b));
+                let s = match (rim_surface, outer) {
+                    (Some(s), true) => s,
+                    _ => f.add_surface(SurfaceKind::Plane),
+                };
+                for t in [[a, b, bh], [a, bh, ah]] {
+                    let t = flip(t, with);
+                    f.push_tri(Tri::new(t[0], t[1], t[2]), s);
+                }
+            }
+        }
+    }
+    f.corners = sheet.corners.iter().flat_map(|&c| [c, up(c)]).collect();
+    let vol = signed_volume(&f);
+    if !(vol > 0.0) {
+        return Err(format!("the extruded solid has no volume ({vol})"));
+    }
+    Ok(f)
 }
 
 // ---------------------------------------------------------------- revolve

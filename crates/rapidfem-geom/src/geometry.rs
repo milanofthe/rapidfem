@@ -358,12 +358,8 @@ impl Geometry {
             g.cut_edges(solid, &op.edges, op.cut, op.void).map_err(|e| e.to_string())?;
         }
         for ids in &self.unions {
-            // holes have no material region to merge
-            let s: Vec<Solid> = ids
-                .iter()
-                .filter(|&&i| !self.objects[i].void)
-                .filter_map(|&i| solids.get(i).copied().flatten())
-                .collect();
+            // holes merge too: fused pieces of one conductor are one hole
+            let s: Vec<Solid> = ids.iter().filter_map(|&i| solids.get(i).copied().flatten()).collect();
             if s.len() > 1 {
                 let keep = g.union(&s).map_err(|e| e.to_string())?;
                 for &i in ids {

@@ -17,5 +17,9 @@ rslab = { path = "../../vendor/rslab", features = ["tuning"] }
 # Small dense eigenproblems only (the Krylov-projected matrices of the
 # eigenmode and port-mode solvers); every sparse solve goes through rslab.
 faer = { version = "0.24", default-features = false, features = ["std"] }
+# The mesh topology (edges, faces, incidences) of rapidmesh's solver
+# interface, std-only without its mesher feature; vendored from
+# https://github.com/milanofthe/rapidmesh.
+rapidmesh-topo = { path = "../../vendor/rapidmesh/crates/rapidmesh-topo" }
 hashbrown = "0.16.1"
 num-complex = "0.4.6"

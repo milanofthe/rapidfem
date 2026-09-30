@@ -243,9 +243,13 @@ fn global_assembly_is_pinned_anisotropic_material() {
 // (0x2cb6abad262c36f9, the same as under the interpolatory basis). It moved only
 // once, at stage 1, when the DOF numbering went from mode-major to entity-major
 // (from 0xc6a1417eefe03ae5) — a permutation, licensed by
-// `numbering_is_a_relabelling_of_the_mode_major_layout`. Nothing else may move it.
+// `numbering_is_a_relabelling_of_the_mode_major_layout`. It moved a second
+// time when the mesh topology came to rapidmesh's `TetTopology`
+// (from 0x2cb6abad262c36f9): the faces are numbered in the order rapidmesh
+// meets them, another permutation of the face DOFs; the abs-sums and
+// Frobenius norms stayed bit-identical. Nothing else may move it.
 // ---------------------------------------------------------------------------
-const PATTERN_HASH: u64 = 0x2cb6_abad_262c_36f9;
+const PATTERN_HASH: u64 = 0x4ff3_6f06_58ab_bd61;
 
 const E_ABS_IDENT: f64 = 3.58422713063467370e2;
 const E_FRO_IDENT: f64 = 1.98545509756439778e1;

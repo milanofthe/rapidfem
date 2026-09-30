@@ -1260,6 +1260,7 @@ dependencies = [
  "faer",
  "hashbrown",
  "num-complex",
+ "rapidmesh-topo",
  "rslab",
 ]
 

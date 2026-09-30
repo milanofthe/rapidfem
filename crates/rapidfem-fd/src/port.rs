@@ -13,6 +13,10 @@ pub trait Port {
     /// Robin BC impedance parameter γ
     fn get_gamma(&self, exc: &Excitation) -> C64;
 
+    /// An anisotropic Robin coefficient (3×3, global frame) for the port's
+    /// `k`-th triangle, where it differs from γ.
+    fn tri_tensor(&self, _exc: &Excitation, _k: usize) -> Option<[[C64; 3]; 3]> { None }
+
     /// Incident field U_inc at a global point (for excitation vector).
     /// Returns None for non-driven ports (e.g. ABC).
     fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<[C64; 3]>;
@@ -79,7 +83,16 @@ macro_rules! impl_driven_port {
 }
 
 impl_passive_port!(crate::waveguide::LumpedElement);
-impl_passive_port!(crate::waveguide::SurfaceImpedance);
+impl Port for crate::waveguide::SurfaceImpedance {
+    fn get_gamma(&self, exc: &Excitation) -> C64 { self.get_gamma(exc) }
+    fn tri_tensor(&self, exc: &Excitation, k: usize) -> Option<[[C64; 3]; 3]> { self.tri_tensor(exc, k) }
+    fn get_uinc(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> Option<[C64; 3]> { None }
+    fn is_driven(&self) -> bool { false }
+    fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation)
+        -> Option<(f64, f64, f64)> { None }
+    fn z_mode(&self, _exc: &Excitation) -> f64 { 0.0 }
+    fn port_number(&self) -> usize { 0 }
+}
 impl_passive_port!(crate::waveguide::AbsorbingBoundary);
 
 impl_driven_port!(crate::waveguide::RectWaveguide, |p: &crate::waveguide::RectWaveguide, exc| p.z_mode(exc));

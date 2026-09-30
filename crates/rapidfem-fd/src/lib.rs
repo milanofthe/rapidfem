@@ -22,6 +22,7 @@ pub mod waveguide;
 pub mod sparam;
 pub mod interp;
 pub mod port;
+pub mod sibc_edge;
 pub mod error_estimator;
 pub mod eigenmode;
 pub mod assembly;

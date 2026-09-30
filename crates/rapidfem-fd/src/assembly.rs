@@ -20,7 +20,7 @@ use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::port::Port;
 use crate::tet_assembly::assemble_global_matrices;
-use crate::tri_assembly::{tri_stiff, tri_force};
+use crate::tri_assembly::{tri_force, tri_stiff, tri_stiff_tensor};
 use crate::quadrature::gaus_quad_tri;
 use std::collections::HashSet;
 
@@ -140,11 +140,14 @@ pub fn assemble_and_solve_with_pml(
         let gamma = port.get_gamma(&exc);
 
         // Robin BC stiffness: for each port tri, compute 8x8 and write into flat array
-        for &ti in *tri_ids {
+        for (k, &ti) in tri_ids.iter().enumerate() {
             let tri = &mesh.tris[ti];
             let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
             let owners = tri_owners(basis, mesh, ti);
-            let bsub = tri_stiff(&owners, &verts, gamma);
+            let bsub = match port.tri_tensor(&exc, k) {
+                Some(tensor) => tri_stiff_tensor(&owners, &verts, &tensor),
+                None => tri_stiff(&owners, &verts, gamma),
+            };
             // The block reserved for this triangle is n×n, with n from the DOF
             // map, and the element produced exactly n functions from the same
             // owner list. Under the minimum rule n need not be 8.
@@ -456,11 +459,14 @@ pub fn frequency_sweep_with_pml(
         bempty.fill(C64::new(0.0, 0.0));
         for (_, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
             let gamma = port.get_gamma(&exc);
-            for &ti in *tri_ids {
+            for (k, &ti) in tri_ids.iter().enumerate() {
                 let tri = &mesh.tris[ti];
                 let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
                 let owners = tri_owners(basis, mesh, ti);
-                let bsub = tri_stiff(&owners, &verts, gamma);
+                let bsub = match port.tri_tensor(&exc, k) {
+                    Some(tensor) => tri_stiff_tensor(&owners, &verts, &tensor),
+                    None => tri_stiff(&owners, &verts, gamma),
+                };
                 let n = basis.tri_dofs(ti).len();
                 let p = basis.tri_block(ti);
                 for ii in 0..n { for jj in 0..n { bempty[p + ii*n + jj] += bsub[ii*n + jj]; } }

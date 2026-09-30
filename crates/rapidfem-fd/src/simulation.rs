@@ -143,7 +143,8 @@ impl Simulation {
                 String::new()
             }
         );
-        let (ports, port_tris) = build_ports(&mesh, &model, &materials)?;
+        let f_min = settings.frequencies.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (ports, port_tris) = build_ports(&mesh, &model, &materials, f_min)?;
         let pec_tris = build_pec_tris(&mesh, &model);
         let pml_regions = build_pml_regions(&mesh, &model);
 
@@ -743,10 +744,13 @@ impl Simulation {
 // Construction helpers, extracted from main.rs's prior orchestration
 // ============================================================================
 
+/// The Robin-type boundaries of the model. `f_min`, the lowest frequency of
+/// the sweep, bounds the reach of the surface impedances' edge correction.
 fn build_ports(
     mesh: &Mesh,
     model: &Model,
     materials: &[Material],
+    f_min: f64,
 ) -> Result<(Vec<Box<dyn Port>>, Vec<Vec<usize>>), String> {
     let mut ports: Vec<Box<dyn Port>> = Vec::new();
     let mut port_tris: Vec<Vec<usize>> = Vec::new();
@@ -911,6 +915,10 @@ fn build_ports(
                 } else {
                     let mut s = SurfaceImpedance::from_conductivity(*conductivity);
                     s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided; s.sheet = *sheet;
+                    if !*sheet && f_min.is_finite() && f_min > 0.0 {
+                        let delta = s.skin_depth(&crate::excitation::Excitation::new(f_min, mesh.l0));
+                        s.edges = crate::sibc_edge::EdgeProfile::build(&mesh, &tri_ids, crate::sibc_edge::REACH * delta / mesh.l0);
+                    }
                     s
                 };
                 eprintln!("  SurfaceImpedance: tag={}, sigma={:.2e}S/m, ur={:.2}, er={:.2}, t={:?}, two_sided={}, sheet={}",

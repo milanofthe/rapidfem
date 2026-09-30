@@ -791,9 +791,14 @@ class SurfaceImpedance(_Physics):
     Note
     ----
     A surface impedance on the walls of a finite-thickness strip is accurate
-    where the metal is thinner than about 1.5 or thicker than about 10 skin
-    depths. In between it underestimates the strip resistance by up to about
-    20 % (measured against a 2D quasi-static reference, issue #48); mesh the
+    where the metal is thinner than about 1.5 or thicker than about 4 skin
+    depths: on one-sided walls (a conductor hollowed out of the mesh) the
+    impedance of the current along a convex edge rises within a few skin
+    depths of it, the current crowding a per-face impedance misses, and the
+    solver adds that from a universal profile (within 3 % of a 2D
+    quasi-static reference from 4 skin depths up, issues #48 and #56). In
+    between, and across conductors narrower than 4 skin depths, it
+    underestimates the strip resistance by up to about 25 %; mesh the
     conductor as a volume there. :func:`rapidfem.rfic.build` makes this
     choice per layer from its ``band``. Never apply the BC to the faces of a
     conductor whose interior is still meshed: on internal faces it acts as a

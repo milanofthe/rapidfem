@@ -421,15 +421,18 @@ pub struct SurfaceImpedance {
     pub sheet: bool,
     /// Optional explicit surface impedance Zs (Ω/sq); overrides σ-based calc when Some
     pub zs: Option<C64>,
+    /// The conductor's convex edges near the faces, for the edge correction
+    /// of a σ-based impedance (see [`crate::sibc_edge`]).
+    pub edges: Option<crate::sibc_edge::EdgeProfile>,
 }
 
 impl SurfaceImpedance {
     pub fn from_conductivity(sigma: f64) -> Self {
-        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: None }
+        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: None, edges: None }
     }
 
     pub fn from_zs(zs: C64) -> Self {
-        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: Some(zs) }
+        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: Some(zs), edges: None }
     }
 
     /// Robin γ-coefficient from the surface impedance Zs: γ = j·k₀·Z₀/Zs.
@@ -437,6 +440,29 @@ impl SurfaceImpedance {
         let r = self.surface_impedance(exc);
         // γ = j*k0*Z0 / R
         C64::new(0.0, exc.k0 * Z0) / r
+    }
+
+    /// Skin depth (m) at the excitation's frequency:
+    /// δ = sqrt( 2ρ/(ωμ) * (sqrt(1 + (ωερ)²) + ρωε) ).
+    pub fn skin_depth(&self, exc: &Excitation) -> f64 {
+        let eps = crate::constants::EPS0 * self.er;
+        let mu = crate::constants::MU0 * self.mur;
+        let rho = 1.0 / self.sigma;
+        let we = exc.omega * eps;
+        let inner = (1.0 + (we * rho).powi(2)).sqrt() + rho * we;
+        (2.0 * rho / (exc.omega * mu) * inner).sqrt()
+    }
+
+    /// The edge-corrected admittance tensor of the `k`-th face triangle
+    /// (see [`crate::sibc_edge`]); `None` where the scalar γ holds: an
+    /// explicit Zs, a sheet, a conductor under 3 δ across, a triangle away
+    /// from the edges.
+    pub fn tri_tensor(&self, exc: &Excitation, k: usize) -> Option<[[C64; 3]; 3]> {
+        let edges = self.edges.as_ref()?;
+        if self.zs.is_some() || self.sheet {
+            return None;
+        }
+        edges.tensor(k, self.get_gamma(exc), self.skin_depth(exc) / exc.l0)
     }
 
     fn surface_impedance(&self, exc: &Excitation) -> C64 {
@@ -447,10 +473,7 @@ impl SurfaceImpedance {
         let eps = crate::constants::EPS0 * self.er;
         let mu = crate::constants::MU0 * self.mur;
         let rho = 1.0 / self.sigma;
-        // Skin depth: δ = sqrt( 2ρ/(ωμ) * (sqrt(1 + (ωερ)²) + ρωε) )
-        let we = w0 * eps;
-        let inner = (1.0 + (we * rho).powi(2)).sqrt() + rho * we;
-        let d_skin = (2.0 * rho / (w0 * mu) * inner).sqrt();
+        let d_skin = self.skin_depth(exc);
         // R = (1 + j) ρ / δ
         let mut r = C64::new(1.0, 1.0) * C64::from(rho / d_skin);
         if let Some(t) = self.thickness {

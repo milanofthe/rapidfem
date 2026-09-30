@@ -211,6 +211,49 @@ pub fn tri_stiff(
     m.iter().map(|&v| gamma * C64::from(v)).collect()
 }
 
+/// Anisotropic surface Robin stiffness: `∫ φ_i·Γ·φ_j dA` for a constant
+/// tensor `Γ` (global frame, only its tangential part acts).
+pub fn tri_stiff_tensor(
+    owners: &[DofOwner],
+    glob_vertices: &[[f64; 3]; 3],
+    tensor: &[[C64; 3]; 3],
+) -> Vec<C64> {
+    let (frame, xs, ys) = tri_local_cs(glob_vertices);
+    let (grads, two_a) = bary_grads_2d(&xs, &ys);
+    let fns = build_surface_basis(owners, &xs, &ys);
+    let area = 0.5 * two_a.abs();
+    // Γ in the triangle's frame: w[a][b] = frame[a]·Γ·frame[b]
+    let w: [[C64; 2]; 2] = std::array::from_fn(|a| {
+        std::array::from_fn(|b| {
+            let mut s = C64::new(0.0, 0.0);
+            for i in 0..3 {
+                for j in 0..3 {
+                    s += C64::from(frame[a][i] * frame[b][j]) * tensor[i][j];
+                }
+            }
+            s
+        })
+    });
+    let n = fns.len();
+    let mut m = vec![C64::new(0.0, 0.0); n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = C64::new(0.0, 0.0);
+            for ti in &fns[i].terms {
+                for tj in &fns[j].terms {
+                    let (gi, gj) = (grads[ti.grad as usize], grads[tj.grad as usize]);
+                    let gwg = C64::from(gi[0]) * (w[0][0] * gj[0] + w[0][1] * gj[1])
+                        + C64::from(gi[1]) * (w[1][0] * gj[0] + w[1][1] * gj[1]);
+                    let e: [u8; 3] = std::array::from_fn(|k| ti.exps[k] + tj.exps[k]);
+                    acc += gwg * C64::from(ti.coeff * tj.coeff * area_coeff_exps(e) * area);
+                }
+            }
+            m[i * n + j] = acc * C64::from(fns[i].scale * fns[j].scale);
+        }
+    }
+    m
+}
+
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.
 /// `dpts[q] = [w, L1, L2, L3]`, `glob_uinc[q]` the incident field at that point.
 pub fn tri_force(

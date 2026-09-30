@@ -154,9 +154,10 @@ class BuiltModel:
 
 #: Thickness-to-skin-depth window in which a surface impedance misses the
 #: strip resistance by more than a few percent (measured against a 2D
-#: quasi-static reference, issue #48); "auto" meshes the conductor there.
+#: quasi-static reference, issues #48 and #56: the edge-corrected impedance
+#: holds from 4 skin depths up); "auto" meshes the conductor there.
 SIBC_RATIO_LOW = 1.5
-SIBC_RATIO_HIGH = 10.0
+SIBC_RATIO_HIGH = 4.0
 
 
 def _skin_depth(f: float, sigma: float) -> float:
@@ -320,15 +321,17 @@ def build(
         carry the boundary condition; the SIBC thickness per conductor piece is
         ``2V/S`` (volume over wall area), which reproduces the DC resistance.
         ``"auto"`` picks per layer from the thickness-to-skin-depth ratio over
-        ``band``: SIBC where ``t/delta < 1.5`` or ``> 10`` across the whole band
-        (the surface model is within a few percent there), otherwise an
-        isotropic volume conductor meshed at the skin depth.
+        ``band``: SIBC where ``t/delta < 1.5`` or ``> 4`` across the whole band
+        (the surface model, with its edge correction, is within a few percent
+        there), otherwise an isotropic volume conductor meshed at the skin
+        depth. A trace narrower than 4 skin depths keeps the uncorrected
+        surface impedance, up to about 17 % low.
     band : (f_min, f_max), optional
         Frequency band the model will be solved over, in Hz. Drives the
         ``"auto"`` conductor choice and the volume-conductor mesh size. Without
-        it ``"auto"`` falls back to SIBC with a warning: between 1.5 and 10 skin
+        it ``"auto"`` falls back to SIBC with a warning: between 1.5 and 4 skin
         depths a surface impedance underestimates the strip resistance by up to
-        about 20 %.
+        about 25 %.
     mesh : MeshSpec or {"fast", "balanced", "accurate"}, optional
         Mesh sizing policy. A preset name (or the default ``None``, which
         means ``"balanced"``) derives every size from the stack and the

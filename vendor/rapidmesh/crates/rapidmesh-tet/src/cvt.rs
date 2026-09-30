@@ -31,14 +31,33 @@ pub fn mesh_budgeted(
     target_elements: Option<usize>,
     optimize_passes: Option<usize>,
 ) -> (TetMesh, MeshParams) {
+    // The volume backend is the restricted-Delaunay REFINEMENT core
+    // (analytic carriers, protecting balls, manifold sweeps); the budget
+    // loop and the optimize pass wrap it unchanged.
+    let infallible: Result<_, std::convert::Infallible> =
+        budgeted(model, params, target_elements, optimize_passes, &|p| {
+            Ok(crate::conform::mesh_model(model, p))
+        });
+    match infallible {
+        Ok(x) => x,
+        Err(never) => match never {},
+    }
+}
+
+/// [`mesh_budgeted`] around any mesher of `model`: the tet budget scales the
+/// sizes over a few meshes, the optimizer runs on each.
+pub fn budgeted<E>(
+    model: &rapidmesh_brep::Model,
+    params: &MeshParams,
+    target_elements: Option<usize>,
+    optimize_passes: Option<usize>,
+    mesher: &dyn Fn(&MeshParams) -> Result<TetMesh, E>,
+) -> Result<(TetMesh, MeshParams), E> {
     // The thickness bounds join the per-region sizes here already, so the
     // optimizer keeps them too.
     let params = &params.with_thickness_caps(&model.plc);
-    let mesh_once = |p: &MeshParams| -> TetMesh {
-        // The volume backend is the restricted-Delaunay REFINEMENT core
-        // (analytic carriers, protecting balls, manifold sweeps); the budget
-        // loop and the optimize pass wrap it unchanged.
-        let mut m = crate::conform::mesh_model(model, p);
+    let mesh_once = |p: &MeshParams| -> Result<TetMesh, E> {
+        let mut m = mesher(p)?;
         if let Some(passes) = optimize_passes {
             let opt = crate::optimize::OptimizeParams {
                 passes,
@@ -49,7 +68,7 @@ pub fn mesh_budgeted(
             };
             crate::optimize::optimize(&mut m, &opt);
         }
-        m
+        Ok(m)
     };
     match target_elements {
         Some(target) if target > 0 => {
@@ -57,7 +76,7 @@ pub fn mesh_budgeted(
             let mut out: Option<(TetMesh, MeshParams)> = None;
             for _ in 0..6 {
                 let p = params.scaled(s);
-                let m = mesh_once(&p);
+                let m = mesh_once(&p)?;
                 let n = m.tets.len().max(1);
                 let rel = (n as f64 - target as f64).abs() / target as f64;
                 out = Some((m, p));
@@ -66,11 +85,11 @@ pub fn mesh_budgeted(
                 }
                 s *= (n as f64 / target as f64).powf(1.0 / 3.0);
             }
-            out.expect("budget loop runs at least once")
+            Ok(out.expect("budget loop runs at least once"))
         }
         _ => {
-            let m = mesh_once(params);
-            (m, params.clone())
+            let m = mesh_once(params)?;
+            Ok((m, params.clone()))
         }
     }
 }

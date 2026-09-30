@@ -205,6 +205,10 @@ impl Curve for PolylineCurve {
     }
 }
 
+/// The most a curve turns per segment, floor or not: a third of a turn, as
+/// a closed edge takes three segments at least.
+const MAX_TURN: f64 = std::f64::consts::TAU / 3.0;
+
 /// Arc-length samples of `curve` spaced by the target `size(s)` at arc
 /// length `s`, refined where the curvature needs it for `deflection`, and
 /// graded by `grad`. A hard size FLOOR: a curvature-radius spike (the sharp
@@ -265,7 +269,25 @@ pub fn distribute_floored(
         cum[i] = cum[i - 1] + 0.5 * (1.0 / h[i] + 1.0 / h[i - 1]) * ds;
     }
     let total = cum[m];
-    let n = (total.round() as usize).max(1); // number of elements
+    // The floor keeps tiny features from refining the mesh, but the curve
+    // takes a segment per MAX_TURN it turns at least: a bend stays one and
+    // is no chord through the solid (a rounded plate edge of a radius below
+    // the floor), where the sizes alone would give it none.
+    let at: Vec<V3> = (0..=m).map(|i| curve.point_at(i as f64 * ds)).collect();
+    let turned: f64 = (1..m)
+        .map(|i| {
+            let (u, v) = (sub(at[i], at[i - 1]), sub(at[i + 1], at[i]));
+            let (lu, lv) = (dot(u, u).sqrt(), dot(v, v).sqrt());
+            if lu > 0.0 && lv > 0.0 {
+                (dot(u, v) / (lu * lv)).clamp(-1.0, 1.0).acos()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    let n = (total.round() as usize)
+        .max(1)
+        .max((turned / MAX_TURN - 1e-9).ceil() as usize); // number of elements
     let mut out = Vec::with_capacity(n + 1);
     out.push(0.0);
     let mut j = 1usize;
@@ -287,6 +309,25 @@ pub fn distribute_floored(
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    /// A bend below the floor keeps a segment per third of a turn: a rounded
+    /// edge of half a turn is no chord through the solid; a straight edge
+    /// stays one segment.
+    #[test]
+    fn a_bend_below_the_floor_keeps_its_segments() {
+        let arc: Vec<V3> = (0..=16)
+            .map(|k| {
+                let t = PI * k as f64 / 16.0;
+                [2.0 * t.cos(), 2.0 * t.sin(), 0.0]
+            })
+            .collect();
+        let bend = PolylineCurve::new(&arc).unwrap();
+        let ss = distribute_floored(&bend, 0.05, &|_| 50.0, 0.5, 5.0);
+        assert_eq!(ss.len(), 3, "{ss:?}");
+        let line = PolylineCurve::new(&[[0.0, 0.0, 0.0], [6.0, 0.0, 0.0]]).unwrap();
+        let ss = distribute_floored(&line, 0.05, &|_| 50.0, 0.5, 5.0);
+        assert_eq!(ss.len(), 2, "{ss:?}");
+    }
 
     fn circle(r: f64, n: usize) -> PolylineCurve {
         let pts: Vec<V3> = (0..=n)

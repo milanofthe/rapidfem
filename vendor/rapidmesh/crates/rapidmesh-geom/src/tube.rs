@@ -71,9 +71,17 @@ impl TubePath {
 
     /// Closest point on the polyline to `p` (exact; the tree only prunes).
     pub fn closest(&self, p: V3) -> V3 {
-        let mut best = (f64::INFINITY, self.pts[0]);
+        let mut best = (f64::INFINITY, self.pts[0], 0);
         self.closest_rec(0, p, &mut best);
         best.1
+    }
+
+    /// The segment (from node `i` to `i + 1`) with the closest point of the
+    /// polyline to `p`.
+    pub fn closest_segment(&self, p: V3) -> usize {
+        let mut best = (f64::INFINITY, self.pts[0], 0);
+        self.closest_rec(0, p, &mut best);
+        best.2
     }
 
     /// Calls `f` with the index of every path segment whose AABB overlaps
@@ -102,7 +110,7 @@ impl TubePath {
         self.near_rec(n.right as usize, lo, hi, f);
     }
 
-    fn closest_rec(&self, ni: usize, p: V3, best: &mut (f64, V3)) {
+    fn closest_rec(&self, ni: usize, p: V3, best: &mut (f64, V3, usize)) {
         let n = self.nodes[ni];
         if box_d2(n.lo, n.hi, p) >= best.0 {
             return;
@@ -114,7 +122,7 @@ impl TubePath {
                 let q = closest_on_seg(p, self.pts[s], self.pts[s + 1]);
                 let dd = d2(p, q);
                 if dd < best.0 {
-                    *best = (dd, q);
+                    *best = (dd, q, s);
                 }
             }
             return;

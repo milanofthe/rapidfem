@@ -228,9 +228,11 @@ impl Geometry {
                     r
                 };
                 let index = self.labels.solids.len() as u32;
+                let roles = self.roles(s).to_vec();
                 self.labels.solids.push(SolidInfo {
                     region,
                     label: None,
+                    roles,
                 });
                 Ok(Object::Solid(Solid { region, index }))
             }
@@ -304,7 +306,8 @@ impl Geometry {
     /// The solid `sheet` sweeps along `vector` (not in its plane), in a
     /// region of its own with target size `maxh`. The sheet stays as it is,
     /// the solid's bottom face on it. Surfaces: bottom, top, then the walls
-    /// (for a disc one cylinder, which needs the vector along its axis).
+    /// (for a disc one cylinder, which needs the vector along its axis); the
+    /// first two named `bottom` and `top`.
     pub fn extrude(&mut self, sheet: SheetRef, vector: P3, maxh: Option<f64>) -> Result<Solid> {
         let i = sheet.index as usize;
         let f = self
@@ -336,6 +339,7 @@ impl Geometry {
         self.labels.solids.push(SolidInfo {
             region,
             label: None,
+            roles: crate::shapes::CAP_ROLES.map(String::from).to_vec(),
         });
         Ok(Solid { region, index })
     }

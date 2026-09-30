@@ -3,15 +3,16 @@
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 """External geometry import via ``Geometry.load``.
 
-STL (and OBJ) surfaces load as meshable solids, placed by unit, scale,
-rotation and position. A ``.msh`` volume mesh loads in mesh mode (its groups
-the handles for materials and physics, no remeshing); the fixture is written
-by ``save_mesh``, so the round trip is tested too. STEP, IGES and BREP import
-is not available on the rapidmesh backend yet (milanofthe/rapidmesh-dev#37);
-its test is a strict expected failure that flips to passing, and fails the
-suite as a reminder, once the backend can.
+STEP files load one solid per body in metres (the fixture is a three-part
+millimetre assembly). STL (and OBJ) surfaces load as meshable solids, placed
+by unit, scale, rotation and position. A ``.msh`` volume mesh loads in mesh
+mode (its groups the handles for materials and physics, no remeshing); the
+fixture is written by ``save_mesh``, so the round trip is tested too. IGES
+and BREP are not supported.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,6 +20,32 @@ import pytest
 import rapidfem as rf
 
 MM = 1e-3
+ASSEMBLY = Path(__file__).parent / "data" / "assembly.step"
+
+
+def _box(obj) -> np.ndarray:
+    b = np.array([f.bbox for f in obj.faces])
+    return np.concatenate([b[:, :3].min(axis=0), b[:, 3:].max(axis=0)])
+
+
+def test_step_assembly_loads_in_metres():
+    g = rf.Geometry(maxh=4 * MM)
+    air = g.box(40 * MM, 40 * MM, 40 * MM, position=(-10 * MM, -10 * MM, -15 * MM),
+                material=rf.Air())
+    base, post, plate = g.load(str(ASSEMBLY), material=rf.Dielectric(er=3.0))
+    assert all(p.dim == 3 for p in (base, post, plate))
+    np.testing.assert_allclose(_box(base), np.array([0, 0, 0, 20, 20, 5]) * MM, atol=1e-9)
+    np.testing.assert_allclose(_box(plate), np.array([0, 0, -4, 20, 20, 0]) * MM, atol=1e-9)
+    assert _box(post)[5] == pytest.approx(17 * MM)
+    g.mesh()
+    assert g.mesh_stats.n_tets > 0 and g.mesh_stats.quality_min > 10
+    assert len(air.faces.outer) == 6
+
+
+def test_step_units_and_placement():
+    g = rf.Geometry()
+    parts = g.load(str(ASSEMBLY), unit="UM", position=(1 * MM, 0, 0))
+    np.testing.assert_allclose(_box(parts[0]), [1e-3, 0, 0, 1e-3 + 20e-6, 20e-6, 5e-6], atol=1e-12)
 
 
 def _icosphere_stl(path, radius: float) -> None:
@@ -97,13 +124,12 @@ def test_missing_file(tmp_path):
         rf.Geometry().load(str(tmp_path / "missing.stl"))
 
 
-@pytest.mark.xfail(raises=NotImplementedError, strict=True,
-                   reason="STEP/IGES/BREP import: milanofthe/rapidmesh-dev#37")
-@pytest.mark.parametrize("ext", [".step", ".stp", ".iges", ".igs", ".brep"])
-def test_cad_import(tmp_path, ext):
+@pytest.mark.parametrize("ext", [".iges", ".igs", ".brep"])
+def test_unsupported_cad_formats(tmp_path, ext):
     p = tmp_path / f"part{ext}"
     p.write_text("")
-    rf.Geometry().load(str(p))
+    with pytest.raises(NotImplementedError, match="STEP"):
+        rf.Geometry().load(str(p))
 
 
 # ── MSH: mesh mode ──────────────────────────────────────────────────────────

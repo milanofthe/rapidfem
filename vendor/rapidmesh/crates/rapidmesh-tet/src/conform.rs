@@ -110,6 +110,9 @@ pub struct TetMesh {
     /// Periodic pairs: every point on a face `a` of a pair with its image
     /// on face `b`.
     pub periodic_points: Vec<[usize; 2]>,
+    /// The faces (indices into `faces`) that close a filled contact wedge:
+    /// off the geometry by design, as wide as the mesh is fine there.
+    pub contact_faces: Vec<usize>,
 }
 
 impl TetMesh {

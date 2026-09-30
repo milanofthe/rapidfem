@@ -7,6 +7,7 @@
 //! mesher consumes it. Surface back-references exist so the order-2 snapping
 //! stage can project midside nodes onto the true surface.
 
+pub mod cdt2;
 pub mod discrete;
 mod faceted;
 pub mod import;

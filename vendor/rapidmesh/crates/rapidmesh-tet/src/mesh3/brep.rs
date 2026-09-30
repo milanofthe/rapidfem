@@ -834,6 +834,103 @@ fn surface_once(model: &rapidmesh_brep::Model, params: &MeshParams) -> SurfaceMe
     }
 }
 
+/// A complex whose points are classified by B-rep entity (corners by
+/// vertex, curve points by edge, patch points by face), improved like the
+/// refinement path's (snap, repair, relaxed surface) and returned as a
+/// [`TetMesh`]. The bottom-up mesher's way into the shared finish.
+pub(crate) fn finish_classified(
+    model: &rapidmesh_brep::Model,
+    params: &MeshParams,
+    domain: &DomainTree,
+    points: Vec<P3>,
+    classes: &[PointClass],
+    tets: Vec<[u32; 4]>,
+    regions: Vec<u32>,
+    faces: Vec<super::Face>,
+    edges: &[([u32; 2], u32)],
+) -> TetMesh {
+    use rapidmesh_exact::log as rmlog;
+    let (plc, brep) = (&model.plc, &model.brep);
+    let t = rapidmesh_exact::clock::Instant::now();
+    let oracle = BrepOracle::new(plc, brep, domain, params);
+    rmlog::stage("finish.oracle", t.elapsed().as_secs_f64());
+    rmlog::heap("oracle");
+    let mut curve_of: Vec<u32> = vec![u32::MAX; brep.edges.len()];
+    for (ci, &e) in oracle.curve_edge.iter().enumerate() {
+        curve_of[e as usize] = ci as u32;
+    }
+    let kinds = classes
+        .iter()
+        .map(|&k| match k {
+            PointClass::Vertex(v) => VertexKind::Corner(v),
+            PointClass::Edge(e) if curve_of[e as usize] != u32::MAX => {
+                VertexKind::Curve(curve_of[e as usize])
+            }
+            PointClass::Edge(_) => VertexKind::Volume,
+            PointClass::Face(f) => VertexKind::Patch(f),
+            PointClass::Interior => VertexKind::Volume,
+        })
+        .collect();
+    let feature_edges = edges
+        .iter()
+        .filter(|&&(_, e)| curve_of[e as usize] != u32::MAX)
+        .map(|&(v, e)| (v, curve_of[e as usize]))
+        .collect();
+    let mut c = Complex {
+        points,
+        kinds,
+        tets,
+        regions,
+        faces,
+        feature_edges,
+    };
+    let t = rapidmesh_exact::clock::Instant::now();
+    let shape = BrepShape::new(brep, &oracle);
+    rmlog::stage("finish.shape", t.elapsed().as_secs_f64());
+    // The points of periodic faces stay where they are: each is the image
+    // of its partner's.
+    let periodic: std::collections::HashSet<u32> =
+        params.periodic.iter().flat_map(|pp| [pp.a, pp.b]).collect();
+    let mut frozen: Vec<u32> = c
+        .faces
+        .iter()
+        .filter(|f| periodic.contains(&f.patch))
+        .flat_map(|f| f.tri)
+        .collect();
+    frozen.sort_unstable();
+    frozen.dedup();
+    let (_, im, left) = super::improve::finish(
+        &mut c,
+        &shape,
+        IMPROVE_BELOW_DEG,
+        IMPROVE_PASSES,
+        SNAP_ROUNDS,
+        &frozen,
+    );
+    rmlog::stage("mesh3.improve", t.elapsed().as_secs_f64());
+    rmlog::heap("improve");
+    rmlog::stat("mesh3.snap_left", left as f64);
+    rmlog::stat(
+        "mesh3.improve_flips",
+        (im.flips23 + im.flips32 + im.flips44) as f64,
+    );
+    rmlog::stat("mesh3.improve_moves", im.moves as f64);
+    rmlog::stat("mesh3.improve_bad_before", im.bad_before as f64);
+    rmlog::stat("mesh3.improve_bad_after", im.bad_after as f64);
+    let t = rapidmesh_exact::clock::Instant::now();
+    let (filled, fill_faces) = crate::bottomup::contact::fill(&mut c, brep, classes);
+    rmlog::stat("bottomup.contact_tets", filled as f64);
+    rmlog::stage("finish.contact", t.elapsed().as_secs_f64());
+    // No verification here: `Mesh::diagnostics` checks conformity on
+    // demand, and the tests run `verify::check` on every path.
+    let t = rapidmesh_exact::clock::Instant::now();
+    let mut mesh = to_tet_mesh(&c, plc, brep, domain, &oracle);
+    mesh.contact_faces = fill_faces;
+    mesh.periodic_points = periodic_points(&mesh, &params.periodic);
+    rmlog::stage("finish.output", t.elapsed().as_secs_f64());
+    mesh
+}
+
 /// Rounds of flips and smoothing on a surface mesh.
 const SURFACE_OPT_PASSES: usize = 4;
 
@@ -907,6 +1004,7 @@ fn to_tet_mesh(
             })
             .collect(),
         periodic_points: Vec::new(),
+        contact_faces: Vec::new(),
     }
 }
 

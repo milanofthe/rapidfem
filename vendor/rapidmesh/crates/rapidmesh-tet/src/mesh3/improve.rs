@@ -9,7 +9,9 @@
 //! face move freely, vertices on one patch move along its carrier without
 //! turning a face; the rest stay. With a shape, a flat tet on a boundary
 //! may also be peeled off (or across an interface), which flips a surface
-//! edge. Work is proportional to the bad tets, not to the mesh.
+//! edge. No change makes a surface face bridge its carrier. Work is
+//! proportional to the bad tets, not to the mesh; a new tet takes the
+//! place of a dead one, so the arrays keep the mesh's size.
 //!
 //! Last comes a relaxation of the surface for its triangles, whose shape
 //! the tets on the boundary follow (gmsh's lead in the mean dihedral came
@@ -48,6 +50,10 @@ pub struct ImproveStats {
 
 /// A change must raise the local worst dihedral by at least this (degrees).
 const GAIN: f64 = 1e-3;
+
+/// A surface face whose centroid is off its carrier by more than this share
+/// of its longest edge bridges it; no change makes one.
+const BRIDGE: f64 = 0.1;
 
 /// Sweeps of the surface relaxation after the repair (a third gains next
 /// to nothing on the gmsh compare pairs).
@@ -180,6 +186,8 @@ struct Improver<'a> {
     batch_size: usize,
     /// The sweep that last took each tet as a candidate.
     seen: Vec<u32>,
+    /// Dead tets whose places a new one takes.
+    free: Vec<u32>,
     sweep: u32,
     stats_flips23: usize,
     stats_flips32: usize,
@@ -217,7 +225,15 @@ impl Improver<'_> {
     /// edge `a b` that is the case exactly when one of the three tets is
     /// flat (four corners on a plane, as the cocircular corners of a small
     /// face leave them), and the two new tets still fill the other two.
+    /// The line through `a b` meeting `f` is not enough: three tets around
+    /// `a b` with `a` and `b` on one side of `f` are the star of `b` inside
+    /// the tet `a f` less the tet `b f`, which the flip would fold over.
     fn crosses(&self, a: u32, b: u32, f: [u32; 3], on_edge: bool) -> bool {
+        let side = |x: u32| orient3d(self.p(f[0]), self.p(f[1]), self.p(f[2]), self.p(x));
+        let (sa, sb) = (side(a), side(b));
+        if !((sa > 0.0 && sb < 0.0) || (sa < 0.0 && sb > 0.0)) {
+            return false;
+        }
         let s: [f64; 3] = std::array::from_fn(|k| {
             orient3d(self.p(f[k]), self.p(f[(k + 1) % 3]), self.p(a), self.p(b))
         });
@@ -250,6 +266,12 @@ impl Improver<'_> {
             .filter(move |&u| self.c.tets[u as usize].contains(&to))
     }
 
+    /// The live tet other than `t` on the triangle `f` of `t`.
+    fn across(&self, t: u32, f: [u32; 3]) -> Option<u32> {
+        self.live(self.hub(&f))
+            .find(|&u| u != t && f.iter().all(|v| self.c.tets[u as usize].contains(v)))
+    }
+
     fn live(&self, v: u32) -> impl Iterator<Item = u32> + '_ {
         self.vtets[v as usize]
             .iter()
@@ -257,12 +279,27 @@ impl Improver<'_> {
             .filter(|&t| self.alive[t as usize])
     }
 
+    /// Adds the tet `t` in the place of a dead one where there is one: the
+    /// flips make and kill tets all the time, and the arrays stay as long
+    /// as the mesh was.
     fn add(&mut self, t: [u32; 4], q: f64, region: u32) {
-        let id = self.c.tets.len() as u32;
-        self.c.tets.push(t);
-        self.c.regions.push(region);
-        self.alive.push(true);
-        self.q.push(q);
+        let id = match self.free.pop() {
+            Some(id) => {
+                let i = id as usize;
+                self.c.tets[i] = t;
+                self.c.regions[i] = region;
+                self.alive[i] = true;
+                self.q[i] = q;
+                id
+            }
+            None => {
+                self.c.tets.push(t);
+                self.c.regions.push(region);
+                self.alive.push(true);
+                self.q.push(q);
+                self.c.tets.len() as u32 - 1
+            }
+        };
         for v in t {
             self.vtets[v as usize].push(id);
             self.touch(v);
@@ -284,8 +321,16 @@ impl Improver<'_> {
         self.star_event[w as usize] = self.event;
     }
 
+    /// Kills the tet `t`: out of its corners' stars, its place free.
     fn kill(&mut self, t: u32) {
         self.alive[t as usize] = false;
+        for v in self.c.tets[t as usize] {
+            let star = &mut self.vtets[v as usize];
+            if let Some(k) = star.iter().position(|&x| x == t) {
+                star.swap_remove(k);
+            }
+        }
+        self.free.push(t);
     }
 
     /// The replacement of the tets `old` by `new` (same region) when every
@@ -335,12 +380,7 @@ impl Improver<'_> {
         if self.faces.contains_key(&sorted3(f)) {
             return None;
         }
-        let u = self.live(self.hub(&f)).find(|&u| {
-            u != t && {
-                let w = self.c.tets[u as usize];
-                w.contains(&f[1]) && w.contains(&f[2])
-            }
-        })?;
+        let u = self.across(t, f)?;
         if self.c.regions[u as usize] != self.c.regions[t as usize] {
             return None;
         }
@@ -481,7 +521,8 @@ impl Improver<'_> {
 
     /// Peels a flat tet `abcd` off a boundary when `abc` and `abd` are its
     /// only faces, on one patch with the same region `s` behind both, and
-    /// `ab` is no feature edge: `acd` and `bcd` become the faces instead,
+    /// `ab` is no feature edge, and neither new face bridges the patch's
+    /// carrier: `acd` and `bcd` become the faces instead,
     /// the surface edge `ab` flipping to `cd`. On the outer boundary
     /// (`s = 0`) the tet goes; on an interface it joins `s`, where its old
     /// faces are interior and ordinary flips can remove it. Only with a
@@ -570,6 +611,15 @@ impl Improver<'_> {
                 return false;
             }
             new[k].tri = tri;
+        }
+        // No new face bridges the carrier (a chord across a sharp tip).
+        let corners = |tri: [u32; 3]| tri.map(|w| self.p(w));
+        if new
+            .iter()
+            .zip([f0, f1])
+            .any(|(f, o)| self.bridge(corners(f.tri), corners(o.tri), f0.patch))
+        {
+            return false;
         }
         if s == 0 {
             self.kill(t);
@@ -866,6 +916,9 @@ impl Improver<'_> {
             return None;
         }
         let x = best.1;
+        if self.mobility[v as usize] == Mobility::Surface && self.strays(v, x) {
+            return None;
+        }
         let star = star
             .into_iter()
             .map(|t| {
@@ -877,6 +930,40 @@ impl Improver<'_> {
             })
             .collect();
         Some(Plan::Move { v, x, star })
+    }
+
+    /// Whether moving the surface vertex `v` to `x` makes a face through it
+    /// a bridge (see [`Improver::bridge`]).
+    fn strays(&self, v: u32, x: P3) -> bool {
+        self.vfaces[v as usize]
+            .iter()
+            .filter(|&&f| self.face_alive[f as usize])
+            .any(|&f| {
+                let face = &self.c.faces[f as usize];
+                let at = |w: u32| if w == v { x } else { self.p(w) };
+                let old = face.tri.map(|w| self.p(w));
+                self.bridge(face.tri.map(at), old, face.patch)
+            })
+    }
+
+    /// Whether the triangle `new` on `patch` strays from its carrier by
+    /// more than [`BRIDGE`] of its longest edge where `old` did not: a
+    /// chord across a sharp tip, which the diagnostics call a bridge.
+    fn bridge(&self, new: [P3; 3], old: [P3; 3], patch: u32) -> bool {
+        let Some(shape) = self.shape else {
+            return false;
+        };
+        let stray = |t: [P3; 3]| -> f64 {
+            let m: P3 = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
+            let off = shape
+                .project(VertexKind::Patch(patch), m)
+                .map_or(0.0, |y| dist(m, y));
+            let longest = (0..3)
+                .map(|k| dist(t[k], t[(k + 1) % 3]))
+                .fold(0.0, f64::max);
+            off / longest.max(f64::MIN_POSITIVE)
+        };
+        stray(new) > BRIDGE && stray(new) > stray(old)
     }
 
     fn smooth_vertex(&mut self, v: u32) -> bool {
@@ -973,6 +1060,7 @@ impl<'a> Improver<'a> {
             failed_at: vec![0; n],
             batch_size: BATCH_START,
             seen: Vec::new(),
+            free: Vec::new(),
             sweep: 0,
             stats_flips23: 0,
             stats_flips32: 0,
@@ -1380,13 +1468,21 @@ pub fn finish(
     rounds: usize,
     frozen: &[u32],
 ) -> (SnapStats, ImproveStats, usize) {
+    let stage = rapidmesh_exact::log::stage;
+    let t = rapidmesh_exact::clock::Instant::now();
     let adopted = adopt_face_vertices(c);
     let verts: Vec<u32> = (0..c.points.len() as u32).collect();
     let mut im = Improver::new(c, Some(shape), frozen);
+    stage("mesh3.index", t.elapsed().as_secs_f64());
+    let t = rapidmesh_exact::clock::Instant::now();
     let (mut ss, mut short) = im.snap(shape, &verts);
     ss.adopted = adopted;
+    stage("mesh3.snap", t.elapsed().as_secs_f64());
+    let t = rapidmesh_exact::clock::Instant::now();
     let before = im.bad(target_deg);
     im.repair(target_deg, passes, true);
+    stage("mesh3.repair", t.elapsed().as_secs_f64());
+    let t = rapidmesh_exact::clock::Instant::now();
     for _ in 0..rounds {
         if short.is_empty() {
             break;
@@ -1399,13 +1495,16 @@ pub fn finish(
             break;
         }
     }
+    stage("mesh3.resnap", t.elapsed().as_secs_f64());
     // Last, so nothing after it undoes what it keeps: the surface relaxed
     // for its triangles, no tet made worse than the target allows.
     let t = rapidmesh_exact::clock::Instant::now();
     let n = im.relax_surface(RELAX_SWEEPS, target_deg);
     rapidmesh_exact::log::stage("mesh3.relax", t.elapsed().as_secs_f64());
     rapidmesh_exact::log::stat("mesh3.relaxed", n as f64);
+    let t = rapidmesh_exact::clock::Instant::now();
     let mut st = im.compact(target_deg);
+    stage("mesh3.compact", t.elapsed().as_secs_f64());
     st.bad_before = before;
     (ss, st, short.len())
 }
@@ -1531,5 +1630,59 @@ mod tests {
         for ((reg, v0), (_, v1)) in before.volumes.iter().zip(&r.volumes) {
             assert!((v0 - v1).abs() < 5e-3 * v0, "region {reg}: {v0} -> {v1}");
         }
+    }
+
+    fn complex(points: Vec<P3>, tets: Vec<[u32; 4]>) -> Complex {
+        Complex {
+            kinds: vec![VertexKind::Volume; points.len()],
+            points,
+            regions: vec![1; tets.len()],
+            tets,
+            ..Complex::default()
+        }
+    }
+
+    /// The star of a vertex `b` inside the tet `a p q r`: three tets around
+    /// `a b` and `b p q r`. The line through `a b` meets `p q r`, the edge
+    /// does not; a 3-2 flip there would fold `a p q r` over `b p q r`.
+    #[test]
+    fn no_3_2_flip_around_an_edge_that_misses_the_triangle() {
+        let (p, q, r, a, b) = (0, 1, 2, 3, 4);
+        let mut c = complex(
+            vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.25, 0.25, 1.0],
+                [0.25, 0.25, 0.9],
+            ],
+            vec![[a, b, p, q], [a, b, q, r], [a, b, r, p], [b, p, q, r]],
+        );
+        let im = Improver::new(&mut c, None, &[]);
+        for t in 0..3 {
+            assert!(im.flip32(t, a, b).is_none(), "tet {t}");
+        }
+    }
+
+    /// The tet across a triangle shares all three of its corners, also when
+    /// the search starts from another corner than the first (a large star
+    /// at the first).
+    #[test]
+    fn the_tet_across_a_triangle_holds_all_its_corners() {
+        let (f0, f1, f2, a, e, c0, c1) = (0u32, 1, 2, 3, 4, 5, 6);
+        let mut points: Vec<P3> = vec![[0.0; 3]; 7];
+        let mut tets = vec![[a, f0, f1, f2], [f1, f2, c0, c1], [f0, f1, f2, e]];
+        for k in 0..=LARGE_STAR as u32 {
+            let v = points.len() as u32;
+            points.extend([
+                [k as f64, 1.0, 0.0],
+                [k as f64, 2.0, 0.0],
+                [k as f64, 3.0, 0.0],
+            ]);
+            tets.push([f0, v, v + 1, v + 2]);
+        }
+        let mut c = complex(points, tets);
+        let im = Improver::new(&mut c, None, &[]);
+        assert_eq!(im.across(0, [f0, f1, f2]), Some(2));
     }
 }

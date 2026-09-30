@@ -51,9 +51,9 @@ pub use rapidmesh_tet::fidelity::Fidelity;
 pub use rapidmesh_tet::mesh3::PeriodicPair;
 pub use rapidmesh_tet::{dorfler_mark, PointClass, QualityStats, SurfaceFace, TetMesh};
 pub use rapidmesh_topo::{
-    mesh_2d, mesh_layers, overlay_regions, union_regions, Classification, Mesh2D, Mesh2DOptions,
-    OverlayRule, Region2D, TetGeometry, TetTopology, TriClassification, TriGeometry, TriTopology,
-    FACE_PERMS, NONE,
+    mesh_2d, mesh_layers, overlay_regions, union_regions, BandDiagonals, Classification, Mesh2D,
+    Mesh2DOptions, OverlayRule, Region2D, TetGeometry, TetTopology, TriClassification, TriGeometry,
+    TriTopology, FACE_PERMS, NONE, OFFSET_GRADING,
 };
 
 /// What can go wrong building or meshing a geometry.

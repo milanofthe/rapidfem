@@ -43,6 +43,8 @@ pub enum Item {
     /// bottom face. The object's first `placed` transforms move the sheet
     /// before the sweep, the rest move both after it.
     Extrusion { sheet: Sheet, vector: [f64; 3], placed: usize },
+    /// Body `body` of the STEP file at `path`, in the file's unit.
+    Step { path: std::path::PathBuf, body: usize },
 }
 
 /// A solid or sheet of the scene with its attributes.
@@ -293,6 +295,18 @@ impl Geometry {
         self.changed();
     }
 
+    /// The solids of the STEP file at `path`, one object each, in the
+    /// file's unit, and the length of that unit in metres.
+    pub fn add_step(&mut self, path: &std::path::Path, maxh: Option<f64>) -> Result<(Vec<ObjId>, f64), String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let step = rapidmesh_step::read(&text, rapidmesh_step::Tolerance::default())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let ids = (0..step.bodies.len())
+            .map(|body| self.push(Item::Step { path: path.to_path_buf(), body }, maxh, false))
+            .collect();
+        Ok((ids, step.metres_per_unit))
+    }
+
     /// Moves, turns, mirrors or stretches an object; its faces keep their
     /// origin.
     pub fn transform(&mut self, id: ObjId, t: Transform) {
@@ -343,6 +357,8 @@ impl Geometry {
     fn realize(&self) -> Result<Realized, String> {
         let mut g = rapidmesh::Geometry::new(self.maxh);
         let mut solids = vec![None; self.objects.len()];
+        // the solids of each STEP file, imported all at once
+        let mut steps: std::collections::HashMap<&std::path::Path, Vec<Solid>> = Default::default();
         let mut order: Vec<ObjId> = (0..self.objects.len()).collect();
         order.sort_by_key(|&i| (self.objects[i].priority, i));
         for i in order {
@@ -366,6 +382,25 @@ impl Geometry {
                     let s = g.extrude(r, *vector, o.maxh).map_err(e)?;
                     solids[i] = Some(s);
                     (vec![r.into(), s.into()], *placed)
+                }
+                Item::Step { path, body } => {
+                    if !steps.contains_key(path.as_path()) {
+                        let removed = self.objects.iter().any(|o| {
+                            !o.alive && matches!(&o.item, Item::Step { path: p, .. } if p == path)
+                        });
+                        if removed {
+                            return Err(format!("{}: a STEP file's solids go together, remove all or none", path.display()));
+                        }
+                        steps.insert(path.as_path(), g.import_step(path, None).map_err(e)?);
+                    }
+                    let s = *steps[path.as_path()]
+                        .get(*body)
+                        .ok_or_else(|| format!("{}: no solid {body}", path.display()))?;
+                    if let Some(h) = o.maxh {
+                        g.set_maxh_on(&Scope::region(Some(s.region)), h).map_err(e)?;
+                    }
+                    solids[i] = Some(s);
+                    (vec![s.into()], 0)
                 }
             };
             for &tr in &o.transforms[done..] {
@@ -482,7 +517,7 @@ impl Geometry {
             (Item::Sheet(_), _) => {
                 vec![FaceSel { origin: FaceOrigin::Sheet { object: id }, side: None, across: None }]
             }
-            (Item::Solid(_) | Item::Extrusion { .. }, Some(s)) => r
+            (Item::Solid(_) | Item::Extrusion { .. } | Item::Step { .. }, Some(s)) => r
                 .faces
                 .iter()
                 .filter(|f| f.regions.contains(&s.region))
@@ -499,7 +534,7 @@ impl Geometry {
                     FaceSel { origin: f.origin, side: Some(id), across: Some(across) }
                 })
                 .collect(),
-            (Item::Solid(_) | Item::Extrusion { .. }, None) => Vec::new(),
+            (Item::Solid(_) | Item::Extrusion { .. } | Item::Step { .. }, None) => Vec::new(),
         };
         out.sort();
         out.dedup();

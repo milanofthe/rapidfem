@@ -14,6 +14,7 @@ doctest = false
 [dependencies]
 rapidfem-core = { path = "../rapidfem-core" }
 rapidmesh = { path = "../../vendor/rapidmesh/crates/rapidmesh" }
+rapidmesh-step = { path = "../../vendor/rapidmesh/crates/rapidmesh-step" }
 rapidmesh-geom = { path = "../../vendor/rapidmesh/crates/rapidmesh-geom" }
 rapidmesh-tet = { path = "../../vendor/rapidmesh/crates/rapidmesh-tet" }
 rapidmesh-topo = { path = "../../vendor/rapidmesh/crates/rapidmesh-topo" }

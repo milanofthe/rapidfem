@@ -165,9 +165,19 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
         v.dedup();
     }
     // Feature edges inside a face (an import's open crease the face wraps
-    // around): the boundary of no face, yet B-rep edges, with the faces
-    // around them. They take part in no loop.
+    // around), and edges where faces cross each other without either ending
+    // (two sheets through each other): the boundary of no face, yet B-rep
+    // edges, with the faces around them. They take part in no loop.
     let mut inner: HashSet<(usize, usize)> = HashSet::default();
+    for (e, fs) in &across {
+        if fs.len() >= 2 && !bedge_faces.contains_key(e) {
+            let mut fs = fs.clone();
+            fs.sort_unstable();
+            fs.dedup();
+            bedge_faces.insert(*e, fs);
+            inner.insert(*e);
+        }
+    }
     for f in &plc.features {
         let e = key2(f[0] as usize, f[1] as usize);
         if bedge_faces.contains_key(&e) {
@@ -926,19 +936,27 @@ fn absorb_thin_faces(
             .as_ref()
             .map_or(f64::INFINITY, |s| dist(s.closest(p).0, p))
     };
-    let facet_err = |f: usize, t: u32| -> f64 {
-        if carrier[f].is_none() {
-            return 0.0;
-        }
-        let q = tri_pts(t);
-        off(f, scale(add(add(q[0], q[1]), q[2]), 1.0 / 3.0))
+    // Per facet, once and in parallel: a projection is the costly part.
+    let facet_err: Vec<f64> = {
+        use rayon::prelude::*;
+        (0..tri_face.len())
+            .into_par_iter()
+            .map(|t| {
+                let f = tri_face[t];
+                if carrier[f].is_none() {
+                    return 0.0;
+                }
+                let q = tri_pts(t as u32);
+                off(f, scale(add(add(q[0], q[1]), q[2]), 1.0 / 3.0))
+            })
+            .collect()
     };
     let err: Vec<f64> = (0..nf)
         .map(|f| {
             faces[f]
                 .facets
                 .iter()
-                .map(|&t| facet_err(f, t))
+                .map(|&t| facet_err[t as usize])
                 .fold(0.0, f64::max)
         })
         .collect();
@@ -969,7 +987,7 @@ fn absorb_thin_faces(
             let l = dist(pos[a], pos[b]);
             perim[f] += l;
             for (g, u) in others {
-                let e = facet_err(g, u);
+                let e = facet_err[u as usize];
                 let s = shared[f].entry(g).or_insert((0.0, Vec::new(), 0.0));
                 s.0 += l;
                 s.1.extend([a, b]);
@@ -1011,22 +1029,60 @@ fn absorb_thin_faces(
             if pair(&faces[g]) != pair(&faces[f]) || carrier[g].is_none() {
                 return false;
             }
+            // On g's carrier: a plane takes coplanar facets only, a curved
+            // carrier those its faceting errors explain (the strip a
+            // sagitta wide), not a face of another surface beside it.
             let plane = matches!(
                 plc.surfaces[faces[g].surface.0 as usize],
                 SurfaceKind::Plane
             );
-            !plane
-                || faces[f]
-                    .facets
-                    .iter()
-                    .all(|&t| tri_pts(t).iter().all(|&p| off(g, p) <= tol))
+            let reach = if plane { tol } else { tol.max(explained) };
+            let worst = faces[f]
+                .facets
+                .iter()
+                .flat_map(|&t| tri_pts(t))
+                .map(|p| off(g, p))
+                .fold(0.0f64, f64::max);
+            if worst > reach {
+                rapidmesh_exact::log::debug(
+                    "brep.absorb",
+                    format!("face {f} kept from face {g}: {worst:.3e} off its carrier, {reach:.3e} explained"),
+                );
+            }
+            worst <= reach
         };
         let target = nbrs
             .iter()
             .map(|&(g, _)| g)
             .filter(|&g| fits(g))
             .max_by(|&a, &b| mismatch(a).total_cmp(&mismatch(b)).then(b.cmp(&a)));
+        if target.is_none() {
+            rapidmesh_exact::log::debug(
+                "brep.absorb",
+                format!(
+                    "face {f} (width {:.3e}, faceting errors {:.3e}) taken by no neighbour of {:?}",
+                    width(f),
+                    explained,
+                    nbrs.iter()
+                        .map(|&(g, _)| (
+                            g,
+                            pair(&faces[g]) == pair(&faces[f]),
+                            carrier[g].is_some()
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+            );
+        }
         if let Some(g) = target {
+            rapidmesh_exact::log::debug(
+                "brep.absorb",
+                format!(
+                    "face {f} ({} facets, width {:.3e}, faceting errors {:.3e}) into face {g}",
+                    faces[f].facets.len(),
+                    width(f),
+                    explained
+                ),
+            );
             let (rf, rg) = (uf_find(&mut rep, f), uf_find(&mut rep, g));
             if rf != rg {
                 rep[rf] = rg;

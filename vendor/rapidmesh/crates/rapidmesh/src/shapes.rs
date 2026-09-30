@@ -470,7 +470,36 @@ into_shape!(
     Revolve, Triangles, Import
 );
 
+/// The faces of a box, in their order.
+pub const BOX_ROLES: [&str; 6] = ["-z", "+z", "-y", "+y", "-x", "+x"];
+/// The faces of a cylinder or cone, in their order.
+pub const AXIAL_ROLES: [&str; 3] = ["side", "top", "bottom"];
+/// The first faces of a prism or an extruded sheet, the walls after them.
+pub const CAP_ROLES: [&str; 2] = ["bottom", "top"];
+
 impl Shape {
+    /// The names of the solid's faces by role: a box's sides, a cylinder's
+    /// or cone's side and ends, a prism's ends, a revolve's profile edges
+    /// (`edge0`, `edge1`, ...) and on a part turn its `start` and `end`.
+    /// Other shapes name none (their faces go by index).
+    pub fn role_names(&self) -> Vec<String> {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect();
+        match self {
+            Shape::Cuboid(_) => names(&BOX_ROLES),
+            Shape::Cylinder(_) | Shape::Cone(_) => names(&AXIAL_ROLES),
+            Shape::Prism(_) => names(&CAP_ROLES),
+            Shape::Revolve(r) => {
+                let mut out: Vec<String> =
+                    (0..r.points.len()).map(|i| format!("edge{i}")).collect();
+                if r.angle < 360.0 {
+                    out.extend(["start".to_string(), "end".to_string()]);
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The faceted solid; `maxh` is the target size at the solid, which
     /// sets the facet density of a sphere.
     pub(crate) fn faceted(&self, maxh: Option<f64>) -> Result<Faceted> {

@@ -407,7 +407,11 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
     let mut labels = Labels::default();
     for &r in &regions {
         let label = groups((3, r)).first().and_then(|&p| name(3, p));
-        labels.solids.push(SolidInfo { region: r, label });
+        labels.solids.push(SolidInfo {
+            region: r,
+            label,
+            roles: Vec::new(),
+        });
     }
     let mut face_sets: BTreeMap<(u8, u32), Vec<u32>> = BTreeMap::new();
     let mut entities: Vec<&(u8, u32)> = raw.entity_groups.keys().collect();
@@ -456,6 +460,7 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
         point_class,
         curve_edges: lines,
         periodic_points: Vec::new(),
+        contact_faces: Vec::new(),
     };
     let quality = quality_stats(&inner);
     Ok(Mesh::new(inner, quality, labels, Run::default(), None))

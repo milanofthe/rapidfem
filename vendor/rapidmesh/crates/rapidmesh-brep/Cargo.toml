@@ -9,6 +9,7 @@ license.workspace = true
 rapidmesh-exact.workspace = true
 rapidmesh-geom.workspace = true
 rapidmesh-csg.workspace = true
+rayon.workspace = true
 rustc-hash.workspace = true
 
 [lints]

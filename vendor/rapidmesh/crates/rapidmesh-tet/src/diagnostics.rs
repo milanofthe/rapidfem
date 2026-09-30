@@ -13,6 +13,7 @@ use crate::conform::TetMesh;
 use rapidmesh_brep::Surface;
 use rapidmesh_geom::vec3::{dist, sub, V3};
 use rapidmesh_geom::SurfaceKind;
+use rayon::prelude::*;
 
 /// The kind of a located mesh defect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,9 +213,17 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     let mut n_slivers = 0usize;
     let mut defects: Vec<Defect> = Vec::new();
     let mut region_vol: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
-    for (ti, t) in mesh.tets.iter().enumerate() {
+    // Per tet: its smallest dihedral, radius-edge ratio and volume.
+    let per_tet: Vec<(f64, Option<f64>, f64)> = mesh
+        .tets
+        .par_iter()
+        .map(|t| {
+            let p = [pt(t[0]), pt(t[1]), pt(t[2]), pt(t[3])];
+            (tet_min_dihedral(p), radius_edge(p), tet_volume(p))
+        })
+        .collect();
+    for (ti, (t, &(md, re, vol))) in mesh.tets.iter().zip(&per_tet).enumerate() {
         let p = [pt(t[0]), pt(t[1]), pt(t[2]), pt(t[3])];
-        let md = tet_min_dihedral(p);
         if md.is_finite() {
             min_dih = min_dih.min(md);
             sum_dih += md;
@@ -229,10 +238,10 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
                 });
             }
         }
-        if let Some(re) = radius_edge(p) {
+        if let Some(re) = re {
             max_re = max_re.max(re);
         }
-        *region_vol.entry(mesh.tet_regions[ti].0).or_insert(0.0) += tet_volume(p);
+        *region_vol.entry(mesh.tet_regions[ti].0).or_insert(0.0) += vol;
     }
     let mean_dih = if mesh.tets.is_empty() {
         0.0
@@ -305,8 +314,8 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     // up within a single region and is still caught. An embedded sheet (the
     // same region on both sides) lies inside its region and bounds nothing,
     // so it is not part of this count.
-    let mut region_edge: std::collections::HashMap<(u32, usize, usize), u32> =
-        std::collections::HashMap::new();
+    let mut region_edge: rustc_hash::FxHashMap<(u32, usize, usize), u32> =
+        rustc_hash::FxHashMap::default();
     for f in &mesh.faces {
         if f.regions[0] == f.regions[1] {
             continue;
@@ -321,7 +330,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             }
         }
     }
-    let mut nm: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+    let mut nm: rustc_hash::FxHashMap<(usize, usize), u32> = rustc_hash::FxHashMap::default();
     for (&(_, a, b), &cnt) in &region_edge {
         if cnt != 2 {
             let e = nm.entry((a, b)).or_insert(0);
@@ -329,7 +338,9 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         }
     }
     let n_nonmanifold = nm.len();
-    for (&(a, b), &cnt) in &nm {
+    let mut nm: Vec<((usize, usize), u32)> = nm.into_iter().collect();
+    nm.sort_unstable();
+    for &((a, b), cnt) in &nm {
         defects.push(Defect {
             kind: DefectKind::NonManifoldEdge,
             pos: centroid(&[pt(a), pt(b)]),
@@ -357,18 +368,30 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             .map(|s| dist(q, s.closest(q).0))
             .fold(f64::INFINITY, f64::min)
     };
-    for f in &mesh.faces {
-        let kind = &mesh.surfaces[f.surface as usize];
-        if matches!(kind, SurfaceKind::Plane) || curved.is_empty() {
-            continue; // planar faces are exact; deviation is 0
-        }
-        let v = [pt(f.tri[0]), pt(f.tri[1]), pt(f.tri[2])];
-        let longest = (0..3)
-            .map(|k| dist(v[k], v[(k + 1) % 3]))
-            .fold(0.0f64, f64::max);
-        // straddler: a VERTEX off EVERY analytic surface (a genuinely leaked
-        // interior point), not merely off this face's tagged surface.
-        let vmax_off = v.iter().map(|&q| nearest_off(q)).fold(0.0f64, f64::max);
+    // A face closing a filled contact wedge spans the wedge by design.
+    let contact: rustc_hash::FxHashSet<usize> = mesh.contact_faces.iter().copied().collect();
+    // Per curved face: its corners, longest edge, the largest distance of a
+    // corner and of its centroid from the nearest surface.
+    let offs: Vec<Option<([V3; 3], f64, f64, f64)>> = mesh
+        .faces
+        .par_iter()
+        .enumerate()
+        .map(|(fi, f)| {
+            let kind = &mesh.surfaces[f.surface as usize];
+            if matches!(kind, SurfaceKind::Plane) || curved.is_empty() || contact.contains(&fi) {
+                return None; // planar faces are exact; deviation is 0
+            }
+            let v = [pt(f.tri[0]), pt(f.tri[1]), pt(f.tri[2])];
+            let longest = (0..3)
+                .map(|k| dist(v[k], v[(k + 1) % 3]))
+                .fold(0.0f64, f64::max);
+            // straddler: a VERTEX off EVERY analytic surface (a genuinely
+            // leaked interior point), not merely off this face's tagged surface.
+            let vmax_off = v.iter().map(|&q| nearest_off(q)).fold(0.0f64, f64::max);
+            Some((v, longest, vmax_off, nearest_off(centroid(&v))))
+        })
+        .collect();
+    for &(v, longest, vmax_off, c_off) in offs.iter().flatten() {
         if longest > 0.0 && vmax_off > 0.25 * longest {
             n_straddlers += 1;
             defects.push(Defect {
@@ -379,7 +402,6 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         }
         // accuracy: chord sagitta = centroid distance to the nearest true surface
         // (a real bridge face -- flat over a concave crease -- still reports far off).
-        let c_off = nearest_off(centroid(&v));
         max_dev = max_dev.max(c_off);
         // bridge face / lid: every VERTEX passes the straddler test (all on
         // some surface), but the face INTERIOR spans far off everything --

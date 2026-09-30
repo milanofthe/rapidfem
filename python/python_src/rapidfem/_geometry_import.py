@@ -70,22 +70,26 @@ class _ImportMixin:
     def load(self, path: str, *,
              material=None,
              maxh: float | None = None,
-             unit: str = "M",
+             unit: str | None = None,
              scale: float = 1.0,
              position: tuple[float, float, float] = (0.0, 0.0, 0.0),
              rotation: "tuple | None" = None,
              heal_angle: float = 40.0):
-        """Load an external surface model as a solid, or a pre-built mesh.
+        """Load external CAD or a surface model as solids, or a pre-built mesh.
 
-        ``.stl`` and ``.obj`` files load as one solid each: the surface must
-        be a closed, consistently oriented 2-manifold; it is split into smooth
-        surfaces at creases sharper than ``heal_angle`` degrees and remeshed.
+        A ``.step``/``.stp`` file (AP203/AP214) loads one solid per body, its
+        faces on their true surfaces (planes, quadrics, tori, B-splines),
+        converted from the file's declared unit to metres. ``.stl`` and
+        ``.obj`` files load as one solid each: the surface must be a closed,
+        consistently oriented 2-manifold; it is split into smooth surfaces at
+        creases sharper than ``heal_angle`` degrees and remeshed. Every
+        imported solid is a normal :class:`GeoObject`: booleans, transforms,
+        face selections, materials and physics work on it as on a primitive.
         A ``.msh`` volume mesh (gmsh MSH 4.1 or 2.2) is taken as it is and
         switches the geometry into *mesh mode*: its named physical groups
         become selectable handles (a :class:`MeshScene`) for materials and
         physics, and :meth:`mesh` bakes the bindings without remeshing.
-        STEP, IGES and BREP import (milanofthe/rapidmesh-dev#37) is not
-        available yet.
+        IGES and BREP import is not available.
 
 
         Parameters
@@ -96,9 +100,10 @@ class _ImportMixin:
             material of the imported solid
         maxh : float, optional
             mesh size on the solid in metres
-        unit : str
+        unit : str, optional
             unit of the file's coordinates (``"M"``, ``"MM"``, ``"UM"``,
-            ``"IN"``, ...); STL carries none
+            ``"IN"``, ...); by default a STEP file's declared unit, metres
+            for STL and OBJ (which carry none)
         scale : float
             extra factor on the coordinates, after ``unit``
         position : tuple[float, float, float]
@@ -112,17 +117,17 @@ class _ImportMixin:
 
         Returns
         -------
-        GeoObject or MeshScene
-            the imported solid, or the groups of a loaded mesh
+        GeoObject or list[GeoObject] or MeshScene
+            the imported solid (a list for a STEP file with several), or the
+            groups of a loaded mesh
         """
         ext = Path(path).suffix.lower()
-        if ext in (".step", ".stp", ".iges", ".igs", ".brep"):
+        if ext in (".iges", ".igs", ".brep"):
             raise NotImplementedError(
-                f"load: {ext} import is not available yet "
-                f"(milanofthe/rapidmesh-dev#37); STL and OBJ are")
-        if ext not in (".stl", ".obj", ".msh"):
+                f"load: {ext} import is not available; export STEP instead")
+        if ext not in (".step", ".stp", ".stl", ".obj", ".msh"):
             raise ValueError(f"load: unsupported extension {ext!r}; "
-                             f"supported: .stl, .obj, .msh")
+                             f"supported: .step, .stp, .stl, .obj, .msh")
         if not Path(path).is_file():
             raise FileNotFoundError(path)
         if ext == ".msh":
@@ -132,24 +137,27 @@ class _ImportMixin:
                     "load(.msh): position/rotation/scale are not supported for a "
                     "pre-built mesh; it is consumed in its own coordinates")
             return self._load_mesh(str(path))
-        try:
-            factor = _UNITS[unit.upper()] * float(scale)
-        except KeyError:
-            raise ValueError(f"load: unknown unit {unit!r}; one of {', '.join(_UNITS)}") from None
-        obj = self._wrap(self._native.add_import(str(path), float(heal_angle), maxh),
-                         sheet=False, material=material, maxh=maxh)
-        if factor != 1.0:
-            self.stretch(obj, factor, factor, factor)
-        if rotation is not None:
-            if len(rotation) not in (2, 3):
-                raise ValueError("rotation must be (angle, axis) or (angle, axis, centre), "
-                                 f"got {rotation!r}")
-            angle, axis, *centre = rotation
-            self.rotate(obj, float(angle), axis=axis,
-                        center=centre[0] if centre else (0.0, 0.0, 0.0))
-        if tuple(position) != (0.0, 0.0, 0.0):
-            self.translate(obj, *position)
-        return obj
+        if rotation is not None and len(rotation) not in (2, 3):
+            raise ValueError("rotation must be (angle, axis) or (angle, axis, centre), "
+                             f"got {rotation!r}")
+        if unit is not None and unit.upper() not in _UNITS:
+            raise ValueError(f"load: unknown unit {unit!r}; one of {', '.join(_UNITS)}")
+        if ext in (".step", ".stp"):
+            ids, file_unit = self._native.add_step(str(path), maxh)
+        else:
+            ids, file_unit = [self._native.add_import(str(path), float(heal_angle), maxh)], 1.0
+        factor = (file_unit if unit is None else _UNITS[unit.upper()]) * float(scale)
+        objs = [self._wrap(i, sheet=False, material=material, maxh=maxh) for i in ids]
+        for obj in objs:
+            if factor != 1.0:
+                self.stretch(obj, factor, factor, factor)
+            if rotation is not None:
+                angle, axis, *centre = rotation
+                self.rotate(obj, float(angle), axis=axis,
+                            center=centre[0] if centre else (0.0, 0.0, 0.0))
+            if tuple(position) != (0.0, 0.0, 0.0):
+                self.translate(obj, *position)
+        return objs[0] if len(objs) == 1 else objs
 
     def _load_mesh(self, path: str) -> MeshScene:
         from .geometry import EntityCollection, _Entity

@@ -13,7 +13,7 @@ type P2 = [f64; 2];
 
 /// Highest supported degree. Basis evaluation runs on fixed-size stack
 /// arrays, so evaluating a curve or surface never allocates.
-pub const MAX_DEGREE: usize = 9;
+pub const MAX_DEGREE: usize = 25;
 pub(crate) const W: usize = MAX_DEGREE + 1;
 
 /// The knot span index containing `u` (Piegl & Tiller A2.1); `n` is the last
@@ -63,11 +63,22 @@ pub(crate) fn basis_funs(span: usize, u: f64, p: usize, knots: &[f64]) -> [f64; 
 /// of degree `p` (Piegl & Tiller A2.3). Returns `ders[k][j]`, `k` in `0..=2`, `j` in
 /// `0..=degree` for control point `span - degree + j`.
 pub(crate) fn ders_basis(knots: &[f64], p: usize, span: usize, u: f64) -> [[f64; W]; 3] {
+    // The triangle of basis values takes (p + 1)^2 entries: on a table for
+    // the common low degrees, not one for the highest on every call.
+    if p < 8 {
+        ders_basis_in::<8>(knots, p, span, u)
+    } else {
+        ders_basis_in::<W>(knots, p, span, u)
+    }
+}
+
+/// [`ders_basis`] with a table of `M` by `M` (`p < M`).
+fn ders_basis_in<const M: usize>(knots: &[f64], p: usize, span: usize, u: f64) -> [[f64; W]; 3] {
     let nd = 2;
     let u_ = knots;
-    let mut ndu = [[0.0f64; W]; W];
-    let mut left = [0.0f64; W];
-    let mut right = [0.0f64; W];
+    let mut ndu = [[0.0f64; M]; M];
+    let mut left = [0.0f64; M];
+    let mut right = [0.0f64; M];
     ndu[0][0] = 1.0;
     for j in 1..=p {
         left[j] = u - u_[span + 1 - j];
@@ -87,7 +98,7 @@ pub(crate) fn ders_basis(knots: &[f64], p: usize, span: usize, u: f64) -> [[f64;
     }
     // derivatives (orders above the degree are identically zero)
     let kmax = nd.min(p);
-    let mut a = [[0.0f64; W]; 2];
+    let mut a = [[0.0f64; M]; 2];
     for r in 0..=p {
         let (mut s1, mut s2) = (0usize, 1usize);
         a[0][0] = 1.0;
@@ -356,16 +367,21 @@ impl NurbsCurve {
             let d: [f64; 2] = std::array::from_fn(|k| (lo[k] - q[k]).max(q[k] - hi[k]).max(0.0));
             d[0] * d[0] + d[1] * d[1]
         };
-        let Some(first) = spans.clone().min_by(|&a, &b| bound(a).total_cmp(&bound(b))) else {
+        // Nearest bound first; once a bound reaches the best distance, no
+        // span after it can beat it.
+        let mut order: Vec<(f64, usize)> = spans.map(|s| (bound(s), s)).collect();
+        if order.is_empty() {
             return self.domain().0;
-        };
-        let mut best = self.closest_in_span(first, q);
-        for s in spans {
-            if s != first && bound(s) < best.1 {
-                let c = self.closest_in_span(s, q);
-                if c.1 < best.1 {
-                    best = c;
-                }
+        }
+        order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut best = (self.domain().0, f64::INFINITY);
+        for (b, s) in order {
+            if b >= best.1 {
+                break;
+            }
+            let c = self.closest_in_span(s, q);
+            if c.1 < best.1 {
+                best = c;
             }
         }
         best.0

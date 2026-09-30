@@ -84,9 +84,12 @@ thread_local! {
     static STATS: RefCell<Vec<(String, f64)>> = const { RefCell::new(Vec::new()) };
     static EVENTS: RefCell<Vec<Event>> = const { RefCell::new(Vec::new()) };
     static START: RefCell<Option<Instant>> = const { RefCell::new(None) };
-    /// Minimum level to print live; `None` = silent (records still collected).
-    static THRESHOLD: RefCell<Option<Level>> = const { RefCell::new(None) };
 }
+
+/// Minimum level to print live, for the whole process (the worker threads
+/// of a mesh print too): 0 silent, else the level's rank plus one. The
+/// records stay per thread.
+static THRESHOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Clears all collectors and (re)starts the run clock. The live-print threshold
 /// is taken from `RAPIDMESH_LOG` (unless already set higher via [`set_level`]).
@@ -103,12 +106,19 @@ pub fn clear() {
 /// Sets the live-print threshold: `Some(level)` prints events at or above
 /// `level`; `None` is silent.
 pub fn set_level(level: Option<Level>) {
-    THRESHOLD.with(|t| *t.borrow_mut() = level);
+    let rank = level.map_or(0, |l| l as u8 + 1);
+    THRESHOLD.store(rank, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The current live-print threshold (`None` = silent).
 pub fn level() -> Option<Level> {
-    THRESHOLD.with(|t| *t.borrow())
+    match THRESHOLD.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(Level::Debug),
+        2 => Some(Level::Info),
+        3 => Some(Level::Warn),
+        4 => Some(Level::Error),
+        _ => None,
+    }
 }
 
 /// Back-compat toggle: `true` = [`Level::Info`], `false` = silent.
@@ -129,7 +139,7 @@ fn elapsed() -> f64 {
 pub fn event(level: Level, stage: &str, message: impl Into<String>) {
     let message = message.into();
     let at = elapsed();
-    if THRESHOLD.with(|t| t.borrow().is_some_and(|thr| level >= thr)) {
+    if self::level().is_some_and(|thr| level >= thr) {
         eprintln!("[{at:8.3}s {:>5} {stage}] {message}", level.tag());
     }
     EVENTS.with(|e| {
@@ -162,11 +172,49 @@ pub fn error(stage: &str, message: impl Into<String>) {
     event(Level::Error, stage, message);
 }
 
-/// Records a stage's wall-clock duration in seconds, in call order, and emits
-/// an info event so the timing is visible live.
+/// Records a stage's wall-clock duration in seconds and emits an info event
+/// so the timing is visible live. A stage run again (a round of a loop) adds
+/// to its first record, so the timings hold each stage's total. Where the
+/// heap is counted (see [`crate::mem`]), its peak during the stage goes to
+/// the stats as `mem.<name>` (MB).
 pub fn stage(name: &str, seconds: f64) {
-    TIMINGS.with(|t| t.borrow_mut().push((name.to_string(), seconds)));
+    TIMINGS.with(|t| {
+        let mut t = t.borrow_mut();
+        match t.iter_mut().find(|(n, _)| n == name) {
+            Some((_, s)) => *s += seconds,
+            None => t.push((name.to_string(), seconds)),
+        }
+    });
     info(name, format!("{seconds:.3}s"));
+    if let Some(peak) = crate::mem::take_peak() {
+        let key = format!("mem.{name}");
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            let mb = peak as f64 / (1 << 20) as f64;
+            match s.iter_mut().find(|(n, _)| *n == key) {
+                Some((_, v)) => *v = v.max(mb),
+                None => s.push((key, mb)),
+            }
+        });
+    }
+    if let Some(calls) = crate::mem::take_calls() {
+        let key = format!("allocs.{name}");
+        STATS.with(|s| {
+            let mut s = s.borrow_mut();
+            match s.iter_mut().find(|(n, _)| *n == key) {
+                Some((_, v)) => *v += calls as f64,
+                None => s.push((key, calls as f64)),
+            }
+        });
+    }
+}
+
+/// Where the heap is counted (see [`crate::mem`]), records the heap in use
+/// now as `heap.<name>` (MB): what a stage leaves behind.
+pub fn heap(name: &str) {
+    if let Some(used) = crate::mem::used() {
+        stat(&format!("heap.{name}"), used as f64 / (1 << 20) as f64);
+    }
 }
 
 /// Records a named statistic (count, size, etc.), in call order.
@@ -187,7 +235,7 @@ pub fn metric(stage_name: &str, name: &str, value: f64, unit: &str) {
 }
 
 /// Drains and returns the collected (timings, stats, events), each ordered by
-/// record time.
+/// (first) record time.
 pub fn take() -> (Vec<(String, f64)>, Vec<(String, f64)>, Vec<Event>) {
     let timings = TIMINGS.with(|t| std::mem::take(&mut *t.borrow_mut()));
     let stats = STATS.with(|s| std::mem::take(&mut *s.borrow_mut()));
@@ -217,13 +265,18 @@ mod tests {
         clear();
         set_level(Some(Level::Warn));
         stage("mesh.x", 0.5);
+        stage("mesh.y", 0.25);
+        stage("mesh.x", 0.25);
         metric("metrics", "tets", 1234.0, "");
         warn("metrics", "a sliver survived");
         let (timings, stats, events) = take();
-        assert_eq!(timings, vec![("mesh.x".to_string(), 0.5)]);
+        assert_eq!(
+            timings,
+            vec![("mesh.x".to_string(), 0.75), ("mesh.y".to_string(), 0.25)]
+        );
         assert_eq!(stats, vec![("metrics.tets".to_string(), 1234.0)]);
         // All three events are collected regardless of the print threshold.
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[2].level, Level::Warn);
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[4].level, Level::Warn);
     }
 }

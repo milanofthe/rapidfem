@@ -524,10 +524,15 @@ impl Faceted {
                         axis: map_dir(*axis),
                         x: map_dir(*x),
                     },
-                    SurfaceKind::Nurbs(n) => SurfaceKind::Nurbs(Arc::new(crate::NurbsSurface {
-                        ctrl: n.ctrl.iter().map(|&q| map(q)).collect(),
-                        ..(**n).clone()
-                    })),
+                    SurfaceKind::Nurbs(n) => {
+                        SurfaceKind::Nurbs(Arc::new(crate::NurbsSurface::new(
+                            n.degree,
+                            n.knots.clone(),
+                            n.n,
+                            n.ctrl.iter().map(|&q| map(q)).collect(),
+                            n.weights.clone(),
+                        )))
+                    }
                     // The discrete carrier IS its point set: map the points,
                     // rebuild the accelerator (normals re-derive from winding).
                     SurfaceKind::Discrete(d) => SurfaceKind::Discrete(std::sync::Arc::new(

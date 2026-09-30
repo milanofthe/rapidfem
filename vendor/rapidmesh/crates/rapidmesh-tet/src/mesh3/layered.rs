@@ -32,33 +32,55 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 type P2 = [f64; 2];
 
-/// The footprint of a vertical facet and the heights it spans.
+/// The heights a wall spans over a plan piece, and whether it is a sheet.
+type Span = ([f64; 2], bool);
+
+/// The footprint of a vertical facet and the heights it spans; a sheet's
+/// stands in one region.
 struct Wall {
     a: P2,
     b: P2,
     z: [f64; 2],
+    sheet: bool,
 }
 
-/// Levels (heights of the horizontal facets) and walls of a layered PLC, or
-/// why it is not one (a sheet, a facet neither horizontal nor vertical).
+/// A horizontal sheet facet: its plan triangle and its height.
+struct Flat {
+    t: [P2; 3],
+    z: f64,
+}
+
+/// Levels (heights of the horizontal facets and of the ends of vertical
+/// sheets), walls and horizontal sheet facets of a layered PLC, or why it
+/// is not one (a facet neither horizontal nor vertical). The outline of each
+/// horizontal sheet is a wall of no height, so the plan conforms to it.
 /// Horizontal and vertical hold up to `tol`, and levels closer than `tol`
 /// are one: stacks built by summing thicknesses carry rounding noise.
-fn layers(plc: &TaggedPlc, tol: f64) -> Result<(Vec<f64>, Vec<Wall>), &'static str> {
+fn layers(plc: &TaggedPlc, tol: f64) -> Result<(Vec<f64>, Vec<Wall>, Vec<Flat>), &'static str> {
     let mut levels: Vec<f64> = Vec::new();
     let mut walls: Vec<Wall> = Vec::new();
-    for (t, rt) in plc.triangles.iter().zip(&plc.region_tags) {
-        if rt[0] == rt[1] {
-            return Err("a sheet");
-        }
+    let mut flats: Vec<Flat> = Vec::new();
+    // Edges of the horizontal sheet facets, per sheet face tag.
+    let mut flat_edges: FxHashMap<(u32, u32, u32), usize> = FxHashMap::default();
+    for (fi, (t, rt)) in plc.triangles.iter().zip(&plc.region_tags).enumerate() {
+        let sheet = rt[0] == rt[1];
         let p = t.map(|i| plc.vertices[i as usize]);
         let zs = p.map(|x| x[2]);
         let zlo = zs.iter().copied().fold(f64::INFINITY, f64::min);
         let zhi = zs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let q = p.map(|x| [x[0], x[1]]);
         if zhi - zlo <= tol {
             levels.push(zlo);
+            if sheet {
+                flats.push(Flat { t: q, z: zlo });
+                let tag = plc.face_tags[fi].0;
+                for e in 0..3 {
+                    let (a, b) = (t[e], t[(e + 1) % 3]);
+                    *flat_edges.entry((a.min(b), a.max(b), tag)).or_default() += 1;
+                }
+            }
             continue;
         }
-        let q = p.map(|x| [x[0], x[1]]);
         // The two footprint points farthest apart span the segment; the
         // third lies on it.
         let d = |i: usize, j: usize| (q[i][0] - q[j][0]).powi(2) + (q[i][1] - q[j][1]).powi(2);
@@ -74,10 +96,29 @@ fn layers(plc: &TaggedPlc, tol: f64) -> Result<(Vec<f64>, Vec<Wall>), &'static s
         if orient2d(q[0], q[1], q[2]).abs() > tol * span {
             return Err("a facet neither horizontal nor vertical");
         }
+        if sheet {
+            levels.extend([zlo, zhi]);
+        }
         walls.push(Wall {
             a: q[i],
             b: q[j],
             z: [zlo, zhi],
+            sheet,
+        });
+    }
+    let mut outline: Vec<&(u32, u32, u32)> = flat_edges
+        .iter()
+        .filter(|(_, &n)| n == 1)
+        .map(|(k, _)| k)
+        .collect();
+    outline.sort_unstable();
+    for &(a, b, _) in outline {
+        let (pa, pb) = (plc.vertices[a as usize], plc.vertices[b as usize]);
+        walls.push(Wall {
+            a: [pa[0], pa[1]],
+            b: [pb[0], pb[1]],
+            z: [pa[2], pa[2]],
+            sheet: true,
         });
     }
     if walls.is_empty() || levels.is_empty() {
@@ -85,7 +126,7 @@ fn layers(plc: &TaggedPlc, tol: f64) -> Result<(Vec<f64>, Vec<Wall>), &'static s
     }
     levels.sort_by(f64::total_cmp);
     levels.dedup_by(|b, a| *b - *a <= tol);
-    Ok((levels, walls))
+    Ok((levels, walls, flats))
 }
 
 /// Points welded at a tolerance, through a hash grid of that cell size.
@@ -122,11 +163,11 @@ impl Weld {
 
 /// The plan: every footprint split where footprints cross or come within
 /// `tol` of each other, as pieces between points welded at `tol`, each with
-/// the heights of the walls over it.
-fn plan(walls: &[Wall], tol: f64) -> (Vec<P2>, FxHashMap<(usize, usize), Vec<[f64; 2]>>) {
+/// the spans of the walls over it.
+fn plan(walls: &[Wall], tol: f64) -> (Vec<P2>, FxHashMap<(usize, usize), Vec<Span>>) {
     // One segment per distinct footprint, with every wall's heights.
     let mut foot: FxHashMap<[u64; 4], usize> = FxHashMap::default();
-    let mut segs: Vec<(P2, P2, Vec<[f64; 2]>)> = Vec::new();
+    let mut segs: Vec<(P2, P2, Vec<Span>)> = Vec::new();
     for w in walls {
         let (a, b) = if (w.a[0], w.a[1]) <= (w.b[0], w.b[1]) {
             (w.a, w.b)
@@ -143,7 +184,7 @@ fn plan(walls: &[Wall], tol: f64) -> (Vec<P2>, FxHashMap<(usize, usize), Vec<[f6
             segs.push((a, b, Vec::new()));
             segs.len() - 1
         });
-        segs[i].2.push(w.z);
+        segs[i].2.push((w.z, w.sheet));
     }
     // Split parameters of each segment, from crossings and touches, found
     // through a grid over the segment boxes.
@@ -214,7 +255,7 @@ fn plan(walls: &[Wall], tol: f64) -> (Vec<P2>, FxHashMap<(usize, usize), Vec<[f6
         pts: Vec::new(),
         grid: FxHashMap::default(),
     };
-    let mut pieces: FxHashMap<(usize, usize), Vec<[f64; 2]>> = FxHashMap::default();
+    let mut pieces: FxHashMap<(usize, usize), Vec<Span>> = FxHashMap::default();
     for (i, (a, b, zs)) in segs.iter().enumerate() {
         let mut ps: Vec<(f64, P2)> = cuts[i].iter().map(|&p| (param(*a, *b, p), p)).collect();
         ps.push((0.0, *a));
@@ -268,7 +309,7 @@ fn layered(
     // a size of microns, which would only give needles. Closer than this,
     // levels, walls and plan points are one.
     let tol = (LAYERED_SNAP * domain.finest()).max(1e-9 * extent);
-    let (levels, walls) = layers(plc, tol)?;
+    let (levels, walls, flats) = layers(plc, tol)?;
     if levels.len() < 2 {
         return Err("a single level");
     }
@@ -299,7 +340,7 @@ fn layered(
     }
     let mut boundary: Vec<P2> = pts.clone();
     let mut segments: Vec<(usize, usize)> = Vec::new();
-    let mut heights: FxHashMap<(usize, usize), Vec<[f64; 2]>> = FxHashMap::default();
+    let mut heights: FxHashMap<(usize, usize), Vec<Span>> = FxHashMap::default();
     let mut keys: Vec<&(usize, usize)> = pieces.keys().collect();
     keys.sort_unstable();
     for &(u, v) in keys {
@@ -333,6 +374,7 @@ fn layered(
         0,
         4,
         12,
+        true,
         |_, _| {},
     );
     if tris.is_empty() {
@@ -344,6 +386,57 @@ fn layered(
         }
     }
     let n2 = p2.len();
+
+    // ---- sheets: the heights each plan triangle carries a horizontal sheet
+    // at, found through a grid of the triangle centroids, and the spans of
+    // the vertical sheets over each plan edge
+    let centroid = |t: &[usize; 3]| -> P2 {
+        std::array::from_fn(|k| (p2[t[0]][k] + p2[t[1]][k] + p2[t[2]][k]) / 3.0)
+    };
+    let mut flat_at: Vec<Vec<f64>> = vec![Vec::new(); tris.len()];
+    if !flats.is_empty() {
+        let cell = ((hi[0] - lo[0]).max(hi[1] - lo[1]) / (tris.len() as f64).sqrt()).max(tol);
+        let key = |x: f64, k: usize| ((x - lo[k]) / cell).floor() as i64;
+        let mut grid: FxHashMap<(i64, i64), Vec<usize>> = FxHashMap::default();
+        for (ti, t) in tris.iter().enumerate() {
+            let c = centroid(t);
+            grid.entry((key(c[0], 0), key(c[1], 1)))
+                .or_default()
+                .push(ti);
+        }
+        for f in &flats {
+            let o = orient2d(f.t[0], f.t[1], f.t[2]).signum();
+            let (flo, fhi) = (0..3).fold(([f64::MAX; 2], [f64::MIN; 2]), |(l, h), i| {
+                (
+                    std::array::from_fn(|k| l[k].min(f.t[i][k])),
+                    std::array::from_fn(|k| h[k].max(f.t[i][k])),
+                )
+            });
+            for gx in key(flo[0], 0)..=key(fhi[0], 0) {
+                for gy in key(flo[1], 1)..=key(fhi[1], 1) {
+                    for &ti in grid.get(&(gx, gy)).into_iter().flatten() {
+                        let c = centroid(&tris[ti]);
+                        let within =
+                            (0..3).all(|e| orient2d(f.t[e], f.t[(e + 1) % 3], c) * o >= 0.0);
+                        if within {
+                            flat_at[ti].push(f.z);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let sheet_sides: FxHashMap<(usize, usize), Vec<[f64; 2]>> = heights
+        .iter()
+        .filter_map(|(&key, zs)| {
+            let spans: Vec<[f64; 2]> = zs
+                .iter()
+                .filter(|&&(z, sheet)| sheet && z[1] - z[0] > tol)
+                .map(|&(z, _)| z)
+                .collect();
+            (!spans.is_empty()).then_some((key, spans))
+        })
+        .collect();
 
     // ---- regions per slab: triangles joined across edges without a wall
     let mut edge_tris: FxHashMap<(usize, usize), Vec<usize>> = FxHashMap::default();
@@ -361,9 +454,10 @@ fn layered(
                 if ts.len() != 2 {
                     continue;
                 }
-                let walled = heights
-                    .get(key)
-                    .is_some_and(|zs| zs.iter().any(|z| z[0] <= zm && zm <= z[1]));
+                let walled = heights.get(key).is_some_and(|zs| {
+                    zs.iter()
+                        .any(|&(z, sheet)| !sheet && z[0] <= zm && zm <= z[1])
+                });
                 if !walled {
                     let (a, b) = (find(&mut parent, ts[0]), find(&mut parent, ts[1]));
                     parent[a] = b;
@@ -420,12 +514,50 @@ fn layered(
         }
     }
     let changes = |ti: usize, k: usize| region_of[slab_of[k - 1]][ti] != region_of[slab_of[k]][ti];
+    // The sheets as level indices, and the levels each plan point keeps for
+    // them: the ends of the vertical sheets beside it, the height of each
+    // horizontal sheet over a triangle at it.
+    let level_of = |z: f64| -> usize {
+        let i = zs.partition_point(|&x| x < z);
+        [i.saturating_sub(1), i.min(last)]
+            .into_iter()
+            .min_by(|&a, &b| (zs[a] - z).abs().total_cmp(&(zs[b] - z).abs()))
+            .expect("two candidates")
+    };
+    let side_levels: FxHashMap<(usize, usize), Vec<[usize; 2]>> = sheet_sides
+        .iter()
+        .map(|(&key, spans)| (key, spans.iter().map(|z| z.map(level_of)).collect()))
+        .collect();
+    let mut flat_faces: FxHashSet<([usize; 3], usize)> = FxHashSet::default();
+    let mut must: Vec<Vec<usize>> = vec![Vec::new(); n2];
+    for (&(u, v), ks) in &side_levels {
+        for k in ks {
+            must[u].extend(k);
+            must[v].extend(k);
+        }
+    }
+    for (ti, t) in tris.iter().enumerate() {
+        for &z in &flat_at[ti] {
+            let k = level_of(z);
+            let mut key = *t;
+            key.sort_unstable();
+            flat_faces.insert((key, k));
+            for &v in t {
+                must[v].push(k);
+            }
+        }
+    }
+    for m in &mut must {
+        m.sort_unstable();
+        m.dedup();
+    }
     let kept: Vec<Vec<usize>> = (0..n2)
         .map(|v| {
             let mut ks = vec![0];
             for k in 1..last {
                 let below = zs[ks[ks.len() - 1]];
                 if point_tris[v].iter().any(|&t| changes(t, k))
+                    || must[v].binary_search(&k).is_ok()
                     || zs[k + 1] - below > hv[v][slab_of[k]] * (1.0 + 1e-9)
                 {
                     ks.push(k);
@@ -436,6 +568,7 @@ fn layered(
         })
         .collect();
     let mut points: Vec<P3> = Vec::new();
+    let mut at: Vec<(usize, usize)> = Vec::new();
     let columns: Vec<Vec<(usize, u32)>> = kept
         .iter()
         .enumerate()
@@ -443,6 +576,7 @@ fn layered(
             ks.iter()
                 .map(|&k| {
                     points.push([p2[v][0], p2[v][1], zs[k]]);
+                    at.push((v, k));
                     (k, points.len() as u32 - 1)
                 })
                 .collect()
@@ -474,7 +608,25 @@ fn layered(
             regions.push(r);
         }
     }
-    Ok(complete(points, tets, regions, oracle, extent, tol))
+    // A face inside a region lies on a sheet: on the side of a plan edge
+    // within the levels of a vertical sheet over it, or on a plan triangle
+    // at the level of a horizontal sheet over it.
+    let on_sheet = |f: [(usize, usize); 3]| -> bool {
+        let mut vs = f.map(|x| x.0);
+        vs.sort_unstable();
+        if vs[0] != vs[1] && vs[1] != vs[2] {
+            return f[0].1 == f[1].1 && f[1].1 == f[2].1 && flat_faces.contains(&(vs, f[0].1));
+        }
+        let (u, v) = (vs[0], if vs[0] == vs[1] { vs[2] } else { vs[1] });
+        side_levels.get(&(u, v)).is_some_and(|spans| {
+            spans
+                .iter()
+                .any(|k| f.iter().all(|x| k[0] <= x.1 && x.1 <= k[1]))
+        })
+    };
+    Ok(complete(
+        points, at, tets, regions, on_sheet, oracle, extent, tol,
+    ))
 }
 
 /// The tets of the column over a plan triangle, each with the level of its
@@ -502,11 +654,15 @@ fn sweep(col: [(usize, &[(usize, u32)]); 3]) -> Vec<([u32; 4], usize)> {
 }
 
 /// Faces, feature edges and vertex kinds of the tets, and the unused
-/// points dropped.
+/// points dropped. `at` holds each point's plan point and level, which
+/// `on_sheet` takes per face corner to tell a sheet face inside a region.
+#[allow(clippy::too_many_arguments)]
 fn complete(
     points: Vec<P3>,
+    at: Vec<(usize, usize)>,
     tets: Vec<[u32; 4]>,
     regions: Vec<u32>,
+    on_sheet: impl Fn([(usize, usize); 3]) -> bool,
     oracle: &BrepOracle<'_>,
     extent: f64,
     tol: f64,
@@ -523,6 +679,12 @@ fn complete(
         }
     }
     let tets: Vec<[u32; 4]> = tets.iter().map(|t| t.map(|v| used[v as usize])).collect();
+    let mut at_kept = vec![(0, 0); kept.len()];
+    for (v, &u) in used.iter().enumerate() {
+        if u != u32::MAX {
+            at_kept[u as usize] = at[v];
+        }
+    }
 
     // Faces: tet faces where the region changes, wound into the tet's side.
     const FACE: [[usize; 3]; 4] = [[1, 3, 2], [0, 2, 3], [0, 3, 1], [0, 1, 2]];
@@ -535,7 +697,7 @@ fn complete(
             key.sort_unstable();
             match first.remove(&key) {
                 Some((g, s)) => {
-                    if s != r {
+                    if s != r || on_sheet(g.map(|v| at_kept[v as usize])) {
                         pairs.push((g, s, r));
                     }
                 }

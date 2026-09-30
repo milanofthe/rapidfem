@@ -62,10 +62,12 @@ pub use tri::{TriGeometry, TriTopology};
 
 #[cfg(feature = "mesher")]
 pub use bundle::{
-    mesh_2d, mesh_3d, mesh_layers, overlay_regions, union_regions, Mesh2D, Mesh2DOptions, Mesh3D,
-    Region2D,
+    mesh_2d, mesh_3d, mesh_layers, overlay_regions, union_regions, BandDiagonals, Mesh2D,
+    Mesh2DOptions, Mesh3D, Region2D,
 };
 #[cfg(feature = "mesher")]
 pub use classes::{Classification, TriClassification};
 #[cfg(feature = "mesher")]
 pub use i_overlay::core::overlay_rule::OverlayRule;
+#[cfg(feature = "mesher")]
+pub use offset::OFFSET_GRADING;

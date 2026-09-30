@@ -20,11 +20,14 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-/// A solid of the geometry: its region (0 for a void) and its label.
+/// A solid of the geometry: its region (0 for a void), its label and the
+/// names of its faces by role (an empty name for a role without one).
 #[derive(Clone, Debug, Serialize)]
 pub struct SolidInfo {
     pub region: u32,
     pub label: Option<String>,
+    #[serde(skip)]
+    pub roles: Vec<String>,
 }
 
 /// The names a mesh carries from its geometry.

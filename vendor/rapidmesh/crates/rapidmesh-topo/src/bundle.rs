@@ -61,6 +61,29 @@ impl Region2D {
     }
 }
 
+/// How the diagonals of the edge band's cells lean along a boundary loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BandDiagonals {
+    /// Alternating from cell to cell (no preferred direction).
+    #[default]
+    Alternate,
+    /// All one way along the loop, turning nowhere.
+    Along,
+}
+
+impl std::str::FromStr for BandDiagonals {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "alternate" => Ok(BandDiagonals::Alternate),
+            "along" => Ok(BandDiagonals::Along),
+            other => Err(format!(
+                "unknown band diagonals {other:?} (expected \"alternate\" or \"along\")"
+            )),
+        }
+    }
+}
+
 /// Tuning for the production 2D path. `Default` matches the wasm landing.
 #[derive(Debug, Clone, Copy)]
 pub struct Mesh2DOptions {
@@ -87,6 +110,21 @@ pub struct Mesh2DOptions {
     /// changes no faster than this per unit distance. Smooths sharp fine→coarse transitions (e.g. an
     /// AMR indicator field) into a graded mesh — essential for element quality.
     pub grading: f64,
+    /// How the diagonals of the edge band's cells lean along the outline.
+    /// Which reads a conductor's loss closer depends on the solver's basis:
+    /// alternating was closer on a thick spiral, one way on a straight
+    /// graded strip (#155).
+    pub band_diagonals: BandDiagonals,
+    /// The size at most this share of the local width of the region (the
+    /// width of a trace at the nearest point of its outline; `0` = off):
+    /// `1.0` gives cells about as long as the trace is wide.
+    pub width_size: f64,
+    /// Constraint chains snapped together: a chain point closer than this
+    /// share of the size to another chain or to the outline moves onto it,
+    /// and chain pieces that then run along another are dropped (`0` =
+    /// off). Nearly coincident outlines of stacked layers otherwise force
+    /// a band of slivers between them.
+    pub snap: f64,
 }
 
 impl Default for Mesh2DOptions {
@@ -99,6 +137,9 @@ impl Default for Mesh2DOptions {
             minh: 0.0,
             maxh: 0.0,
             grading: 0.0,
+            band_diagonals: BandDiagonals::Alternate,
+            width_size: 0.0,
+            snap: 0.0,
         }
     }
 }
@@ -269,6 +310,29 @@ pub fn mesh_layers(
     //     evaluated in O(1), and — crucially — sharp fine→coarse jumps are Lipschitz-smoothed to slope
     //     `opts.grading` so the mesh grades cleanly (element quality). A flat field is unaffected.
     //     This is THE canonical way to feed rapidmesh a graded / adaptive sizing field.
+    if opts.snap > 0.0 {
+        for p in &mut patches {
+            snap_chains(&mut p.outer, &mut p.holes, &mut p.chains, &|q| {
+                opts.snap * target(q)
+            });
+        }
+    }
+    // The size at most a share of the local width, where asked for: cells
+    // as long as the trace is wide along it, the band rows across.
+    let width = (opts.width_size > 0.0).then(|| {
+        let rings: Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> = patches
+            .iter()
+            .map(|p| (p.outer.clone(), p.holes.clone()))
+            .collect();
+        crate::offset::WidthField::new(&rings)
+    });
+    let target = |p: [f64; 2]| -> f64 {
+        let t = target(p);
+        match &width {
+            Some(w) => t.min(opts.width_size * w.at(p)),
+            None => t,
+        }
+    };
     let (mut wlo, mut whi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
     let mut h_seed = f64::INFINITY;
     for p in &patches {
@@ -396,8 +460,13 @@ pub fn mesh_layers(
         }
         extent = extent.max(hi[0] - lo[0]).max(hi[1] - lo[1]);
         field_step = field_step.min(field(centroid2(&p.outer)).max(1e-12));
+        rs_chains.push(
+            p.chains
+                .iter()
+                .map(|c| align_chain(c, &loops, &field))
+                .collect(),
+        );
         rs_loops.push(loops);
-        rs_chains.push(p.chains.iter().map(|c| resample_chain(c, &field)).collect());
         bbmin.push(lo);
     }
     let step = if budget > 0 && f_min.is_finite() {
@@ -470,8 +539,15 @@ pub fn mesh_layers(
         cvt_iters: opts.cvt_iters,
         max_passes: opts.max_passes,
     };
-    let (cpoints, ctris) =
+    let (cpoints, mut ctris) =
         mesh_polygon_with_chains(&all_loops, &all_chains, canvas_target, &params, |_, _| {});
+    orient_band_diagonals(
+        &cpoints,
+        &mut ctris,
+        &all_loops,
+        &all_chains,
+        opts.band_diagonals,
+    );
 
     // 6. Read back: un-translate every vertex, then split the triangles per group. Each emitted
     //    triangle lies wholly within one patch (cross-gap triangles were filtered by `inside`), so
@@ -626,6 +702,150 @@ fn chain_midpoint(ch: &[[f64; 2]]) -> [f64; 2] {
 }
 
 /// Insert `q` as a vertex of the loop if it lies on one of its edges (and is not a vertex yet).
+/// Snaps the constraint chains of a patch together: each chain point closer
+/// than `tol` at it to the outline, a hole or another chain moves onto the
+/// nearest point there, which that loop or chain takes as a point of its
+/// own; then the chain pieces that run along a loop or an earlier chain are
+/// dropped (the chain splits there).
+fn snap_chains(
+    outer: &mut Vec<[f64; 2]>,
+    holes: &mut [Vec<[f64; 2]>],
+    chains: &mut Vec<Vec<[f64; 2]>>,
+    tol: &dyn Fn([f64; 2]) -> f64,
+) {
+    let nearest_on = |pts: &[[f64; 2]], closed: bool, q: [f64; 2]| -> Option<(f64, [f64; 2])> {
+        let n = pts.len();
+        let segs = if closed { n } else { n.saturating_sub(1) };
+        let mut best: Option<(f64, [f64; 2])> = None;
+        for i in 0..segs {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0.0 {
+                (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / l2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let x = [a[0] + t * dx, a[1] + t * dy];
+            let d = (x[0] - q[0]).hypot(x[1] - q[1]);
+            if best.is_none_or(|b| d < b.0) {
+                best = Some((d, x));
+            }
+        }
+        best
+    };
+    // Where snapped points go: 0 the outer loop, 1 + k hole k, and
+    // chains by index after the holes.
+    let mut into: Vec<(usize, [f64; 2])> = Vec::new();
+    for ci in 0..chains.len() {
+        for vi in 0..chains[ci].len() {
+            let q = chains[ci][vi];
+            let reach = tol(q);
+            let mut best: Option<(f64, [f64; 2], usize)> = None;
+            let mut consider = |hit: Option<(f64, [f64; 2])>, owner: usize| {
+                if let Some((d, x)) = hit {
+                    if d > 0.0 && d <= reach && best.is_none_or(|b| d < b.0) {
+                        best = Some((d, x, owner));
+                    }
+                }
+            };
+            consider(nearest_on(outer, true, q), 0);
+            for (k, h) in holes.iter().enumerate() {
+                consider(nearest_on(h, true, q), 1 + k);
+            }
+            for (cj, other) in chains.iter().enumerate() {
+                if cj != ci {
+                    consider(nearest_on(other, false, q), 1 + holes.len() + cj);
+                }
+            }
+            if let Some((_, x, owner)) = best {
+                chains[ci][vi] = x;
+                into.push((owner, x));
+            }
+        }
+    }
+    for (owner, x) in into {
+        match owner {
+            0 => insert_on_loop(outer, x),
+            k if k <= holes.len() => insert_on_loop(&mut holes[k - 1], x),
+            k => insert_on_chain(&mut chains[k - 1 - holes.len()], x),
+        }
+    }
+    // Pieces along a loop or an earlier chain go.
+    let bits = |p: [f64; 2]| (p[0].to_bits(), p[1].to_bits());
+    let key = |a: [f64; 2], b: [f64; 2]| {
+        let (x, y) = (bits(a), bits(b));
+        if x <= y {
+            (x, y)
+        } else {
+            (y, x)
+        }
+    };
+    let mut taken: std::collections::HashSet<((u64, u64), (u64, u64))> = Default::default();
+    for lp in std::iter::once(&*outer).chain(holes.iter()) {
+        for i in 0..lp.len() {
+            taken.insert(key(lp[i], lp[(i + 1) % lp.len()]));
+        }
+    }
+    let mut out: Vec<Vec<[f64; 2]>> = Vec::new();
+    for ch in chains.iter() {
+        let mut ch: Vec<[f64; 2]> = ch.clone();
+        ch.dedup_by(|a, b| bits(*a) == bits(*b));
+        let mut piece: Vec<[f64; 2]> = Vec::new();
+        for w in ch.windows(2) {
+            if taken.contains(&key(w[0], w[1])) {
+                if piece.len() >= 2 {
+                    out.push(std::mem::take(&mut piece));
+                }
+                piece.clear();
+                continue;
+            }
+            if piece.is_empty() {
+                piece.push(w[0]);
+            }
+            piece.push(w[1]);
+        }
+        if piece.len() >= 2 {
+            out.push(piece);
+        }
+        for w in ch.windows(2) {
+            taken.insert(key(w[0], w[1]));
+        }
+    }
+    *chains = out;
+}
+
+/// Puts `q` into the open chain `ch` on the segment it lies on.
+fn insert_on_chain(ch: &mut Vec<[f64; 2]>, q: [f64; 2]) {
+    let mut scale = 0.0f64;
+    for p in ch.iter() {
+        scale = scale.max(p[0].abs()).max(p[1].abs());
+    }
+    let eps = 1e-9 * scale.max(1e-30);
+    if ch
+        .iter()
+        .any(|p| (p[0] - q[0]).abs() <= eps && (p[1] - q[1]).abs() <= eps)
+    {
+        return;
+    }
+    for i in 0..ch.len().saturating_sub(1) {
+        let (a, b) = (ch[i], ch[i + 1]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l2 = dx * dx + dy * dy;
+        if l2 <= 0.0 {
+            continue;
+        }
+        let t = ((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / l2;
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+        if (q[0] - a[0] - t * dx).hypot(q[1] - a[1] - t * dy) <= eps {
+            ch.insert(i + 1, q);
+            return;
+        }
+    }
+}
+
 fn insert_on_loop(lp: &mut Vec<[f64; 2]>, q: [f64; 2]) {
     let n = lp.len();
     if n < 2 {
@@ -657,6 +877,215 @@ fn insert_on_loop(lp: &mut Vec<[f64; 2]>, q: [f64; 2]) {
         if d <= eps {
             lp.insert(i + 1, q);
             return;
+        }
+    }
+}
+
+/// A constraint chain resampled on the nodes of the loops it runs along. A chain next to an
+/// outline (an edge band row) would otherwise be split to the field on its own: its segments
+/// are shorter than the outline's (their ends are mitred), so its nodes drift against the
+/// outline's from both ends and the drift changes sign in the middle, where the band's cell
+/// diagonals then turn over (a node column through the band; on a thick conductor a local
+/// loss excess, #155). Here every loop node whose perpendicular foot lies inside
+/// a chain segment, within half the local size, puts a chain node at that foot; a segment no
+/// loop node projects onto is resampled to the field as before.
+fn align_chain(
+    ch: &[[f64; 2]],
+    loops: &[Vec<[f64; 2]>],
+    target: &impl Fn([f64; 2]) -> f64,
+) -> Vec<[f64; 2]> {
+    let n = ch.len();
+    if n < 2 {
+        return ch.to_vec();
+    }
+    // loop nodes in a uniform grid, so a segment scans only the cells around it
+    let pts: Vec<[f64; 2]> = loops.iter().flatten().copied().collect();
+    let cell = ch
+        .windows(2)
+        .map(|w| target(w[0]))
+        .fold(f64::INFINITY, f64::min)
+        .max(1e-12);
+    let key = |p: [f64; 2]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64);
+    let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+    for (i, &p) in pts.iter().enumerate() {
+        grid.entry(key(p)).or_default().push(i);
+    }
+    let mut out = Vec::with_capacity(2 * n);
+    for w in ch.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let l2 = dx * dx + dy * dy;
+        out.push(a);
+        if l2 <= 0.0 {
+            continue;
+        }
+        let len = l2.sqrt();
+        let at = |t: f64| [a[0] + t * dx, a[1] + t * dy];
+        let reach = 0.5 * target(a).max(target(b));
+        let (k0, k1) = (
+            key([a[0].min(b[0]) - reach, a[1].min(b[1]) - reach]),
+            key([a[0].max(b[0]) + reach, a[1].max(b[1]) + reach]),
+        );
+        let mut ts: Vec<f64> = Vec::new();
+        for kx in k0.0..=k1.0 {
+            for ky in k0.1..=k1.1 {
+                for &i in grid.get(&(kx, ky)).into_iter().flatten() {
+                    let p = pts[i];
+                    let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2;
+                    if t <= 0.0 || t >= 1.0 {
+                        continue;
+                    }
+                    let f = at(t);
+                    if (p[0] - f[0]).hypot(p[1] - f[1]) <= 0.5 * target(f) {
+                        ts.push(t);
+                    }
+                }
+            }
+        }
+        if ts.is_empty() {
+            let seg = resample_chain(&[a, b], target);
+            out.extend_from_slice(&seg[1..seg.len() - 1]);
+            continue;
+        }
+        ts.sort_by(f64::total_cmp);
+        // one node per foot, none crowding another or the segment's ends
+        let mut last = 0.0;
+        for t in ts {
+            let h = target(at(t));
+            if (t - last) * len >= 0.25 * h && (1.0 - t) * len >= 0.25 * h {
+                out.push(at(t));
+                last = t;
+            }
+        }
+    }
+    out.push(ch[n - 1]);
+    out
+}
+
+/// The diagonals of the band between each loop and a chain along it, alternating from cell to
+/// cell along the loop. For a loop edge `(p, q)` whose triangle has its apex `x` on a chain, the
+/// band cell behind it is the quad `p, q, y, x` with `y` the chain node across `q`; its diagonal
+/// runs from `p` to `y` on every even loop edge and from `q` to the node across `p` on every
+/// odd one, set by flipping the cell's inner edge where the cell is convex. On an aligned band
+/// (`align_chain`) the cells are rectangles, whose Delaunay diagonal is a tie that round-off
+/// decides, turning over at random along a run. The alternating pattern has no preferred
+/// direction: measured on a thick spiral against a 3D reference it read the loss 1 to 1.5
+/// points closer than one diagonal orientation along the whole loop (#155).
+fn orient_band_diagonals(
+    points: &[[f64; 2]],
+    tris: &mut [[usize; 3]],
+    loops: &[Vec<[f64; 2]>],
+    chains: &[Vec<[f64; 2]>],
+    lean: BandDiagonals,
+) {
+    let bits = |p: [f64; 2]| (p[0].to_bits(), p[1].to_bits());
+    let index: std::collections::HashMap<(u64, u64), usize> = points
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (bits(p), i))
+        .collect();
+    let on_chain: std::collections::HashSet<usize> = chains
+        .iter()
+        .flatten()
+        .filter_map(|&p| index.get(&bits(p)).copied())
+        .collect();
+    let is_constraint = {
+        let mut s: std::collections::HashSet<(usize, usize)> = Default::default();
+        let mut add = |u: usize, v: usize| {
+            s.insert((u.min(v), u.max(v)));
+        };
+        for lp in loops {
+            for k in 0..lp.len() {
+                if let (Some(&u), Some(&v)) = (
+                    index.get(&bits(lp[k])),
+                    index.get(&bits(lp[(k + 1) % lp.len()])),
+                ) {
+                    add(u, v);
+                }
+            }
+        }
+        for ch in chains {
+            for w in ch.windows(2) {
+                if let (Some(&u), Some(&v)) = (index.get(&bits(w[0])), index.get(&bits(w[1]))) {
+                    add(u, v);
+                }
+            }
+        }
+        s
+    };
+    // triangles by edge
+    let mut by_edge: std::collections::HashMap<(usize, usize), Vec<usize>> = Default::default();
+    for (t, tri) in tris.iter().enumerate() {
+        for k in 0..3 {
+            let (u, v) = (tri[k], tri[(k + 1) % 3]);
+            by_edge.entry((u.min(v), u.max(v))).or_default().push(t);
+        }
+    }
+    let orient = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let apex =
+        |tri: &[usize; 3], u: usize, v: usize| *tri.iter().find(|&&w| w != u && w != v).unwrap();
+    let dist =
+        |i: usize, j: usize| (points[i][0] - points[j][0]).hypot(points[i][1] - points[j][1]);
+    for lp in loops {
+        for k in 0..lp.len() {
+            let (Some(&p), Some(&q)) = (
+                index.get(&bits(lp[k])),
+                index.get(&bits(lp[(k + 1) % lp.len()])),
+            ) else {
+                continue;
+            };
+            // odd loop edges lean the other way (the same rule with the edge's ends swapped),
+            // unless every cell leans one way
+            let (p, q) = if k % 2 == 1 && lean == BandDiagonals::Alternate {
+                (q, p)
+            } else {
+                (p, q)
+            };
+            let Some(&t1) = by_edge.get(&(p.min(q), p.max(q))).and_then(|v| v.first()) else {
+                continue;
+            };
+            let x = apex(&tris[t1], p, q);
+            // only a band cell whose apex sits by `p`: its diagonal (q, x) runs backward
+            if !on_chain.contains(&x) || dist(x, p) >= dist(x, q) {
+                continue;
+            }
+            let e = (q.min(x), q.max(x));
+            if is_constraint.contains(&e) {
+                continue;
+            }
+            let Some(&t2) = by_edge.get(&e).and_then(|v| v.iter().find(|&&t| t != t1)) else {
+                continue;
+            };
+            let y = apex(&tris[t2], q, x);
+            if !on_chain.contains(&y) || y == p {
+                continue;
+            }
+            // the flipped pair (p, q, y) and (p, y, x) must keep the orientation of the old one
+            let s = orient(points[p], points[q], points[x]).signum();
+            let (n1, n2) = ([p, q, y], [p, y, x]);
+            let ok = |t: [usize; 3]| orient(points[t[0]], points[t[1]], points[t[2]]) * s > 0.0;
+            if !ok(n1) || !ok(n2) {
+                continue;
+            }
+            let fix = |t: [usize; 3]| if s > 0.0 { t } else { [t[0], t[2], t[1]] };
+            let (old1, old2) = (tris[t1], tris[t2]);
+            tris[t1] = fix(n1);
+            tris[t2] = fix(n2);
+            // keep the edge map true for the next loop edges
+            for (t, old, new) in [(t1, old1, tris[t1]), (t2, old2, tris[t2])] {
+                for k in 0..3 {
+                    let (u, v) = (old[k], old[(k + 1) % 3]);
+                    if let Some(l) = by_edge.get_mut(&(u.min(v), u.max(v))) {
+                        l.retain(|&w| w != t);
+                    }
+                }
+                for k in 0..3 {
+                    let (u, v) = (new[k], new[(k + 1) % 3]);
+                    by_edge.entry((u.min(v), u.max(v))).or_default().push(t);
+                }
+            }
         }
     }
 }
@@ -883,6 +1312,168 @@ mod tests {
                 ang(a, b, c).min(ang(b, c, a)).min(ang(c, a, b))
             })
             .fold(180.0, f64::min)
+    }
+
+    /// An edge band (a ring chain a sixteenth of the width inside a strip) is laid on the
+    /// outline's nodes and its cell diagonals alternate along the whole outline: every chain node
+    /// on a long side sits at the perpendicular foot of an outline node, and along each long
+    /// side the apex of the triangle on an outline edge switches between the edge's two ends from
+    /// one cell to the next (no run of one orientation that turns over midway, #155).
+    #[test]
+    /// Two constraint chains 0.05 apart at size 1 force slivers between
+    /// them; snapped, they are one and the triangles keep their angles.
+    fn nearly_coincident_chains_snap_together() {
+        let mut r = Region2D::new(vec![[0.0, 0.0], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]], 1);
+        r.constraints = vec![
+            vec![[2.0, 3.0], [10.0, 3.0], [18.0, 3.0]],
+            vec![[2.0, 3.05], [18.0, 3.05]],
+        ];
+        let worst = |snap: f64| {
+            let opts = Mesh2DOptions {
+                snap,
+                ..Default::default()
+            };
+            let m = mesh_2d(std::slice::from_ref(&r), |_p| 1.0, &opts);
+            m.geom
+                .min_angle
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min)
+        };
+        let (apart, snapped) = (worst(0.0), worst(0.25));
+        assert!(apart < 10.0, "chains apart: {apart} deg");
+        assert!(snapped > 20.0, "snapped: {snapped} deg");
+    }
+
+    #[test]
+    /// With `width_size`, a narrow strip meshed at a size far above its
+    /// width gets cells about as long as it is wide.
+    fn width_size_follows_the_trace() {
+        let (len, w) = (200.0, 4.0);
+        let strip = Region2D::new(vec![[0.0, 0.0], [len, 0.0], [len, w], [0.0, w]], 1);
+        let mean_edge = |opts: &Mesh2DOptions| {
+            let m = mesh_2d(std::slice::from_ref(&strip), |_p| 50.0, opts);
+            let (mut sum, mut n) = (0.0, 0usize);
+            for t in &m.tris {
+                for k in 0..3 {
+                    let (a, b) = (m.points[t[k] as usize], m.points[t[(k + 1) % 3] as usize]);
+                    sum += (a[0] - b[0]).hypot(a[1] - b[1]);
+                    n += 1;
+                }
+            }
+            sum / n as f64
+        };
+        let coarse = mean_edge(&Mesh2DOptions::default());
+        let fine = mean_edge(&Mesh2DOptions {
+            width_size: 1.0,
+            ..Default::default()
+        });
+        assert!(fine < 0.5 * coarse, "mean edge {fine} against {coarse}");
+        assert!(
+            fine > 0.3 * w && fine < 1.5 * w,
+            "mean edge {fine} for width {w}"
+        );
+    }
+
+    #[test]
+    /// With the diagonals along, every band cell on a side leans the same
+    /// way: no change of direction along the outline.
+    fn edge_band_diagonals_along_turn_nowhere() {
+        let (len, w) = (100.0, 10.0);
+        let d = w / 16.0;
+        let mut strip = Region2D::new(vec![[0.0, 0.0], [len, 0.0], [len, w], [0.0, w]], 1);
+        strip.constraints = vec![vec![
+            [d, d],
+            [len - d, d],
+            [len - d, w - d],
+            [d, w - d],
+            [d, d],
+        ]];
+        let opts = Mesh2DOptions {
+            band_diagonals: BandDiagonals::Along,
+            ..Default::default()
+        };
+        let m = mesh_2d(&[strip], |_p| w / 2.0, &opts);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let on_row = |p: [f64; 2], y: f64| near(p[1], y) && p[0] > 5.0 && p[0] < len - 5.0;
+        for (edge, row) in [(0.0, d), (w, w - d)] {
+            let mut leans: Vec<bool> = Vec::new();
+            for t in &m.tris {
+                let pts = t.map(|i| m.points[i as usize]);
+                let on_edge: Vec<[f64; 2]> =
+                    pts.iter().copied().filter(|p| on_row(*p, edge)).collect();
+                let apex: Vec<[f64; 2]> = pts.iter().copied().filter(|p| on_row(*p, row)).collect();
+                if on_edge.len() == 2 && apex.len() == 1 {
+                    leans.push(near(apex[0][0], on_edge[0][0].max(on_edge[1][0])));
+                }
+            }
+            assert!(leans.len() >= 15, "only {} band cells", leans.len());
+            assert!(
+                leans.iter().all(|&l| l == leans[0]),
+                "the diagonals turn on the side y = {edge}: {leans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_band_is_aligned_with_alternating_diagonals() {
+        let (len, w) = (100.0, 10.0);
+        let d = w / 16.0;
+        let mut strip = Region2D::new(vec![[0.0, 0.0], [len, 0.0], [len, w], [0.0, w]], 1);
+        strip.constraints = vec![vec![
+            [d, d],
+            [len - d, d],
+            [len - d, w - d],
+            [d, w - d],
+            [d, d],
+        ]];
+        let m = mesh_2d(&[strip], |_p| w / 2.0, &Mesh2DOptions::default());
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let on_row = |p: [f64; 2], y: f64| near(p[1], y) && p[0] > 5.0 && p[0] < len - 5.0;
+        for &q in &m.points {
+            for (row, edge) in [(d, 0.0), (w - d, w)] {
+                if on_row(q, row) {
+                    assert!(
+                        m.points
+                            .iter()
+                            .any(|&p| near(p[1], edge) && near(p[0], q[0])),
+                        "chain node {q:?} has no outline node below it"
+                    );
+                }
+            }
+        }
+        for (edge, row) in [(0.0, d), (w, w - d)] {
+            // per band cell along this side: (edge midpoint, apex over the edge's right end)
+            let mut cells: Vec<(f64, bool)> = Vec::new();
+            for t in &m.tris {
+                let pts = t.map(|i| m.points[i as usize]);
+                let on_edge: Vec<[f64; 2]> =
+                    pts.iter().copied().filter(|p| on_row(*p, edge)).collect();
+                let apex: Vec<[f64; 2]> = pts.iter().copied().filter(|p| on_row(*p, row)).collect();
+                if on_edge.len() == 2 && apex.len() == 1 {
+                    let right = on_edge[0][0].max(on_edge[1][0]);
+                    let left = on_edge[0][0].min(on_edge[1][0]);
+                    assert!(
+                        near(apex[0][0], right) || near(apex[0][0], left),
+                        "apex {apex:?} not over the edge {on_edge:?}"
+                    );
+                    cells.push((0.5 * (left + right), near(apex[0][0], right)));
+                }
+            }
+            cells.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert!(
+                cells.len() >= 15,
+                "only {} band cells on the side y = {edge}",
+                cells.len()
+            );
+            for pair in cells.windows(2) {
+                assert!(
+                    pair[0].1 != pair[1].1,
+                    "same diagonal twice in a row at {:?}",
+                    pair
+                );
+            }
+        }
     }
 
     #[test]
@@ -1199,6 +1790,7 @@ mod tests {
             point_class: vec![rapidmesh_tet::PointClass::Interior; 4],
             curve_edges: Vec::new(),
             periodic_points: Vec::new(),
+            contact_faces: Vec::new(),
         };
         let v = Mesh3D::build(mesh);
         assert_eq!(v.topo.edges.len(), 6);

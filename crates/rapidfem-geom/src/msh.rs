@@ -134,16 +134,18 @@ pub fn write_msh(
 ) -> io::Result<Vec<String>> {
     let keep: Vec<usize> = (0..mesh.tets.len()).filter(|&t| !holes.contains(&mesh.tet_regions[t].0)).collect();
     let open = |r: RegionTag| if holes.contains(&r.0) { RegionTag(0) } else { r };
-    let faces = mesh
-        .faces
-        .iter()
-        .map(|f| {
-            let mut f = f.clone();
-            f.regions = f.regions.map(open);
-            f
-        })
-        .filter(|f| f.regions != [RegionTag(0); 2])
-        .collect();
+    // faces inside a hole go, the rest are renumbered
+    let mut new_index = vec![usize::MAX; mesh.faces.len()];
+    let mut faces = Vec::with_capacity(mesh.faces.len());
+    for (i, f) in mesh.faces.iter().enumerate() {
+        let mut f = f.clone();
+        f.regions = f.regions.map(open);
+        if f.regions != [RegionTag(0); 2] {
+            new_index[i] = faces.len();
+            faces.push(f);
+        }
+    }
+    let contact_faces = mesh.contact_faces.iter().map(|&i| new_index[i]).filter(|&i| i != usize::MAX).collect();
     let m = TetMesh {
         points: mesh.points.clone(),
         tets: keep.iter().map(|&t| mesh.tets[t]).collect(),
@@ -156,6 +158,7 @@ pub fn write_msh(
         point_class: mesh.point_class.clone(),
         curve_edges: mesh.curve_edges.clone(),
         periodic_points: mesh.periodic_points.clone(),
+        contact_faces,
     };
     let mut region_groups = HashMap::new();
     let mut dropped = Vec::new();

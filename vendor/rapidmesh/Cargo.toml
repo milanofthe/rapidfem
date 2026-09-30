@@ -1,5 +1,5 @@
 # Vendored copy of rapidmesh (milanofthe/rapidmesh-dev) at commit
-# 953565e, written by rapidfem's scripts/vendor_rapidmesh.py: the
+# e26f528, written by rapidfem's scripts/vendor_rapidmesh.py: the
 # library crates behind the `rapidmesh` facade, without tests,
 # benches, examples, binaries or dev-dependencies. The own [workspace]
 # keeps the vendored tree out of the consuming workspace.
@@ -11,12 +11,13 @@ members = [
     "crates/rapidmesh-geom",
     "crates/rapidmesh-csg",
     "crates/rapidmesh-brep",
+    "crates/rapidmesh-step",
     "crates/rapidmesh-tet",
     "crates/rapidmesh-topo",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "1.0.0"
 edition = "2021"
 publish = false
 license = "AGPL-3.0-only"
@@ -36,6 +37,7 @@ too_many_arguments = "allow"
 rapidmesh-exact = { path = "crates/rapidmesh-exact" }
 rapidmesh-geom = { path = "crates/rapidmesh-geom" }
 rapidmesh-csg = { path = "crates/rapidmesh-csg" }
+rapidmesh-step = { path = "crates/rapidmesh-step" }
 rapidmesh-brep = { path = "crates/rapidmesh-brep" }
 rapidmesh-tet = { path = "crates/rapidmesh-tet" }
 rapidmesh-topo = { path = "crates/rapidmesh-topo" }

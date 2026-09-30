@@ -129,7 +129,7 @@ impl std::fmt::Display for AssembleError {
 impl std::error::Error for AssembleError {}
 
 /// A scene of material solids and embedded sheets.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Scene {
     solids: Vec<Faceted>,
     /// Region each solid resolves to (position = priority, value = tag;

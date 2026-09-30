@@ -33,6 +33,7 @@ CRATES = [
     "rapidmesh-geom",
     "rapidmesh-csg",
     "rapidmesh-brep",
+    "rapidmesh-step",
     "rapidmesh-tet",
     "rapidmesh-topo",
 ]

@@ -19,6 +19,7 @@
 // `tetrahedralize` / ...). The canonical embedding front door is
 // `rapidmesh_topo::{mesh_2d, mesh_3d}`.
 pub mod adapt;
+pub mod bottomup;
 pub mod diagnostics;
 pub mod fidelity;
 pub mod gradefield;
@@ -41,7 +42,7 @@ pub use conform::{
     log_metrics, log_surface_metrics, mesh_model, mesh_plc, mesh_plc_with, quality_stats,
     CurveEdge, MeshParams, PointClass, QualityStats, SurfaceFace, SurfaceMesh, TetMesh,
 };
-pub use cvt::mesh_budgeted;
+pub use cvt::{budgeted, mesh_budgeted};
 pub use mesh3::brep::surface_mesh;
 pub use optimize::{optimize, OptimizeParams};
 pub use tri::{tetrahedralize, Triangulation};

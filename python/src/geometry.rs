@@ -292,6 +292,13 @@ impl PyGeometry {
         self.inner.set_face_maxh(origins.into_iter().map(sel_of).collect(), h);
     }
 
+    /// The solids of a STEP file (one object each, in the file's unit) and
+    /// the length of that unit in metres.
+    #[pyo3(signature = (path, maxh=None))]
+    fn add_step(&mut self, path: String, maxh: Option<f64>) -> PyResult<(Vec<ObjId>, f64)> {
+        self.inner.add_step(std::path::Path::new(&path), maxh).map_err(PyValueError::new_err)
+    }
+
     /// A closed STL or OBJ surface as a solid, split into smooth surfaces
     /// at creases sharper than `crease_deg`.
     #[pyo3(signature = (path, crease_deg=40.0, maxh=None))]
@@ -387,12 +394,12 @@ impl PyGeometry {
 
     /// Meshes the scene; returns `(n_points, n_tets, min_dihedral_deg,
     /// n_slivers)`.
-    #[pyo3(signature = (maxh=None, grading=None, cells_across=1.0, optimize=false, target_elements=None))]
+    #[pyo3(signature = (maxh=None, grading=None, cells_across=None, optimize=false, target_elements=None))]
     fn mesh(
         &mut self,
         maxh: Option<f64>,
         grading: Option<f64>,
-        cells_across: f64,
+        cells_across: Option<f64>,
         optimize: bool,
         target_elements: Option<usize>,
     ) -> PyResult<(usize, usize, f64, usize)> {

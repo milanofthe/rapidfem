@@ -61,11 +61,11 @@ and layout via `rapidfem.rfic` (`rfic.Stack`, `Geometry.from_gds`).
 ```python
 g = rf.Geometry(maxh=rf.lambda_maxh(f_max=20e9))
 
-# A closed STL or OBJ surface becomes a solid, split into smooth faces at its
-# creases: a normal GeoObject, so boolean it, transform it, select its faces,
-# attach materials and physics, exactly like a g.box(...). unit= reads the
-# file's coordinates, rotation= and position= place the part.
-part = g.load("horn.stl", unit="MM", material=rf.Air(),
+# A STEP file brings one solid per body, its faces on their true surfaces, in
+# metres whatever unit the file declares: a normal GeoObject, so boolean it,
+# transform it, select its faces, attach materials and physics, exactly like
+# a g.box(...). rotation= and position= place the part.
+part = g.load("horn.step", material=rf.Air(),
               rotation=(math.pi, (0, 0, 1)), position=(0, 0, 5e-3))
 post = g.cylinder(radius=0.5e-3, height=5e-3)
 g.cut(part, post)                                # compose with primitives
@@ -73,6 +73,10 @@ g.rotate(part, math.pi / 2, axis=(0, 1, 0))      # full transform API applies
 rf.RectWaveguidePort(part.faces.max(axis="z"))
 rf.PEC(*part.faces.unassigned)
 g.mesh()
+
+# A closed STL or OBJ surface becomes a solid too, split into smooth faces at
+# its creases; STL carries no unit, unit= names the file's.
+blob = g.load("antenna.stl", unit="MM", material=rf.Air())
 
 # A pre-built .msh volume mesh (gmsh MSH 4.1 or 2.2) is already tessellated, so
 # loading one switches the geometry into mesh mode: its named physical groups
@@ -89,8 +93,8 @@ g.mesh()
 result = rf.Problem(g).sweep(np.linspace(8e9, 12e9, 21))
 ```
 
-STEP, IGES and BREP import is not available yet (milanofthe/rapidmesh-dev#37).
-`examples/fd_stl_import.py` is a full STL-driven sweep.
+IGES and BREP are not supported; export STEP. `examples/fd_stl_import.py` is a full STL-driven
+sweep.
 
 ## Local UI
 

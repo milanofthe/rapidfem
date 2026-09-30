@@ -133,19 +133,21 @@ pub fn check(c: &Complex) -> Report {
 
     // Facet incidences (facet, tet, local corner), sorted so the tets of one
     // facet are adjacent, in ascending tet order.
-    let mut incidences: Vec<([u32; 3], u32, u8)> =
-        c.tets
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(ti, t)| {
-                FACE_LOCAL.iter().enumerate().map(move |(i, fl)| {
-                    (sorted3([t[fl[0]], t[fl[1]], t[fl[2]]]), ti as u32, i as u8)
-                })
-            })
-            .collect();
+    // Written in place: a parallel collect would hold its pieces and the
+    // whole at once.
+    let mut incidences: Vec<([u32; 3], u32, u8)> = vec![([0; 3], 0, 0); 4 * c.tets.len()];
+    incidences
+        .par_chunks_mut(4)
+        .zip(c.tets.par_iter())
+        .enumerate()
+        .for_each(|(ti, (out, t))| {
+            for (i, fl) in FACE_LOCAL.iter().enumerate() {
+                out[i] = (sorted3([t[fl[0]], t[fl[1]], t[fl[2]]]), ti as u32, i as u8);
+            }
+        });
     incidences.par_sort_unstable();
-    let facets: Vec<&[([u32; 3], u32, u8)]> = incidences.chunk_by(|x, y| x.0 == y.0).collect();
-    rep.overfull_facets = facets.iter().filter(|g| g.len() > 2).count();
+    let facets = || incidences.chunk_by(|x, y| x.0 == y.0);
+    rep.overfull_facets = facets().filter(|g| g.len() > 2).count();
 
     // Faces by vertex set.
     let mut faces: FxHashMap<[u32; 3], Vec<usize>> = FxHashMap::default();
@@ -160,7 +162,7 @@ pub fn check(c: &Complex) -> Report {
     }
 
     // The label on each side of every facet, and the matching faces.
-    for inc in &facets {
+    for inc in facets() {
         let key = inc[0].0;
         let label = |k: usize| inc.get(k).map_or(0, |&(_, t, _)| c.regions[t as usize]);
         let (l0, l1) = (label(0), label(1));

@@ -46,7 +46,7 @@ pub enum EdgeCut {
 }
 
 impl EdgeCut {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             EdgeCut::Chamfer(_) => "chamfer",
             EdgeCut::Fillet(_) => "fillet",

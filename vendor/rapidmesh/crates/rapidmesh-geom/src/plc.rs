@@ -13,6 +13,7 @@ pub struct SurfaceRef(pub u32);
 /// requirement for Maxwell FEM. `RegionTag(0)` is the background (outside all
 /// scene solids).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
 pub struct RegionTag(pub u32);
 
 /// Boundary/face tag for ports, PEC surfaces, ABC/PML interfaces.

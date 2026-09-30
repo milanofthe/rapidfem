@@ -207,13 +207,17 @@ impl DomainTree {
         };
         // Per facet: the target, and the cap where it undercuts `maxh` (where
         // the size may jump; INFINITY elsewhere).
-        let mut targets: Vec<f64> = Vec::with_capacity(plc.triangles.len());
-        let mut caps: Vec<f64> = Vec::with_capacity(plc.triangles.len());
-        for i in 0..plc.triangles.len() {
-            let (cap, target) = facet_target(i);
-            targets.push(target);
-            caps.push(if cap < maxh { cap } else { f64::INFINITY });
-        }
+        // In parallel: a curved carrier projects each centroid.
+        let (targets, caps): (Vec<f64>, Vec<f64>) = {
+            use rayon::prelude::*;
+            (0..plc.triangles.len())
+                .into_par_iter()
+                .map(|i| {
+                    let (cap, target) = facet_target(i);
+                    (target, if cap < maxh { cap } else { f64::INFINITY })
+                })
+                .unzip()
+        };
 
         // The finest volume target anywhere: the base BCC spacing `s0`. The
         // surface is oversampled finer than this; the BCC only has to resolve the

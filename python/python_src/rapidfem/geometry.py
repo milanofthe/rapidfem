@@ -1540,8 +1540,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     ):
         """tetrahedralize the scene and build the solver mesh
 
-        Meshes the scene with rapidmesh (restricted-Delaunay refinement with
-        exact predicates), honouring the global ``maxh``, per-object and
+        Meshes the scene with rapidmesh (bottom-up: edges, then every face
+        on its true surface, then every region by its constrained Delaunay
+        tetrahedralization, with exact predicates), honouring the global ``maxh``, per-object and
         per-face sizes and the size points of :meth:`refine_near_points`,
         then tags every material and physics object and hands the mesh to
         the solvers in memory. Fills :attr:`mesh_stats`.
@@ -1558,9 +1559,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             run the quality optimizer after meshing
         cells_across : float, optional
             elements across the thickness of every region, so a thin layer
-            gets proper tets through it (0 turns it off: a stack of layers far
-            thinner than the size takes flat tets through each layer, the
-            default of :func:`rapidfem.rfic.build` geometries); 1 by default
+            gets proper tets through it; off by default (a stack of layers far
+            thinner than the size then takes flat tets through each layer)
         target_elements : int, optional
             tet budget: the global size is scaled to land near it
 
@@ -1581,10 +1581,11 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         else:
             h = maxh if maxh is not None else self._maxh
             if cells_across is None:
-                cells_across = self._mesh_defaults.get("cells_across", 1.0)
+                cells_across = self._mesh_defaults.get("cells_across")
             n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
                 maxh=h, grading=None if self._grading else 1e9,
-                cells_across=float(cells_across), optimize=bool(optimize),
+                cells_across=None if cells_across is None else float(cells_across),
+                optimize=bool(optimize),
                 target_elements=target_elements)
             face_groups, volume_groups = self._assign_groups()
             self._fem_mesh = self._native.fem_mesh(face_groups, volume_groups)

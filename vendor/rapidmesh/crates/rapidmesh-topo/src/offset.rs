@@ -15,6 +15,10 @@
 
 use crate::bundle::{Mesh2DOptions, Region2D};
 
+/// The grading of offset chains where the caller sets none: rows grow
+/// away from the boundary by at most this slope.
+pub const OFFSET_GRADING: f64 = 0.3;
+
 /// `(a, b, outward unit normal)` of one boundary segment.
 type Segment = ([f64; 2], [f64; 2], [f64; 2]);
 
@@ -138,6 +142,107 @@ impl Boundary {
     }
 }
 
+/// The local width of regions, as a field over the plane: the width at
+/// samples along each boundary (segment middles, long segments in pieces
+/// about as long as the width there), read at the sample nearest a point.
+pub(crate) struct WidthField {
+    samples: Vec<([f64; 2], f64)>,
+    cell: f64,
+    grid: std::collections::HashMap<(i64, i64), Vec<usize>>,
+}
+
+impl WidthField {
+    /// The field of `patches`, each its outer ring and its holes.
+    pub(crate) fn new(patches: &[(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)]) -> WidthField {
+        let mut samples: Vec<([f64; 2], f64)> = Vec::new();
+        for (outer, holes) in patches {
+            let rings: Vec<Vec<[f64; 2]>> = std::iter::once(outer)
+                .chain(holes.iter())
+                .map(|r| clean(r))
+                .collect();
+            let b = Boundary::new(&rings);
+            for &(a, c, m) in &b.segs {
+                let inward = [-m[0], -m[1]];
+                let len = (c[0] - a[0]).hypot(c[1] - a[1]);
+                let at = |t: f64| [a[0] + t * (c[0] - a[0]), a[1] + t * (c[1] - a[1])];
+                let w = b.width_at(at(0.5), inward);
+                let pieces = if w.is_finite() && w > 0.0 {
+                    ((len / w).ceil() as usize).clamp(1, 64)
+                } else {
+                    1
+                };
+                for k in 0..pieces {
+                    let q = at((k as f64 + 0.5) / pieces as f64);
+                    samples.push((q, b.width_at(q, inward)));
+                }
+            }
+        }
+        let mut widths: Vec<f64> = samples
+            .iter()
+            .map(|s| s.1)
+            .filter(|w| w.is_finite())
+            .collect();
+        widths.sort_by(f64::total_cmp);
+        let cell = widths
+            .get(widths.len() / 2)
+            .copied()
+            .unwrap_or(1.0)
+            .max(1e-12);
+        let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = Default::default();
+        let key = |p: [f64; 2]| ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64);
+        for (i, s) in samples.iter().enumerate() {
+            grid.entry(key(s.0)).or_default().push(i);
+        }
+        WidthField {
+            samples,
+            cell,
+            grid,
+        }
+    }
+
+    /// The width at `p`: the least width of the samples within their own
+    /// width of it (so a trace's side governs up to its ends, not the end
+    /// wall that faces the far end), else the width of the nearest sample
+    /// (INFINITY without any).
+    pub(crate) fn at(&self, p: [f64; 2]) -> f64 {
+        let c = (
+            (p[0] / self.cell).floor() as i64,
+            (p[1] / self.cell).floor() as i64,
+        );
+        let mut near = f64::INFINITY;
+        let mut nearest = (f64::INFINITY, f64::INFINITY);
+        for r in 0..4096i64 {
+            for x in c.0 - r..=c.0 + r {
+                for y in c.1 - r..=c.1 + r {
+                    if (x - c.0).abs().max((y - c.1).abs()) != r {
+                        continue;
+                    }
+                    for &i in self.grid.get(&(x, y)).into_iter().flatten() {
+                        let (q, w) = self.samples[i];
+                        let d = (q[0] - p[0]).hypot(q[1] - p[1]);
+                        if d <= w {
+                            near = near.min(w);
+                        }
+                        if d < nearest.0 {
+                            nearest = (d, w);
+                        }
+                    }
+                }
+            }
+            // Past the typical width (a cell) and the nearest sample, no
+            // farther sample reaches `p` through its width in practice.
+            if r >= 2 && nearest.0 <= r as f64 * self.cell {
+                break;
+            }
+        }
+        if near.is_finite() {
+            near
+        } else {
+            nearest.1
+        }
+    }
+}
+
 /// Where the two offset lines meeting at vertex `i` cross, each at its own distance.
 ///
 /// Parallel neighbours give the offset point itself; a sharp convex corner whose mitre runs
@@ -242,6 +347,13 @@ impl Region2D {
     /// This is the canonical input for an automatic sizing field: `local_width / k` asks for
     /// `k` elements across the shape wherever it happens to be.
     pub fn local_width(&self, p: [f64; 2], inward: [f64; 2]) -> f64 {
+        // The direction only: any length of `inward` measures the same.
+        let n = inward[0].hypot(inward[1]);
+        let inward = if n > 0.0 {
+            [inward[0] / n, inward[1] / n]
+        } else {
+            inward
+        };
         let rings: Vec<Vec<[f64; 2]>> = std::iter::once(&self.outer)
             .chain(self.holes.iter())
             .map(|r| clean(r))
@@ -522,6 +634,16 @@ mod tests {
             0,
         );
         assert!((notched.local_width([50.0, 0.0], [0.0, 1.0]) - 30.0).abs() < 1e-9);
+    }
+
+    /// Only the direction of `inward` counts, not its length.
+    #[test]
+    fn local_width_takes_any_length_of_the_direction() {
+        let r = rect(600.0, 20.0);
+        for scale in [0.01, 1.0, 7.5] {
+            let w = r.local_width([300.0, 0.0], [0.0, scale]);
+            assert!((w - 20.0).abs() < 1e-9, "scale {scale}: {w}");
+        }
     }
 
     /// Two rows around a uniform strip: closed rings at the pitch and three times it, each

@@ -436,15 +436,16 @@ impl Simulation {
         )
     }
 
-    /// Radiation efficiency η = 1 − Σ |S_i1|² for the first driven port at the given freq.
-    /// Used as the gain-offset for far-field. Returns None if no driven ports / no S data.
-    pub fn radiation_efficiency(&self, result: &SweepResult, freq_idx: usize) -> Option<f64> {
+    /// The fraction of the incident power at port `port` the structure
+    /// accepts, 1 − Σ_i |S_i,port|² (what a lossless antenna radiates; the
+    /// realized-gain offset of the far field). `None` without S data.
+    pub fn accepted_fraction(&self, result: &SweepResult, freq_idx: usize, port: usize) -> Option<f64> {
         let s = result.sparams.get(freq_idx)?;
-        if s.is_empty() || s[0].is_empty() {
+        let column: Vec<f64> = s.iter().filter_map(|row| row.get(port)).map(|s| s.norm_sqr()).collect();
+        if column.is_empty() {
             return None;
         }
-        let s11_sum_sq: f64 = s.iter().filter_map(|row| row.first()).map(|s| s.norm_sqr()).sum();
-        Some((1.0 - s11_sum_sq).clamp(0.0, 1.0))
+        Some((1.0 - column.iter().sum::<f64>()).clamp(0.0, 1.0))
     }
 
     /// Monk-style residual a-posteriori error indicator per tet for a given
@@ -616,7 +617,8 @@ impl Simulation {
         Some(out)
     }
 
-    /// Magnetic field H = ∇×E / (jωμ₀μ_r) at each mesh node, in (A/m).
+    /// Magnetic field H = ∇×E / (-jωμ₀μ_r) at each mesh node, in (A/m)
+    /// (time dependence e^{jωt}: ∇×E = -jωμH).
     /// Returns `Vec<C64>` of length `3 · n_nodes` (interleaved Hx, Hy, Hz).
     /// Uses the analytic Nédélec-2 curl evaluated at the node position.
     pub fn h_field_at_nodes(&self, result: &SweepResult, freq_idx: usize, port_idx: usize) -> Option<Vec<C64>> {
@@ -639,8 +641,8 @@ impl Simulation {
                 &self.mesh, &self.basis, solution, tet_idx, p[0], p[1], p[2],
             );
             // ∇×E on the normalized mesh is L₀²·(∇×E)_phys (one L₀ from the basis
-            // field, one from the normalized ∇), so H = ∇×E/(jωμ) needs /L₀².
-            let denom = j * C64::from(omega * MU0 * mur[tet_idx] * self.mesh.l0 * self.mesh.l0);
+            // field, one from the normalized ∇), so H = ∇×E/(-jωμ) needs /L₀².
+            let denom = -j * C64::from(omega * MU0 * mur[tet_idx] * self.mesh.l0 * self.mesh.l0);
             out.push(curl[0] / denom);
             out.push(curl[1] / denom);
             out.push(curl[2] / denom);
@@ -648,9 +650,12 @@ impl Simulation {
         Some(out)
     }
 
-    /// Compute the far-field at a given (freq_idx, exc_port_idx). NFFT surface = `model.far_field_tag`
-    /// (the first ABC tag if not specified). PEC surfaces from `model.pec_tags` are included to close
-    /// the integration boundary.
+    /// The far-field pattern at `(freq_idx, exc_port_idx)`. The Huygens
+    /// surface is `model.far_field_tag` if one is marked, else the outer
+    /// boundary of the domain (open problems, with an ABC on it); `None`
+    /// without either. When every outer face but the ABC lies in one plane
+    /// (a ground or symmetry plane), that plane is infinite: the surface is
+    /// the ABC, closed by its image (see [`crate::farfield`]).
     pub fn compute_farfield(
         &self,
         result: &SweepResult,
@@ -660,48 +665,77 @@ impl Simulation {
         n_phi: usize,
     ) -> Option<RadiationPattern> {
         let solution = result.solutions.get(freq_idx).and_then(|s| s.get(exc_port_idx))?;
-        let nfft_tag = self.model.far_field_tag.or_else(|| {
-            self.model.faces.iter().find_map(|f| match f {
-                FaceSpec::Abc { tag } => Some(*tag),
-                _ => None,
-            })
-        })?;
-        let pec_nfft: Vec<usize> = self
-            .model
-            .pec_tags
-            .iter()
-            .flat_map(|&t| self.mesh.tris_for_tag(t).to_vec())
-            .collect();
-        // A face can carry both the NFFT tag and a PEC tag (e.g. a ground
-        // plane the user also marked as part of the Huygens surface). Drop
-        // those tris from the NFFT set so they aren't integrated twice; the
-        // PEC pass already covers them (with M_s = 0, the correct treatment
-        // of tangential E on a conductor).
-        let pec_set: std::collections::HashSet<usize> = pec_nfft.iter().copied().collect();
-        let nfft_tris: Vec<usize> = self
-            .mesh
-            .tris_for_tag(nfft_tag)
-            .iter()
-            .copied()
-            .filter(|t| !pec_set.contains(t))
-            .collect();
-        if nfft_tris.is_empty() {
+        let (surface, image) = self.huygens_surface()?;
+        if surface.is_empty() {
             return None;
         }
-        let efficiency = self.radiation_efficiency(result, freq_idx);
-
-        Some(crate::farfield::compute_farfield_full(
+        Some(crate::farfield::compute_farfield(
             &self.mesh,
             &self.basis,
             solution,
-            &nfft_tris,
-            &pec_nfft,
+            &surface,
+            image,
             result.frequencies[freq_idx],
             n_theta,
             n_phi,
             4,
-            efficiency,
+            self.accepted_fraction(result, freq_idx, exc_port_idx),
         ))
+    }
+
+    /// The triangles of the far-field surface and the image plane closing
+    /// it, see [`Self::compute_farfield`]. The candidate surface is the
+    /// marked one, else the outer boundary (with an ABC on it). Its pieces
+    /// on the domain's conducting boundary (outer faces that are no ABC:
+    /// PEC, PMC, the untagged PEC default) close it: in one plane they are
+    /// that plane's image, otherwise they stay on the surface (n̂ × E = 0
+    /// on PEC leaves only their electric currents).
+    fn huygens_surface(&self) -> Option<(Vec<usize>, Option<crate::farfield::ImagePlane>)> {
+        let tagged = |pick: fn(&FaceSpec) -> Option<i32>| -> std::collections::HashSet<usize> {
+            self.model.faces.iter().filter_map(pick).flat_map(|t| self.mesh.tris_for_tag(t).to_vec()).collect()
+        };
+        let abc = tagged(|f| if let FaceSpec::Abc { tag } = f { Some(*tag) } else { None });
+        let pmc = tagged(|f| if let FaceSpec::Pmc { tag } = f { Some(*tag) } else { None });
+        let outer = |t: usize| self.mesh.tri_to_tet[t][1] == usize::MAX;
+        let candidate: Vec<usize> = match self.model.far_field_tag {
+            Some(tag) => self.mesh.tris_for_tag(tag).to_vec(),
+            None if !abc.is_empty() => (0..self.mesh.n_tris()).filter(|&t| outer(t)).collect(),
+            None => return None,
+        };
+        let (closing, open): (Vec<usize>, Vec<usize>) =
+            candidate.iter().copied().partition(|&t| outer(t) && !abc.contains(&t));
+        match self.plane_of(&closing) {
+            Some((point, normal)) => {
+                let pec = !closing.iter().all(|t| pmc.contains(t));
+                Some((open, Some(crate::farfield::ImagePlane { point, normal, pec })))
+            }
+            None => Some((candidate, None)),
+        }
+    }
+
+    /// The plane all of `tris` (boundary triangles) lie in, with the normal
+    /// into the domain; `None` if they are empty or not coplanar.
+    fn plane_of(&self, tris: &[usize]) -> Option<([f64; 3], [f64; 3])> {
+        let m = &self.mesh;
+        let &first = tris.first()?;
+        let [a, b, c] = m.tris[first].map(|v| m.nodes[v]);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        let mut n = n.map(|x| x / len);
+        // the nodes are O(1) (normalized mesh)
+        let tol = 1e-9;
+        let off = |p: [f64; 3]| (p[0] - a[0]) * n[0] + (p[1] - a[1]) * n[1] + (p[2] - a[2]) * n[2];
+        if !tris.iter().all(|&t| m.tris[t].iter().all(|&i| off(m.nodes[i]).abs() < tol)) {
+            return None;
+        }
+        let tet = m.tets[m.tri_to_tet[first][0]];
+        let centre: [f64; 3] = std::array::from_fn(|k| tet.iter().map(|&i| m.nodes[i][k]).sum::<f64>() / 4.0);
+        if off(centre) < 0.0 {
+            n = n.map(|x| -x);
+        }
+        Some((a, n))
     }
 }
 

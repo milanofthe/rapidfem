@@ -221,7 +221,7 @@ pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize>
 ///   ∇×φ = scale·coeff·[ L_q·(∇L_p×∇L_g) + L_p·(∇L_q×∇L_g) ]
 ///
 /// linear in position via the L's (no constant-per-tet approximation). Used by
-/// the error estimator, far-field integration, and H = ∇×E / (jωμ).
+/// the error estimator, far-field integration, and H = ∇×E / (-jωμ).
 pub fn eval_curl_in_tet(
     mesh: &Mesh,
     basis: &NedelecBasis,

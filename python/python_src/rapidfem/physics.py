@@ -694,12 +694,18 @@ class FarFieldSurface(_Physics):
     sampled. :meth:`rapidfem.Problem.farfield` propagates those currents
     to the far zone via the Stratton-Chu integral.
 
-    When the domain is truncated by an :class:`ABC`, the ABC face is
-    already a closed Huygens surface and the solver auto-detects it, so
-    no ``FarFieldSurface`` is needed. With a :class:`PML` there is no such
+    When the domain is truncated by an :class:`ABC`, its outer boundary
+    is the Huygens surface and the solver takes it by itself, so no
+    ``FarFieldSurface`` is needed. With a :class:`PML` there is no such
     surface (the outer hull is PEC-backed absorber, not free space), so
     you must mark one explicitly: the bulk-air / PML interface is the
     natural choice, a closed box sitting just inside the absorber.
+
+    A ground or symmetry plane on the domain boundary (the PEC floor an
+    antenna rests on, a PMC half-model plane) is taken as infinite: the
+    parts of the surface lying on it are replaced by the images of the
+    rest, and the pattern fills the half-space of the domain. This holds
+    when every conducting piece of the surface lies in one plane.
 
 
     Note

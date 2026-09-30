@@ -4,9 +4,16 @@
 
 //! Near-field to far-field transformation (NFFT) for radiation patterns.
 //!
-//! Uses the equivalence principle on a closed surface (typically the ABC boundary):
+//! Love's equivalence on a closed surface S enclosing every source: with the
+//! outward normal n̂,
 //!   J_s = n̂ × H     (equivalent electric current)
 //!   M_s = -n̂ × E    (equivalent magnetic current)
+//! radiate the field outside S in free space. S is the outer boundary of the
+//! computational domain (the ABC, the ground and walls: n̂ × E vanishes on
+//! PEC by construction, so M_s drops out there by itself), or a surface
+//! marked explicitly (the air / PML interface). Sheets inside S (patches,
+//! strips) are not part of it: their currents are sources the fields on S
+//! already carry.
 //!
 //! Far-field radiation integrals:
 //!   N(θ,φ) = ∫∫ J_s · e^{jk r̂·r'} dS'
@@ -14,6 +21,12 @@
 //!
 //! E_θ^far = -jk/(4π) (L_φ + η₀ N_θ)
 //! E_φ^far = -jk/(4π) (-L_θ + η₀ N_φ)
+//!
+//! A domain resting on an infinite PEC (or PMC) plane, a ground plane or a
+//! symmetry plane, has that plane as part of its boundary: the surface is
+//! then the rest of the boundary, closed by the images of its currents in
+//! the plane (PEC: J' = -R J, M' = R M; PMC: J' = R J, M' = -R M, with R the
+//! reflection), and the far field lives in the half-space of the domain.
 
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
@@ -37,7 +50,9 @@ pub struct RadiationPattern {
     pub e_phi: Vec<Vec<C64>>,
     /// Directivity in dBi
     pub directivity_dbi: Vec<Vec<f64>>,
-    /// Gain in dBi, accounts for input mismatch (= directivity × (1-|S11|²) when input_power is provided)
+    /// Realized gain in dBi: directivity × the accepted power fraction
+    /// (1 - Σ|S_i1|²) when it is given, which a lossless antenna radiates
+    /// in full.
     pub gain_dbi: Vec<Vec<f64>>,
     /// Axial ratio in dB. AR=0dB → circular polarization, AR=∞ → linear.
     pub axial_ratio_db: Vec<Vec<f64>>,
@@ -53,71 +68,39 @@ pub struct RadiationPattern {
     pub radiated_power: f64,
 }
 
-/// Compute the far-field radiation pattern from the FEM solution.
+/// An infinite PEC or PMC plane through `point` (mesh units), `normal`
+/// pointing into the domain's half-space.
+#[derive(Clone, Copy, Debug)]
+pub struct ImagePlane {
+    pub point: [f64; 3],
+    pub normal: [f64; 3],
+    pub pec: bool,
+}
+
+/// The far-field pattern of the FEM solution from the closed surface
+/// `surface_tris`. A boundary triangle takes its fields from its one tet and
+/// its normal away from it; a triangle inside the domain (a marked Huygens
+/// surface) takes them from its first tet, its normal away from the
+/// surface's centroid (the surface is taken to be star-shaped about it, as
+/// a box is).
 ///
-/// `nfft_tri_ids`: triangle indices of the closed surface (ABC boundary)
-/// `solution`: FEM solution vector (complex DOF coefficients)
-/// `frequency`: operating frequency (Hz)
-/// `n_theta`: number of theta angles (0 to π)
-/// `n_phi`: number of phi angles (0 to 2π)
-/// `gq_order`: Gauss quadrature order for surface integration
+/// With an `image` plane the surface is closed by the images of its
+/// currents and the pattern is zero outside the domain's half-space.
+///
+/// `accepted_fraction`: the fraction of the incident power the antenna
+/// accepts, for the realized gain; `None` makes the gain the directivity.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_farfield(
     mesh: &Mesh,
     basis: &NedelecBasis,
     solution: &[C64],
-    nfft_tri_ids: &[usize],
+    surface_tris: &[usize],
+    image: Option<ImagePlane>,
     frequency: f64,
     n_theta: usize,
     n_phi: usize,
     gq_order: usize,
-) -> RadiationPattern {
-    compute_farfield_with_input(mesh, basis, solution, nfft_tri_ids, frequency, n_theta, n_phi, gq_order, None)
-}
-
-/// Same as `compute_farfield`, but lets the caller pass a radiation efficiency η = P_rad/P_in
-/// for accurate gain calculation. The caller computes η from the S-parameters of the port
-/// (typically η = 1 - Σ|S_i1|² for a single-driven port). When `radiation_efficiency = None`,
-/// gain == directivity (lossless, matched assumption).
-///
-/// Note: we do NOT use the FEM-integrated radiated power for the gain offset, because the
-/// FEM E-field scale is an internal-to-the-solver convention (see LumpedPort `get_uinc`).
-/// Directivity is unit-invariant; gain requires an externally known efficiency.
-pub fn compute_farfield_with_input(
-    mesh: &Mesh,
-    basis: &NedelecBasis,
-    solution: &[C64],
-    nfft_tri_ids: &[usize],
-    frequency: f64,
-    n_theta: usize,
-    n_phi: usize,
-    gq_order: usize,
-    radiation_efficiency: Option<f64>,
-) -> RadiationPattern {
-    compute_farfield_full(mesh, basis, solution, nfft_tri_ids, &[], frequency,
-                          n_theta, n_phi, gq_order, radiation_efficiency)
-}
-
-/// Full-fidelity far-field with separate ABC (radiation) and PEC (image-closing) surfaces.
-///
-/// On the ABC surface, both J_s = n̂×H and M_s = -n̂×E contribute (radiating equivalence).
-/// On PEC surfaces, tangential E = 0 by construction so M_s = 0, only J_s = n̂×H from the
-/// air-side is included. Adding the PEC surface CLOSES the integration boundary around the
-/// antenna, eliminating the phantom back lobe that an open-surface NFFT produces over a
-/// half-space antenna with a finite ground plane.
-///
-/// `nfft_tri_ids`: open radiating surface (typically ABC tri tags).
-/// `pec_tri_ids`: PEC closing surfaces (ground, side walls); empty = no closure.
-pub fn compute_farfield_full(
-    mesh: &Mesh,
-    basis: &NedelecBasis,
-    solution: &[C64],
-    nfft_tri_ids: &[usize],
-    pec_tri_ids: &[usize],
-    frequency: f64,
-    n_theta: usize,
-    n_phi: usize,
-    gq_order: usize,
-    radiation_efficiency: Option<f64>,
+    accepted_fraction: Option<f64>,
 ) -> RadiationPattern {
     let exc = crate::excitation::Excitation::new(frequency, mesh.l0);
     // Lever ④: the near-to-far transform is done entirely in physical units —
@@ -132,10 +115,6 @@ pub fn compute_farfield_full(
     let thetas: Vec<f64> = (0..n_theta).map(|i| PI * i as f64 / (n_theta - 1) as f64).collect();
     let phis: Vec<f64> = (0..n_phi).map(|i| 2.0 * PI * i as f64 / n_phi as f64).collect();
 
-    // Build spatial hash for point-in-tet queries
-    let grid = interp::TetGrid::new(mesh);
-
-    // Precompute quadrature points and fields on the NFFT surface
     let quad_pts = gaus_quad_tri(gq_order);
 
     // For each observation direction (theta, phi), compute N and L integrals
@@ -143,103 +122,108 @@ pub fn compute_farfield_full(
     let mut e_theta = vec![vec![C64::new(0.0, 0.0); n_theta]; n_phi];
     let mut e_phi = vec![vec![C64::new(0.0, 0.0); n_theta]; n_phi];
 
-    // Precompute surface data: for each triangle, store quadrature point data
-    // (position, E-field, H-field, normal, area*weight, is_pec)
+    let centroid_of = |tri: [usize; 3]| -> [f64; 3] {
+        let [a, b, c] = tri.map(|v| mesh.nodes[v]);
+        std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0)
+    };
+    // area-weighted centroid of the surface, for the inner triangles' normals
+    let mut surface_centre = [0.0; 3];
+    let mut surface_area = 0.0;
+    for &t in surface_tris {
+        let [a, b, c] = mesh.tris[t].map(|v| mesh.nodes[v]);
+        let area = 0.5 * norm3(cross3(sub3(b, a), sub3(c, a)));
+        let m = centroid_of(mesh.tris[t]);
+        for k in 0..3 {
+            surface_centre[k] += area * m[k];
+        }
+        surface_area += area;
+    }
+    let surface_centre = surface_centre.map(|v| v / surface_area.max(f64::MIN_POSITIVE));
+
+    // Per quadrature point: position, the equivalent currents J = n̂ × H and
+    // M = -n̂ × E, area × weight (physical units).
     struct SurfPoint {
         pos: [f64; 3],
-        e: [C64; 3],
-        h: [C64; 3],
-        normal: [f64; 3],
-        aw: f64,    // area * quadrature weight
-        is_pec: bool, // true → M_s = 0 (tangential E = 0 on PEC by construction)
+        j: [C64; 3],
+        m: [C64; 3],
+        aw: f64,
     }
-
-    let mut surf_data: Vec<SurfPoint> = Vec::new();
-    let all_tris: Vec<(usize, bool)> = nfft_tri_ids.iter().map(|&t| (t, false))
-        .chain(pec_tri_ids.iter().map(|&t| (t, true)))
-        .collect();
-
-    for &(tri_idx, is_pec) in &all_tris {
+    let ccross = |n: [f64; 3], v: [C64; 3]| -> [C64; 3] {
+        [
+            C64::from(n[1]) * v[2] - C64::from(n[2]) * v[1],
+            C64::from(n[2]) * v[0] - C64::from(n[0]) * v[2],
+            C64::from(n[0]) * v[1] - C64::from(n[1]) * v[0],
+        ]
+    };
+    let mut surf_data: Vec<SurfPoint> = Vec::with_capacity(surface_tris.len() * quad_pts.len());
+    for &tri_idx in surface_tris {
         let tri = mesh.tris[tri_idx];
-        let v0 = mesh.nodes[tri[0]];
-        let v1 = mesh.nodes[tri[1]];
-        let v2 = mesh.nodes[tri[2]];
-
-        // Triangle edges and normal
-        let e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
-        let e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
-        let cr = [
-            e1[1]*e2[2] - e1[2]*e2[1],
-            e1[2]*e2[0] - e1[0]*e2[2],
-            e1[0]*e2[1] - e1[1]*e2[0],
-        ];
-        let area = 0.5 * (cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]).sqrt();
-        let nn = 2.0 * area;
-        let mut normal = [cr[0]/nn, cr[1]/nn, cr[2]/nn];
-
-        // Orient normal outward using adjacent tet
-        let adj_tet = mesh.tri_to_tet[tri_idx][0];
-        if adj_tet != usize::MAX {
-            let tet = &mesh.tets[adj_tet];
-            let tc = [
-                (mesh.nodes[tet[0]][0]+mesh.nodes[tet[1]][0]+mesh.nodes[tet[2]][0]+mesh.nodes[tet[3]][0])/4.0,
-                (mesh.nodes[tet[0]][1]+mesh.nodes[tet[1]][1]+mesh.nodes[tet[2]][1]+mesh.nodes[tet[3]][1])/4.0,
-                (mesh.nodes[tet[0]][2]+mesh.nodes[tet[1]][2]+mesh.nodes[tet[2]][2]+mesh.nodes[tet[3]][2])/4.0,
-            ];
-            let tri_center = [
-                (v0[0]+v1[0]+v2[0])/3.0,
-                (v0[1]+v1[1]+v2[1])/3.0,
-                (v0[2]+v1[2]+v2[2])/3.0,
-            ];
-            let to_tet = [tc[0]-tri_center[0], tc[1]-tri_center[1], tc[2]-tri_center[2]];
-            if normal[0]*to_tet[0] + normal[1]*to_tet[1] + normal[2]*to_tet[2] > 0.0 {
-                normal = [-normal[0], -normal[1], -normal[2]];
-            }
+        let [v0, v1, v2] = tri.map(|v| mesh.nodes[v]);
+        let cr = cross3(sub3(v1, v0), sub3(v2, v0));
+        let area = 0.5 * norm3(cr);
+        let mut normal = cr.map(|c| c / (2.0 * area));
+        let [t0, t1] = mesh.tri_to_tet[tri_idx];
+        let centre = centroid_of(tri);
+        let away_from = if t1 == usize::MAX {
+            // outward: away from the one tet
+            let tet = mesh.tets[t0];
+            std::array::from_fn(|k| tet.iter().map(|&v| mesh.nodes[v][k]).sum::<f64>() / 4.0)
+        } else {
+            surface_centre
+        };
+        if dot3(normal, sub3(centre, away_from)) < 0.0 {
+            normal = normal.map(|c| -c);
         }
-
-        // Evaluate E and H at quadrature points
+        let tet = t0;
         for qp in &quad_pts {
             let (w, l1, l2, l3) = (qp[0], qp[1], qp[2], qp[3]);
-            let x = v0[0]*l1 + v1[0]*l2 + v2[0]*l3;
-            let y = v0[1]*l1 + v1[1]*l2 + v2[1]*l3;
-            let z = v0[2]*l1 + v1[2]*l2 + v2[2]*l3;
-
-            // Find containing tet for this point
-            let tet_idx = grid.find_containing_tet(mesh, x, y, z)
-                .or_else(|| {
-                    // Fallback: use the adjacent tet
-                    let t = mesh.tri_to_tet[tri_idx][0];
-                    if t != usize::MAX { Some(t) } else { None }
-                });
-
-            if let Some(tet) = tet_idx {
-                // Reconstruct on the (L₀-normalized) mesh, then convert to
-                // physical units: E_recon = L₀·E_phys, curl_recon = L₀²·curl_phys.
-                let il = 1.0 / l0;
-                let (ex, ey, ez) = interp::eval_field_in_tet(mesh, basis, solution, tet, x, y, z);
-
-                // curl(E) = jωμ₀ H  =>  H = curl(E) / (jωμ₀); the extra L₀²
-                // (curl normalization) is folded into the denominator.
-                let curl_e = eval_curl_in_tet(mesh, basis, solution, tet, x, y, z);
-                let denom = j * C64::from(omega * MU0 * l0 * l0);
-                let hx = curl_e[0] / denom;
-                let hy = curl_e[1] / denom;
-                let hz = curl_e[2] / denom;
-
-                surf_data.push(SurfPoint {
-                    pos: [x * l0, y * l0, z * l0],          // physical position
-                    e: [ex * il, ey * il, ez * il],         // physical E (V/m)
-                    h: [hx, hy, hz],                         // physical H (A/m)
-                    normal,                                  // unit vector, scale-free
-                    aw: area * w * l0 * l0,                  // physical area element
-                    is_pec,
-                });
-            }
+            let x = v0[0] * l1 + v1[0] * l2 + v2[0] * l3;
+            let y = v0[1] * l1 + v1[1] * l2 + v2[1] * l3;
+            let z = v0[2] * l1 + v1[2] * l2 + v2[2] * l3;
+            // Reconstruct on the (L₀-normalized) mesh, then convert to
+            // physical units: E_recon = L₀·E_phys, curl_recon = L₀²·curl_phys.
+            let il = 1.0 / l0;
+            let (ex, ey, ez) = interp::eval_field_in_tet(mesh, basis, solution, tet, x, y, z);
+            // curl(E) = -jωμ₀ H  =>  H = curl(E) / (-jωμ₀); the extra L₀²
+            // (curl normalization) is folded into the denominator.
+            let curl_e = eval_curl_in_tet(mesh, basis, solution, tet, x, y, z);
+            let denom = -j * C64::from(omega * MU0 * l0 * l0);
+            let e = [ex * il, ey * il, ez * il];
+            let h = curl_e.map(|c| c / denom);
+            surf_data.push(SurfPoint {
+                pos: [x * l0, y * l0, z * l0],
+                j: ccross(normal, h),
+                m: ccross(normal, e).map(|c| -c),
+                aw: area * w * l0 * l0,
+            });
         }
     }
+    // The images in the plane close the surface.
+    if let Some(ip) = image {
+        let n = ip.normal;
+        let p0 = ip.point.map(|c| c * l0);
+        let reflect = |v: [C64; 3]| -> [C64; 3] {
+            let vn = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+            std::array::from_fn(|k| v[k] - vn * C64::from(2.0 * n[k]))
+        };
+        let (sj, sm) = if ip.pec { (-1.0, 1.0) } else { (1.0, -1.0) };
+        let images: Vec<SurfPoint> = surf_data
+            .iter()
+            .map(|sp| {
+                let d = dot3(sub3(sp.pos, p0), n);
+                SurfPoint {
+                    pos: std::array::from_fn(|k| sp.pos[k] - 2.0 * d * n[k]),
+                    j: reflect(sp.j).map(|c| c * sj),
+                    m: reflect(sp.m).map(|c| c * sm),
+                    aw: sp.aw,
+                }
+            })
+            .collect();
+        surf_data.extend(images);
+    }
 
-    eprintln!("  Far-field: {} surface integration points ({} ABC tris + {} PEC tris)",
-        surf_data.len(), nfft_tri_ids.len(), pec_tri_ids.len());
+    eprintln!("  Far-field: {} surface integration points on {} tris",
+        surf_data.len(), surface_tris.len());
 
     // Compute far-field for each (theta, phi) direction.
     // The outer loop is embarrassingly parallel: each direction integrates the same surf_data
@@ -263,6 +247,10 @@ pub fn compute_farfield_full(
             let r_hat = [sin_t * cos_p, sin_t * sin_p, cos_t];
             let theta_hat = [cos_t * cos_p, cos_t * sin_p, -sin_t];
             let phi_hat = [-sin_p, cos_p, 0.0];
+            // behind an image plane there is no field
+            if image.is_some_and(|ip| dot3(r_hat, ip.normal) < -1e-12) {
+                return (ip, it, C64::new(0.0, 0.0), C64::new(0.0, 0.0), 0.0);
+            }
 
             let mut nt = C64::new(0.0, 0.0);
             let mut np = C64::new(0.0, 0.0);
@@ -274,19 +262,8 @@ pub fn compute_farfield_full(
                 let phase = (j * C64::from(k0 * rdot)).exp();
                 let daw = C64::from(sp.aw) * phase;
 
-                let jx = C64::from(sp.normal[1]) * sp.h[2] - C64::from(sp.normal[2]) * sp.h[1];
-                let jy = C64::from(sp.normal[2]) * sp.h[0] - C64::from(sp.normal[0]) * sp.h[2];
-                let jz = C64::from(sp.normal[0]) * sp.h[1] - C64::from(sp.normal[1]) * sp.h[0];
-
-                let (mx, my, mz) = if sp.is_pec {
-                    (C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0))
-                } else {
-                    (
-                        -(C64::from(sp.normal[1]) * sp.e[2] - C64::from(sp.normal[2]) * sp.e[1]),
-                        -(C64::from(sp.normal[2]) * sp.e[0] - C64::from(sp.normal[0]) * sp.e[2]),
-                        -(C64::from(sp.normal[0]) * sp.e[1] - C64::from(sp.normal[1]) * sp.e[0]),
-                    )
-                };
+                let [jx, jy, jz] = sp.j;
+                let [mx, my, mz] = sp.m;
 
                 let j_t = jx * C64::from(theta_hat[0]) + jy * C64::from(theta_hat[1]) + jz * C64::from(theta_hat[2]);
                 let j_p = jx * C64::from(phi_hat[0]) + jy * C64::from(phi_hat[1]) + jz * C64::from(phi_hat[2]);
@@ -340,8 +317,8 @@ pub fn compute_farfield_full(
         }
     }
 
-    // Gain: directivity scaled by user-supplied radiation efficiency.
-    let efficiency = radiation_efficiency.unwrap_or(1.0).clamp(0.0, 1.0);
+    // Realized gain: directivity scaled by the accepted power fraction.
+    let efficiency = accepted_fraction.unwrap_or(1.0).clamp(0.0, 1.0);
     let efficiency_db_offset = if efficiency > SINGULAR_EPS { 10.0 * efficiency.log10() } else { FARFIELD_DB_FLOOR };
 
     let mut gain = vec![vec![0.0f64; n_theta]; n_phi];
@@ -403,7 +380,7 @@ pub fn compute_farfield_full(
         }
     }
 
-    eprintln!("  Peak directivity: {:.2} dBi, peak gain: {:.2} dBi, radiation efficiency: {:.1}%",
+    eprintln!("  Peak directivity: {:.2} dBi, peak realized gain: {:.2} dBi, accepted power: {:.1}%",
         peak_d, peak_g, efficiency * 100.0);
 
     RadiationPattern {
@@ -422,73 +399,18 @@ pub fn compute_farfield_full(
     }
 }
 
-/// Write radiation pattern to a CSV file for plotting.
-pub fn write_pattern_csv(
-    path: &str,
-    pattern: &RadiationPattern,
-) -> Result<(), String> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| format!("Cannot create {}: {}", path, e))?;
-
-    writeln!(file, "phi_deg,theta_deg,directivity_dBi,gain_dBi,AR_dB,LCP_dBi,RCP_dBi,E_theta_re,E_theta_im,E_phi_re,E_phi_im")
-        .map_err(|e| e.to_string())?;
-
-    for (ip, &phi) in pattern.phi.iter().enumerate() {
-        for (it, &theta) in pattern.theta.iter().enumerate() {
-            let et = pattern.e_theta[ip][it];
-            let ep = pattern.e_phi[ip][it];
-            writeln!(file,
-                "{:.1},{:.1},{:.4},{:.4},{:.4},{:.4},{:.4},{:.6e},{:.6e},{:.6e},{:.6e}",
-                phi.to_degrees(),
-                theta.to_degrees(),
-                pattern.directivity_dbi[ip][it],
-                pattern.gain_dbi[ip][it],
-                pattern.axial_ratio_db[ip][it],
-                pattern.lcp_dbi[ip][it],
-                pattern.rcp_dbi[ip][it],
-                et.re, et.im, ep.re, ep.im,
-            ).map_err(|e| e.to_string())?;
-        }
-    }
-
-    Ok(())
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-/// Write principal plane cuts (E-plane and H-plane) to CSV.
-pub fn write_plane_cuts_csv(
-    path: &str,
-    pattern: &RadiationPattern,
-) -> Result<(), String> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)
-        .map_err(|e| format!("Cannot create {}: {}", path, e))?;
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
 
-    writeln!(file, "plane,theta_deg,directivity_dBi,gain_dBi,AR_dB,LCP_dBi,RCP_dBi")
-        .map_err(|e| e.to_string())?;
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
 
-    let mut write_cut = |ip: usize, label: &str| -> Result<(), String> {
-        for (it, &theta) in pattern.theta.iter().enumerate() {
-            writeln!(file, "{},{:.1},{:.4},{:.4},{:.4},{:.4},{:.4}",
-                label,
-                theta.to_degrees(),
-                pattern.directivity_dbi[ip][it],
-                pattern.gain_dbi[ip][it],
-                pattern.axial_ratio_db[ip][it],
-                pattern.lcp_dbi[ip][it],
-                pattern.rcp_dbi[ip][it],
-            ).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    };
-
-    // E-plane: φ=0° (xz-plane)
-    write_cut(0, "E")?;
-
-    // H-plane: φ=90°
-    let ip_h = pattern.phi.iter().position(|&p| (p - PI/2.0).abs() < 0.01)
-        .unwrap_or(pattern.phi.len() / 4);
-    write_cut(ip_h, "H")?;
-
-    Ok(())
+fn norm3(a: [f64; 3]) -> f64 {
+    dot3(a, a).sqrt()
 }

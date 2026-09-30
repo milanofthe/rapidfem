@@ -1363,8 +1363,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         Note
         ----
         Idempotent, only writes ``maxh`` when it's currently ``None``,
-        so explicit per-volume sizes (set via ``g.box(..., maxh=...)``
-        or ``obj.maxh = ...``) always win.
+        so explicit per-volume sizes (set via ``g.box(..., maxh=...)``,
+        ``obj.maxh = ...`` or the material's ``maxh``) always win.
 
 
         Example
@@ -1400,6 +1400,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         for obj in self._objects:
             if obj.dim != 3 or obj.maxh is not None:
                 continue
+            if getattr(obj.material, "maxh", None) is not None:
+                continue  # sized by its material
             box = self._object_info(obj._id)[4]
             dims = (box[3] - box[0], box[4] - box[1], box[5] - box[2])
             positive = [d for d in dims if d > 0]

@@ -14,17 +14,11 @@ directivity, positive radiated power).
 
 Setup: ~2.4 GHz patch, lumped edge feed, an air box terminated by a first-order
 ABC (open radiating boundary). The ground plane is the substrate bottom; the
-air-box bottom defaults to PEC, so the whole z = 0 plane is ground and the
-upper hemisphere (θ ≤ 90°, +z) is the only radiating half-space. The near-to-
-far transform's Huygens surface is auto-detected from the ABC boundary.
-
-NOTE on the global peak: this solver's closed-NFFT far field over a *finite*
-ground plane leaves a residual back lobe, so ``peak_directivity_dbi`` (~5.5 dBi)
-actually lands at θ = 180° (into the ground), while the broadside (θ = 0) value
-is only ~1.3 dBi. This matches the bundled ``builder_patch_antenna.py``, which
-documents "broadside D ≈ 1.8 dBi" alongside a peak of ~5 dBi. The broadside
-assertion below therefore takes the max over the *upper hemisphere* (as the task
-specifies), which correctly points within a few degrees of θ = 0.
+air-box bottom defaults to PEC, so the whole z = 0 plane is ground: the
+near-to-far transform takes it as an infinite image plane, and the far field
+fills the upper hemisphere (θ ≤ 90°) only. On an infinite ground a single
+patch radiates about 6-7 dBi broadside. The unmatched edge feed accepts only
+about half of the incident power, so the realized gain sits ~3 dB below.
 
 Reference: Balanis, *Antenna Theory*, ch. 14 (microstrip antennas).
 """
@@ -105,8 +99,10 @@ def test_patch_antenna_broadside_farfield():
     theta = np.asarray(pat.theta_rad)          # [n_theta], 0 (+z) … π (−z)
     peak_d = float(pat.peak_directivity_dbi)
 
-    # ── Plausibility: a single patch radiates a few dBi. ───────────────────
-    assert 5.0 < peak_d < 11.0, f"peak directivity {peak_d:.2f} dBi implausible"
+    # ── Plausibility: a single patch on an infinite ground, 6-7 dBi. ─────
+    assert 5.0 < peak_d < 8.0, f"peak directivity {peak_d:.2f} dBi implausible"
+    # nothing radiates into the ground plane
+    assert np.all(D[:, theta > np.pi / 2 + 1e-9] < -90)
 
     # ── Self-consistency of the pattern object. ────────────────────────────
     # The reported peak equals the grid maximum…

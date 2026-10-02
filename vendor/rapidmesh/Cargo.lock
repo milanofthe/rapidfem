@@ -9,18 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "bumpalo"
-version = "3.20.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
-name = "cfg-if"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,12 +141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "once_cell"
-version = "1.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -181,7 +163,6 @@ name = "rapidmesh"
 version = "1.0.0"
 dependencies = [
  "rapidmesh-brep",
- "rapidmesh-csg",
  "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-step",
@@ -198,7 +179,6 @@ dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
  "rapidmesh-geom",
- "rapidmesh-testutil",
  "rayon",
  "rustc-hash",
 ]
@@ -208,7 +188,6 @@ name = "rapidmesh-csg"
 version = "1.0.0"
 dependencies = [
  "geometry-predicates",
- "num-bigint",
  "num-rational",
  "num-traits",
  "rapidmesh-exact",
@@ -233,6 +212,7 @@ dependencies = [
 name = "rapidmesh-geom"
 version = "1.0.0"
 dependencies = [
+ "i_overlay",
  "num-rational",
  "num-traits",
  "rapidmesh-csg",
@@ -257,7 +237,6 @@ dependencies = [
 name = "rapidmesh-testutil"
 version = "1.0.0"
 dependencies = [
- "num-bigint",
  "num-rational",
  "num-traits",
  "rapidmesh-csg",
@@ -285,18 +264,10 @@ dependencies = [
 name = "rapidmesh-topo"
 version = "1.0.0"
 dependencies = [
- "i_overlay",
  "rapidmesh-brep",
+ "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-tet",
-]
-
-[[package]]
-name = "rapidmesh-wasm"
-version = "0.1.0"
-dependencies = [
- "rapidmesh-tet",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -324,12 +295,6 @@ name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
-
-[[package]]
-name = "rustversion"
-version = "1.0.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "serde"
@@ -396,51 +361,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "wasm-bindgen"
-version = "0.2.126"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b067c0c11094aef6b7a801c1e34a26affafdf3d051dba08456b868789aaf9a4"
-dependencies = [
- "cfg-if",
- "once_cell",
- "rustversion",
- "wasm-bindgen-macro",
- "wasm-bindgen-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-macro"
-version = "0.2.126"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "167ce5e579f6bcf889c4f7175a8a5a585de84e8ff93976ce393efa5f2837aab1"
-dependencies = [
- "quote",
- "wasm-bindgen-macro-support",
-]
-
-[[package]]
-name = "wasm-bindgen-macro-support"
-version = "0.2.126"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3997c7839262f4ef12cf90b818d6340c18e80f263f1a94bf157d0ec4420380e"
-dependencies = [
- "bumpalo",
- "proc-macro2",
- "quote",
- "syn",
- "wasm-bindgen-shared",
-]
-
-[[package]]
-name = "wasm-bindgen-shared"
-version = "0.2.126"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
-dependencies = [
- "unicode-ident",
-]
 
 [[package]]
 name = "zmij"

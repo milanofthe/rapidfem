@@ -118,7 +118,18 @@ pub fn tetrahedralize_on(
         // Where the wrapping finds no apex (a curved face at a sharp angle
         // left short of the Delaunay condition), a point of its own just in
         // front of the face lets it go on.
-        let Some(q) = w.apex(f).or_else(|| {
+        let found = w.apex(f);
+        if found.is_none() && w.pts.len() == n0 {
+            rapidmesh_exact::log::debug(
+                "bottomup.cdt",
+                format!(
+                    "no apex for open face {:?} at {:?}",
+                    f.map(global),
+                    f.map(|v| w.pts[v as usize])
+                ),
+            );
+        }
+        let Some(q) = found.or_else(|| {
             (w.pts.len() - n0 < MAX_STEINER.max(n0 / 16))
                 .then(|| w.steiner(f))
                 .flatten()
@@ -127,18 +138,6 @@ pub fn tetrahedralize_on(
                 face: f.map(&global),
             });
         };
-        #[cfg(test)]
-        if std::env::var("RAPIDMESH_TRACE_CDT").is_ok() {
-            trace_cdt(
-                &w.pts,
-                faces,
-                &local,
-                [f[0], f[1], f[2], q],
-                f,
-                tets.len(),
-                &w,
-            );
-        }
         w.front.remove(&canon(f));
         let [a, b, c] = f;
         // The tet a b c q is positive, and `g` are its faces through q with
@@ -177,101 +176,6 @@ const SEARCH_BASE: usize = 1 << 16;
 
 /// Points the wrapping may add to a region of few points.
 const MAX_STEINER: usize = 64;
-
-/// Reports the first tet with a vertex in its sphere that its centroid
-/// sees across no constraint (debugging aid).
-#[cfg(test)]
-fn trace_cdt(
-    pts: &[P3],
-    faces: &[[u32; 3]],
-    local: &FxHashMap<u32, u32>,
-    t: [u32; 4],
-    f: [u32; 3],
-    n: usize,
-    w: &Wrap,
-) {
-    let pt = t.map(|v| pts[v as usize]);
-    let cen0: P3 = std::array::from_fn(|k| (pt[0][k] + pt[1][k] + pt[2][k] + pt[3][k]) / 4.0);
-    let cons: Vec<[u32; 3]> = faces.iter().map(|g| g.map(|x| local[&x])).collect();
-    let samples: Vec<P3> = std::iter::once(cen0)
-        .chain((0..4).map(|i| std::array::from_fn(|k| 0.8 * pt[i][k] + 0.2 * cen0[k])))
-        .collect();
-    for v in 0..pts.len() as u32 {
-        if t.contains(&v) || !inside(pt, pts[v as usize], [t[0], t[1], t[2], t[3], v]) {
-            continue;
-        }
-        let x = pts[v as usize];
-        let blocked_from = |cen: P3| {
-            cons.iter().any(|g| {
-                if g.contains(&v) {
-                    return false;
-                }
-                let [g0, g1, g2] = g.map(|u| pts[u as usize]);
-                let (s0, s1) = (orient(g0, g1, g2, cen), orient(g0, g1, g2, x));
-                if s0 == 0 || s1 == 0 || s0 == s1 {
-                    return false;
-                }
-                let o = [
-                    orient(cen, x, g0, g1),
-                    orient(cen, x, g1, g2),
-                    orient(cen, x, g2, g0),
-                ];
-                !(o.iter().any(|&k| k > 0) && o.iter().any(|&k| k < 0))
-            })
-        };
-        if samples.iter().any(|&c| !blocked_from(c)) {
-            if let Some(&q) = w.apexes.get(&canon(f)) {
-                for g in [[f[0], q, f[1]], [f[1], q, f[2]], [f[2], q, f[0]]] {
-                    let away = canon([g[0], g[2], g[1]]);
-                    if w.front.contains_key(&away) && !w.front.contains_key(&canon(g)) {
-                        eprintln!("TRACE   dt apex {q}: new face {g:?} on the meshed side of an open face");
-                    }
-                }
-                let tq = [f[0], f[1], f[2], q];
-                let ptq = tq.map(|u| pts[u as usize]);
-                for g in w.front.values() {
-                    if canon(*g) == canon(f) {
-                        continue;
-                    }
-                    let mut why = Vec::new();
-                    for e in [[f[0], q], [f[1], q], [f[2], q]] {
-                        if seg_meets_tri(pts, e, *g) {
-                            why.push(format!("edge {e:?}"));
-                        }
-                    }
-                    for k in 0..3 {
-                        let e = [g[k], g[(k + 1) % 3]];
-                        for h in [[f[0], f[1], q], [f[1], f[2], q], [f[2], f[0], q]] {
-                            if seg_meets_tri(pts, e, h) {
-                                why.push(format!("front edge {e:?} vs {h:?}"));
-                            }
-                        }
-                    }
-                    for &u in g {
-                        if !tq.contains(&u) && strictly_inside(ptq, pts[u as usize]) {
-                            why.push(format!("vertex {u} inside"));
-                        }
-                    }
-                    if !why.is_empty() {
-                        eprintln!(
-                            "TRACE   dt apex {q} {:?} blocked by {g:?} {:?}: {why:?}",
-                            pts[q as usize],
-                            g.map(|u| pts[u as usize])
-                        );
-                    }
-                }
-            }
-            eprintln!(
-                "TRACE tet {n}: face {f:?} {:?} dt apex {:?} took {} {:?}; vertex {v} {x:?} in the sphere, visible",
-                f.map(|u| pts[u as usize]),
-                w.apexes.get(&canon(f)),
-                t[3],
-                pt[3]
-            );
-            return;
-        }
-    }
-}
 
 /// Per Delaunay tet, whether it meets a constraint (a triangle of `faces`)
 /// other than in shared vertices and edges. Only constraints that are no
@@ -1140,49 +1044,5 @@ mod tests {
         );
         let (model, b, tets) = fill(scene, 0.25);
         check(&model, &b, &tets, &[27.0]);
-    }
-
-    /// A region read from `/tmp/region.txt` (as RAPIDMESH_DUMP_REGION
-    /// writes it), for tracing a failure found on a model; with
-    /// RAPIDMESH_TRACE_CDT set it reports the first tet that is not
-    /// constrained Delaunay.
-    #[test]
-    #[ignore]
-    fn region_from_file() {
-        let txt = std::fs::read_to_string("/tmp/region.txt").unwrap();
-        let mut lines = txt.lines();
-        let head: Vec<usize> = lines
-            .next()
-            .unwrap()
-            .split(' ')
-            .map(|x| x.parse().unwrap())
-            .collect();
-        let pts: Vec<P3> = (0..head[0])
-            .map(|_| {
-                let v: Vec<f64> = lines
-                    .next()
-                    .unwrap()
-                    .split(' ')
-                    .map(|x| x.parse().unwrap())
-                    .collect();
-                [v[0], v[1], v[2]]
-            })
-            .collect();
-        let faces: Vec<[u32; 3]> = (0..head[1])
-            .map(|_| {
-                let v: Vec<u32> = lines
-                    .next()
-                    .unwrap()
-                    .split(' ')
-                    .map(|x| x.parse().unwrap())
-                    .collect();
-                [v[0], v[1], v[2]]
-            })
-            .collect();
-        let r = tetrahedralize(&pts, &faces);
-        eprintln!(
-            "result: {:?}",
-            r.as_ref().map(|f| (f.tets.len(), f.steiner.len()))
-        );
     }
 }

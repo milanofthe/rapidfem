@@ -10,6 +10,8 @@ rapidmesh-exact.workspace = true
 rapidmesh-csg.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+# Robust 2D polygon booleans (MIT): the union of layout polygons into outlines.
+i_overlay = "1.9"
 
 [lints]
 workspace = true

@@ -137,3 +137,69 @@ pub fn triangulate_polygon(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[
     debug_assert_eq!(ft.orientation, Sign::Positive);
     out
 }
+
+/// The union of planar polygons, each `(outer, holes)`, into connected shapes
+/// (i_overlay, non-zero fill): overlapping or abutting polygons merge, separate
+/// ones stay separate. The input may run either way round; each output shape
+/// is `(outer, holes)`, the outer counter-clockwise and the holes clockwise.
+/// Builds the outlines of layout layers, whose rectangles overlap, before
+/// they become sheets or prisms.
+pub fn polygon_union(
+    polygons: &[(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)],
+) -> Vec<(Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>)> {
+    use i_overlay::core::fill_rule::FillRule;
+    use i_overlay::float::simplify::SimplifyShape;
+    let area = |p: &[[f64; 2]]| {
+        (0..p.len())
+            .map(|k| {
+                let (a, b) = (p[k], p[(k + 1) % p.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum::<f64>()
+    };
+    let turned = |p: &[[f64; 2]], ccw: bool| {
+        let mut q = p.to_vec();
+        if (area(p) > 0.0) != ccw {
+            q.reverse();
+        }
+        q
+    };
+    let mut contours: Vec<Vec<[f64; 2]>> = Vec::new();
+    for (outer, holes) in polygons {
+        if outer.len() >= 3 {
+            contours.push(turned(outer, true));
+            contours.extend(
+                holes
+                    .iter()
+                    .filter(|h| h.len() >= 3)
+                    .map(|h| turned(h, false)),
+            );
+        }
+    }
+    contours
+        .simplify_shape(FillRule::NonZero, 0.0)
+        .into_iter()
+        .map(|shape| {
+            let mut it = shape.into_iter();
+            let outer = it.next().unwrap_or_default();
+            (outer, it.collect())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod union_tests {
+    use super::*;
+
+    #[test]
+    fn abutting_squares_are_one_shape_and_separate_ones_two() {
+        let sq = |x: f64| {
+            (
+                vec![[x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0]],
+                vec![],
+            )
+        };
+        assert_eq!(polygon_union(&[sq(0.0), sq(1.0)]).len(), 1);
+        assert_eq!(polygon_union(&[sq(0.0), sq(3.0)]).len(), 2);
+    }
+}

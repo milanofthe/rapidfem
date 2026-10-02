@@ -371,11 +371,9 @@ fn layered(
         inside,
         domain.finest(),
         28.0,
-        0,
         4,
         12,
-        true,
-        |_, _| {},
+        |_| true,
     );
     if tris.is_empty() {
         return Err("an empty plan mesh");

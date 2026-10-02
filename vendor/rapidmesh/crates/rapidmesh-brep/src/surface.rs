@@ -96,18 +96,37 @@ pub enum Surface {
 }
 
 impl Surface {
-    /// Builds the surface from a CSG [`SurfaceKind`]. `frame_pts` are the face's
-    /// ordered boundary points, needed ONLY to fit a plane's frame (every other
-    /// kind is self-contained from its parameters).
+    /// Builds the surface from a CSG [`SurfaceKind`]. `frame_pts` are points
+    /// of the face, in order: a plane's frame starts at the first and points
+    /// its `u` toward the next, so chart coordinates stay small; a faceted
+    /// kind is framed by the plane they span. Every other kind is
+    /// self-contained from its parameters.
     pub fn from_kind(kind: &SurfaceKind, frame_pts: &[V3]) -> Surface {
         match kind {
-            SurfaceKind::Plane => {
-                let (o, u, v) = fit_plane(frame_pts);
+            SurfaceKind::Plane { .. } | SurfaceKind::Facets => {
+                let (point, normal) = kind
+                    .plane()
+                    .or_else(|| SurfaceKind::plane_of(frame_pts).plane())
+                    .unwrap_or(([0.0; 3], [0.0, 0.0, 1.0]));
+                let onto = |p: V3| sub(p, scale(normal, dot(sub(p, point), normal)));
+                let o = if frame_pts.is_empty() {
+                    point
+                } else {
+                    let n = frame_pts.len() as f64;
+                    onto(std::array::from_fn(|k| {
+                        frame_pts.iter().map(|p| p[k]).sum::<f64>() / n
+                    }))
+                };
+                let u = frame_pts
+                    .iter()
+                    .map(|&p| sub(onto(p), o))
+                    .find(|d| dot(*d, *d) > 1e-20)
+                    .map_or_else(|| perp(normal), norm);
                 Surface::Plane {
                     o,
                     u,
-                    v,
-                    normal: norm(cross(u, v)),
+                    v: cross(normal, u),
+                    normal,
                 }
             }
             SurfaceKind::Cylinder {
@@ -205,10 +224,10 @@ impl Surface {
         }
     }
 
-    /// The carrier of a curved kind; none for a plane, whose frame the kind
-    /// lacks (a plane face takes it from its facets).
+    /// The carrier of a curved kind; none for a plane or faceted kind.
     pub fn curved(kind: &SurfaceKind) -> Option<Surface> {
-        (!matches!(kind, SurfaceKind::Plane)).then(|| Surface::from_kind(kind, &[]))
+        (!matches!(kind, SurfaceKind::Plane { .. } | SurfaceKind::Facets))
+            .then(|| Surface::from_kind(kind, &[]))
     }
 
     /// Closest point on the surface and the outward normal there -- the
@@ -602,35 +621,6 @@ impl Surface {
     }
 }
 
-/// Fits an orthonormal plane frame to points: centroid origin, Newell normal, an
-/// in-plane `u` from the first significant boundary direction, `v = n x u`.
-fn fit_plane(pts: &[V3]) -> (V3, V3, V3) {
-    if pts.is_empty() {
-        return ([0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
-    }
-    let n = pts.len() as f64;
-    let o: V3 = std::array::from_fn(|k| pts.iter().map(|p| p[k]).sum::<f64>() / n);
-    let mut nrm = [0.0f64; 3];
-    for i in 0..pts.len() {
-        let a = pts[i];
-        let b = pts[(i + 1) % pts.len()];
-        nrm[0] += (a[1] - b[1]) * (a[2] + b[2]);
-        nrm[1] += (a[2] - b[2]) * (a[0] + b[0]);
-        nrm[2] += (a[0] - b[0]) * (a[1] + b[1]);
-    }
-    let nrm = norm(nrm);
-    let mut u = [1.0, 0.0, 0.0];
-    for p in pts {
-        let d = sub(*p, o);
-        let prp: V3 = std::array::from_fn(|k| d[k] - nrm[k] * dot(d, nrm));
-        if dot(prp, prp) > 1e-20 {
-            u = norm(prp);
-            break;
-        }
-    }
-    (o, u, norm(cross(nrm, u)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,7 +633,7 @@ mod tests {
     #[test]
     fn plane_roundtrip() {
         let s = Surface::from_kind(
-            &SurfaceKind::Plane,
+            &SurfaceKind::Facets,
             &[
                 [0.0, 0.0, 1.0],
                 [2.0, 0.0, 1.0],

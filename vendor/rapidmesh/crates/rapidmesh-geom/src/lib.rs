@@ -29,7 +29,7 @@ pub use import::{
 pub use nurbs::NurbsCurve;
 pub use nurbs_surface::NurbsSurface;
 pub use plc::{FaceTag, RegionTag, SurfaceRef, TaggedPlc};
-pub use polygon::{polygon_orientation, triangulate_polygon};
+pub use polygon::{polygon_orientation, polygon_union, triangulate_polygon};
 pub use prim::{
     cylinder, cylinder_iso, extrude_polygon, extrude_profile, extrude_sheet,
     extrude_spline_profile, facet_count, facet_subdivisions, frustum, frustum_iso, helix,

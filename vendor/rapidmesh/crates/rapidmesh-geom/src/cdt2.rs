@@ -1,7 +1,8 @@
 //! Exact 2D Delaunay and constrained Delaunay triangulation: incremental
 //! Bowyer-Watson with a super-triangle, constraints forced by Sloan's edge
-//! flips, exact `orient2d`/`incircle2d` throughout. It backs the planar mesher
-//! (triangulation, refinement and relaxation of faces in their charts) and
+//! flips, exact `orient2d`/`incircle2d` throughout. It backs the face meshing
+//! of the surface stage (triangulation, refinement and relaxation of faces in
+//! their charts) and
 //! the tessellation of imported faces in their parameters.
 
 use rapidmesh_exact::{incircle2d, orient2d, Axis, Point3, Sign};

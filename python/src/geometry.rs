@@ -394,16 +394,15 @@ impl PyGeometry {
 
     /// Meshes the scene; returns `(n_points, n_tets, min_dihedral_deg,
     /// n_slivers)`.
-    #[pyo3(signature = (maxh=None, grading=None, cells_across=None, optimize=false, target_elements=None))]
+    #[pyo3(signature = (maxh=None, grading=None, cells_across=None, target_elements=None))]
     fn mesh(
         &mut self,
         maxh: Option<f64>,
         grading: Option<f64>,
         cells_across: Option<f64>,
-        optimize: bool,
         target_elements: Option<usize>,
     ) -> PyResult<(usize, usize, f64, usize)> {
-        let opts = MeshOptions { maxh, grading, cells_across, optimize, target_elements, ..Default::default() };
+        let opts = MeshOptions { maxh, grading, cells_across, target_elements, ..Default::default() };
         let m = self.inner.mesh(&opts).map_err(err)?;
         let stats = (m.points.len(), m.tets.len(), m.quality.min_dihedral_deg, m.quality.n_slivers);
         self.mesh = Some(m);

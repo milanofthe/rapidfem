@@ -17,6 +17,9 @@ fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
 fn scale(a: [f64; 3], s: f64) -> [f64; 3] {
     [a[0] * s, a[1] * s, a[2] * s]
 }
@@ -90,9 +93,20 @@ pub fn solid_box(min: [f64; 3], max: [f64; 3]) -> Faceted {
         [0, 4, 6, 2], // -x
         [1, 3, 7, 5], // +x
     ];
+    let normals: [[f64; 3]; 6] = [
+        [0.0, 0.0, -1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+    ];
     let mut f = Faceted::new();
-    for q in quads {
-        let s = f.add_surface(SurfaceKind::Plane);
+    for (q, normal) in quads.into_iter().zip(normals) {
+        let s = f.add_surface(SurfaceKind::Plane {
+            point: c[q[0]],
+            normal,
+        });
         let loop4 = vec![c[q[0]], c[q[1]], c[q[2]], c[q[3]]];
         let tris = [
             Tri::new(c[q[0]], c[q[1]], c[q[2]]),
@@ -162,7 +176,10 @@ pub fn frustum(
             f.push_tri(Tri::new(bottom[i], top[j], top[i]), barrel);
         }
         // Top cap: ring CCW around +axis matches the outward (+axis) normal.
-        let cap = f.add_surface(SurfaceKind::Plane);
+        let cap = f.add_surface(SurfaceKind::Plane {
+            point: top_center,
+            normal: axis,
+        });
         let cap_tris: Vec<Tri> = (0..segments)
             .map(|i| Tri::new(top_center, top[i], top[(i + 1) % segments]))
             .collect();
@@ -170,7 +187,10 @@ pub fn frustum(
     }
     // Bottom cap: outward normal is -axis, so the boundary runs the bottom
     // ring in reverse (clockwise around +axis), matching the fan winding.
-    let cap = f.add_surface(SurfaceKind::Plane);
+    let cap = f.add_surface(SurfaceKind::Plane {
+        point: base_center,
+        normal: scale(axis, -1.0),
+    });
     let cap_tris: Vec<Tri> = (0..segments)
         .map(|i| Tri::new(base_center, bottom[(i + 1) % segments], bottom[i]))
         .collect();
@@ -310,7 +330,10 @@ pub fn extrude_polygon(
     // Bottom cap: counterclockwise in (u, v) faces along +(u x v); the
     // outward bottom normal is the opposite, so reverse the winding (both the
     // fan triangles and the boundary loops).
-    let bottom = f.add_surface(SurfaceKind::Plane);
+    let bottom = f.add_surface(SurfaceKind::Plane {
+        point: base,
+        normal: scale(cross3(u, v), -1.0),
+    });
     let bottom_tris: Vec<Tri> = cap
         .iter()
         .map(|t| {
@@ -332,7 +355,10 @@ pub fn extrude_polygon(
         bottom,
     );
 
-    let top = f.add_surface(SurfaceKind::Plane);
+    let top = f.add_surface(SurfaceKind::Plane {
+        point: top_base,
+        normal: cross3(u, v),
+    });
     let top_tris: Vec<Tri> = cap
         .iter()
         .map(|t| {
@@ -361,7 +387,10 @@ pub fn extrude_polygon(
             let a = embed(base, u, v, ring[i]);
             let b = embed(base, u, v, ring[j]);
             let (at, bt) = (add(a, h), add(b, h));
-            let side = f.add_surface(SurfaceKind::Plane);
+            let side = f.add_surface(SurfaceKind::Plane {
+                point: a,
+                normal: cross3(sub(b, a), h),
+            });
             let tris = [Tri::new(a, b, bt), Tri::new(a, bt, at)];
             f.push_flat(PlanarFacet::new(vec![a, b, bt, at]), &tris, side);
         }
@@ -406,7 +435,10 @@ pub fn extrude_spline_profile(
 
     let mut f = Faceted::new();
     // Bottom cap: reverse winding for the outward -(uxv) normal.
-    let bottom = f.add_surface(SurfaceKind::Plane);
+    let bottom = f.add_surface(SurfaceKind::Plane {
+        point: base,
+        normal: scale(cross3(u, v), -1.0),
+    });
     let bottom_tris: Vec<Tri> = cap
         .iter()
         .map(|t| {
@@ -420,7 +452,10 @@ pub fn extrude_spline_profile(
     let bottom_loop: Vec<[f64; 3]> = pts2.iter().rev().map(|&p| embed(base, u, v, p)).collect();
     f.push_flat(PlanarFacet::new(bottom_loop), &bottom_tris, bottom);
 
-    let top = f.add_surface(SurfaceKind::Plane);
+    let top = f.add_surface(SurfaceKind::Plane {
+        point: top_base,
+        normal: cross3(u, v),
+    });
     let top_tris: Vec<Tri> = cap
         .iter()
         .map(|t| {
@@ -452,9 +487,12 @@ pub fn extrude_spline_profile(
     // Closing flat wall (chord end->start) for an open profile.
     let (q0, qn) = (pts2[0], pts2[n_seg]);
     if (q0[0] - qn[0]).hypot(q0[1] - qn[1]) > 1e-12 {
-        let flat = f.add_surface(SurfaceKind::Plane);
         let a = embed(base, u, v, qn);
         let b = embed(base, u, v, q0);
+        let flat = f.add_surface(SurfaceKind::Plane {
+            point: a,
+            normal: cross3(sub(b, a), h),
+        });
         let (at, bt) = (add(a, h), add(b, h));
         let tris = [Tri::new(a, b, bt), Tri::new(a, bt, at)];
         f.push_flat(PlanarFacet::new(vec![a, b, bt, at]), &tris, flat);
@@ -665,14 +703,20 @@ pub fn cylinder_iso(
     // Top cap: ring CCW around +axis -> outward (+axis) normal.
     let top = &levels[rows];
     let top_center = add(base_center, axis);
-    let cap_t = f.add_surface(SurfaceKind::Plane);
+    let cap_t = f.add_surface(SurfaceKind::Plane {
+        point: top_center,
+        normal: axis,
+    });
     let top_tris: Vec<Tri> = (0..segments)
         .map(|i| Tri::new(top_center, top[i], top[(i + 1) % segments]))
         .collect();
     f.push_flat(PlanarFacet::new(top.clone()), &top_tris, cap_t);
     // Bottom cap: outward normal -axis -> reverse the ring.
     let bot = &levels[0];
-    let cap_b = f.add_surface(SurfaceKind::Plane);
+    let cap_b = f.add_surface(SurfaceKind::Plane {
+        point: base_center,
+        normal: scale(axis, -1.0),
+    });
     let bot_tris: Vec<Tri> = (0..segments)
         .map(|i| Tri::new(base_center, bot[(i + 1) % segments], bot[i]))
         .collect();
@@ -753,14 +797,20 @@ pub fn frustum_iso(
     }
     if r_top > 0.0 {
         let top = &levels[rows];
-        let cap_t = f.add_surface(SurfaceKind::Plane);
+        let cap_t = f.add_surface(SurfaceKind::Plane {
+            point: top_center,
+            normal: axis,
+        });
         let top_tris: Vec<Tri> = (0..segments)
             .map(|i| Tri::new(top_center, top[i], top[(i + 1) % segments]))
             .collect();
         f.push_flat(PlanarFacet::new(top.clone()), &top_tris, cap_t);
     }
     let bot = &levels[0];
-    let cap_b = f.add_surface(SurfaceKind::Plane);
+    let cap_b = f.add_surface(SurfaceKind::Plane {
+        point: base_center,
+        normal: scale(axis, -1.0),
+    });
     let bot_tris: Vec<Tri> = (0..segments)
         .map(|i| Tri::new(base_center, bot[(i + 1) % segments], bot[i]))
         .collect();
@@ -965,13 +1015,13 @@ pub fn pipe(path: &[[f64; 3]], radius: f64, segments: usize) -> Faceted {
         }
     }
     // End caps lie in planes normal to the end tangents, so they are flat.
-    let cap0 = f.add_surface(SurfaceKind::Plane);
     let cap0_tris: Vec<Tri> = (0..segments)
         .map(|j| Tri::new(path[0], rings[0][(j + 1) % segments], rings[0][j]))
         .collect();
     let cap0_loop: Vec<[f64; 3]> = rings[0].iter().rev().copied().collect();
+    let cap0 = f.add_surface(SurfaceKind::plane_of(&cap0_loop));
     f.push_flat(PlanarFacet::new(cap0_loop), &cap0_tris, cap0);
-    let cap1 = f.add_surface(SurfaceKind::Plane);
+    let cap1 = f.add_surface(SurfaceKind::plane_of(&rings[n - 1]));
     let cap1_tris: Vec<Tri> = (0..segments)
         .map(|j| {
             Tri::new(
@@ -1036,17 +1086,18 @@ pub fn loft(profile_a: &[[f64; 3]], profile_b: &[[f64; 3]]) -> Faceted {
     };
     let (ca, cb) = (centroid(profile_a), centroid(profile_b));
     let mut f = Faceted::new();
-    let cap_a = f.add_surface(SurfaceKind::Plane);
+    let reversed: Vec<[f64; 3]> = profile_a.iter().rev().copied().collect();
+    let cap_a = f.add_surface(SurfaceKind::plane_or_facets(&reversed));
     for i in 0..n {
         let j = (i + 1) % n;
         f.push_tri(Tri::new(ca, profile_a[j], profile_a[i]), cap_a);
     }
-    let cap_b = f.add_surface(SurfaceKind::Plane);
+    let cap_b = f.add_surface(SurfaceKind::plane_or_facets(profile_b));
     for i in 0..n {
         let j = (i + 1) % n;
         f.push_tri(Tri::new(cb, profile_b[i], profile_b[j]), cap_b);
     }
-    let side = f.add_surface(SurfaceKind::Plane);
+    let side = f.add_surface(SurfaceKind::Facets);
     for i in 0..n {
         let j = (i + 1) % n;
         let (a, b) = (profile_a[i], profile_a[j]);
@@ -1069,7 +1120,10 @@ pub fn loft(profile_a: &[[f64; 3]], profile_b: &[[f64; 3]]) -> Faceted {
 /// Parallelogram sheet spanned by `u`, `v` at `corner`.
 pub fn sheet_rect(corner: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Faceted {
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Plane);
+    let s = f.add_surface(SurfaceKind::Plane {
+        point: corner,
+        normal: cross3(u, v),
+    });
     let b = add(corner, u);
     let c = add(add(corner, u), v);
     let d = add(corner, v);
@@ -1092,7 +1146,10 @@ pub fn sheet_polygon(
     v: [f64; 3],
 ) -> Faceted {
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Plane);
+    let s = f.add_surface(SurfaceKind::Plane {
+        point: base,
+        normal: cross3(u, v),
+    });
     let tris: Vec<Tri> = triangulate_polygon(outer, holes)
         .iter()
         .map(|t| {
@@ -1132,7 +1189,10 @@ pub fn sheet_polygon(
 pub fn sheet_disk(center: [f64; 3], e1: [f64; 3], e2: [f64; 3], segments: usize) -> Faceted {
     assert!(segments >= 3);
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Plane);
+    let s = f.add_surface(SurfaceKind::Plane {
+        point: center,
+        normal: cross3(e1, e2),
+    });
     let ring: Vec<[f64; 3]> = (0..segments)
         .map(|i| {
             let t = 2.0 * std::f64::consts::PI * i as f64 / segments as f64;
@@ -1212,8 +1272,26 @@ pub fn extrude_sheet(
     }
     let mut f = Faceted::new();
     f.frame = sheet.frame;
-    let bottom = f.add_surface(SurfaceKind::Plane);
-    let top = f.add_surface(SurfaceKind::Plane);
+    // The sheet's plane: its facets' area vector, the side the sweep goes.
+    let n0 = sheet.tris.iter().fold([0.0; 3], |acc, t| {
+        add(
+            acc,
+            cross3(
+                crate::vec3::sub(t.v[1], t.v[0]),
+                crate::vec3::sub(t.v[2], t.v[0]),
+            ),
+        )
+    });
+    let sign = if dot3(n0, w) > 0.0 { 1.0 } else { -1.0 };
+    let p0 = sheet.tris[0].v[0];
+    let bottom = f.add_surface(SurfaceKind::Plane {
+        point: p0,
+        normal: scale(n0, -sign),
+    });
+    let top = f.add_surface(SurfaceKind::Plane {
+        point: add(p0, w),
+        normal: scale(n0, sign),
+    });
     let rim_surface = rim.map(|k| f.add_surface(k));
     let up = |p: [f64; 3]| add(p, w);
     for fl in &sheet.flats {
@@ -1268,7 +1346,13 @@ pub fn extrude_sheet(
                 let (ah, bh) = (up(a), up(b));
                 let s = match (rim_surface, outer) {
                     (Some(s), true) => s,
-                    _ => f.add_surface(SurfaceKind::Plane),
+                    _ => f.add_surface(SurfaceKind::Plane {
+                        point: a,
+                        normal: scale(
+                            cross3(crate::vec3::sub(b, a), w),
+                            if with { 1.0 } else { -1.0 },
+                        ),
+                    }),
                 };
                 for t in [[a, b, bh], [a, bh, ah]] {
                     let t = flip(t, with);
@@ -1431,7 +1515,14 @@ pub fn extrude_profile(
     let mut f = Faceted::new();
     for (i, piece) in pieces.into_iter().enumerate() {
         let kind = match piece {
-            Piece::Line(..) => SurfaceKind::Plane,
+            // Its outward side: counterclockwise, (b - a) x h.
+            Piece::Line(p, q) => SurfaceKind::Plane {
+                point: at(p),
+                normal: scale(
+                    cross3(crate::vec3::sub(at(q), at(p)), h),
+                    if ccw { 1.0 } else { -1.0 },
+                ),
+            },
             Piece::Arc(c, rho) => SurfaceKind::Cylinder {
                 center: at(c),
                 axis,
@@ -1466,7 +1557,10 @@ pub fn extrude_profile(
     let tris = triangulate_polygon(&loop2, &[]);
     // The bottom faces against h, the top along it.
     for (shift, up) in [([0.0; 3], false), (h, true)] {
-        let s = f.add_surface(SurfaceKind::Plane);
+        let s = f.add_surface(SurfaceKind::Plane {
+            point: add(at(loop2[0]), shift),
+            normal: scale(cross3(u, v), if up { 1.0 } else { -1.0 }),
+        });
         let mut lp: Vec<[f64; 3]> = loop2.iter().map(|&p| add(at(p), shift)).collect();
         let ts: Vec<Tri> = tris
             .iter()
@@ -1588,7 +1682,12 @@ pub fn revolve_at(
                 if p[0] == 0.0 && q[0] == 0.0 {
                     None
                 } else if p[1] == q[1] {
-                    Some(SurfaceKind::Plane)
+                    // Across the axis at its height; the profile's interior
+                    // lies left of it, its outside right: (dz, -dr) in (r, z).
+                    Some(SurfaceKind::Plane {
+                        point: on_axis(p[1]),
+                        normal: scale(a, p[0] - q[0]),
+                    })
                 } else if p[0] == q[0] {
                     Some(SurfaceKind::Cylinder {
                         center: origin,
@@ -1682,7 +1781,7 @@ pub fn revolve_at(
         };
         // An edge on the axis keeps its surface slot (roles follow the
         // edges) but has no faces.
-        let s = f.add_surface(kind.clone().unwrap_or(SurfaceKind::Plane));
+        let s = f.add_surface(kind.clone().unwrap_or(SurfaceKind::Facets));
         if kind.is_none() {
             continue;
         }
@@ -1707,7 +1806,14 @@ pub fn revolve_at(
         };
         let tris = triangulate_polygon(&loop2, &[]);
         for (k, outward) in [(0, true), (turns, false)] {
-            let s = f.add_surface(SurfaceKind::Plane);
+            // Through the axis at the cap's angle, facing x cross axis
+            // turned there, the end cap the other way.
+            let t = angles[k];
+            let dir = add(scale(x, t.cos()), scale(y, t.sin()));
+            let s = f.add_surface(SurfaceKind::Plane {
+                point: origin,
+                normal: scale(cross3(dir, a), if outward { 1.0 } else { -1.0 }),
+            });
             let mut lp: Vec<[f64; 3]> = loop2.iter().map(|&v| point(v, k)).collect();
             let ts: Vec<Tri> = tris
                 .iter()

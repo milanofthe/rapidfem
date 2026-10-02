@@ -332,28 +332,9 @@ pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
         self_pairs(&bvh, &boxes, &mut pairs);
     }
 
-    let trace = std::env::var_os("RAPIDMESH_TRACE").is_some();
-    let t_pairs = rapidmesh_exact::clock::Instant::now();
-    let n_pairs = pairs.len();
     let mut points: Vec<Vec<Point3>> = vec![Vec::new(); tris.len()];
     let mut constraints: Vec<Vec<Constraint>> = vec![Vec::new(); tris.len()];
     let mut skipped = [0usize; 1];
-    let check = std::env::var_os("RAPIDMESH_ARRANGE_CHECK").is_some();
-    let validate = |branch: &str, fi: usize, fj: usize, p: &Point3| {
-        if !check {
-            return;
-        }
-        let facet = &tris[fi];
-        let (axis, orientation) = facet.projection_axis();
-        if !facet.contains_coplanar(p, axis, orientation) {
-            eprintln!(
-                "ARRANGE CHECK: {branch} point {:?} outside facet {fi} {:?} (pair {fi},{fj} other {:?})",
-                p.approx(),
-                facet.v,
-                tris[fj].v,
-            );
-        }
-    };
     for (i, j) in pairs {
         // Fast path for mesh-adjacent / disjoint pairs (see adjacency_skip):
         // the dominant candidate kind on clean closed surfaces, contributing
@@ -366,16 +347,10 @@ pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
         match tri_tri_intersection(&tris[i], &tris[j]) {
             TriTriIsect::Disjoint => {}
             TriTriIsect::Touching(p) => {
-                validate("touch", i, j, &p);
-                validate("touch", j, i, &p);
                 points[i].push(p.clone());
                 points[j].push(p);
             }
             TriTriIsect::Segment(a, b) => {
-                validate("seg-a", i, j, &a);
-                validate("seg-b", i, j, &b);
-                validate("seg-a", j, i, &a);
-                validate("seg-b", j, i, &b);
                 constraints[i].push(Constraint {
                     a: a.clone(),
                     b: b.clone(),
@@ -394,8 +369,6 @@ pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
                     for e in 0..3 {
                         let (u, v) = (other.v[e], other.v[(e + 1) % 3]);
                         if let Some((lo, hi)) = clip_coplanar_edge(facet, u, v) {
-                            validate("clip-lo", fi, fj, &lo);
-                            validate("clip-hi", fi, fj, &hi);
                             if lo.coincides(&hi) {
                                 points[fi].push(lo);
                             } else {
@@ -412,14 +385,6 @@ pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
         }
     }
 
-    if trace {
-        eprintln!(
-            "arrange: {n_pairs} pairs in {:.1?} (skipped {})",
-            t_pairs.elapsed(),
-            skipped[0]
-        );
-    }
-    let t_tri = rapidmesh_exact::clock::Instant::now();
     // Each facet retriangulates independently from its own intersection
     // points and constraints (read-only), and this dominates assembly on
     // boolean-heavy scenes; run it in parallel. collect() into an indexed
@@ -433,9 +398,6 @@ pub fn arrange(tris: &[Tri]) -> Result<Arrangement, ArrangeError> {
                 .map_err(|message| ArrangeError { facet: i, message })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if trace {
-        eprintln!("arrange: triangulate {:.1?}", t_tri.elapsed());
-    }
     Ok(Arrangement {
         facets,
         constraints,

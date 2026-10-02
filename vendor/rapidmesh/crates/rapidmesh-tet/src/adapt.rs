@@ -7,6 +7,27 @@
 use crate::conform::SurfaceMesh;
 use rapidmesh_geom::vec3::{len, sub};
 
+/// The knobs of Dörfler marking and the refinement it asks for.
+#[derive(Clone, Copy, Debug)]
+pub struct Dorfler {
+    /// The share of the summed squared indicator the marked set reaches.
+    pub theta: f64,
+    /// A marked element's size is its local size over this.
+    pub factor: f64,
+    /// No marked size below this (0 off).
+    pub h_min: f64,
+}
+
+impl Default for Dorfler {
+    fn default() -> Dorfler {
+        Dorfler {
+            theta: 0.5,
+            factor: 2.0,
+            h_min: 0.0,
+        }
+    }
+}
+
 /// Dörfler (bulk) marking: the indices of the smallest element set whose summed
 /// SQUARED indicator reaches `theta` of the total (`theta` in `(0, 1]`; 0.5 is
 /// the common choice). The squared convention treats `eta` as an energy-norm

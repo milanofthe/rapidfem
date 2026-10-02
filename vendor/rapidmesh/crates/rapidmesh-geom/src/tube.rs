@@ -84,32 +84,6 @@ impl TubePath {
         best.2
     }
 
-    /// Calls `f` with the index of every path segment whose AABB overlaps
-    /// the AABB of query segment `a -> b` inflated by `pad` (a conservative
-    /// superset of the segments within `pad` of the query). Zero-alloc; the
-    /// analytic tube-crossing solver collects its candidate quadratics here.
-    pub fn for_segments_near(&self, a: V3, b: V3, pad: f64, f: &mut impl FnMut(usize)) {
-        let lo: V3 = std::array::from_fn(|k| a[k].min(b[k]) - pad);
-        let hi: V3 = std::array::from_fn(|k| a[k].max(b[k]) + pad);
-        self.near_rec(0, lo, hi, f);
-    }
-
-    fn near_rec(&self, ni: usize, lo: V3, hi: V3, f: &mut impl FnMut(usize)) {
-        let n = self.nodes[ni];
-        if (0..3).any(|k| n.hi[k] < lo[k] || n.lo[k] > hi[k]) {
-            return;
-        }
-        if n.right < 0 {
-            let (start, count) = (n.left as usize, (!n.right) as usize);
-            for &si in &self.order[start..start + count] {
-                f(si as usize);
-            }
-            return;
-        }
-        self.near_rec(n.left as usize, lo, hi, f);
-        self.near_rec(n.right as usize, lo, hi, f);
-    }
-
     fn closest_rec(&self, ni: usize, p: V3, best: &mut (f64, V3, usize)) {
         let n = self.nodes[ni];
         if box_d2(n.lo, n.hi, p) >= best.0 {

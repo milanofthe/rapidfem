@@ -425,7 +425,6 @@ impl Scene {
             flatten(f, None, *tag);
         }
 
-        let trace = std::env::var_os("RAPIDMESH_TRACE").is_some();
         let t0 = rapidmesh_exact::clock::Instant::now();
         let arr = arrange_facets(&facets).map_err(|e| AssembleError {
             solid: src[e.facet].solid,
@@ -434,9 +433,6 @@ impl Scene {
         })?;
         rapidmesh_exact::log::stage("assemble.arrange", t0.elapsed().as_secs_f64());
         rapidmesh_exact::log::stat("assemble.input_facets", facets.len() as f64);
-        if trace {
-            eprintln!("assemble: arrange {:.1?}", t0.elapsed());
-        }
         let t1 = rapidmesh_exact::clock::Instant::now();
 
         // Scene bounding box for ray targets, over every facet's geometry.
@@ -623,9 +619,6 @@ impl Scene {
         }
 
         rapidmesh_exact::log::stage("assemble.classify_emit", t1.elapsed().as_secs_f64());
-        if trace {
-            eprintln!("assemble: classify+emit {:.1?}", t1.elapsed());
-        }
         // ------------------------------------------------- snap and emit
         // The PLC is pure f64 from here on. Exact arithmetic faithfully
         // preserves microscopic input asymmetries (e.g. cos and sin of the

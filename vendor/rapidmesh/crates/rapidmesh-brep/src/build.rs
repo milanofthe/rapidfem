@@ -352,10 +352,9 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
     let mut coedges: Vec<CoEdge> = Vec::new();
     for fid in 0..faces.len() {
         let signed = order_loops(&face_edges[fid], &edges);
-        // Frame for the surface. For a plane this must be EXACT (so on-plane
-        // carriers stay bit-exact on the PLC plane -> exact region volumes): use an
-        // originating facet triangle (exact PLC vertices, cross-product normal),
-        // not the float edge points. Other kinds ignore the frame (self-contained).
+        // Where a plane's frame starts and points: an originating facet
+        // (exact PLC vertices), so chart coordinates stay small. The normal
+        // is the plane's own; other kinds ignore the frame.
         let frame_pts: Vec<V3> = if let Some(&tfi) = faces[fid].facets.first() {
             let t = plc.triangles[tfi as usize];
             vec![
@@ -370,14 +369,30 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
                 .unwrap_or_default()
         };
         let mut kind = plc.surfaces[faces[fid].surface.0 as usize].clone();
-        // A `Plane` kind whose facets are NOT coplanar is a faceted CURVED
-        // face without an analytic recovery -- loft mantles, swept tubes,
-        // helix coils all tag their whole side wall as one Plane surface. A
-        // plane fit through such a face is a garbage carrier (the refinement
-        // core projects and classifies against it, shredding the mesh into
-        // fragments). Carry it as a DISCRETE patch of its own facets instead:
-        // the same closest-point oracle that remeshes STL imports.
-        if matches!(kind, SurfaceKind::Plane) && !face_facets_coplanar(&faces[fid], plc, tol) {
+        // A face whose facets are its carrier (a loft mantle, a swept wall)
+        // is a DISCRETE patch of its own facets, the same closest-point
+        // oracle that remeshes STL imports; one that happens to be flat is
+        // the plane of its facets. A plane whose facets leave it (which the
+        // geometry should never produce) is carried by its facets too.
+        let flat = match kind {
+            SurfaceKind::Facets if faces[fid].facets.is_empty() => {
+                Some(SurfaceKind::plane_of(&frame_pts).plane())
+            }
+            SurfaceKind::Plane { .. } | SurfaceKind::Facets => {
+                Some(facets_plane(&faces[fid], &kind, plc, tol))
+            }
+            _ => None,
+        };
+        if let Some(Some((point, normal))) = flat {
+            kind = SurfaceKind::Plane { point, normal };
+        }
+        if let Some(None) = flat {
+            if kind.is_plane() {
+                rapidmesh_exact::log::debug(
+                    "brep.plane",
+                    format!("face {fid} leaves its plane, carried by its facets"),
+                );
+            }
             let mut vmap: HashMap<usize, u32> = HashMap::default();
             let mut dpoints: Vec<V3> = Vec::new();
             let mut dtris: Vec<[u32; 3]> = Vec::new();
@@ -791,10 +806,10 @@ fn recover_curve(chain: &[V3], rad: &[FaceId], faces: &[Face], plc: &TaggedPlc, 
         .filter(|f| {
             matches!(
                 plc.surfaces[faces[f.0 as usize].plc_surface as usize],
-                SurfaceKind::Plane
+                SurfaceKind::Plane { .. }
             )
         })
-        .filter_map(|f| exact_face_plane(&faces[f.0 as usize], plc))
+        .filter_map(|f| plc.surfaces[faces[f.0 as usize].plc_surface as usize].plane())
         .collect();
     for f in rad {
         let kind = &plc.surfaces[faces[f.0 as usize].plc_surface as usize];
@@ -860,7 +875,10 @@ fn recover_curve(chain: &[V3], rad: &[FaceId], faces: &[Face], plc: &TaggedPlc, 
             .map(|&f| {
                 let sid = faces[f.0 as usize].plc_surface;
                 (
-                    matches!(plc.surfaces[sid as usize], SurfaceKind::Plane),
+                    matches!(
+                        plc.surfaces[sid as usize],
+                        SurfaceKind::Plane { .. } | SurfaceKind::Facets
+                    ),
                     sid,
                     f,
                 )
@@ -884,19 +902,23 @@ fn recover_curve(chain: &[V3], rad: &[FaceId], faces: &[Face], plc: &TaggedPlc, 
     Curve::Polyline
 }
 
-/// The analytic carrier of a face; none for a discrete patch or a curved
-/// wall tagged plane.
+/// The analytic carrier of a face; none for a discrete patch or a face
+/// whose facets are not flat but carry it.
 fn face_carrier(f: &Face, plc: &TaggedPlc, tol: f64) -> Option<Surface> {
     let kind = &plc.surfaces[f.surface.0 as usize];
-    if matches!(kind, SurfaceKind::Discrete(_)) {
-        return None;
-    }
-    if matches!(kind, SurfaceKind::Plane) && !face_facets_coplanar(f, plc, tol) {
-        return None;
-    }
     let t = plc.triangles[*f.facets.first()? as usize];
     let frame: Vec<V3> = t.iter().map(|&v| plc.vertices[v as usize]).collect();
-    Some(Surface::from_kind(kind, &frame))
+    match kind {
+        SurfaceKind::Discrete(_) => None,
+        SurfaceKind::Plane { .. } | SurfaceKind::Facets => {
+            let (point, normal) = facets_plane(f, kind, plc, tol)?;
+            Some(Surface::from_kind(
+                &SurfaceKind::Plane { point, normal },
+                &frame,
+            ))
+        }
+        _ => Some(Surface::from_kind(kind, &frame)),
+    }
 }
 
 /// Carriers whose normals are this close to parallel (cos 10 deg) touch
@@ -1034,7 +1056,7 @@ fn absorb_thin_faces(
             // sagitta wide), not a face of another surface beside it.
             let plane = matches!(
                 plc.surfaces[faces[g].surface.0 as usize],
-                SurfaceKind::Plane
+                SurfaceKind::Plane { .. } | SurfaceKind::Facets
             );
             let reach = if plane { tol } else { tol.max(explained) };
             let worst = faces[f]
@@ -1122,35 +1144,23 @@ fn absorb_thin_faces(
     *faces = out;
 }
 
-/// True if every facet vertex of the face lies on the plane of its FIRST
-/// facet (within `tol`): the gate that separates a real planar face from a
-/// faceted curved side wall mis-tagged as `Plane`.
-fn face_facets_coplanar(face: &Face, plc: &TaggedPlc, tol: f64) -> bool {
-    let Some((o, n)) = exact_face_plane(face, plc) else {
-        return true;
+/// The plane `(point, unit normal)` all facets of a face lie on (within
+/// `tol`): a plane's own, or for faceted kind the plane of its first proper
+/// facet. None where they leave it.
+fn facets_plane(face: &Face, kind: &SurfaceKind, plc: &TaggedPlc, tol: f64) -> Option<(V3, V3)> {
+    let corners = |tfi: &u32| plc.triangles[*tfi as usize].map(|v| plc.vertices[v as usize]);
+    let (o, n) = match kind.plane() {
+        Some(p) => p,
+        None => face.facets.iter().map(corners).find_map(|[a, b, c]| {
+            let n = cross(sub(b, a), sub(c, a));
+            (dot(n, n) >= 1e-24).then(|| (a, norm(n)))
+        })?,
     };
-    face.facets.iter().all(|&tfi| {
-        let t = plc.triangles[tfi as usize];
-        (0..3).all(|k| dot(sub(plc.vertices[t[k] as usize], o), n).abs() <= tol)
-    })
-}
-
-/// The EXACT carrier plane of a planar face `(origin, unit normal)`, from its
-/// first originating PLC facet (exact vertices, cross-product normal) -- not a
-/// Newell fit to float edge points.
-fn exact_face_plane(face: &Face, plc: &TaggedPlc) -> Option<(V3, V3)> {
-    let &tfi = face.facets.first()?;
-    let t = plc.triangles[tfi as usize];
-    let (a, b, c) = (
-        plc.vertices[t[0] as usize],
-        plc.vertices[t[1] as usize],
-        plc.vertices[t[2] as usize],
-    );
-    let n = cross(sub(b, a), sub(c, a));
-    if dot(n, n) < 1e-24 {
-        return None;
-    }
-    Some((a, norm(n)))
+    face.facets
+        .iter()
+        .flat_map(corners)
+        .all(|p| dot(sub(p, o), n).abs() <= tol)
+        .then_some((o, n))
 }
 
 /// How close to square (or to parallel) a plane must meet an axis for the
@@ -1217,10 +1227,10 @@ fn own_axis(k: &SurfaceKind) -> Option<(V3, V3)> {
     }
 }
 
-/// The meridian of carrier `k` (with `plane`, the exact geometry of a plane
-/// face) about the axis `(o, a)`, if it is a surface of revolution about it.
-/// `size` scales the tolerance for a centre on the axis.
-fn meridian(k: &SurfaceKind, plane: Option<(V3, V3)>, o: V3, a: V3, size: f64) -> Option<Meridian> {
+/// The meridian of carrier `k` about the axis `(o, a)`, if it is a surface
+/// of revolution about it. `size` scales the tolerance for a centre on the
+/// axis.
+fn meridian(k: &SurfaceKind, o: V3, a: V3, size: f64) -> Option<Meridian> {
     let on_axis = |c: V3| {
         let d = sub(c, o);
         let off = sub(d, scale(a, dot(d, a)));
@@ -1229,13 +1239,10 @@ fn meridian(k: &SurfaceKind, plane: Option<(V3, V3)>, o: V3, a: V3, size: f64) -
     let along = |b: V3| dot(norm(b), a).abs() >= 1.0 - SQUARE_TOL;
     let z = |c: V3| dot(sub(c, o), a);
     match k {
-        SurfaceKind::Plane => {
-            let (po, pn) = plane?;
-            along(pn).then_some(Meridian::Line {
-                p: [0.0, z(po)],
-                d: [1.0, 0.0],
-            })
-        }
+        SurfaceKind::Plane { point, normal } => along(*normal).then_some(Meridian::Line {
+            p: [0.0, z(*point)],
+            d: [1.0, 0.0],
+        }),
         SurfaceKind::Sphere { center, radius } => on_axis(*center).then_some(Meridian::Circle {
             c: [0.0, z(*center)],
             r: *radius,
@@ -1351,21 +1358,15 @@ fn revolution_circle(
 ) -> Option<(V3, V3, f64, V3)> {
     let size = arc_len(chain).max(f64::MIN_POSITIVE);
     let kind = |f: &FaceId| &plc.surfaces[faces[f.0 as usize].plc_surface as usize];
-    let plane = |f: &FaceId| {
-        matches!(kind(f), SurfaceKind::Plane)
-            .then(|| exact_face_plane(&faces[f.0 as usize], plc))
-            .flatten()
-    };
     for (i, f) in rad.iter().enumerate() {
         for g in &rad[i + 1..] {
             let (kf, kg) = (kind(f), kind(g));
             let axis = own_axis(kf)
                 .or_else(|| own_axis(kg))
                 .or_else(|| match (kf, kg) {
-                    (SurfaceKind::Sphere { center, .. }, SurfaceKind::Plane)
-                    | (SurfaceKind::Plane, SurfaceKind::Sphere { center, .. }) => {
-                        let (_, n) = plane(f).or_else(|| plane(g))?;
-                        Some((*center, n))
+                    (SurfaceKind::Sphere { center, .. }, p @ SurfaceKind::Plane { .. })
+                    | (p @ SurfaceKind::Plane { .. }, SurfaceKind::Sphere { center, .. }) => {
+                        Some((*center, p.plane()?.1))
                     }
                     (
                         SurfaceKind::Sphere { center: c1, .. },
@@ -1377,10 +1378,7 @@ fn revolution_circle(
                     _ => None,
                 });
             let Some((o, a)) = axis else { continue };
-            let (Some(mf), Some(mg)) = (
-                meridian(kf, plane(f), o, a, size),
-                meridian(kg, plane(g), o, a, size),
-            ) else {
+            let (Some(mf), Some(mg)) = (meridian(kf, o, a, size), meridian(kg, o, a, size)) else {
                 continue;
             };
             // Start from the chain's mean radius and height.

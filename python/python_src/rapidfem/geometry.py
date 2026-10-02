@@ -1554,11 +1554,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ----------
         maxh : float, optional
             global size override for this call
-        transition_distance, algorithm : optional
+        transition_distance, algorithm, optimize : optional
             accepted for compatibility (the size field grades by itself;
-            there is one algorithm)
-        optimize : bool
-            run the quality optimizer after meshing
+            there is one algorithm, and it needs no optimizer pass)
         cells_across : float, optional
             elements across the thickness of every region, so a thin layer
             gets proper tets through it; off by default (a stack of layers far
@@ -1587,7 +1585,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
                 maxh=h, grading=None if self._grading else 1e9,
                 cells_across=None if cells_across is None else float(cells_across),
-                optimize=bool(optimize),
                 target_elements=target_elements)
             face_groups, volume_groups = self._assign_groups()
             self._fem_mesh = self._native.fem_mesh(face_groups, volume_groups)

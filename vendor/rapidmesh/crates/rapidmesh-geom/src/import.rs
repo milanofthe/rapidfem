@@ -253,7 +253,10 @@ pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Face
             })
         });
         if flat {
-            let s = f.add_surface(SurfaceKind::Plane);
+            let s = f.add_surface(SurfaceKind::Plane {
+                point: o,
+                normal: n,
+            });
             for &fi in &members {
                 f.push_tri(tris[fi as usize], s);
             }

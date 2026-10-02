@@ -3,39 +3,32 @@
 //!
 //! The volume engine itself is the restricted-Delaunay core ([`crate::mesh3`],
 //! reached via [`crate::conform::mesh_model`]); this module wraps it with the
-//! element-budget retune loop. The surface export runs on the same core
-//! ([`crate::mesh3::brep::surface_mesh`]).
+//! element-budget retune loop.
 
 use crate::conform::{MeshParams, TetMesh};
 use crate::domain::DomainTree;
 use rapidmesh_geom::vec3::dist;
 
-/// Mesh `plc` to an optional element budget, with the optional quality pass.
-///
-/// `optimize_passes`: `Some(n)` runs [`crate::optimize::optimize`] (whose size
-/// targets mirror the params, so the quality pass respects the mesher's sizing)
-/// for `n` passes after each remesh; `None` skips it.
+/// Mesh `plc` to an optional element budget.
 ///
 /// `target_elements`: `Some(target)` retunes the GLOBAL size scale over a few
-/// remeshes so the FINAL tet count (after optimize, which can shrink it ~25%)
-/// lands within 6% of `target` -- the tet count scales as `scale^-3`, so each
+/// remeshes so the tet count lands within 6% of `target` -- the tet count scales as `scale^-3`, so each
 /// step multiplies the scale by `(n/target)^(1/3)`. The relative refinement
 /// (curvature + size points) keeps its shape throughout. `None` meshes once.
 ///
 /// Returns the mesh and the (possibly budget-scaled) params it was built with.
 /// This is the count-driven volume entry point; the surface analogue is the
-/// `surf_target_count` budget of [`crate::mesh3::brep::surface_mesh`].
+/// `surf_target_count` budget of [`crate::bottomup::surface_mesh`].
 pub fn mesh_budgeted(
     model: &rapidmesh_brep::Model,
     params: &MeshParams,
     target_elements: Option<usize>,
-    optimize_passes: Option<usize>,
 ) -> (TetMesh, MeshParams) {
     // The volume backend is the restricted-Delaunay REFINEMENT core
     // (analytic carriers, protecting balls, manifold sweeps); the budget
-    // loop and the optimize pass wrap it unchanged.
+    // loop wraps it unchanged.
     let infallible: Result<_, std::convert::Infallible> =
-        budgeted(model, params, target_elements, optimize_passes, &|p| {
+        budgeted(model, params, target_elements, &|p| {
             Ok(crate::conform::mesh_model(model, p))
         });
     match infallible {
@@ -45,31 +38,16 @@ pub fn mesh_budgeted(
 }
 
 /// [`mesh_budgeted`] around any mesher of `model`: the tet budget scales the
-/// sizes over a few meshes, the optimizer runs on each.
+/// sizes over a few meshes.
 pub fn budgeted<E>(
     model: &rapidmesh_brep::Model,
     params: &MeshParams,
     target_elements: Option<usize>,
-    optimize_passes: Option<usize>,
     mesher: &dyn Fn(&MeshParams) -> Result<TetMesh, E>,
 ) -> Result<(TetMesh, MeshParams), E> {
-    // The thickness bounds join the per-region sizes here already, so the
-    // optimizer keeps them too.
+    // the thickness bounds join the per-region sizes
     let params = &params.with_thickness_caps(&model.plc);
-    let mesh_once = |p: &MeshParams| -> Result<TetMesh, E> {
-        let mut m = mesher(p)?;
-        if let Some(passes) = optimize_passes {
-            let opt = crate::optimize::OptimizeParams {
-                passes,
-                maxh: p.maxh,
-                region_maxh: p.region_maxh.clone(),
-                face_maxh: p.face_maxh.clone(),
-                surface_maxh: p.surface_maxh.clone(),
-            };
-            crate::optimize::optimize(&mut m, &opt);
-        }
-        Ok(m)
-    };
+    let mesh_once = |p: &MeshParams| mesher(p);
     match target_elements {
         Some(target) if target > 0 => {
             let mut s = 1.0_f64;
@@ -97,8 +75,8 @@ pub fn budgeted<E>(
 /// Builds the domain sizing octree with the per-entity overrides applied: per-face
 /// `surf_maxh` -> per-facet volume target (`facet_surf`), and per-edge `edge_maxh`
 /// -> point sources sampled along the brep edge chain (so the field stays fine
-/// along a refined edge). Shared by the volume path (`mesh_refine`) and the
-/// surface-only export (`surface_mesh`), so BOTH honor the same sizing knobs
+/// along a refined edge). Shared by the volume meshes and the surface-only
+/// export (`bottomup::surface_mesh`), so BOTH honor the same sizing knobs
 /// (per-entity AND global caps, which `DomainTree::build` composes).
 pub(crate) fn build_sizing_domain(
     model: &rapidmesh_brep::Model,

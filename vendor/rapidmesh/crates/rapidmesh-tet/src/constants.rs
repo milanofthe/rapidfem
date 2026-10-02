@@ -17,26 +17,6 @@ pub(crate) const DEFAULT_SUBDIV: f64 = 8.0;
 /// A tet whose smallest dihedral angle is below this (degrees) is a sliver.
 pub const SLIVER_DEG: f64 = 10.0;
 
-// ---- quality optimization (optimize.rs) -----------------------------------
-/// New edges up to this multiple of the local size target are legal (the same
-/// slack the mesher's own max-edge contract uses).
-pub(crate) const EDGE_CONTRACT: f64 = 1.5;
-/// Edges shorter than this fraction of the local target are collapse candidates.
-pub(crate) const COARSEN_FRACTION: f64 = 0.5;
-/// Local complexes already at/above this `-max|cos(dihedral)|` quality
-/// (min dihedral ~35 deg) are left alone (HXT recipe). `-cos(35 deg)`.
-pub(crate) const TARGET_Q: f64 = -0.8191520442889918;
-/// Degenerate-quality epsilon below which a tet is treated as flat.
-pub(crate) const QUALITY_EPS: f64 = 1e-12;
-/// A smoothing move shorter than this fraction of the local size is skipped.
-pub(crate) const MIN_REL_MOVE: f64 = 1e-3;
-/// Max edge ring size handled by edge removal.
-pub(crate) const MAX_RING: usize = 12;
-/// Vertex insertion targets tets whose min dihedral is below this (degrees).
-pub(crate) const INSERT_BELOW_DEG: f64 = 10.0;
-/// ...and allows the inserted point's radius-edge up to this.
-pub(crate) const INSERT_RE_ALLOW: f64 = 16.0;
-
 // ---- spatial structures ----------------------------------------------------
 /// Domain octree max refinement depth (`domain.rs`).
 pub(crate) const DOMAIN_MAX_DEPTH: u32 = 18;

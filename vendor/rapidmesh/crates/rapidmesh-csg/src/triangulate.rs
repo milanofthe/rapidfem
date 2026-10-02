@@ -181,8 +181,6 @@ pub fn triangulate_seeded(
     constraints: &[Constraint],
     canonical: bool,
 ) -> Result<FacetTriangulation, String> {
-    let tri_trace = std::env::var_os("RAPIDMESH_TRI_TRACE").is_some();
-    let t_pool = rapidmesh_exact::clock::Instant::now();
     // ------------------------------------------------------ vertex pool
     let mut pool = Pool::new(axis, seed_pool);
     let seed_len = pool.len();
@@ -224,8 +222,6 @@ pub fn triangulate_seeded(
         .filter(|((a, b), _)| a != b)
         .map(|(&(a, b), &l)| (a, b, l))
         .collect();
-    let d_pool = t_pool.elapsed();
-    let t_presplit = rapidmesh_exact::clock::Instant::now();
 
     // Pre-split: exact crossing points of strictly crossing constraint pairs.
     for (i, ci) in constraints.iter().enumerate() {
@@ -255,15 +251,11 @@ pub fn triangulate_seeded(
         }
     }
 
-    let d_presplit = t_presplit.elapsed();
-    let t_insert = rapidmesh_exact::clock::Instant::now();
     // ------------------------------------------------- point insertion
     let mut tris = Tris::new(seed_tris);
     for k in seed_len..pool.len() {
         insert_vertex(&mut tris, &pool, orientation, k)?;
     }
-    let d_insert = t_insert.elapsed();
-    let t_recover = rapidmesh_exact::clock::Instant::now();
 
     // -------------------------------------------- constraint recovery
     // Cached f64 positions for the segment bounding-box prefilter below.
@@ -328,23 +320,11 @@ pub fn triangulate_seeded(
     // function of the geometry, so coincident coplanar facets of different
     // inputs triangulate their overlap identically and can be matched
     // triangle-by-triangle downstream.
-    let d_recover = t_recover.elapsed();
-    let t_delaunay = rapidmesh_exact::clock::Instant::now();
     let constrained: rustc_hash::FxHashSet<(usize, usize)> = chain_edges
         .iter()
         .map(|&(u, v)| (u.min(v), u.max(v)))
         .collect();
     delaunay_pass(&mut tris, &pool, orientation, &constrained, canonical)?;
-    if tri_trace {
-        let total = t_pool.elapsed();
-        if total.as_millis() > 50 {
-            eprintln!(
-                "tri facet: {} pts, {} constraints, {} tris in {:.1?} (pool {:.1?}, presplit {:.1?}, insert {:.1?}, recover {:.1?}, delaunay {:.1?})",
-                pool.len(), constraints.len(), tris.len(), total,
-                d_pool, d_presplit, d_insert, d_recover, t_delaunay.elapsed(),
-            );
-        }
-    }
 
     Ok(FacetTriangulation {
         vertices: pool.points,

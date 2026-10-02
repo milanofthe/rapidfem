@@ -14,7 +14,7 @@ use super::refine::{mesh, Params};
 use super::snap::Shape;
 use super::{Complex, VertexKind};
 use crate::brep_mesh::edge_curve;
-use crate::conform::{MeshParams, PointClass, SurfaceFace, SurfaceMesh, TetMesh};
+use crate::conform::{MeshParams, PointClass, SurfaceFace, TetMesh};
 use crate::curve::{closest_arc, Curve, PolylineCurve};
 use crate::domain::DomainTree;
 use geometry_predicates::orient3d;
@@ -633,207 +633,6 @@ fn describe_defects(c: &Complex, rep: &super::verify::Report) -> Vec<String> {
     out
 }
 
-/// The surface of a model: every B-rep face meshed by the restricted
-/// Delaunay core alone (facet refinement, no cells, see
-/// [`super::refine::Params::surface_only`]), curves and corners conforming
-/// across faces through shared protecting balls, the vertices on their
-/// analytic carriers. Each triangle is oriented like the PLC facet of its
-/// face it lies on, with that facet's regions (front, back).
-///
-/// A triangle budget (`surf_target_count`, 0 = none) coarsens the sizes
-/// until the count is within it: the mesh is the finer of the field and
-/// the budget.
-pub fn surface_mesh(model: &rapidmesh_brep::Model, params: &MeshParams) -> SurfaceMesh {
-    let target = params.surf_target_count;
-    let mut out = surface_once(model, params);
-    let mut s = 1.0_f64;
-    for _ in 0..BUDGET_ROUNDS {
-        let n = out.faces.len();
-        if target == 0 || n as f64 <= (1.0 + BUDGET_SLACK) * target as f64 {
-            break;
-        }
-        // Triangles go with the inverse square of the size.
-        s *= (n as f64 / target as f64).sqrt();
-        out = surface_once(model, &params.scaled(s));
-    }
-    out
-}
-
-/// Remeshes at most this often to meet a triangle budget.
-const BUDGET_ROUNDS: usize = 6;
-/// A count this fraction over the budget meets it.
-const BUDGET_SLACK: f64 = 0.06;
-
-/// The surface size field: the domain's, floored by the surface minimum.
-struct SurfaceSize<'a>(&'a DomainTree);
-
-impl SizeField for SurfaceSize<'_> {
-    fn size(&self, p: P3) -> f64 {
-        self.0.h_at_surf(p)
-    }
-}
-
-fn surface_once(model: &rapidmesh_brep::Model, params: &MeshParams) -> SurfaceMesh {
-    use rapidmesh_exact::log as rmlog;
-    let (plc, brep) = (&model.plc, &model.brep);
-    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
-    for p in &plc.vertices {
-        for k in 0..3 {
-            lo[k] = lo[k].min(p[k]);
-            hi[k] = hi[k].max(p[k]);
-        }
-    }
-    let extent = (0..3)
-        .map(|k| hi[k] - lo[k])
-        .fold(0.0_f64, f64::max)
-        .max(1e-12);
-    let domain = crate::cvt::build_sizing_domain(model, params);
-    let oracle = BrepOracle::new(plc, brep, &domain, params);
-    let defaults = Params::default();
-    let prm = Params {
-        facet_angle_deg: if params.surf_min_angle > 0.0 {
-            params.surf_min_angle
-        } else {
-            defaults.facet_angle_deg
-        },
-        curve_grading: if params.grading > 0.0 {
-            params.grading
-        } else {
-            0.5
-        },
-        min_size: params.h_floor(extent),
-        max_points: params.max_points,
-        surface_only: true,
-        ..defaults
-    };
-    let t1 = rapidmesh_exact::clock::Instant::now();
-    let (mut c, _) = mesh(&oracle, &SurfaceSize(&domain), &prm);
-    rmlog::stage("mesh3.surface", t1.elapsed().as_secs_f64());
-
-    // Vertices onto their carriers (no tets to keep valid).
-    let shape = BrepShape::new(brep, &oracle);
-    let mut used = vec![false; c.points.len()];
-    for f in &c.faces {
-        for &v in &f.tri {
-            used[v as usize] = true;
-        }
-    }
-    for (v, p) in c.points.iter_mut().enumerate() {
-        if used[v] {
-            if let Some(q) = shape.project(c.kinds[v], *p) {
-                *p = q;
-            }
-        }
-    }
-
-    // Compact to the used points; orient and label by the PLC facet of the
-    // face nearest the triangle's centroid.
-    let mut remap = vec![usize::MAX; c.points.len()];
-    let mut points: Vec<P3> = Vec::new();
-    let mut kinds: Vec<VertexKind> = Vec::new();
-    for (v, &u) in used.iter().enumerate() {
-        if u {
-            remap[v] = points.len();
-            points.push(c.points[v]);
-            kinds.push(c.kinds[v]);
-        }
-    }
-    let index = domain.index();
-    let mut faces: Vec<SurfaceFace> = c
-        .faces
-        .iter()
-        .map(|f| {
-            let mut tri = f.tri.map(|v| remap[v as usize]);
-            let bf = brep.faces.get(f.patch as usize);
-            let (mut regions, face_tag, surface) = match bf {
-                Some(bf) => (bf.regions, bf.face_tag, bf.plc_surface),
-                None => (
-                    [RegionTag(f.regions[0]), RegionTag(f.regions[1])],
-                    rapidmesh_geom::FaceTag(0),
-                    0,
-                ),
-            };
-            let p = tri.map(|v| points[v]);
-            let centroid: P3 = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
-            let own = |fi: u32| oracle.facet_face[fi as usize] == f.patch;
-            if let Some((fi, _)) = index.nearest_where(centroid, &own) {
-                let t = plc.triangles[fi as usize].map(|v| plc.vertices[v as usize]);
-                use rapidmesh_geom::vec3::{cross, dot, sub};
-                let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-                let m = cross(sub(t[1], t[0]), sub(t[2], t[0]));
-                if dot(n, m) < 0.0 {
-                    tri.swap(1, 2);
-                }
-                regions = plc.region_tags[fi as usize];
-            }
-            SurfaceFace {
-                tri,
-                face_tag,
-                regions,
-                patch: f.patch,
-                surface,
-            }
-        })
-        .collect();
-
-    // Flips inside the patches, smoothing of the patch vertices on their
-    // carriers and of the curve vertices along their curves; corners and
-    // feature edges stay.
-    let t2 = rapidmesh_exact::clock::Instant::now();
-    let free: Vec<bool> = kinds
-        .iter()
-        .map(|k| matches!(k, VertexKind::Patch(_) | VertexKind::Curve(_)))
-        .collect();
-    let fixed: rustc_hash::FxHashSet<(usize, usize)> = c
-        .feature_edges
-        .iter()
-        .map(|&([a, b], _)| (remap[a as usize], remap[b as usize]))
-        .filter(|&(a, b)| a != usize::MAX && b != usize::MAX)
-        .map(|(a, b)| (a.min(b), a.max(b)))
-        .collect();
-    let mut tris: Vec<super::surfopt::Tri> = faces
-        .iter()
-        .map(|f| super::surfopt::Tri {
-            v: f.tri,
-            patch: f.patch,
-        })
-        .collect();
-    super::surfopt::optimize(
-        &mut points,
-        &mut tris,
-        &free,
-        &fixed,
-        &|v, x| shape.project(kinds[v], x),
-        SURFACE_OPT_PASSES,
-    );
-    for (f, t) in faces.iter_mut().zip(&tris) {
-        f.tri = t.v;
-    }
-    rmlog::stage("mesh3.surface_opt", t2.elapsed().as_secs_f64());
-    let curve_edges = c
-        .feature_edges
-        .iter()
-        .filter_map(|&([a, b], curve)| {
-            let v = [remap[a as usize], remap[b as usize]];
-            (v[0] != usize::MAX && v[1] != usize::MAX).then(|| crate::conform::CurveEdge {
-                v,
-                edge: oracle.curve_edge[curve as usize],
-            })
-        })
-        .collect();
-    SurfaceMesh {
-        point_class: kinds
-            .iter()
-            .map(|&k| point_class(k, brep, &oracle))
-            .collect(),
-        points,
-        faces,
-        surfaces: plc.surfaces.clone(),
-        surface_owners: plc.surface_owners.clone(),
-        curve_edges,
-    }
-}
-
 /// A complex whose points are classified by B-rep entity (corners by
 /// vertex, curve points by edge, patch points by face), improved like the
 /// refinement path's (snap, repair, relaxed surface) and returned as a
@@ -930,9 +729,6 @@ pub(crate) fn finish_classified(
     rmlog::stage("finish.output", t.elapsed().as_secs_f64());
     mesh
 }
-
-/// Rounds of flips and smoothing on a surface mesh.
-const SURFACE_OPT_PASSES: usize = 4;
 
 /// What a mesh vertex of `kind` lies on, in B-rep ids.
 fn point_class(kind: VertexKind, brep: &Brep, oracle: &BrepOracle<'_>) -> PointClass {
@@ -1209,14 +1005,15 @@ mod tests {
             32,
         ));
         let plc = scene.assemble();
-        let sm = surface_mesh(
+        let sm = crate::bottomup::surface_mesh(
             &rapidmesh_brep::Model::new(plc.clone()),
             &MeshParams {
                 maxh: 0.2,
                 surf_min_angle: 20.0,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         let mut count: HashMap<(usize, usize), usize> = HashMap::new();
         for f in &sm.faces {
             for k in 0..3 {
@@ -1240,13 +1037,14 @@ mod tests {
         let mut scene = Scene::new();
         scene.add_solid(solid_box([0.0, 0.0, 0.0], [2.0, 3.0, 4.0]));
         let plc = scene.assemble();
-        let sm = surface_mesh(
+        let sm = crate::bottomup::surface_mesh(
             &rapidmesh_brep::Model::new(plc.clone()),
             &MeshParams {
                 maxh: 0.8,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
         assert!(
             sm.faces.len() > 12,
             "box surface should be tessellated, got {}",
@@ -1273,13 +1071,14 @@ mod tests {
         scene.add_solid(icosphere([0.0, 0.0, 0.0], 1.0, 2));
         scene.add_solid(icosphere([1.2, 0.0, 0.0], 1.0, 2));
         let plc = scene.assemble();
-        let sm = surface_mesh(
+        let sm = crate::bottomup::surface_mesh(
             &rapidmesh_brep::Model::new(plc.clone()),
             &MeshParams {
                 maxh: 0.5,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         // Interior points are projected EXACTLY onto the analytic sphere.
         // Points on the intersection curve (shared with the other sphere) sit
@@ -1364,13 +1163,14 @@ mod tests {
         let mut scene = Scene::new();
         scene.add_solid(solid);
         let plc = scene.assemble();
-        let sm = surface_mesh(
+        let sm = crate::bottomup::surface_mesh(
             &rapidmesh_brep::Model::new(plc.clone()),
             &MeshParams {
                 maxh: 0.4,
                 ..Default::default()
             },
-        );
+        )
+        .unwrap();
 
         let mut curved = 0usize;
         let mut exact_on = 0usize;

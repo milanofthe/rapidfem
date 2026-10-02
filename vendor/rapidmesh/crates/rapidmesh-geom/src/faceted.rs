@@ -27,8 +27,17 @@ pub struct FlatFacet {
 /// projects onto. Metadata only — exactness of the mesh never depends on it.
 #[derive(Debug, Clone)]
 pub enum SurfaceKind {
-    /// A flat face (the triangle itself is the exact surface).
-    Plane,
+    /// A plane through `point` with the normal `normal` (not necessarily
+    /// unit).
+    Plane {
+        /// A point of the plane.
+        point: [f64; 3],
+        /// Its normal.
+        normal: [f64; 3],
+    },
+    /// No analytic carrier: the face's facets are its surface (a lofted or
+    /// swept wall, an analytic face after a scale that is not uniform).
+    Facets,
     /// A DISCRETE smooth patch of an imported triangle soup (an STL region
     /// between crease edges): the carrier is the patch itself, queried by
     /// closest-point projection, so the import is REMESHED against its own
@@ -117,6 +126,65 @@ pub enum SurfaceKind {
     /// A NURBS surface, the general free-form carrier. Affine maps act on its
     /// control points exactly, so it survives any transform.
     Nurbs(Arc<crate::NurbsSurface>),
+}
+
+impl SurfaceKind {
+    /// The plane of the flat polygon `pts` (at least three points, not all
+    /// on a line): through their centroid, with their Newell normal, which
+    /// is its area vector. Where the geometry knows its normal exactly (an
+    /// axis, a frame), it gives [`SurfaceKind::Plane`] that instead.
+    pub fn plane_of(pts: &[[f64; 3]]) -> SurfaceKind {
+        let n = pts.len().max(1) as f64;
+        let point: [f64; 3] = std::array::from_fn(|k| pts.iter().map(|p| p[k]).sum::<f64>() / n);
+        let mut normal = [0.0; 3];
+        for i in 0..pts.len() {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            normal[0] += (a[1] - b[1]) * (a[2] + b[2]);
+            normal[1] += (a[2] - b[2]) * (a[0] + b[0]);
+            normal[2] += (a[0] - b[0]) * (a[1] + b[1]);
+        }
+        SurfaceKind::Plane { point, normal }
+    }
+
+    /// The plane of the polygon `pts` where they lie in one (within a
+    /// billionth of their extent), else [`SurfaceKind::Facets`]: a fan over
+    /// a loop that need not be flat (a loft's end).
+    pub fn plane_or_facets(pts: &[[f64; 3]]) -> SurfaceKind {
+        let plane = SurfaceKind::plane_of(pts);
+        let SurfaceKind::Plane { point, normal } = plane else {
+            return SurfaceKind::Facets;
+        };
+        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        let extent = pts
+            .iter()
+            .map(|p| (0..3).map(|k| (p[k] - point[k]).abs()).fold(0.0, f64::max))
+            .fold(0.0, f64::max);
+        let flat = len > 0.0
+            && pts.iter().all(|p| {
+                let off: f64 = (0..3).map(|k| (p[k] - point[k]) * normal[k]).sum::<f64>() / len;
+                off.abs() <= 1e-9 * extent
+            });
+        if flat {
+            plane
+        } else {
+            SurfaceKind::Facets
+        }
+    }
+
+    /// Whether this is a plane.
+    pub fn is_plane(&self) -> bool {
+        matches!(self, SurfaceKind::Plane { .. })
+    }
+
+    /// A plane's point and unit normal; none for any other kind or a plane
+    /// without a normal.
+    pub fn plane(&self) -> Option<([f64; 3], [f64; 3])> {
+        let SurfaceKind::Plane { point, normal } = self else {
+            return None;
+        };
+        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        (len > 0.0).then(|| (*point, normal.map(|x| x / len)))
+    }
 }
 
 /// An affine map from a shape's own frame to the scene: `x -> linear x +
@@ -433,6 +501,18 @@ impl Faceted {
         let map_dir = |d: [f64; 3]| -> [f64; 3] {
             std::array::from_fn(|i| linear[i][0] * d[0] + linear[i][1] * d[1] + linear[i][2] * d[2])
         };
+        // A normal maps with the cofactor matrix of the linear part (its
+        // determinant times the inverse transpose): a plane stays a plane
+        // under any linear map, turned with the facets' winding.
+        let m = |i: usize, j: usize| linear[i % 3][j % 3];
+        let cof: [[f64; 3]; 3] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| {
+                m(i + 1, j + 1) * m(i + 2, j + 2) - m(i + 1, j + 2) * m(i + 2, j + 1)
+            })
+        });
+        let map_normal = |n: [f64; 3]| -> [f64; 3] {
+            std::array::from_fn(|i| cof[i][0] * n[0] + cof[i][1] * n[1] + cof[i][2] * n[2])
+        };
         Faceted {
             frame: self.frame.then(linear, offset),
             corners: self.corners.iter().map(|&p| map(p)).collect(),
@@ -456,7 +536,11 @@ impl Faceted {
                 .surfaces
                 .iter()
                 .map(|s| match s {
-                    SurfaceKind::Plane => SurfaceKind::Plane,
+                    SurfaceKind::Plane { point, normal } => SurfaceKind::Plane {
+                        point: map(*point),
+                        normal: map_normal(*normal),
+                    },
+                    SurfaceKind::Facets => SurfaceKind::Facets,
                     SurfaceKind::Cylinder {
                         center,
                         axis,
@@ -578,7 +662,7 @@ impl Faceted {
     /// Copy scaled per axis about `center`. Uniform scaling keeps the
     /// analytic surface metadata (radii scale along); NON-uniform scaling
     /// turns cylinders/spheres into quadrics this library does not model, so
-    /// curved back-references DEGRADE to [`SurfaceKind::Plane`] (each facet
+    /// curved back-references DEGRADE to [`SurfaceKind::Facets`] (each facet
     /// becomes its own exact constraint; fidelity snapping is off for them).
     /// Negative factors with a negative product invert orientation and flip
     /// the winding accordingly.
@@ -599,7 +683,7 @@ impl Faceted {
             let s = factors[0].abs();
             for kind in &mut out.surfaces {
                 match kind {
-                    SurfaceKind::Plane => {}
+                    SurfaceKind::Plane { .. } | SurfaceKind::Facets => {}
                     // discrete carriers scale with their (already transformed)
                     // point set; nothing else to adjust
                     SurfaceKind::Discrete(_) => {}
@@ -617,7 +701,7 @@ impl Faceted {
                     // `transformed` already scaled the (meant-to-be-unit) frame
                     // vectors, so the analytic extrusion no longer holds; keep
                     // the facets but drop the back-reference.
-                    SurfaceKind::Extruded { .. } => *kind = SurfaceKind::Plane,
+                    SurfaceKind::Extruded { .. } => *kind = SurfaceKind::Facets,
                     // uniform scale: the path scaled with the shape, only the
                     // radius follows here
                     SurfaceKind::Tube { radius, .. } => *radius *= s,
@@ -635,14 +719,17 @@ impl Faceted {
             }
         } else {
             for kind in &mut out.surfaces {
-                // discrete and NURBS carriers survive any linear map (their
-                // points were transformed); analytic kinds lose their closed
-                // form
+                // planes, discrete and NURBS carriers survive any linear map
+                // (their points were transformed); other analytic kinds lose
+                // their closed form, their facets remain
                 if !matches!(
                     kind,
-                    SurfaceKind::Plane | SurfaceKind::Discrete(_) | SurfaceKind::Nurbs(_)
+                    SurfaceKind::Plane { .. }
+                        | SurfaceKind::Facets
+                        | SurfaceKind::Discrete(_)
+                        | SurfaceKind::Nurbs(_)
                 ) {
-                    *kind = SurfaceKind::Plane;
+                    *kind = SurfaceKind::Facets;
                 }
             }
         }

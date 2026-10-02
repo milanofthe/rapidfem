@@ -91,6 +91,21 @@ const MOVE_STAR_MAX: usize = 512;
 /// smaller star (see [`Improver::hub`]).
 const LARGE_STAR: usize = 256;
 
+/// Smallest angle of a triangle, in degrees (0 when degenerate).
+pub(crate) fn min_angle(p: [P3; 3]) -> f64 {
+    let dot = |u: P3, v: P3| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let mut m = f64::INFINITY;
+    for k in 0..3 {
+        let (u, v) = (sub3(p[(k + 1) % 3], p[k]), sub3(p[(k + 2) % 3], p[k]));
+        let d = (dot(u, u) * dot(v, v)).sqrt();
+        if !(d > 0.0) {
+            return 0.0;
+        }
+        m = m.min((dot(u, v) / d).clamp(-1.0, 1.0).acos().to_degrees());
+    }
+    m
+}
+
 fn sub3(a: P3, b: P3) -> P3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -1215,7 +1230,7 @@ impl<'a> Improver<'a> {
                 .iter()
                 .map(|t| {
                     let at = |w: u32| if w == v { x } else { self.p(w) };
-                    super::surfopt::min_angle([at(t[0]), at(t[1]), at(t[2])])
+                    min_angle([at(t[0]), at(t[1]), at(t[2])])
                 })
                 .fold(f64::INFINITY, f64::min)
         };
@@ -1606,7 +1621,7 @@ mod tests {
             let angles: Vec<f64> = c
                 .faces
                 .iter()
-                .map(|f| super::super::surfopt::min_angle(f.tri.map(|v| c.points[v as usize])))
+                .map(|f| super::min_angle(f.tri.map(|v| c.points[v as usize])))
                 .collect();
             angles.iter().sum::<f64>() / angles.len() as f64
         };

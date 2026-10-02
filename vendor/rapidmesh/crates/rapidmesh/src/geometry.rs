@@ -18,7 +18,7 @@ use rapidmesh_brep::{EdgeFilter, FaceFilter, Model, Topology};
 use rapidmesh_exact::clock::Instant;
 use rapidmesh_geom::{FaceTag, RegionTag, Scene};
 use rapidmesh_tet::mesh3::PeriodicPair;
-use rapidmesh_tet::{mesh_budgeted, quality_stats, surface_mesh, MeshParams, OptimizeParams};
+use rapidmesh_tet::{mesh_budgeted, quality_stats, MeshParams};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -189,10 +189,6 @@ pub struct MeshOptions {
     pub maxh_edge: Option<f64>,
     pub maxh_surf: Option<f64>,
     pub maxh_vol: Option<f64>,
-    /// Also run the quality optimizer (it moves boundary points, so not
-    /// with periodic faces).
-    pub optimize: bool,
-    pub optimize_passes: Option<usize>,
     /// Tet budget: the global size is scaled over a few remeshes to land
     /// near it.
     pub target_elements: Option<usize>,
@@ -215,8 +211,6 @@ impl Default for MeshOptions {
             maxh_edge: None,
             maxh_surf: None,
             maxh_vol: None,
-            optimize: false,
-            optimize_passes: None,
             target_elements: None,
             min_h_surf: 0.0,
             min_h_vol: 0.0,
@@ -234,11 +228,9 @@ pub struct SurfaceOptions {
     pub maxh_edge: Option<f64>,
     pub maxh_surf: Option<f64>,
     pub maxh_vol: Option<f64>,
-    /// Triangle budget: the refinement stops once it is reached.
+    /// Triangle budget: the sizes are coarsened by one factor until the
+    /// count is at most a little over it.
     pub target_triangles: Option<usize>,
-    /// The mesher, as in [`MeshOptions::bottom_up`] (a triangle budget
-    /// falls back to restricted Delaunay refinement).
-    pub bottom_up: Option<bool>,
 }
 
 /// The geometry builder.
@@ -636,6 +628,42 @@ impl Geometry {
         self.size_points.push((p, h));
     }
 
+    /// [`Geometry::add_size_point`] for each point with its own size.
+    pub fn add_size_points(&mut self, points: &[P3], hs: &[f64]) -> Result<()> {
+        if points.len() != hs.len() {
+            return Err(Error::Invalid(format!(
+                "{} points but {} sizes",
+                points.len(),
+                hs.len()
+            )));
+        }
+        self.size_points
+            .extend(points.iter().copied().zip(hs.iter().copied()));
+        Ok(())
+    }
+
+    /// The MARK -> REFINE half of an adaptive loop: Dörfler-marks the
+    /// triangles of `mesh` by their indicators `eta` and adds each marked one
+    /// as a size point at its centroid, its local size over `d.factor`.
+    /// Returns the marked triangles; mesh again to refine.
+    pub fn mark_dorfler(
+        &mut self,
+        mesh: &rapidmesh_tet::SurfaceMesh,
+        eta: &[f64],
+        d: &rapidmesh_tet::Dorfler,
+    ) -> Result<Vec<u32>> {
+        if eta.len() != mesh.faces.len() {
+            return Err(Error::Invalid(format!(
+                "{} indicators for {} triangles",
+                eta.len(),
+                mesh.faces.len()
+            )));
+        }
+        let (marked, points, hs) = mesh.dorfler_size_points(eta, d.theta, d.factor, d.h_min);
+        self.add_size_points(&points, &hs)?;
+        Ok(marked)
+    }
+
     /// The ids `scope` selects in the current model.
     pub fn resolve(&self, scope: &Scope) -> Result<Vec<u32>> {
         let topo = self.topology()?;
@@ -896,11 +924,6 @@ impl Geometry {
     /// Assembles every solid and sheet exactly, meshes the arrangement with
     /// tetrahedra and improves them.
     pub fn mesh(&self, opts: &MeshOptions) -> Result<Mesh> {
-        if opts.optimize && !self.periodic.is_empty() {
-            return Err(Error::Invalid(
-                "optimize moves boundary vertices; not with periodic faces".into(),
-            ));
-        }
         let t0 = Instant::now();
         rapidmesh_exact::log::clear();
         let ta = Instant::now();
@@ -921,20 +944,16 @@ impl Geometry {
                 [opts.maxh_edge, opts.maxh_surf, opts.maxh_vol],
             )?
         };
-        let passes = opts.optimize.then(|| {
-            opts.optimize_passes
-                .unwrap_or(OptimizeParams::default().passes)
-        });
         let tm = Instant::now();
         let legacy = || {
             let params = MeshParams {
                 cells_across: opts.cells_across.unwrap_or(DEFAULT_CELLS_ACROSS),
                 ..params.clone()
             };
-            mesh_budgeted(&model, &params, opts.target_elements, passes).0
+            mesh_budgeted(&model, &params, opts.target_elements).0
         };
         let bottom_up = || {
-            rapidmesh_tet::budgeted(&model, &params, opts.target_elements, passes, &|p| {
+            rapidmesh_tet::budgeted(&model, &params, opts.target_elements, &|p| {
                 rapidmesh_tet::bottomup::mesh_scene(&self.scene, &model, p)
             })
             .map(|x| x.0)
@@ -960,14 +979,6 @@ impl Geometry {
         rapidmesh_exact::log::stage("mesh.total", t_mesh.as_secs_f64());
         let quality = quality_stats(&mesh);
         rapidmesh_tet::log_metrics(&quality, mesh.points.len());
-        if std::env::var_os("RAPIDMESH_TIMING").is_some() {
-            eprintln!(
-                "stages: assemble {:?} ({} plc facets), mesh+optimize {:?}",
-                t_assemble,
-                model.plc.triangles.len(),
-                t_mesh,
-            );
-        }
         Ok(Mesh::new(
             mesh,
             quality,
@@ -993,24 +1004,8 @@ impl Geometry {
                 [opts.maxh_edge, opts.maxh_surf, opts.maxh_vol],
             )?
         };
-        let mesh = match (opts.bottom_up, opts.target_triangles) {
-            (Some(false), _) | (None, Some(_)) => surface_mesh(&model, &params),
-            (Some(true), _) => rapidmesh_tet::bottomup::surface_mesh(&model, &params)
-                .map_err(|e| Error::Invalid(format!("bottom-up surface mesh: {e}")))?,
-            (None, None) => {
-                match bottom_up_or_why(|| rapidmesh_tet::bottomup::surface_mesh(&model, &params)) {
-                    Ok(m) => m,
-                    Err(why) => {
-                        rapidmesh_exact::log::warn(
-                            "mesh.mesher",
-                            format!("bottom-up failed ({why}); restricted Delaunay instead"),
-                        );
-                        rapidmesh_exact::log::stat("mesh.fallback", 1.0);
-                        surface_mesh(&model, &params)
-                    }
-                }
-            }
-        };
+        let mesh = rapidmesh_tet::bottomup::surface_mesh(&model, &params)
+            .map_err(|e| Error::Invalid(format!("surface mesh: {e}")))?;
         rapidmesh_tet::log_surface_metrics(&mesh);
         Ok(SurfaceMesh::new(mesh, self.labels()?, Run::finish(t0)))
     }

@@ -59,105 +59,40 @@ fn circumcenter(a: P2, b: P2, c: P2) -> Option<P2> {
 /// Sizing-field-driven Delaunay (Ruppert/Chew) refinement of a constrained
 /// triangulation: repeatedly insert the circumcentre of any triangle whose
 /// minimum angle is below `min_angle_deg` OR whose circumradius exceeds the local
-/// `target` size (so the result is graded to the field). A circumcentre that
-/// encroaches a REFINABLE boundary segment splits that segment at its midpoint
-/// instead (Ruppert's segment protection), so free sheet boundaries stay
-/// conforming while the interior gains a guaranteed angle bound -- no slivers.
-/// Boundary midpoints are appended to `boundary`/`segments`/`refinable`; interior
-/// points to `interior`. Terminates for input angles >= ~60 deg.
-/// `target_count > 0` is a triangle BUDGET (a cap, not a target): the angle bound
-/// is always met (no slivers) and the field is resolved down to its `min_h_surf`
-/// floor as usual, but once the triangle count reaches `target_count` no further
-/// size-driven splits are made -- the budget caps the refinement at
-/// `min(field-resolved, target_count)`, spending its last splits on the most
-/// oversized triangles first.
+/// `target` size (so the result is graded to the field), the interior gaining a
+/// guaranteed angle bound -- no slivers. Interior points are appended to `interior`; the boundary segments are
+/// protected (a circumcentre that encroaches one is not inserted).
 #[allow(clippy::too_many_arguments)]
-pub fn refine_quality_with(
-    boundary: &mut Vec<P2>,
-    segments: &mut Vec<(usize, usize)>,
-    refinable: &mut Vec<bool>,
+fn refine_quality(
+    boundary: &mut [P2],
+    segments: &[(usize, usize)],
     interior: &mut Vec<P2>,
     target: impl Fn(P2) -> f64,
     inside: impl Fn(P2) -> bool,
     min_angle_deg: f64,
-    target_count: usize,
     // Hard cap on refinement passes. Each pass re-triangulates the whole patch,
     // so this bounds the cost: the surface stage runs the full set, a display
     // mesh only a few (the boundary conformity + angle bound are met early; the
     // rest is marginal interior density).
     max_passes: usize,
-    // Whether the final smoothing may slide boundary points along straight
-    // stretches of the outline; off where the outline's points are shared
-    // with other meshes and must stay where they are.
-    slide: bool,
-    // Called once per refinement pass with the current `(points, triangles)`
-    // BEFORE that pass's inserts -- the coarse-to-fine intermediate states. A
-    // no-op in the default `refine_quality`; the landing page collects them to
-    // animate the mesher live.
-    mut on_pass: impl FnMut(&[P2], &[[usize; 3]]),
+    // Whether the final smoothing may slide a boundary point along a straight
+    // stretch of the outline; not where the outline's points are shared with
+    // other meshes and must stay where they are.
+    slide: impl Fn(P2) -> bool,
 ) {
     let diam2 = |b: &[P2], u: usize, v: usize| 0.25 * dist2(b[u], b[v]);
     let mid = |b: &[P2], u: usize, v: usize| [0.5 * (b[u][0] + b[v][0]), 0.5 * (b[u][1] + b[v][1])];
-    // Per-pass stage timing (RAPIDMESH_2D_TRACE): rebuild / criteria / apply.
-    static TRACE2D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let trace = *TRACE2D.get_or_init(|| std::env::var_os("RAPIDMESH_2D_TRACE").is_some());
     let cos_min = min_angle_deg.to_radians().cos();
     let mut good: rustc_hash::FxHashSet<[[u64; 2]; 3]> = rustc_hash::FxHashSet::default();
-    for pass in 0..max_passes {
-        let t0 = rapidmesh_exact::clock::Instant::now();
-        let mut all = boundary.clone();
+    for _ in 0..max_passes {
+        let mut all = boundary.to_vec();
         all.extend_from_slice(interior);
         let tris = triangulate_constrained(&all, segments, &inside);
-        let t_tri = t0.elapsed();
-        on_pass(&all, &tris);
-        let mut split: Vec<usize> = Vec::new();
         let mut inserts: Vec<P2> = Vec::new();
-        let t1 = rapidmesh_exact::clock::Instant::now();
 
-        // Edge -> the opposite apex of each incident triangle. A constrained
-        // segment can only be encroached by a vertex VISIBLE to it, i.e. an apex
-        // of one of its two triangles -- so we test those O(1) vertices instead of
-        // every mesh vertex. (The all-vertices scan was O(segments * points) per
-        // round, the refinement's quadratic cost.)
-        let mut apex: rustc_hash::FxHashMap<(usize, usize), [usize; 2]> =
-            rustc_hash::FxHashMap::default();
-        for t in &tris {
-            for e in 0..3 {
-                let (a, b, c) = (t[e], t[(e + 1) % 3], t[(e + 2) % 3]);
-                let slot = apex.entry((a.min(b), a.max(b))).or_insert([usize::MAX; 2]);
-                if slot[0] == usize::MAX {
-                    slot[0] = c;
-                } else {
-                    slot[1] = c;
-                }
-            }
-        }
-
-        // (1) protect segments: split any refinable segment whose diametral circle
-        // contains a visible vertex. Done BEFORE circumcentres to keep termination.
-        for (si, &(u, v)) in segments.iter().enumerate() {
-            if !refinable[si] {
-                continue;
-            }
-            let (m, h2) = (mid(boundary, u, v), diam2(boundary, u, v));
-            if let Some(aps) = apex.get(&(u.min(v), u.max(v))) {
-                if aps
-                    .iter()
-                    .any(|&k| k != usize::MAX && k != u && k != v && dist2(all[k], m) < h2 - 1e-12)
-                {
-                    split.push(si);
-                }
-            }
-        }
-
-        // (2) otherwise, drive on bad/oversized triangles. Angle-violating
-        // triangles are always refined (mandatory, priority +inf); field-oversized
-        // ones carry their relative oversize as priority. In budget mode only the
-        // angle fixes plus enough of the WORST oversized to approach `target_count`
-        // are taken -- so the refinement stops at min(field-resolved, budget).
-        if split.is_empty() {
-            let cur = tris.len();
-            let mut cand: Vec<(f64, P2)> = Vec::new();
+        // Bad triangles: below the angle bound, or larger than the field.
+        {
+            let mut cand: Vec<P2> = Vec::new();
             // Segment lookup grid for the circumcentre encroachment test below:
             // every segment registers the cells its DIAMETRAL DISK overlaps, so a
             // candidate reads exactly one cell and tests only nearby segments --
@@ -209,82 +144,31 @@ pub fn refine_quality_with(
                 let tg = target(cc).max(1e-12);
                 let ratio = dist2(p[0], cc) / (tg * tg);
                 let angle_bad = smallest_angle_cos(p[0], p[1], p[2]) > cos_min;
-                let size_bad = ratio > SIZE_SPLIT_RADIUS * SIZE_SPLIT_RADIUS
-                    && (target_count == 0 || cur < target_count);
+                let size_bad = ratio > SIZE_SPLIT_RADIUS * SIZE_SPLIT_RADIUS;
                 if !(angle_bad || size_bad) {
                     good.insert(key);
                     continue;
                 }
                 // Encroachment: a circumcentre inside a boundary segment's
-                // diametral circle. A refinable segment is split; a PROTECTED one
-                // makes us drop the insert -- jamming a point against a fixed edge
-                // is exactly what seeds the boundary slivers, so we leave the
-                // (mildly bad) triangle rather than make it worse. A disk
-                // containing `cc` registered `cc`'s cell, so one lookup is exact.
-                let mut split_seg = None;
-                let mut hits_protected = false;
-                if let Some(list) = seg_grid.get(&skey(cc)) {
-                    for &si in list {
+                // diametral circle is dropped -- jamming a point against a
+                // fixed edge is exactly what seeds the boundary slivers, so we
+                // leave the (mildly bad) triangle rather than make it worse. A
+                // disk containing `cc` registered `cc`'s cell, so one lookup is
+                // exact.
+                let encroaches = seg_grid.get(&skey(cc)).is_some_and(|list| {
+                    list.iter().any(|&si| {
                         let (u, v) = segments[si as usize];
-                        if dist2(cc, mid(boundary, u, v)) < diam2(boundary, u, v) {
-                            if refinable[si as usize] {
-                                split_seg = Some(si as usize);
-                                break;
-                            }
-                            hits_protected = true;
-                        }
-                    }
-                }
-                if let Some(si) = split_seg {
-                    split.push(si);
-                    continue;
-                }
-                if hits_protected {
-                    continue;
-                }
-                if inside(cc) {
-                    cand.push((if angle_bad { f64::INFINITY } else { ratio }, cc));
+                        dist2(cc, mid(boundary, u, v)) < diam2(boundary, u, v)
+                    })
+                });
+                if !encroaches && inside(cc) {
+                    cand.push(cc);
                 }
             }
-            if split.is_empty() {
-                if target_count > 0 {
-                    cand.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-                    let n_angle = cand.iter().take_while(|c| c.0.is_infinite()).count();
-                    let deficit = target_count.saturating_sub(cur);
-                    // each accepted insert adds ~2 triangles; take the angle fixes
-                    // plus enough of the worst oversized to reach the budget.
-                    let want = n_angle.max(deficit.div_ceil(2)).min(cand.len());
-                    inserts.extend(cand[..want].iter().map(|c| c.1));
-                } else {
-                    inserts.extend(cand.iter().map(|c| c.1));
-                }
-            }
+            inserts.extend(cand);
         }
-
-        split.sort_unstable();
-        split.dedup();
-        if split.is_empty() && inserts.is_empty() {
+        if inserts.is_empty() {
             break;
-        }
-        if !split.is_empty() {
-            let mut ns = Vec::with_capacity(segments.len() + split.len());
-            let mut nr = Vec::with_capacity(refinable.len() + split.len());
-            for (i, &(u, v)) in segments.iter().enumerate() {
-                if split.binary_search(&i).is_ok() {
-                    let m = mid(boundary, u, v);
-                    let mi = boundary.len();
-                    boundary.push(m);
-                    ns.push((u, mi));
-                    nr.push(true);
-                    ns.push((mi, v));
-                    nr.push(true);
-                } else {
-                    ns.push((u, v));
-                    nr.push(refinable[i]);
-                }
-            }
-            *segments = ns;
-            *refinable = nr;
         }
         // Spacing guard via a uniform hash grid: reject an insert within
         // 0.5*target of an existing vertex. O(1) per insert instead of
@@ -325,21 +209,10 @@ pub fn refine_quality_with(
                 }
             }
         }
-        if trace {
-            eprintln!(
-                "2D pass {pass}: tris {} segs {} pts {}  rebuild {:.3}s criteria+apply {:.3}s",
-                tris.len(),
-                segments.len(),
-                all.len(),
-                t_tri.as_secs_f64(),
-                t1.elapsed().as_secs_f64()
-            );
-        }
     }
     // The Ruppert refinement met the angle bound but left the elements uneven;
     // relax the whole mesh (interior freely, the outline sliding) to convergence for
     // near-equilateral, gmsh-grade shape.
-    let t_sm = rapidmesh_exact::clock::Instant::now();
     smooth_mesh(
         boundary,
         segments,
@@ -349,37 +222,6 @@ pub fn refine_quality_with(
         min_angle_deg,
         12,
         slide,
-    );
-    if trace {
-        eprintln!("2D smooth: {:.3}s", t_sm.elapsed().as_secs_f64());
-    }
-}
-
-/// Sizing-field-driven Ruppert/Chew refinement (see [`refine_quality_with`])
-/// without per-pass snapshots -- the default path.
-#[allow(clippy::too_many_arguments)]
-pub fn refine_quality(
-    boundary: &mut Vec<P2>,
-    segments: &mut Vec<(usize, usize)>,
-    refinable: &mut Vec<bool>,
-    interior: &mut Vec<P2>,
-    target: impl Fn(P2) -> f64,
-    inside: impl Fn(P2) -> bool,
-    min_angle_deg: f64,
-    target_count: usize,
-) {
-    refine_quality_with(
-        boundary,
-        segments,
-        refinable,
-        interior,
-        target,
-        inside,
-        min_angle_deg,
-        target_count,
-        60,
-        true,
-        |_, _| {},
     );
 }
 
@@ -403,7 +245,7 @@ fn smooth_mesh(
     target: impl Fn(P2) -> f64,
     min_angle_deg: f64,
     max_iters: usize,
-    slide: bool,
+    slide: impl Fn(P2) -> bool,
 ) {
     let nb = boundary.len();
     if nb == 0 {
@@ -434,7 +276,7 @@ fn smooth_mesh(
     let tangent: Vec<Option<[f64; 2]>> = (0..nb)
         .map(|i| {
             let [n0, n1] = nbr[i];
-            if !slide || n0 == usize::MAX || n1 == usize::MAX || deg[i] != 2 {
+            if n0 == usize::MAX || n1 == usize::MAX || deg[i] != 2 || !slide(boundary[i]) {
                 return None;
             }
             let (a, p, b) = (boundary[n0], boundary[i], boundary[n1]);
@@ -531,12 +373,19 @@ fn smooth_mesh(
             // CCW guard over the FULL star (exterior/hole triangles included):
             // the live structure's flip invariants need every alive triangle
             // to stay positively oriented, not just the in-domain ones.
-            let ok = incident[i].iter().all(|&ti| {
-                let t = tris[ti];
-                let q: [P2; 3] =
-                    std::array::from_fn(|j| if t[j] == i { cand } else { cdt.point(t[j]) });
-                smallest_angle_cos(q[0], q[1], q[2]) <= min_angle_deg.to_radians().cos()
-            }) && {
+            let bound = min_angle_deg.to_radians().cos();
+            let worst = |at: P2| {
+                incident[i]
+                    .iter()
+                    .map(|&ti| {
+                        let t = tris[ti];
+                        let q: [P2; 3] =
+                            std::array::from_fn(|j| if t[j] == i { at } else { cdt.point(t[j]) });
+                        smallest_angle_cos(q[0], q[1], q[2])
+                    })
+                    .fold(f64::NEG_INFINITY, f64::max)
+            };
+            let ok = worst(cand) <= bound && {
                 cdt.star(i, &mut star)
                     && star.iter().all(|&ti| {
                         let t = cdt.triangle(ti);
@@ -796,9 +645,8 @@ impl LevelGrid {
 /// crossing rule and per-edge arithmetic as the classic even-odd scan (so the
 /// answers are bit-identical), but a query only touches the edges whose
 /// y-interval intersects its row -- the linear all-loops scan per `inside`
-/// query was THE canvas-scale hot spot (every triangle filter, CVT candidate
-/// and smoothing gate pays one query; with mesh_layers packing every patch
-/// into one canvas, each query scanned the whole layout's outline).
+/// query was the hot spot on large faces (every triangle filter, CVT
+/// candidate and smoothing gate pays one query).
 pub(crate) struct PipRows {
     y0: f64,
     cell: f64,
@@ -896,153 +744,30 @@ fn pt_seg_dist2(p: P2, a: P2, b: P2) -> f64 {
     (p[0] - (a[0] + t * vx)).powi(2) + (p[1] - (a[1] + t * vy)).powi(2)
 }
 
-/// Knobs for [`mesh_polygon`] -- everything but the contour loops, the sizing field,
-/// and the per-pass callback. `step` seeds the CVT grid (about the finest target edge
-/// length); `target_count` is the triangle BUDGET (`0` = field-driven, else the mesh
-/// is capped at `min(field-resolved, budget)`); `min_angle_deg` is the Ruppert quality
-/// bound; `cvt_iters`/`max_passes` bound the work.
-#[derive(Clone, Copy, Debug)]
-pub struct PolyMeshParams {
-    pub step: f64,
-    pub min_angle_deg: f64,
-    pub target_count: usize,
-    pub cvt_iters: usize,
-    pub max_passes: usize,
-}
-
-impl Default for PolyMeshParams {
-    fn default() -> Self {
-        PolyMeshParams {
-            step: 0.0,
-            min_angle_deg: 28.0,
-            target_count: 0,
-            cvt_iters: 4,
-            max_passes: 12,
-        }
-    }
-}
-
-/// Mesh a polygon-with-holes in ONE call -- the 2D entry point: contour loops
-/// and a sizing field in, a sliver-free graded triangle mesh out. This is the
-/// same path the surface stage runs per planar patch: a graded CVT seed
-/// ([`cvt_fill`]) fills the interior at the field density, Ruppert
-/// ([`refine_quality`]) enforces the angle bound, then the constrained
-/// triangulation is read back.
-///
-/// `loops` are the boundary contours -- the outer boundary followed by the holes
-/// (orientation irrelevant; membership is even-odd). `target` is the desired edge
-/// length at any point (uniform or graded). `on_pass(points, triangles)` fires once
-/// per Ruppert pass with the current intermediate mesh (a no-op `|_, _| {}` for the
-/// non-animated path). Returns `(points, triangles)`.
-///
-/// THE single 2D loops entry point: every knob (the CVT seed `step`, the Ruppert
-/// quality bound, the triangle BUDGET, the work bounds) rides in [`PolyMeshParams`].
-pub fn mesh_polygon(
-    loops: &[Vec<P2>],
-    target: impl Fn(P2) -> f64,
-    params: &PolyMeshParams,
-    on_pass: impl FnMut(&[P2], &[[usize; 3]]),
-) -> (Vec<P2>, Vec<[usize; 3]>) {
-    mesh_polygon_with_chains(loops, &[], target, params, on_pass)
-}
-
-/// [`mesh_polygon`] with additional CONSTRAINT CHAINS: open polylines (or closed ones given
-/// with a repeated end point) whose segments are honoured as element edges like the contour
-/// segments — protected from splitting, seeds cleared from them — but which play NO part in
-/// the membership (even-odd over `loops` only). This is how a planar layer is meshed
-/// ALIGNED to the outlines of the conductors on the layers above and below it: the outlines,
-/// clipped to the layer, come in as chains, and every cell boundary the neighbouring
-/// conductor induces in the charge is an element edge. A chain must lie inside the region
-/// (chain end points on a contour must be contour vertices).
-pub fn mesh_polygon_with_chains(
-    loops: &[Vec<P2>],
-    chains: &[Vec<P2>],
-    target: impl Fn(P2) -> f64,
-    params: &PolyMeshParams,
-    on_pass: impl FnMut(&[P2], &[[usize; 3]]),
-) -> (Vec<P2>, Vec<[usize; 3]>) {
-    let mut boundary: Vec<P2> = Vec::new();
-    let mut segments: Vec<(usize, usize)> = Vec::new();
-    for lp in loops {
-        let n = lp.len();
-        if n < 3 {
-            continue;
-        }
-        let base = boundary.len();
-        boundary.extend_from_slice(lp);
-        for i in 0..n {
-            segments.push((base + i, base + (i + 1) % n));
-        }
-    }
-    // Chains: their points are welded onto EXISTING boundary points where they coincide (a
-    // chain end on a contour vertex), so no duplicate vertex enters the triangulation.
-    for ch in chains {
-        if ch.len() < 2 {
-            continue;
-        }
-        let mut idx: Vec<usize> = Vec::with_capacity(ch.len());
-        for &q in ch {
-            let found = boundary
-                .iter()
-                .position(|&b| (b[0] - q[0]).abs() <= 1e-12 && (b[1] - q[1]).abs() <= 1e-12);
-            idx.push(match found {
-                Some(i) => i,
-                None => {
-                    boundary.push(q);
-                    boundary.len() - 1
-                }
-            });
-        }
-        for w in idx.windows(2) {
-            if w[0] != w[1] {
-                segments.push((w[0], w[1]));
-            }
-        }
-    }
-    let pip = PipRows::build(loops);
-    mesh_constrained(
-        boundary,
-        segments,
-        target,
-        |p| pip.inside(p),
-        params.step,
-        params.min_angle_deg,
-        params.target_count,
-        params.cvt_iters,
-        params.max_passes,
-        true,
-        on_pass,
-    )
-}
-
-/// THE 2D meshing core, shared by EVERY 2D mesh in the project (the surface
-/// stage's planar patches and the landing page): a fixed boundary (`boundary`
-/// points + constraint `segments`), a sizing `target`, and an `inside`
-/// predicate in -> a graded, sliver-free triangulation out.
+/// A planar patch meshed: its boundary (points and constraint `segments`), a
+/// sizing `target` and an `inside` predicate in, a graded, sliver-free
+/// triangulation out.
 ///
 /// A graded CVT seed ([`cvt_fill`]) fills the interior at the field; seeds that
 /// would hide under a contour edge are dropped (edge clearance); then Ruppert
-/// ([`refine_quality_with`]) refines the interior with the boundary PROTECTED --
-/// the caller pre-samples the contours, so re-splitting them would only chase the
-/// seed points off the boundary into thin spikes. `target_count` caps the element
-/// count (0 = field-driven); `step` seeds the CVT grid; `max_passes`/`cvt_iters`
-/// bound the work. `slide` lets the final smoothing move boundary points
-/// along straight stretches of the outline; without it the boundary comes
-/// back exactly as given. Returns `(points, triangles)` with the boundary
-/// first (in its order, extended by any split points) then the interior.
+/// refines the interior with the boundary PROTECTED -- the caller pre-samples
+/// the contours, so re-splitting them would only chase the seed points off the
+/// boundary into thin spikes. `step` seeds the CVT grid; `max_passes` and
+/// `cvt_iters` bound the work. `slide` tells the boundary points the final
+/// smoothing may move along straight stretches of the outline; the others come
+/// back exactly as given. Returns `(points, triangles)`, the boundary first (in
+/// its order), then the interior.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_constrained(
     mut boundary: Vec<P2>,
-    mut segments: Vec<(usize, usize)>,
+    segments: Vec<(usize, usize)>,
     target: impl Fn(P2) -> f64,
     inside: impl Fn(P2) -> bool,
     step: f64,
     min_angle_deg: f64,
-    target_count: usize,
     cvt_iters: usize,
     max_passes: usize,
-    slide: bool,
-    on_pass: impl FnMut(&[P2], &[[usize; 3]]),
+    slide: impl Fn(P2) -> bool,
 ) -> (Vec<P2>, Vec<[usize; 3]>) {
     if boundary.len() < 3 {
         return (boundary, Vec::new());
@@ -1054,15 +779,7 @@ pub fn mesh_constrained(
         hi[0] = hi[0].max(p[0]);
         hi[1] = hi[1].max(p[1]);
     }
-    let t_cvt = rapidmesh_exact::clock::Instant::now();
     let mut interior = cvt_fill(&boundary, lo, hi, step, &target, cvt_iters, &inside, true);
-    if std::env::var_os("RAPIDMESH_2D_TRACE").is_some() {
-        eprintln!(
-            "2D cvt: {} seeds {:.3}s",
-            interior.len(),
-            t_cvt.elapsed().as_secs_f64()
-        );
-    }
     // cvt_fill clears boundary POINTS but not boundary EDGES, so a seed can land
     // just under a contour segment and form a flat boundary triangle. Drop seeds
     // closer than ~half the local size to any segment. Segments live in a
@@ -1114,28 +831,23 @@ pub fn mesh_constrained(
             true
         });
     }
-    // The boundary is PROTECTED (caller pre-samples it): Ruppert refines the
-    // interior but never re-splits a contour edge, so no boundary spikes.
-    let mut refin = vec![false; segments.len()];
-    refine_quality_with(
+    // The boundary is PROTECTED where the caller says (it pre-samples it): Ruppert refines
+    // the interior but never re-splits such a contour edge, so no boundary spikes.
+    refine_quality(
         &mut boundary,
-        &mut segments,
-        &mut refin,
+        &segments,
         &mut interior,
         &target,
         &inside,
         min_angle_deg,
-        target_count,
         max_passes,
         slide,
-        on_pass,
     );
     let mut all = boundary;
     all.extend(interior);
     let tris = triangulate_constrained(&all, &segments, &inside);
     (all, tris)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1274,7 +986,7 @@ mod tests {
             true,
         );
         assert!(!interior.is_empty());
-        let mut all = boundary.clone();
+        let mut all = boundary.to_vec();
         all.extend_from_slice(&interior);
         let mut min_sep2 = f64::MAX;
         for i in 0..all.len() {

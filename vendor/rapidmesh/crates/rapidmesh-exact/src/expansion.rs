@@ -51,13 +51,6 @@ fn split(a: f64) -> (f64, f64) {
     (a_hi, a - a_hi)
 }
 
-/// Exact product of two f64: returns (approximate product, roundoff term).
-#[inline]
-pub fn two_product(a: f64, b: f64) -> (f64, f64) {
-    let (b_hi, b_lo) = split(b);
-    two_product_presplit(a, b, b_hi, b_lo)
-}
-
 /// Exact product where b is already split.
 #[inline]
 fn two_product_presplit(a: f64, b: f64, b_hi: f64, b_lo: f64) -> (f64, f64) {

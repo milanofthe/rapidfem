@@ -28,12 +28,6 @@ pub struct DiscreteSurface {
     /// approximation). Feeds the same curvature-driven sizing as the
     /// analytic carriers.
     curv_r: Vec<f64>,
-    /// Whether the patch is a CLOSED surface (every edge has exactly two
-    /// incident facets). Open patches (smooth regions ending at crease
-    /// edges) have a rim, and their offset field beyond the rim is not
-    /// sign-faithful -- consumers that rely on field semantics (crossing
-    /// solvers) must fall back to tracing there.
-    closed: bool,
     /// Flat AABB tree (node = (lo, hi, left, right | leaf tri range)).
     nodes: Vec<Node>,
     /// Triangle order for leaf ranges.
@@ -132,7 +126,6 @@ impl DiscreteSurface {
         // importer splits patches there, so both owners are same-patch by
         // construction.
         let mut curv_r = vec![f64::INFINITY; tris.len()];
-        let mut closed = !tris.is_empty();
         {
             let mut by_edge: std::collections::HashMap<(u32, u32), [u32; 2]> =
                 std::collections::HashMap::new();
@@ -150,8 +143,7 @@ impl DiscreteSurface {
             }
             for s in by_edge.values() {
                 if s[1] == u32::MAX {
-                    closed = false; // rim edge: the patch is open
-                    continue;
+                    continue; // rim edge
                 }
                 let (i, j) = (s[0] as usize, s[1] as usize);
                 let cosang = dot(normals[i], normals[j]).clamp(-1.0, 1.0);
@@ -201,7 +193,6 @@ impl DiscreteSurface {
             tris,
             normals,
             curv_r,
-            closed,
             nodes,
             order,
         }
@@ -270,11 +261,6 @@ impl DiscreteSurface {
         }
     }
 
-    /// Whether every patch edge has exactly two incident facets (no rim).
-    pub fn is_closed(&self) -> bool {
-        self.closed
-    }
-
     /// Signed offset of `p`: distance along the facet normal at the footpoint
     /// (positive on the outward side). The sign flips exactly at the surface --
     /// the sphere-tracing / crossing-bisection contract of the refinement path.
@@ -282,94 +268,6 @@ impl DiscreteSurface {
         let (foot, n) = self.closest(p);
         dot(sub(p, foot), n)
     }
-
-    /// Parameters `t` in the OPEN interval `(0, 1)` where the segment
-    /// `a -> b` pierces a patch triangle: one BVH walk (segment-AABB slab
-    /// pruning), Moeller-Trumbore per leaf triangle. This is a CANDIDATE
-    /// set: a hit on a shared edge/vertex is reported by every incident
-    /// triangle (duplicates), parallel/grazing triangles report nothing --
-    /// the consumer decides transversality by sign reconstruction over the
-    /// candidate partition (the tube-crossings pattern). Unsorted.
-    pub fn segment_hits(&self, a: V3, b: V3, out: &mut Vec<f64>) {
-        if self.nodes.is_empty() {
-            return;
-        }
-        self.hits_rec(0, a, sub(b, a), out);
-    }
-
-    fn hits_rec(&self, ni: usize, a: V3, d: V3, out: &mut Vec<f64>) {
-        let n = self.nodes[ni];
-        if !seg_box(a, d, n.lo, n.hi) {
-            return;
-        }
-        if n.right < 0 {
-            let (start, count) = (n.left as usize, (!n.right) as usize);
-            for &ti in &self.order[start..start + count] {
-                let t = self.tris[ti as usize];
-                if let Some(tt) = seg_tri(
-                    a,
-                    d,
-                    self.points[t[0] as usize],
-                    self.points[t[1] as usize],
-                    self.points[t[2] as usize],
-                ) {
-                    out.push(tt);
-                }
-            }
-            return;
-        }
-        self.hits_rec(n.left as usize, a, d, out);
-        self.hits_rec(n.right as usize, a, d, out);
-    }
-}
-
-/// Segment/AABB overlap (slab test restricted to `t` in `[0, 1]`).
-fn seg_box(a: V3, d: V3, lo: V3, hi: V3) -> bool {
-    let (mut t0, mut t1) = (0.0f64, 1.0f64);
-    for k in 0..3 {
-        if d[k] == 0.0 {
-            if a[k] < lo[k] || a[k] > hi[k] {
-                return false;
-            }
-        } else {
-            let inv = 1.0 / d[k];
-            let (mut u, mut v) = ((lo[k] - a[k]) * inv, (hi[k] - a[k]) * inv);
-            if u > v {
-                std::mem::swap(&mut u, &mut v);
-            }
-            t0 = t0.max(u);
-            t1 = t1.min(v);
-            if t0 > t1 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Moeller-Trumbore segment/triangle intersection: `Some(t)` with `t` in the
-/// open `(0, 1)` for a hit anywhere in the CLOSED triangle (edge and vertex
-/// hits included -- the caller dedups); `None` for parallel (`det == 0`).
-fn seg_tri(a: V3, d: V3, p0: V3, p1: V3, p2: V3) -> Option<f64> {
-    let (e1, e2) = (sub(p1, p0), sub(p2, p0));
-    let pv = cross(d, e2);
-    let det = dot(e1, pv);
-    if det == 0.0 {
-        return None;
-    }
-    let inv = 1.0 / det;
-    let tv = sub(a, p0);
-    let u = dot(tv, pv) * inv;
-    if !(0.0..=1.0).contains(&u) {
-        return None;
-    }
-    let qv = cross(tv, e1);
-    let v = dot(d, qv) * inv;
-    if v < 0.0 || u + v > 1.0 {
-        return None;
-    }
-    let t = dot(e2, qv) * inv;
-    (t > 0.0 && t < 1.0).then_some(t)
 }
 
 fn build(

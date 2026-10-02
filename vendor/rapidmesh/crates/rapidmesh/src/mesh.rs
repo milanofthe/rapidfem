@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Write};
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 /// A solid of the geometry: its region (0 for a void), its label and the
@@ -66,7 +66,7 @@ impl Labels {
     /// The physical groups of the MSH file: the region groups (tag = their
     /// lowest region), the named sheet tags, and the named faces and edges
     /// with tags after the sheet tags.
-    fn msh_names(&self, regions: bool) -> Names {
+    pub(crate) fn msh_names(&self, regions: bool) -> Names {
         let mut region_groups = HashMap::new();
         if regions {
             for (name, rs) in self.region_groups() {
@@ -162,6 +162,25 @@ pub struct Sets {
     /// Faces per geometric face, edges per geometric edge.
     pub patches: BTreeMap<u32, Vec<u32>>,
     pub curves: BTreeMap<u32, Vec<u32>>,
+}
+
+/// A name as an OpenFOAM word: letters, digits and `_`, `-`, `.` kept,
+/// anything else `_`, a leading digit behind a `_`.
+fn foam_word(name: &str) -> String {
+    let mut w: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_-.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if !w.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        w.insert(0, '_');
+    }
+    w
 }
 
 fn indices(n: usize, keep: impl Fn(usize) -> bool) -> Vec<u32> {
@@ -308,16 +327,6 @@ impl<'a> Viewer<'a> {
             defects: None,
         }
     }
-
-    fn write(&self, name: &str, dir: &Path) -> io::Result<PathBuf> {
-        std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("rapidmesh_{name}.json"));
-        let mut w = io::BufWriter::new(std::fs::File::create(&path)?);
-        serde_json::to_writer(&mut w, self)?;
-        w.flush()?;
-        crate::export::write_manifest(dir)?;
-        Ok(path)
-    }
 }
 
 /// Python's `{:.4g}`: four significant digits, exponent form outside
@@ -443,6 +452,126 @@ impl Mesh {
         rapidmesh_topo::export::write_msh(&self.inner, &self.labels.msh_names(true), w)
     }
 
+    /// The finite volume mesh: the tets as cells, or (`polyhedral`) the
+    /// median dual, a polyhedral cell per vertex and region group. The
+    /// boundary patches are the named geometric faces, then the named sheet
+    /// tags, the rest `boundary` (the names in [`Mesh::foam_patches`]); every
+    /// cell's zone is its region group.
+    pub fn poly_mesh(&self, polyhedral: bool) -> rapidmesh_topo::foam::PolyMesh {
+        let v = self.view();
+        let (patch, _) = self.foam_patches();
+        let groups = self.labels.region_groups();
+        let zone: Vec<u32> = self
+            .inner
+            .tet_regions
+            .iter()
+            .map(|r| {
+                groups
+                    .iter()
+                    .position(|(_, rs)| rs.contains(&r.0))
+                    .unwrap_or(groups.len()) as u32
+            })
+            .collect();
+        if polyhedral {
+            rapidmesh_topo::foam::PolyMesh::dual(&self.inner.points, &v.topo, &zone, &patch)
+        } else {
+            rapidmesh_topo::foam::PolyMesh::from_tets(&self.inner.points, &v.topo, &zone, &patch)
+        }
+    }
+
+    /// The patch of every face of the topology (read on the boundary) and
+    /// the patch names: the named geometric faces, then the named sheet
+    /// tags, then `boundary` for the rest.
+    pub fn foam_patches(&self) -> (Vec<u32>, Vec<String>) {
+        let v = self.view();
+        let nf = v.topo.faces.len();
+        let mut names: Vec<String> = Vec::new();
+        let mut patch = vec![NONE; nf];
+        let mut take = |name: &str, faces: Vec<u32>, patch: &mut Vec<u32>| {
+            let id = names.len() as u32;
+            names.push(foam_word(name));
+            for f in faces {
+                if patch[f as usize] == NONE {
+                    patch[f as usize] = id;
+                }
+            }
+        };
+        for (name, ids) in &self.labels.face_names {
+            take(
+                name,
+                indices(nf, |f| ids.contains(&v.class.face_patch[f])),
+                &mut patch,
+            );
+        }
+        for (&tag, name) in &self.labels.tag_labels {
+            take(
+                name,
+                indices(nf, |f| v.class.face_tag[f] == tag),
+                &mut patch,
+            );
+        }
+        take("boundary", (0..nf as u32).collect(), &mut patch);
+        (patch, names)
+    }
+
+    /// Writes the OpenFOAM `polyMesh` into `dir` (a case's
+    /// `constant/polyMesh`), the cells as in [`Mesh::poly_mesh`]; the region
+    /// groups are cell zones, and with the tets as cells the named faces
+    /// and tags inside the mesh (sheets, interfaces) face zones.
+    pub fn write_foam(&self, dir: impl AsRef<Path>, polyhedral: bool) -> io::Result<()> {
+        use rapidmesh_topo::foam::{write_poly_mesh, FoamZone};
+        let v = self.view();
+        let m = self.poly_mesh(polyhedral);
+        let (_, names) = self.foam_patches();
+        let groups = self.labels.region_groups();
+        let cell_zones: Vec<FoamZone> = groups
+            .iter()
+            .enumerate()
+            .map(|(z, (name, _))| FoamZone {
+                name: foam_word(name),
+                ids: indices(m.n_cells(), |c| m.cell_zone[c] == z as u32),
+            })
+            .filter(|z| !z.ids.is_empty())
+            .collect();
+        let mut face_zones: Vec<FoamZone> = Vec::new();
+        if !polyhedral {
+            let nf = v.topo.faces.len();
+            let inside = |f: usize| v.topo.face_tets[f][1] != NONE;
+            let named = self
+                .labels
+                .face_names
+                .iter()
+                .map(|(n, ids)| {
+                    (
+                        n.clone(),
+                        indices(nf, |f| inside(f) && ids.contains(&v.class.face_patch[f])),
+                    )
+                })
+                .chain(self.labels.tag_labels.iter().map(|(&t, n)| {
+                    (
+                        n.clone(),
+                        indices(nf, |f| inside(f) && v.class.face_tag[f] == t),
+                    )
+                }));
+            for (name, ids) in named {
+                if !ids.is_empty() {
+                    face_zones.push(FoamZone {
+                        name: foam_word(&name),
+                        ids,
+                    });
+                }
+            }
+        }
+        write_poly_mesh(dir.as_ref(), &m, &names, &cell_zones, &face_zones)
+    }
+
+    /// The finite volume quality of every face of [`Mesh::poly_mesh`]
+    /// (non-orthogonality and skewness as OpenFOAM's `checkMesh` measures
+    /// them).
+    pub fn fvm_quality(&self, polyhedral: bool) -> rapidmesh_topo::foam::FvmQuality {
+        self.poly_mesh(polyhedral).quality()
+    }
+
     /// Writes a VTK XML unstructured grid: the tets and the geometric
     /// faces, with cell data `region`, `patch` and `face_tag`.
     pub fn write_vtu(&self, path: impl AsRef<Path>) -> io::Result<()> {
@@ -539,12 +668,6 @@ impl Mesh {
     /// The mesh in the viewer JSON schema, with the located defects.
     pub fn viewer_json(&self, name: &str) -> String {
         serde_json::to_string(&self.viewer(name)).expect("serialize")
-    }
-
-    /// Writes `rapidmesh_<name>.json` into `dir` and refreshes the viewer
-    /// manifest there.
-    pub fn save_viewer_json(&self, name: &str, dir: impl AsRef<Path>) -> io::Result<PathBuf> {
-        self.viewer(name).write(name, dir.as_ref())
     }
 }
 

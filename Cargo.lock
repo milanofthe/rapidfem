@@ -1318,7 +1318,6 @@ name = "rapidmesh"
 version = "1.0.0"
 dependencies = [
  "rapidmesh-brep",
- "rapidmesh-csg",
  "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-step",
@@ -1363,6 +1362,7 @@ dependencies = [
 name = "rapidmesh-geom"
 version = "1.0.0"
 dependencies = [
+ "i_overlay",
  "rapidmesh-csg",
  "rapidmesh-exact",
  "rayon",
@@ -1398,8 +1398,8 @@ dependencies = [
 name = "rapidmesh-topo"
 version = "1.0.0"
 dependencies = [
- "i_overlay",
  "rapidmesh-brep",
+ "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-tet",
 ]

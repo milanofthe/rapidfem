@@ -17,7 +17,6 @@ pub mod oracle;
 pub(crate) mod periodic;
 pub mod refine;
 pub mod snap;
-pub(crate) mod surfopt;
 pub mod verify;
 
 pub use oracle::{Crossing, DomainOracle, FeatureCurve, Patch, SizeField, Uniform, P3};

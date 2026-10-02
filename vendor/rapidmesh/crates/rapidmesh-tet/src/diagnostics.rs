@@ -249,62 +249,6 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         sum_dih / mesh.tets.len() as f64
     };
 
-    // Sliver census (RAPIDMESH_SLIVER_CENSUS): classify every sliver tet by
-    // its surface entanglement -- how many of its vertices sit on surface
-    // faces, whether all four share ONE analytic surface (the on-carrier
-    // chord/cap configuration no smoothing can lift), and how many of its
-    // facets are constrained. The histogram picks the repair strategy.
-    if std::env::var_os("RAPIDMESH_SLIVER_CENSUS").is_some() {
-        use std::collections::{HashMap, HashSet};
-        // vertex -> surfaces of its incident faces
-        let mut vsurf: HashMap<usize, Vec<u32>> = HashMap::new();
-        let mut ftris: HashSet<[usize; 3]> = HashSet::new();
-        for f in &mesh.faces {
-            for &v in &f.tri {
-                let e = vsurf.entry(v).or_default();
-                if !e.contains(&f.surface) {
-                    e.push(f.surface);
-                }
-            }
-            let mut k = f.tri;
-            k.sort_unstable();
-            ftris.insert(k);
-        }
-        let mut census: HashMap<(usize, bool, usize), usize> = HashMap::new();
-        for t in &mesh.tets {
-            let p = [pt(t[0]), pt(t[1]), pt(t[2]), pt(t[3])];
-            let md = tet_min_dihedral(p);
-            if !md.is_finite() || md >= SLIVER_DEG {
-                continue;
-            }
-            let on_surf = t.iter().filter(|v| vsurf.contains_key(v)).count();
-            // all four on ONE common surface?
-            let common = t
-                .iter()
-                .filter_map(|v| vsurf.get(v))
-                .fold(None::<Vec<u32>>, |acc, s| match acc {
-                    None => Some(s.clone()),
-                    Some(a) => Some(a.into_iter().filter(|x| s.contains(x)).collect()),
-                })
-                .is_some_and(|c| on_surf == 4 && !c.is_empty());
-            let mut cfaces = 0usize;
-            for i in 0..4 {
-                let mut f: [usize; 3] = [t[(i + 1) % 4], t[(i + 2) % 4], t[(i + 3) % 4]];
-                f.sort_unstable();
-                if ftris.contains(&f) {
-                    cfaces += 1;
-                }
-            }
-            *census.entry((on_surf, common, cfaces)).or_insert(0) += 1;
-        }
-        let mut rows: Vec<_> = census.into_iter().collect();
-        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
-        eprintln!("SLIVER CENSUS (on_surf_verts, all4_one_surface, constrained_facets) -> count");
-        for ((os, com, cf), n) in rows.iter().take(12) {
-            eprintln!("  ({os}, {com}, {cf}) -> {n}");
-        }
-    }
-
     // ---- conformity: non-manifold surface edges, PER REGION (Diag5) -------
     // Each region's boundary (the faces that touch it) must be a closed 2-manifold:
     // every edge shared by exactly TWO of that region's faces. A triple curve --
@@ -359,8 +303,8 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     // measured against the surface it ACTUALLY lies on (the nearest one), not the
     // face's tagged surface: near an intersection ring a face is easily tagged with
     // the wrong sphere, and a tagged-only test then reports a phantom straddler for
-    // every on-surface vertex it mislabels. Planes carry no geometry here
-    // (the kind lacks the frame), so they cannot anchor the fit.
+    // every on-surface vertex it mislabels. Planes and faceted faces are left
+    // out: they cannot anchor the fit.
     let curved: Vec<Surface> = mesh.surfaces.iter().filter_map(Surface::curved).collect();
     let nearest_off = |q: V3| -> f64 {
         curved
@@ -378,7 +322,10 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         .enumerate()
         .map(|(fi, f)| {
             let kind = &mesh.surfaces[f.surface as usize];
-            if matches!(kind, SurfaceKind::Plane) || curved.is_empty() || contact.contains(&fi) {
+            if matches!(kind, SurfaceKind::Plane { .. } | SurfaceKind::Facets)
+                || curved.is_empty()
+                || contact.contains(&fi)
+            {
                 return None; // planar faces are exact; deviation is 0
             }
             let v = [pt(f.tri[0]), pt(f.tri[1]), pt(f.tri[2])];

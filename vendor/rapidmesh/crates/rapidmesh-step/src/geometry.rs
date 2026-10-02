@@ -533,7 +533,10 @@ impl Surface {
     /// The carrier for the model.
     pub fn kind(&self) -> SurfaceKind {
         match self {
-            Surface::Plane(_) => SurfaceKind::Plane,
+            Surface::Plane(f) => SurfaceKind::Plane {
+                point: f.o,
+                normal: f.z,
+            },
             Surface::Cylinder(f, r) => SurfaceKind::Cylinder {
                 center: f.o,
                 axis: f.z,

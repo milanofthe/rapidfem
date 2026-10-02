@@ -78,10 +78,14 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32) -> (Check, Kept) {
     segments.sort_unstable();
     let mut edges = Vec::new();
     for (fi, (f, tris)) in brep.faces.iter().zip(&b.faces).enumerate() {
+        // A planar face is a facet of its own only where its points are
+        // exactly in one plane (an axis-aligned one); a tilted plane's
+        // points are off it by their rounding, and its triangles are
+        // facets each, like a curved face's.
         let planar = matches!(
             brep.surface(f.surface),
             rapidmesh_brep::Surface::Plane { .. }
-        );
+        ) && exactly_planar(b, tris);
         if planar || !f.regions.iter().any(|x| x.0 == r) {
             continue;
         }
@@ -111,6 +115,17 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32) -> (Check, Kept) {
         }
     }
     (Check { segments, edges }, Kept { pts, dt })
+}
+
+/// Whether the points of `tris` lie exactly in one plane.
+fn exactly_planar(b: &Boundary, tris: &[[u32; 3]]) -> bool {
+    let Some(t0) = tris.first() else {
+        return true;
+    };
+    let p = t0.map(|v| b.points[v as usize]);
+    tris.iter()
+        .flatten()
+        .all(|&v| super::predicates::orient(p[0], p[1], p[2], b.points[v as usize]) == 0)
 }
 
 /// A region's Delaunay tetrahedralization and the points it is over.

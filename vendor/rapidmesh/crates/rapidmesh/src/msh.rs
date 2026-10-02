@@ -453,7 +453,7 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
         tets,
         tet_regions,
         faces,
-        surfaces: vec![SurfaceKind::Plane],
+        surfaces: vec![SurfaceKind::Facets],
         surface_owners: vec![SHEET_OWNER],
         plc_points: 0,
         point_size: vec![0.0; n],

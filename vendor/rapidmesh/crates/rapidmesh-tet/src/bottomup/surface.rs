@@ -189,6 +189,9 @@ pub fn boundary_keeping(
 
     // ---- edges: the samples between the corners
     let floor = params.h_floor(extent);
+    if rapidmesh_exact::log::level() == Some(rapidmesh_exact::log::Level::Debug) {
+        log_feature_sizes(model, floor);
+    }
     let grading = if params.grading > 0.0 {
         params.grading
     } else {
@@ -450,10 +453,7 @@ pub fn boundary_keeping(
                     .collect::<Vec<_>>()
             ),
         );
-        let max_rounds = std::env::var("RAPIDMESH_SPLIT_ROUNDS")
-            .ok()
-            .and_then(|x| x.parse().ok())
-            .unwrap_or(MAX_SPLIT_ROUNDS);
+        let max_rounds = MAX_SPLIT_ROUNDS;
         grew = if left > before { grew + 1 } else { 0 };
         before = left;
         if grew >= DIVERGED_ROUNDS {
@@ -912,6 +912,17 @@ const DIVERGED_ROUNDS: usize = 3;
 /// between the corners), the faces in `dirty` meshed on them afresh and the
 /// others taken from `cache`.
 #[allow(clippy::too_many_arguments)]
+/// The axis and coordinate of a plane normal to an axis (to a rounding of
+/// its normal), if it is one.
+fn axis_plane(s: &rapidmesh_brep::Surface) -> Option<(usize, f64)> {
+    let rapidmesh_brep::Surface::Plane { o, normal, .. } = s else {
+        return None;
+    };
+    let k = (0..3).max_by(|&a, &b| normal[a].abs().total_cmp(&normal[b].abs()))?;
+    let off: f64 = (0..3).filter(|&j| j != k).map(|j| normal[j].abs()).sum();
+    (off <= 1e-12 * normal[k].abs()).then_some((k, o[k]))
+}
+
 fn faces_on(
     model: &Model,
     curves: &[Option<PolylineCurve>],
@@ -927,7 +938,27 @@ fn faces_on(
     params: &MeshParams,
 ) -> Result<Boundary, BoundaryError> {
     let brep = &model.brep;
-    let mut points: Vec<P3> = brep.vertices.iter().map(|v| v.pos).collect();
+    // A point on an axis-aligned plane takes the plane's coordinate exactly:
+    // a curve's samples and a corner are on it only to a rounding otherwise,
+    // and a plane whose points are off it is no single facet but one per
+    // triangle, each of whose edges the regions must then have.
+    let on_planes = |mut p: P3, faces: &mut dyn Iterator<Item = usize>| -> P3 {
+        for f in faces {
+            if let Some((k, x)) = axis_plane(brep.surface(brep.faces[f].surface)) {
+                p[k] = x;
+            }
+        }
+        p
+    };
+    let mut edge_faces: Vec<Vec<usize>> = vec![Vec::new(); brep.edges.len()];
+    for c in &brep.coedges {
+        edge_faces[c.edge.0 as usize].push(c.face.0 as usize);
+    }
+    let mut points: Vec<P3> = brep
+        .vertices
+        .iter()
+        .map(|v| on_planes(v.pos, &mut v.faces.iter().map(|f| f.0 as usize)))
+        .collect();
     let mut of_sample: FxHashMap<Fixed, u32> = FxHashMap::default();
     let edges: Vec<Vec<u32>> = brep
         .edges
@@ -940,7 +971,10 @@ fn faces_on(
                     let id = points.len() as u32;
                     of_sample.insert(Fixed::Sample(ei as u32, s.to_bits()), id);
                     ids.push(id);
-                    points.push(c.point_at(s));
+                    points.push(on_planes(
+                        c.point_at(s),
+                        &mut edge_faces[ei].iter().copied(),
+                    ));
                 }
             }
             ids.push(e.ends[1].0);
@@ -2131,11 +2165,9 @@ fn mesh_domain(
         },
         step,
         min_angle,
-        0,
         4,
         12,
-        false,
-        |_, _| {},
+        |_| false,
     );
     if tris.is_empty() {
         rapidmesh_exact::log::debug(
@@ -2436,6 +2468,50 @@ fn cross(a: P3, b: P3) -> P3 {
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     ]
+}
+
+/// The local feature sizes of the model's corners and edges against the size
+/// floor (#217, measured before protection uses them).
+fn log_feature_sizes(model: &Model, floor: f64) {
+    let brep = &model.brep;
+    let fs = rapidmesh_brep::feature::FeatureSize::new(model);
+    let corners: Vec<(f64, P3)> = (0..brep.vertices.len() as u32)
+        .into_par_iter()
+        .map(|v| (fs.at_corner(brep, v), brep.vertices[v as usize].pos))
+        .collect();
+    let edges: Vec<(f64, P3)> = (0..brep.edges.len())
+        .into_par_iter()
+        .flat_map_iter(|e| {
+            let chain = &brep.edges[e].chain;
+            let fs = &fs;
+            chain.windows(2).map(move |w| {
+                let m: P3 = std::array::from_fn(|k| 0.5 * (w[0][k] + w[1][k]));
+                (fs.at_edge(brep, e as u32, m), m)
+            })
+        })
+        .collect();
+    let summary = |name: &str, xs: &[(f64, P3)]| {
+        let mut v: Vec<(f64, P3)> = xs.iter().copied().filter(|x| x.0.is_finite()).collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let below = v.iter().filter(|x| x.0 < floor).count();
+        let q = |f: f64| {
+            v.get(((v.len() as f64 - 1.0) * f) as usize)
+                .map_or(f64::NAN, |x| x.0)
+        };
+        rapidmesh_exact::log::debug(
+            "bottomup.features",
+            format!(
+                "{name}: {} measured, {below} below the floor {floor:.3e}; least {:.3e}, 10% {:.3e}, median {:.3e}; smallest at {:?}",
+                v.len(),
+                q(0.0),
+                q(0.1),
+                q(0.5),
+                v.iter().take(3).map(|x| x.1).collect::<Vec<_>>()
+            ),
+        );
+    };
+    summary("corners", &corners);
+    summary("edges", &edges);
 }
 
 #[cfg(test)]

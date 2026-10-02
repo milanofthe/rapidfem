@@ -25,6 +25,7 @@ use rapidmesh_geom::{FaceTag, RegionTag, Scene, TaggedPlc};
 use std::sync::Arc;
 
 pub mod build;
+pub mod feature;
 pub mod index;
 pub mod surface;
 pub mod topology;

@@ -308,7 +308,7 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         let (sa, sb) = (label[a as usize], label[b as usize]);
         sa == sb
             && match plc.surfaces[sa as usize] {
-                SurfaceKind::Plane => false,
+                SurfaceKind::Plane { .. } | SurfaceKind::Facets => false,
                 SurfaceKind::Discrete(_) => cos_bend > cos_crease,
                 _ => true,
             }

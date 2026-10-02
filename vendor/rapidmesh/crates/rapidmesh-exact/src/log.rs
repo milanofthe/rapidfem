@@ -11,7 +11,7 @@
 //! log level is at or below their severity. The level is a fastsim-style
 //! threshold (`Debug < Info < Warn < Error`): set `RAPIDMESH_LOG` to
 //! `debug`/`info`/`warn`/`error` (or `1`/`true` = info, unset/`0`/`off` = silent),
-//! or call [`set_level`] / [`set_verbose`] from the host. So a user can watch the
+//! or call [`set_level`] from the host. So a user can watch the
 //! mesher's stages, metrics, and warnings as they happen -- not just a summary
 //! after it finishes.
 
@@ -121,16 +121,6 @@ pub fn level() -> Option<Level> {
     }
 }
 
-/// Back-compat toggle: `true` = [`Level::Info`], `false` = silent.
-pub fn set_verbose(on: bool) {
-    set_level(on.then_some(Level::Info));
-}
-
-/// True if any live printing is on.
-pub fn is_verbose() -> bool {
-    level().is_some()
-}
-
 fn elapsed() -> f64 {
     START.with(|s| s.borrow().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0))
 }
@@ -165,11 +155,6 @@ pub fn info(stage: &str, message: impl Into<String>) {
 /// Warning-level event.
 pub fn warn(stage: &str, message: impl Into<String>) {
     event(Level::Warn, stage, message);
-}
-
-/// Error-level event (record before a panic so the log explains the abort).
-pub fn error(stage: &str, message: impl Into<String>) {
-    event(Level::Error, stage, message);
 }
 
 /// Records a stage's wall-clock duration in seconds and emits an info event
@@ -222,18 +207,6 @@ pub fn stat(name: &str, value: f64) {
     STATS.with(|s| s.borrow_mut().push((name.to_string(), value)));
 }
 
-/// Records a mesh metric BOTH as a machine-readable stat (`stage.name`) and a
-/// human-readable info line (`name = value unit`), so the important numbers show
-/// up live and in `mesh.stats`.
-pub fn metric(stage_name: &str, name: &str, value: f64, unit: &str) {
-    stat(&format!("{stage_name}.{name}"), value);
-    if unit.is_empty() {
-        info(stage_name, format!("{name} = {value:.4}"));
-    } else {
-        info(stage_name, format!("{name} = {value:.4} {unit}"));
-    }
-}
-
 /// Drains and returns the collected (timings, stats, events), each ordered by
 /// (first) record time.
 pub fn take() -> (Vec<(String, f64)>, Vec<(String, f64)>, Vec<Event>) {
@@ -267,16 +240,15 @@ mod tests {
         stage("mesh.x", 0.5);
         stage("mesh.y", 0.25);
         stage("mesh.x", 0.25);
-        metric("metrics", "tets", 1234.0, "");
         warn("metrics", "a sliver survived");
         let (timings, stats, events) = take();
         assert_eq!(
             timings,
             vec![("mesh.x".to_string(), 0.75), ("mesh.y".to_string(), 0.25)]
         );
-        assert_eq!(stats, vec![("metrics.tets".to_string(), 1234.0)]);
-        // All three events are collected regardless of the print threshold.
-        assert_eq!(events.len(), 5);
-        assert_eq!(events[4].level, Level::Warn);
+        assert!(stats.is_empty());
+        // All events are collected regardless of the print threshold.
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[3].level, Level::Warn);
     }
 }

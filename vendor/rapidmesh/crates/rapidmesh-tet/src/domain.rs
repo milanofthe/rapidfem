@@ -17,7 +17,7 @@ use rapidmesh_brep::Surface;
 use rapidmesh_csg::classify::{ray_target, segment_crosses_triangle, RAY_TARGETS};
 use rapidmesh_csg::Tri;
 use rapidmesh_exact::{Point3, Prepared3};
-use rapidmesh_geom::vec3::{dist, dot, sub, V3};
+use rapidmesh_geom::vec3::{dist, V3};
 use rapidmesh_geom::{SurfaceKind, TaggedPlc};
 use std::sync::Arc;
 
@@ -413,7 +413,12 @@ fn edge_sizing_segments(plc: &TaggedPlc, deflection: f64, maxh: f64) -> Vec<(Tri
     use rustc_hash::FxHashMap;
     let chord = (8.0 * deflection).sqrt();
     let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
-    let is_curved = |sid: u32| !matches!(plc.surfaces[sid as usize], SurfaceKind::Plane);
+    let is_curved = |sid: u32| {
+        !matches!(
+            plc.surfaces[sid as usize],
+            SurfaceKind::Plane { .. } | SurfaceKind::Facets
+        )
+    };
 
     // Distinct analytic surfaces meeting along each undirected edge.
     let mut edge_surf: FxHashMap<(u32, u32), Vec<u32>> = FxHashMap::default();
@@ -435,41 +440,16 @@ fn edge_sizing_segments(plc: &TaggedPlc, deflection: f64, maxh: f64) -> Vec<(Tri
         .collect();
     feature.sort_unstable();
 
-    // The carrier of every surface; a plane's is recovered from the PLC (the
-    // `SurfaceKind::Plane` itself carries none): origin + unit normal of the
-    // first facet on it. Needed so POCS can project onto a plane-cut edge, not
-    // only the curved side.
+    // The carrier of every surface, a faceted one the plane of its first
+    // facet. Needed so POCS can project onto a plane-cut edge, not only the
+    // curved side.
     let mut carrier: FxHashMap<u32, Surface> = FxHashMap::default();
     for (fi, t) in plc.triangles.iter().enumerate() {
         let s = plc.surface_refs[fi].0;
-        if matches!(plc.surfaces[s as usize], SurfaceKind::Plane) {
-            carrier.entry(s).or_insert_with(|| {
-                let (v0, v1, v2) = (
-                    plc.vertices[t[0] as usize],
-                    plc.vertices[t[1] as usize],
-                    plc.vertices[t[2] as usize],
-                );
-                let (e1, e2) = (sub(v1, v0), sub(v2, v0));
-                let n = [
-                    e1[1] * e2[2] - e1[2] * e2[1],
-                    e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0],
-                ];
-                let nl = dot(n, n).sqrt();
-                Surface::plane(
-                    v0,
-                    if nl > 1e-12 {
-                        [n[0] / nl, n[1] / nl, n[2] / nl]
-                    } else {
-                        [0.0, 0.0, 1.0]
-                    },
-                )
-            });
-        } else {
-            carrier
-                .entry(s)
-                .or_insert_with(|| Surface::from_kind(&plc.surfaces[s as usize], &[]));
-        }
+        carrier.entry(s).or_insert_with(|| {
+            let corners = t.map(|v| plc.vertices[v as usize]);
+            Surface::from_kind(&plc.surfaces[s as usize], &corners)
+        });
     }
     // Edge-curve neighbours of each feature vertex (its polyline link), and ALL
     // analytic surfaces meeting along the curve at each vertex (both sides).

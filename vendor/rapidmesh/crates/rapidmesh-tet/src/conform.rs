@@ -18,7 +18,7 @@ type DState = BuildHasherDefault<rustc_hash::FxHasher>;
 type DMap<K, V> = HashMap<K, V, DState>;
 
 /// A boundary surface mesh: the conforming triangulation of the PLC patches,
-/// produced by the early-exit surface path ([`crate::mesh3::brep::surface_mesh`])
+/// produced by the surface path ([`crate::bottomup::surface_mesh`])
 /// without the volume tetrahedralization. Same face schema as [`TetMesh`].
 #[derive(Debug)]
 pub struct SurfaceMesh {
@@ -145,7 +145,7 @@ impl TetMesh {
         type FaceKey = (u32, u32, u32, u32, u32);
         let face_key = |sf: &SurfaceFace| -> FaceKey {
             let smooth = match self.surfaces[sf.surface as usize] {
-                SurfaceKind::Plane => sf.patch,
+                SurfaceKind::Plane { .. } | SurfaceKind::Facets => sf.patch,
                 _ => u32::MAX,
             };
             let (r0, r1) = (

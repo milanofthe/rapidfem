@@ -133,7 +133,15 @@ mod tests {
 
     #[test]
     fn plane_has_no_override() {
-        assert!(surface_normal(&SurfaceKind::Plane, [1.0, 2.0, 3.0]).is_none());
-        assert!(surface_curvature(&SurfaceKind::Plane, [1.0, 2.0, 3.0]).is_none());
+        for k in [
+            SurfaceKind::Plane {
+                point: [0.0; 3],
+                normal: [0.0, 0.0, 1.0],
+            },
+            SurfaceKind::Facets,
+        ] {
+            assert!(surface_normal(&k, [1.0, 2.0, 3.0]).is_none());
+            assert!(surface_curvature(&k, [1.0, 2.0, 3.0]).is_none());
+        }
     }
 }

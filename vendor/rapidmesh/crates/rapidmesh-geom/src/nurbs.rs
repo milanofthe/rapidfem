@@ -232,25 +232,8 @@ impl NurbsCurve {
         }
     }
 
-    /// A uniform clamped cubic (degree 3) interpolating the given control points
-    /// directly (control polygon, not interpolation): a convenience for tests
-    /// and simple profiles. Non-rational.
-    pub fn clamped_uniform(degree: usize, ctrl: Vec<P2>) -> NurbsCurve {
-        let n = ctrl.len();
-        let p = degree;
-        // clamped: p+1 zeros, interior 1..(n-p), p+1 ones (count n+p+1)
-        let interior = n.saturating_sub(p + 1);
-        let mut knots = vec![0.0; p + 1];
-        for i in 1..=interior {
-            knots.push(i as f64 / (interior + 1) as f64);
-        }
-        knots.extend(std::iter::repeat_n(1.0, p + 1));
-        let weights = vec![1.0; n];
-        NurbsCurve::new(degree, knots, ctrl, weights)
-    }
-
     /// Cubic B-spline INTERPOLATING the given points (the curve passes through
-    /// each, unlike `clamped_uniform` which uses them as control points). Gives
+    /// each). Gives
     /// the FAITHFUL curvature of the sampled shape -- no control-polygon
     /// artifacts -- so a curvature sizing field refines only the genuinely
     /// curved regions (Piegl & Tiller, global interpolation A9.1: chord-length

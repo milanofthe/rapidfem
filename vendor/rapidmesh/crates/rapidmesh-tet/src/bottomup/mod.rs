@@ -190,15 +190,7 @@ pub fn mesh(model: &Model, params: &MeshParams) -> Result<TetMesh, MeshError> {
 /// [`mesh`] of the model of `scene`, a large one in blocks (see
 /// [`blocks`]).
 pub fn mesh_scene(scene: &Scene, model: &Model, params: &MeshParams) -> Result<TetMesh, MeshError> {
-    // RAPIDMESH_BLOCK_TETS plans smaller blocks, to try them on small
-    // models; RAPIDMESH_NO_BLOCKS meshes any model whole, for comparison.
-    if std::env::var_os("RAPIDMESH_NO_BLOCKS").is_some() {
-        return mesh(model, params);
-    }
-    let block = std::env::var("RAPIDMESH_BLOCK_TETS")
-        .ok()
-        .and_then(|x| x.parse().ok());
-    mesh_in_blocks(model, Some((scene, block)), params)
+    mesh_in_blocks(model, Some((scene, None)), params)
 }
 
 fn mesh_in_blocks(
@@ -263,22 +255,6 @@ fn mesh_in_blocks(
     rapidmesh_exact::log::heap("cdt");
     let mut filled_ok: Vec<(u32, cdt::Filled)> = Vec::with_capacity(filled.len());
     for (r, ts) in filled {
-        // A region left without its tetrahedralization is written to the
-        // file named by RAPIDMESH_DUMP_REGION (points, then its faces turned
-        // into it), for `cdt::tests::region_from_file` to trace.
-        if ts.is_err() {
-            if let Ok(path) = std::env::var("RAPIDMESH_DUMP_REGION") {
-                let faces = region_faces(brep, &b, r);
-                let mut txt = format!("{} {}\n", b.points.len(), faces.len());
-                for p in &b.points {
-                    txt += &format!("{:?} {:?} {:?}\n", p[0], p[1], p[2]);
-                }
-                for t in &faces {
-                    txt += &format!("{} {} {}\n", t[0], t[1], t[2]);
-                }
-                std::fs::write(path, txt).ok();
-            }
-        }
         let ts = ts.map_err(|error| MeshError::Region { region: r, error })?;
         filled_ok.push((r, ts));
     }
@@ -451,8 +427,31 @@ fn from_blocks(
 }
 
 /// The surface mesh of `model` by the bottom-up stages: each B-rep face
-/// meshed alone on the shared samples of its edges.
+/// meshed alone on the shared samples of its edges. A triangle budget
+/// (`surf_target_count`, 0 = none) coarsens the sizes by one global factor
+/// over a few remeshes until the count is at most a little over it.
 pub fn surface_mesh(model: &Model, params: &MeshParams) -> Result<SurfaceMesh, BoundaryError> {
+    let target = params.surf_target_count;
+    let mut out = surface_once(model, params)?;
+    let mut s = 1.0_f64;
+    for _ in 0..BUDGET_ROUNDS {
+        let n = out.faces.len();
+        if target == 0 || n as f64 <= (1.0 + BUDGET_SLACK) * target as f64 {
+            break;
+        }
+        // triangles go with the inverse square of the size
+        s *= (n as f64 / target as f64).sqrt();
+        out = surface_once(model, &params.scaled(s))?;
+    }
+    Ok(out)
+}
+
+/// Remeshes at most this often to meet a triangle budget.
+const BUDGET_ROUNDS: usize = 6;
+/// A count this fraction over the budget meets it.
+const BUDGET_SLACK: f64 = 0.06;
+
+fn surface_once(model: &Model, params: &MeshParams) -> Result<SurfaceMesh, BoundaryError> {
     let domain = crate::cvt::build_sizing_domain(model, params);
     let b = boundary(model, &domain, params)?;
     let brep = &model.brep;

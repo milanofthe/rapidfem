@@ -1,4 +1,4 @@
-//! rapidmesh: conforming tetrahedral and surface meshes for EM FEM and MoM.
+//! rapidmesh: conforming tetrahedral and surface meshes for FEM and FVM.
 //!
 //! The Rust API is the whole mesher; the Python package is a thin layer
 //! over it. Build a [`Geometry`] from [`shapes`] and sheets, size it
@@ -24,19 +24,16 @@
 //! mesh.write_msh("cell.msh")?;
 //! # Ok::<(), rapidmesh::Error>(())
 //! ```
-//!
-//! The planar endpoints ([`mesh_2d`], [`mesh_layers`]) mesh tagged 2D
-//! regions for MoM.
 
-pub mod export;
 mod features;
+mod fem;
 mod geometry;
 mod mesh;
 mod msh;
-pub mod scenes;
 pub mod shapes;
 
 pub use features::{EdgeCut, EdgePick};
+pub use fem::{SecondOrder, TET10_EDGES};
 pub use geometry::{
     Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions, DEFAULT_CELLS_ACROSS,
 };
@@ -45,15 +42,14 @@ pub use mesh::{Diagnostics, Labels, Mesh, Run, Sets, SolidInfo, SurfaceMesh, Tet
 pub use msh::{load_msh, read_msh};
 pub use rapidmesh_brep::{EdgeFilter, EdgeKind, FaceFilter, Topology};
 pub use rapidmesh_exact::log::{Event, Level as LogLevel};
-pub use rapidmesh_geom::TaggedPlc;
+pub use rapidmesh_geom::{polygon_union, TaggedPlc};
 pub use rapidmesh_tet::diagnostics::{Defect, DefectKind, MeshDiagnostics};
 pub use rapidmesh_tet::fidelity::Fidelity;
 pub use rapidmesh_tet::mesh3::PeriodicPair;
-pub use rapidmesh_tet::{dorfler_mark, PointClass, QualityStats, SurfaceFace, TetMesh};
+pub use rapidmesh_tet::{dorfler_mark, Dorfler, PointClass, QualityStats, SurfaceFace, TetMesh};
 pub use rapidmesh_topo::{
-    mesh_2d, mesh_layers, overlay_regions, union_regions, BandDiagonals, Classification, Mesh2D,
-    Mesh2DOptions, OverlayRule, Region2D, TetGeometry, TetTopology, TriClassification, TriGeometry,
-    TriTopology, FACE_PERMS, NONE, OFFSET_GRADING,
+    Classification, TetGeometry, TetTopology, TriClassification, TriGeometry, TriTopology,
+    FACE_PERMS, NONE,
 };
 
 /// What can go wrong building or meshing a geometry.

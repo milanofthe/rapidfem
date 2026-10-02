@@ -116,37 +116,14 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Result<Arrangement, ArrangeError
             }
         })
         .collect();
-    let check = std::env::var_os("RAPIDMESH_ARRANGE_CHECK").is_some();
-    let validate = |branch: &str, fi: usize, p: &Point3| {
-        if !check {
-            return;
-        }
-        let on_some_helper = input[fi].helpers.iter().any(|h| {
-            let (axis, orientation) = h.projection_axis();
-            h.contains_coplanar(p, axis, orientation)
-        });
-        if !on_some_helper {
-            eprintln!(
-                "ARRANGE CHECK(planar): {branch} point {:?} outside facet {fi} boundary {:?}",
-                p.approx(),
-                input[fi].boundary.outer,
-            );
-        }
-    };
     for r in results {
         match r {
             PR::Touch(mi, mj, p) => {
-                validate("touch", member_facet[mi], &p);
-                validate("touch", member_facet[mj], &p);
                 points[member_facet[mi]].push(p.clone());
                 points[member_facet[mj]].push(p);
             }
             PR::Seg(mi, mj, a, b) => {
                 let (fi, fj) = (member_facet[mi], member_facet[mj]);
-                validate("seg-a", fi, &a);
-                validate("seg-b", fi, &b);
-                validate("seg-a", fj, &a);
-                validate("seg-b", fj, &b);
                 cut[fi].entry(fj).or_default().push(CutSeg {
                     a: a.clone(),
                     b: b.clone(),
@@ -209,13 +186,6 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Result<Arrangement, ArrangeError
         })
         .collect();
     for (target, cs, ps) in contribs {
-        for c in &cs {
-            validate("cop-a", target, &c.a);
-            validate("cop-b", target, &c.b);
-        }
-        for p in &ps {
-            validate("cop-pt", target, p);
-        }
         cop[target].extend(cs);
         points[target].extend(ps);
     }

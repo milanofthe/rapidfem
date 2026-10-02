@@ -3,6 +3,17 @@
 use super::*;
 
 impl KluSymbolic {
+    /// Heap bytes this analysis holds: the block permutations and the stored
+    /// pattern the refactorization checks against.
+    pub fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.pre_row_perm)
+            + vec_bytes(&self.col_perm)
+            + vec_bytes(&self.block_ptr)
+            + vec_bytes(&self.pat_col_ptr)
+            + vec_bytes(&self.pat_row_idx)
+    }
+
     /// Analyze the pattern of `a`: BTF (unless disabled) + per-block AMD.
     /// The values are read only by the row matching.
     ///
@@ -123,9 +134,18 @@ impl KluSymbolic {
         let mut l_rowidx: Vec<usize> = Vec::new();
         let mut leaves: Vec<usize> = Vec::new();
         let (mut u_nnz, mut f_nnz, mut flops) = (0u64, 0u64, 0u64);
+        // The drivers' buffers, block by block (see `BlockCaps`): the
+        // sequential driver appends to arrays reserved at 4, 2 and 1/4 times
+        // the input and reuses one block buffer; the parallel one gives
+        // every block a fresh buffer.
+        let nblocks = self.block_ptr.len() - 1;
+        let (mut seq, mut par) = (BlockCaps::default(), (0u64, 0u64));
+        let mut cap = [4 * self.nnz, 2 * self.nnz, self.nnz / 4];
+        let mut len = [0usize; 3];
 
-        for b in 0..self.block_ptr.len() - 1 {
+        for b in 0..nblocks {
             let (bs, be) = (self.block_ptr[b], self.block_ptr[b + 1]);
+            let before = (l_rowidx.len(), u_nnz as usize, f_nnz as usize);
             for j in bs..be {
                 let sj = j + 1;
                 leaves.clear();
@@ -187,13 +207,63 @@ impl KluSymbolic {
                 flops += (l_rowidx.len() - l_colptr[j]) as u64; // divisions
                 l_colptr.push(l_rowidx.len());
             }
+            let annz = self.pat_col_ptr[be] - self.pat_col_ptr[bs];
+            let got = [
+                l_rowidx.len() - before.0,
+                u_nnz as usize - before.1,
+                f_nnz as usize - before.2,
+            ];
+            seq.fill(be - bs, annz, got[0], got[1], got[2]);
+            let mut fresh = BlockCaps::default();
+            fresh.fill(be - bs, annz, got[0], got[1], got[2]);
+            let (v, o) = fresh.bytes();
+            par = (par.0 + v, par.1 + o);
+            for i in 0..3 {
+                cap[i] = crate::memory::grown(cap[i], len[i] + got[i]);
+                len[i] += got[i];
+            }
         }
+        let n1 = (n + 1) as u64;
+        let (seq_arrays, seq_block) = if nblocks == 1 {
+            // The one block's `L`, `U`, diagonal and their column pointers
+            // move out of the block buffer into the factor.
+            let moved = (
+                (seq.l + seq.u + seq.diag) as u64,
+                (4 * (seq.l + seq.u) + 8 * (seq.colptr[0] + seq.colptr[1])) as u64,
+            );
+            let all = seq.bytes();
+            (
+                (moved.0, moved.1 + 8 * n1),
+                (all.0 - moved.0, all.1 - moved.1),
+            )
+        } else {
+            let entries = cap.iter().sum::<usize>() as u64;
+            ((entries + n as u64, 4 * entries + 24 * n1), seq.bytes())
+        };
         KluFill {
             l_nnz: l_rowidx.len() as u64,
             u_nnz,
             f_nnz,
             flops,
+            seq_arrays,
+            seq_block,
+            par_blocks: par,
         }
+    }
+
+    /// Whether the first factorization runs its blocks in parallel: forced
+    /// by the setting, or under `Auto` when the input is large enough and no
+    /// block holds half the matrix (the a-priori work floor and Amdahl ratio;
+    /// the refactorization decides from the exact plan instead).
+    pub(super) fn parallel_blocks(&self, settings: &KluSettings) -> bool {
+        let nblocks = self.block_ptr.len() - 1;
+        (match settings.parallel {
+            KluParallel::On => true,
+            KluParallel::Off => false,
+            KluParallel::Auto => {
+                self.nnz >= settings.par_min_nnz && self.max_block_size() * 2 <= self.n
+            }
+        }) && nblocks > 1
     }
 
     /// Exact symbolic factor fill (`L` + `U` + diagonal + off-block entries)
@@ -215,22 +285,74 @@ impl KluSymbolic {
     /// `max_tree_width == 1`; there are no dense panels.
     pub fn estimate_memory<T: Scalar>(&self) -> crate::diagnostics::MemoryEstimate {
         let fill = self.symbolic_fill();
-        let value_bytes = std::mem::size_of::<T>();
-        let entry = (value_bytes + std::mem::size_of::<usize>()) as u64;
-        let factor_nnz = fill.l_nnz + fill.u_nnz + self.n as u64 + fill.f_nnz;
-        let factor_bytes = factor_nnz * entry;
-        let input_bytes = self.nnz as u64 * entry;
-        let workspace_bytes = self.n as u64 * (value_bytes as u64 + 4 * 8);
+        let plan = self.memory_plan::<T>(&KluSettings::default(), 1);
         crate::diagnostics::MemoryEstimate {
-            value_bytes,
-            factor_nnz,
-            factor_bytes,
+            value_bytes: std::mem::size_of::<T>(),
+            factor_nnz: fill.l_nnz + fill.u_nnz + self.n as u64 + fill.f_nnz,
+            factor_bytes: plan.factor_bytes,
             panels_all_bytes: 0,
             panel_live_peak_bytes: 0,
-            transient_peak_bytes: factor_bytes + input_bytes + workspace_bytes,
+            transient_peak_bytes: plan.peak_bytes(),
             factor_flops: fill.flops,
             critical_path_flops: fill.flops,
             max_tree_width: 1,
+        }
+    }
+
+    /// The heap a factorization of scalar type `T` under `settings` needs,
+    /// and a solve of `nrhs` right-hand sides after it, predicted from the
+    /// stored pattern before any numeric work, mirroring
+    /// [`LuSymbolic::memory_plan`](crate::LuSymbolic::memory_plan). The fill
+    /// is exact under diagonal pivoting; the first call pays the symbolic
+    /// fill pass, about the cost of a factorization.
+    pub fn memory_plan<T: Scalar>(&self, settings: &KluSettings, nrhs: usize) -> crate::MemoryPlan {
+        let fill = self.symbolic_fill();
+        let vb = std::mem::size_of::<T>() as u64;
+        let (n, nnz) = (self.n as u64, self.nnz as u64);
+        let nblocks = (self.block_ptr.len() - 1) as u64;
+        let price = |(v, o): (u64, u64)| v * vb + o;
+        let parallel = self.parallel_blocks(settings);
+        let threads = if parallel {
+            rayon::current_num_threads()
+        } else {
+            1
+        };
+        // `L`, `U` and the off-block entries at their exact sizes (the
+        // parallel splice), the diagonal and the three column pointers.
+        let entries = fill.l_nnz + fill.u_nnz + fill.f_nnz;
+        let exact = (entries + n) * vb + 4 * entries + 24 * (n + 1);
+        let arrays = if parallel {
+            exact
+        } else {
+            price(fill.seq_arrays)
+        };
+        // Held besides: the row scaling, the final row permutation and its
+        // inverse, copies of the column permutation and the block pointers,
+        // the refactorization's scatter program and its pipelined blocks.
+        let around = 8 * n + 16 * n + 8 * n + 8 * (nblocks + 1) + 8 * nnz + 16 * nblocks;
+        let factor = arrays + around;
+        // While the blocks are factored: the scaling, the scatter program,
+        // the pre-pivot inverse and final positions, the arrays, the block
+        // buffers and each worker's DFS scratch (sized to the largest block).
+        let max_bn = self.max_block_size() as u64;
+        let scratch = max_bn * (8 + 4 + vb + 4 + 8 + 4 + 4 + 8);
+        let base = 8 * n + 8 * nnz + 8 * n;
+        let during = if parallel {
+            base + price(fill.par_blocks) + exact + threads as u64 * scratch + 64 * nblocks
+        } else {
+            base + arrays + price(fill.seq_block) + scratch
+        };
+        crate::MemoryPlan {
+            threads,
+            nrhs,
+            analysis_bytes: self.heap_bytes(),
+            analysis_growth_bytes: 0,
+            factor_bytes: factor,
+            factor_peak_bytes: during.max(factor + 8 * n) + crate::memory::BOOKKEEPING,
+            // The solution and the permuted work vector.
+            solve_bytes: 2 * n * nrhs as u64 * vb,
+            // Its buffers belong to the factor.
+            kept_bytes: 0,
         }
     }
 

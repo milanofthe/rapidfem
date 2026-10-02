@@ -16,16 +16,18 @@
 //! Pattern reuse: the first `factorize` runs the symbolic analysis (the
 //! ordering race; the worker count comes from the calibration when
 //! `install_diagnose` has run) and caches it with the settings; `refactorize`
-//! reuses both and only redoes the numeric phase, which is what a frequency
-//! sweep or a series of eigen shifts on one pattern needs. rslab validates
-//! that the pattern (n, nnz) is unchanged and errors otherwise; `refactorize`
-//! then falls back to a fresh `factorize` instead of solving on a stale
-//! symbolic.
+//! reuses both and redoes only the numeric phase, in place: the new factor
+//! is written into the old one's buffers and keeps its solve schedule and
+//! kernel scratch (rslab's `refactor`, the same bits as a fresh factor),
+//! which is what a frequency sweep or a series of eigen shifts on one
+//! pattern needs. rslab validates that the pattern (n, nnz) is unchanged and
+//! errors otherwise; `refactorize` then falls back to a fresh `factorize`
+//! instead of solving on a stale symbolic.
 //!
-//! Before any numeric work, rslab's a-priori `MemoryEstimate` (from the
-//! symbolic structure alone) is checked against the machine's RAM, so a
-//! factorisation too big for the machine fails fast with a clear message
-//! instead of driving it into swap mid-sweep.
+//! Before any numeric work, rslab's `MemoryPlan` (from the symbolic structure,
+//! the worker count and the number of right-hand sides) is checked against
+//! the machine's RAM, so a factorisation too big for the machine fails fast
+//! with a clear message instead of driving it into swap mid-sweep.
 
 use rslab::{CscMatrix, Inertia, LdltSolver, LdltSymbolic, OrderingMethod, Scalar, SolverSettings};
 
@@ -34,18 +36,24 @@ use rslab::{CscMatrix, Inertia, LdltSolver, LdltSymbolic, OrderingMethod, Scalar
 /// caller's field data; beyond it the machine swaps long before OOM.
 const MEM_BUDGET_FRACTION: f64 = 0.8;
 
-/// A-priori memory gate: estimate the factorisation's transient peak and
-/// error out (before any numeric work) if it exceeds the budget. Returns the
-/// log line describing the estimate.
-fn check_memory<T: Scalar>(sym: &LdltSymbolic) -> Result<String, String> {
-    let est = sym.estimate_memory::<T>();
-    let peak = est.transient_peak_bytes;
+/// A-priori memory gate: plan the factorisation and a solve of `nrhs`
+/// right-hand sides under `settings` and error out (before any numeric work)
+/// if the peak exceeds the budget. Returns the log line describing the plan.
+fn check_memory<T: Scalar>(
+    sym: &LdltSymbolic,
+    settings: &SolverSettings,
+    nrhs: usize,
+) -> Result<String, String> {
+    let plan = sym.memory_plan::<T>(settings, nrhs);
+    let peak = plan.peak_bytes();
     let hw = rslab::tuning::HardwareInfo::probe();
     let budget = (hw.total_ram_bytes as f64 * MEM_BUDGET_FRACTION) as u64;
     let line = format!(
-        "factor nnz {:.2e}, est. peak {:.0} MB (RAM {:.0} MB, {:.0} MB free)",
-        est.factor_nnz as f64,
+        "factor nnz {:.2e}, est. peak {:.0} MB at {} threads, {} rhs (RAM {:.0} MB, {:.0} MB free)",
+        sym.estimate_memory::<T>().factor_nnz as f64,
         peak as f64 / 1e6,
+        plan.threads,
+        plan.nrhs,
         hw.total_ram_bytes as f64 / 1e6,
         hw.available_ram_bytes as f64 / 1e6,
     );
@@ -69,6 +77,8 @@ pub struct SymmetricSolver<T: Scalar> {
     solver: Option<LdltSolver<T>>,
     /// rslab's a-priori estimate of the factorisation: (flops, factor nnz).
     estimate: Option<(u64, u64)>,
+    /// Right-hand sides per solve, for the memory plan.
+    nrhs: usize,
     // Lower-triangle triplet buffers, reused across refactorizations.
     lo_rows: Vec<usize>,
     lo_cols: Vec<usize>,
@@ -77,8 +87,14 @@ pub struct SymmetricSolver<T: Scalar> {
 
 impl<T: Scalar> SymmetricSolver<T> {
     pub fn new() -> Self {
-        Self { n: 0, symbolic: None, solver: None, estimate: None,
+        Self { n: 0, symbolic: None, solver: None, estimate: None, nrhs: 1,
                lo_rows: Vec::new(), lo_cols: Vec::new(), lo_vals: Vec::new() }
+    }
+
+    /// The number of right-hand sides solved at once (the driven ports),
+    /// so the memory plan counts their work vectors.
+    pub fn expect_rhs(&mut self, nrhs: usize) {
+        self.nrhs = nrhs.max(1);
     }
 
     /// Filter the full COO triplets to the lower triangle (row ≥ col) into the
@@ -134,7 +150,7 @@ impl<T: Scalar> SymmetricSolver<T> {
         }
         let sym = LdltSymbolic::analyze(&a, &settings)
             .map_err(|e| format!("rslab analyze: {e:?}"))?;
-        let mem_line = check_memory::<T>(&sym)?;
+        let mem_line = check_memory::<T>(&sym, &settings, self.nrhs)?;
         let est = sym.estimate_memory::<T>();
         self.estimate = Some((est.factor_flops, est.factor_nnz));
         eprintln!(
@@ -172,21 +188,26 @@ impl<T: Scalar> SymmetricSolver<T> {
         }
         let a = self.build_matrix(n, rows, cols, vals)?;
         let (sym, settings) = self.symbolic.as_ref().unwrap();
-        match sym.factor(&a, settings) {
-            Ok(solver) => {
-                if solver.n_perturbed() > 0 {
-                    eprintln!(
-                        "  rslab: WARNING {} perturbed pivots on refactorize",
-                        solver.n_perturbed()
-                    );
+        let done = match self.solver.as_mut() {
+            Some(solver) => sym.refactor(&a, settings, solver).is_ok(),
+            None => match sym.factor(&a, settings) {
+                Ok(solver) => {
+                    self.solver = Some(solver);
+                    true
                 }
-                self.solver = Some(solver);
-                Ok(())
-            }
+                Err(_) => false,
+            },
+        };
+        if !done {
             // Pattern drift (e.g. a Robin entry that is exactly zero at one
             // frequency): redo the analysis instead of failing the sweep.
-            Err(_) => self.factorize(n, rows, cols, vals),
+            return self.factorize(n, rows, cols, vals);
         }
+        let perturbed = self.solver.as_ref().map_or(0, |s| s.n_perturbed());
+        if perturbed > 0 {
+            eprintln!("  rslab: WARNING {perturbed} perturbed pivots on refactorize");
+        }
+        Ok(())
     }
 
     /// Solve `K · x = b` on the cached factorisation.

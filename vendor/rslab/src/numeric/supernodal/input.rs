@@ -27,6 +27,16 @@ pub(crate) struct InputProgram {
 }
 
 impl InputProgram {
+    /// Heap bytes held by the program.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.col_ptr)
+            + vec_bytes(&self.row_idx)
+            + vec_bytes(&self.row_ptr)
+            + vec_bytes(&self.col_idx)
+            + vec_bytes(&self.pos)
+    }
+
     /// The symmetric fold of a lower triangle (LDL^T): entry `(i, j)` lands
     /// at `(max(gi, gj), min(gi, gj))` of `P^T A P`, `g = perm_inv[*]`.
     pub fn symmetric(col_ptr: &[usize], row_idx: &[usize], perm_inv: &[usize]) -> Self {

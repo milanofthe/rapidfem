@@ -109,7 +109,15 @@ pub(super) fn factor_csc<T: Scalar>(
 
 /// Row-max scaling reciprocals (1 for empty rows / scaling off).
 pub(super) fn row_scale_inv<T: Scalar>(a: &GeneralCsc<T>, enabled: bool) -> Vec<f64> {
-    let mut rs = vec![0.0f64; a.n];
+    let mut rs = Vec::new();
+    row_scale_inv_into(a, enabled, &mut rs);
+    rs
+}
+
+/// [`row_scale_inv`] into `rs`, in its storage.
+pub(super) fn row_scale_inv_into<T: Scalar>(a: &GeneralCsc<T>, enabled: bool, rs: &mut Vec<f64>) {
+    rs.clear();
+    rs.resize(a.n, 0.0);
     if enabled {
         for (k, &i) in a.row_idx.iter().enumerate() {
             let m = a.values[k].magnitude();
@@ -118,15 +126,13 @@ pub(super) fn row_scale_inv<T: Scalar>(a: &GeneralCsc<T>, enabled: bool) -> Vec<
             }
         }
     }
-    rs.iter()
-        .map(|&m| {
-            if m > 0.0 && m.is_finite() {
-                1.0 / m
-            } else {
-                1.0
-            }
-        })
-        .collect()
+    for m in rs.iter_mut() {
+        *m = if *m > 0.0 && m.is_finite() {
+            1.0 / *m
+        } else {
+            1.0
+        };
+    }
 }
 
 /// Per-block factor output in absolute position spaces: row indices of
@@ -627,11 +633,7 @@ pub(super) fn factor_impl<T: Scalar>(
     // floor, `no block holds half the matrix` as the block-level Amdahl
     // ratio. The refactor decision is replaced by the exact plan
     // ([`compute_replay_plan`]) once the pattern is frozen.
-    let parallel = match settings.parallel {
-        KluParallel::On => true,
-        KluParallel::Off => false,
-        KluParallel::Auto => sym.nnz >= settings.par_min_nnz && sym.max_block_size() * 2 <= sym.n,
-    } && nblocks > 1;
+    let parallel = sym.parallel_blocks(settings);
     let max_bn = sym.max_block_size();
 
     // Numeric output buffers, filled either incrementally block-by-block
@@ -900,5 +902,7 @@ pub(super) fn factor_impl<T: Scalar>(
         scatter_target,
         pipelined,
         par_refactor,
+        rs_next: Vec::new(),
+        replay_x: Vec::new(),
     })
 }

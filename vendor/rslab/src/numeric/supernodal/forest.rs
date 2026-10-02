@@ -29,24 +29,6 @@ pub(crate) fn ll_forest(
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     const NONE: usize = usize::MAX;
-    let nodes = &sym.supernodes;
-    // Parents and the leaves, depth first from the roots.
-    let mut parent = vec![NONE; nodes.len()];
-    let mut leaves = Vec::new();
-    let mut stack: Vec<usize> = forest_roots(sym);
-    while let Some(s) = stack.pop() {
-        if nodes[s].children.is_empty() {
-            leaves.push(s);
-        }
-        for &c in &nodes[s].children {
-            parent[c] = s;
-            stack.push(c);
-        }
-    }
-    let pending: Vec<AtomicUsize> = nodes
-        .iter()
-        .map(|sn| AtomicUsize::new(sn.children.len()))
-        .collect();
     let failed = AtomicBool::new(false);
     let error = std::sync::Mutex::new(None);
 
@@ -82,42 +64,45 @@ pub(crate) fn ll_forest(
         }
         true
     };
-    fn run<'s>(
-        scope: &rayon::Scope<'s>,
-        s: usize,
-        node: &'s (dyn Fn(usize) -> bool + Sync),
-        parent: &'s [usize],
-        pending: &'s [AtomicUsize],
-    ) {
-        if !node(s) {
-            return;
+    if rayon::current_num_threads() == 1 {
+        // One worker: the supernodes in index order, children before their
+        // parents, with no task per node.
+        for s in 0..sym.supernodes.len() {
+            if !node(s) {
+                break;
+            }
         }
-        let p = parent[s];
-        if p != NONE && pending[p].fetch_sub(1, Ordering::AcqRel) == 1 {
-            scope.spawn(move |sc| run(sc, p, node, parent, pending));
+    } else {
+        fn run<'s>(
+            scope: &rayon::Scope<'s>,
+            s: usize,
+            node: &'s (dyn Fn(usize) -> bool + Sync),
+            parent: &'s [usize],
+            pending: &'s [AtomicUsize],
+        ) {
+            if !node(s) {
+                return;
+            }
+            let p = parent[s];
+            if p != NONE && pending[p].fetch_sub(1, Ordering::AcqRel) == 1 {
+                scope.spawn(move |sc| run(sc, p, node, parent, pending));
+            }
         }
+        let pending: Vec<AtomicUsize> = sym
+            .supernodes
+            .iter()
+            .map(|sn| AtomicUsize::new(sn.children.len()))
+            .collect();
+        let node: &(dyn Fn(usize) -> bool + Sync) = &node;
+        let (parent, pending) = (&sched.parent[..], &pending[..]);
+        rayon::scope(|sc| {
+            for &leaf in &sched.leaves {
+                sc.spawn(move |sc| run(sc, leaf, node, parent, pending));
+            }
+        });
     }
-    let node: &(dyn Fn(usize) -> bool + Sync) = &node;
-    let (parent, pending) = (&parent[..], &pending[..]);
-    rayon::scope(|sc| {
-        for &leaf in &leaves {
-            sc.spawn(move |sc| run(sc, leaf, node, parent, pending));
-        }
-    });
     match error.into_inner() {
         Ok(Some(e)) => Err(e),
         _ => Ok(()),
     }
-}
-
-/// Roots of the assembly forest: supernodes that are no node's child.
-fn forest_roots(sym: &crate::symbolic::SymbolicFactorization) -> Vec<usize> {
-    let nsuper = sym.supernodes.len();
-    let mut is_child = vec![false; nsuper];
-    for snode in &sym.supernodes {
-        for &ch in &snode.children {
-            is_child[ch] = true;
-        }
-    }
-    (0..nsuper).filter(|&s| !is_child[s]).collect()
 }

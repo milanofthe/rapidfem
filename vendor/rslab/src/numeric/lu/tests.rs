@@ -717,7 +717,8 @@ fn exact_structure_bounds_the_factor() {
         let opts = SolverSettings::default().with_matching(matching);
         let lusym = LuSymbolic::analyze(&a, &opts).unwrap();
         assert_eq!(lusym.has_matching(), matching);
-        let num = factor_general_lu_numeric(&lusym, &a, &opts).unwrap();
+        let num = factor_general_lu_numeric(&lusym, &a, &opts, None, &super::node::LuPools::new())
+            .unwrap();
         let (sym, _) = lusym.symb.sym_and_levels().unwrap();
         let sched = lusym.symb.ll_schedule().unwrap();
         let st = &lusym.structure;
@@ -727,7 +728,10 @@ fn exact_structure_bounds_the_factor() {
             if sn.ncol == 0 {
                 continue;
             }
-            let (lk, uk) = (&num.l.rows[k], &num.ut.rows[k]);
+            let rows = |f: &crate::numeric::supernodal::panel::PanelFactor<f64>| {
+                f.rows[f.row_ptr[k]..f.row_ptr[k + 1]].to_vec()
+            };
+            let (lk, uk) = (&rows(&num.l), &rows(&num.ut));
             let (lrows, ucols) = (&st.rows_l(s)[sn.ncol..], &st.cols_u(s)[sn.ncol..]);
             assert!(
                 lk.len() <= lrows.len(),

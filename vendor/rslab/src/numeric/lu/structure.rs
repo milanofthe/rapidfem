@@ -30,6 +30,12 @@ pub(super) struct LuStructure {
 }
 
 impl LuStructure {
+    /// Heap bytes held by the `L` and `U` row structures.
+    pub fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.l_off) + vec_bytes(&self.l) + vec_bytes(&self.u_off) + vec_bytes(&self.u)
+    }
+
     /// The structure of an empty analysis.
     pub fn empty() -> Self {
         LuStructure {

@@ -11,14 +11,59 @@ use crate::error::RslabError;
 use crate::refine::{refine_in_place, RefineOperator, RefineOutcome, RefinePolicy};
 use crate::scalar::Scalar;
 
+/// The scratch of a solve, lent by the caller: sized by the first solve and
+/// reused by every later one, so `solve_into` and its siblings on
+/// [`KluSolver`](crate::KluSolver), [`LuSolver`](crate::LuSolver) and
+/// [`LdltSolver`](crate::LdltSolver) allocate nothing once warm. One work
+/// serves any direct solver and any number of right-hand sides; a thread
+/// that solves concurrently keeps its own.
+pub struct SolveWork<T> {
+    /// The right-hand side block in the factor's order.
+    pub(crate) y: Vec<T>,
+    /// One row of a block, staged apart from the rows it updates.
+    pub(crate) row: Vec<T>,
+    /// The supernodal sweeps' scratch.
+    pub(crate) plan: crate::numeric::supernodal::solve::PlanWork<T>,
+}
+
+impl<T> Default for SolveWork<T> {
+    fn default() -> Self {
+        Self {
+            y: Vec::new(),
+            row: Vec::new(),
+            plan: Default::default(),
+        }
+    }
+}
+
+impl<T> SolveWork<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// The part of a direct solver the shared entry points build on.
 pub(crate) trait SolveCore<T: Scalar> {
     /// The path's name in log records.
     const NAME: &'static str;
     fn dim(&self) -> usize;
     /// `A X = B` (or `A^T X = B`) for a column-major block `b` whose shape
-    /// the caller has checked, without accounting.
-    fn solve_raw(&self, b: &[T], nrhs: usize, transpose: bool) -> Result<Vec<T>, RslabError>;
+    /// the caller has checked, into `x` of the same shape, without
+    /// accounting.
+    fn solve_raw_into(
+        &self,
+        b: &[T],
+        nrhs: usize,
+        transpose: bool,
+        x: &mut [T],
+        work: &mut SolveWork<T>,
+    ) -> Result<(), RslabError>;
+    /// [`solve_raw_into`](Self::solve_raw_into) into a fresh vector.
+    fn solve_raw(&self, b: &[T], nrhs: usize, transpose: bool) -> Result<Vec<T>, RslabError> {
+        let mut x = vec![T::zero(); b.len()];
+        self.solve_raw_into(b, nrhs, transpose, &mut x, &mut SolveWork::new())?;
+        Ok(x)
+    }
     fn counter(&self) -> &SolveCounter;
 }
 
@@ -44,6 +89,22 @@ fn check(n: usize, len: usize, nrhs: usize) -> Result<(), RslabError> {
     Ok(())
 }
 
+pub(crate) fn solve_into<T: Scalar, S: SolveCore<T>>(
+    s: &S,
+    b: &[T],
+    nrhs: usize,
+    transpose: bool,
+    x: &mut [T],
+    work: &mut SolveWork<T>,
+) -> Result<(), RslabError> {
+    check(s.dim(), b.len(), nrhs)?;
+    check(s.dim(), x.len(), nrhs)?;
+    let t = crate::clock::Instant::now();
+    s.solve_raw_into(b, nrhs, transpose, x, work)?;
+    record(s, nrhs, t, 0);
+    Ok(())
+}
+
 pub(crate) fn solve<T: Scalar, S: SolveCore<T>>(
     s: &S,
     b: &[T],
@@ -51,9 +112,8 @@ pub(crate) fn solve<T: Scalar, S: SolveCore<T>>(
     transpose: bool,
 ) -> Result<Vec<T>, RslabError> {
     check(s.dim(), b.len(), nrhs)?;
-    let t = crate::clock::Instant::now();
-    let x = s.solve_raw(b, nrhs, transpose)?;
-    record(s, nrhs, t, 0);
+    let mut x = vec![T::zero(); b.len()];
+    solve_into(s, b, nrhs, transpose, &mut x, &mut SolveWork::new())?;
     Ok(x)
 }
 
@@ -139,6 +199,41 @@ macro_rules! direct_solver {
             /// the adjoint `A^H x = b` conjugate `b` before and `x` after).
             pub fn solve_transpose(&self, b: &[T]) -> Result<Vec<T>, $crate::RslabError> {
                 $crate::numeric::direct::solve(self, b, 1, true)
+            }
+
+            /// [`solve`](Self::solve) into `x`, working in `work`: no
+            /// allocation once `work` has served a solve of this size. The
+            /// same bits as [`solve`](Self::solve).
+            pub fn solve_into(
+                &self,
+                b: &[T],
+                x: &mut [T],
+                work: &mut $crate::SolveWork<T>,
+            ) -> Result<(), $crate::RslabError> {
+                $crate::numeric::direct::solve_into(self, b, 1, false, x, work)
+            }
+
+            /// [`solve_many`](Self::solve_many) into the column-major `x`,
+            /// working in `work`.
+            pub fn solve_many_into(
+                &self,
+                b: &[T],
+                nrhs: usize,
+                x: &mut [T],
+                work: &mut $crate::SolveWork<T>,
+            ) -> Result<(), $crate::RslabError> {
+                $crate::numeric::direct::solve_into(self, b, nrhs, false, x, work)
+            }
+
+            /// [`solve_transpose`](Self::solve_transpose) into `x`, working in
+            /// `work`.
+            pub fn solve_transpose_into(
+                &self,
+                b: &[T],
+                x: &mut [T],
+                work: &mut $crate::SolveWork<T>,
+            ) -> Result<(), $crate::RslabError> {
+                $crate::numeric::direct::solve_into(self, b, 1, true, x, work)
             }
 
             /// Solve `A x = b` with iterative refinement against `a`, the matrix

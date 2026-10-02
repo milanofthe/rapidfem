@@ -248,6 +248,7 @@ pub fn assemble_and_solve_with_pml(
     eprintln!("  COO: {} entries, built in {:.1}ms", coo_rows.len(), t2.elapsed().as_secs_f64()*1e3);
 
     let mut solver = rapidfem_core::linalg::SymmetricSolver::<C64>::new();
+    solver.expect_rhs(port_vectors.len());
     let t_solve = web_time::Instant::now();
     solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
     eprintln!("  {}: factorized in {:.1}ms", solver.name(), t_solve.elapsed().as_secs_f64()*1e3);
@@ -544,6 +545,7 @@ pub fn frequency_sweep_with_pml(
         // worth avoiding. A 681k-DOF iris filter swept over 21 points ran
         // 2.6x faster this way, S-parameters equal to 5e-11. A point that does
         // not converge within its budget refactors and becomes the reference.
+        solver.expect_rhs(b_frees.len());
         let budget = sweep_iteration_budget(&solver, b_frees.len());
         let nearby = if have_factor && budget >= SWEEP_ITERATE_MIN_BUDGET {
             solver.solve_nearby(n_free, &coo_rows, &coo_cols, &coo_vals, &b_frees,

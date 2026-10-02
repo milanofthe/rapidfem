@@ -13,23 +13,58 @@ impl<T: Scalar> crate::numeric::direct::SolveCore<T> for KluSolver<T> {
         &self.solves
     }
 
-    fn solve_raw(&self, b: &[T], nrhs: usize, transpose: bool) -> Result<Vec<T>, RslabError> {
+    fn solve_raw_into(
+        &self,
+        b: &[T],
+        nrhs: usize,
+        transpose: bool,
+        x: &mut [T],
+        work: &mut crate::SolveWork<T>,
+    ) -> Result<(), RslabError> {
         let n = self.factors.n;
-        Ok(if transpose {
-            (0..nrhs)
-                .flat_map(|c| self.solve_transpose_one(&b[c * n..(c + 1) * n]))
-                .collect()
+        if transpose {
+            for c in 0..nrhs {
+                let cols = c * n..(c + 1) * n;
+                self.solve_transpose_one(&b[cols.clone()], &mut x[cols], &mut work.y);
+            }
         } else if nrhs == 1 {
-            self.solve_one(b)
+            self.solve_one(b, x, &mut work.y);
         } else {
-            self.solve_block(b, nrhs)
-        })
+            self.solve_block(b, nrhs, x, work);
+        }
+        Ok(())
     }
 }
 
 crate::numeric::direct::direct_solver!(KluSolver);
 
 impl<T: Scalar> KluSolver<T> {
+    /// Heap bytes this factor holds: `L`, `U` and the off-block entries of
+    /// every block, the permutations and scalings, and the refactorization's
+    /// scatter program.
+    pub fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        let f = &self.factors;
+        vec_bytes(&f.block_ptr)
+            + vec_bytes(&f.row_perm)
+            + vec_bytes(&f.pinv)
+            + vec_bytes(&f.col_perm)
+            + vec_bytes(&f.rs_inv)
+            + vec_bytes(&f.l_colptr)
+            + vec_bytes(&f.l_rowidx)
+            + vec_bytes(&f.l_val)
+            + vec_bytes(&f.u_colptr)
+            + vec_bytes(&f.u_rowidx)
+            + vec_bytes(&f.u_val)
+            + vec_bytes(&f.udiag)
+            + vec_bytes(&f.f_colptr)
+            + vec_bytes(&f.f_rowidx)
+            + vec_bytes(&f.f_val)
+            + vec_bytes(&f.scatter_expect)
+            + vec_bytes(&f.scatter_target)
+            + vec_bytes(&f.pipelined)
+    }
+
     /// One-shot analyze + factor with the given settings. Skips the a-priori
     /// estimate and stage timing (empty [`diagnostics`](Self::diagnostics)),
     /// like [`LuSolver::factor`](crate::LuSolver::factor); use the phased
@@ -133,18 +168,18 @@ impl<T: Scalar> KluSolver<T> {
         &self.factors.rs_inv
     }
 
-    fn solve_one(&self, b: &[T]) -> Vec<T> {
+    fn solve_one(&self, b: &[T], x: &mut [T], w: &mut Vec<T>) {
         let f = &self.factors;
-        let mut w = vec![T::zero(); f.n];
-        for (k, &orig) in f.row_perm.iter().enumerate() {
-            w[k] = b[orig] * T::from_real(f.rs_inv[orig]);
-        }
-        self.solve_permuted(&mut w);
-        let mut xout = vec![T::zero(); f.n];
+        w.clear();
+        w.extend(
+            f.row_perm
+                .iter()
+                .map(|&orig| b[orig] * T::from_real(f.rs_inv[orig])),
+        );
+        self.solve_permuted(w);
         for (k, &c) in f.col_perm.iter().enumerate() {
-            xout[c] = w[k];
+            x[c] = w[k];
         }
-        xout
     }
 
     /// Solve the transposed system `A^T x = b` with the **same** factorization.
@@ -162,21 +197,17 @@ impl<T: Scalar> KluSolver<T> {
     /// contributions from the already-solved earlier blocks), then scatter
     /// through the row permutation and undo the row scaling. Sequential and
     /// bit-deterministic, like [`solve`](Self::solve).
-    fn solve_transpose_one(&self, b: &[T]) -> Vec<T> {
+    fn solve_transpose_one(&self, b: &[T], x: &mut [T], w: &mut Vec<T>) {
         let f = &self.factors;
         // w = C*b: position k of the permuted system reads b at its column.
-        let mut w = vec![T::zero(); f.n];
-        for (k, &c) in f.col_perm.iter().enumerate() {
-            w[k] = b[c];
-        }
-        self.solve_permuted_transpose(&mut w);
+        w.clear();
+        w.extend(f.col_perm.iter().map(|&c| b[c]));
+        self.solve_permuted_transpose(w);
         // x = Rs^-1 * P_r^T * w: scatter through the row permutation, then undo
         // the row scaling (Rs is diagonal, so it transposes onto the solution).
-        let mut xout = vec![T::zero(); f.n];
         for (k, &orig) in f.row_perm.iter().enumerate() {
-            xout[orig] = w[k] * T::from_real(f.rs_inv[orig]);
+            x[orig] = w[k] * T::from_real(f.rs_inv[orig]);
         }
-        xout
     }
 
     /// The transposed block substitution on the permuted vector: `M^T` is block
@@ -221,11 +252,13 @@ impl<T: Scalar> KluSolver<T> {
         }
     }
 
-    fn solve_block(&self, b: &[T], nrhs: usize) -> Vec<T> {
+    fn solve_block(&self, b: &[T], nrhs: usize, x: &mut [T], work: &mut crate::SolveWork<T>) {
         let f = &self.factors;
         let n = f.n;
         // Permute + scale all columns into the row-major work block.
-        let mut w = vec![T::zero(); n * nrhs];
+        work.y.clear();
+        work.y.resize(n * nrhs, T::zero());
+        let w = work.y.as_mut_slice();
         for (k, &orig) in f.row_perm.iter().enumerate() {
             let sv = T::from_real(f.rs_inv[orig]);
             for c in 0..nrhs {
@@ -233,7 +266,9 @@ impl<T: Scalar> KluSolver<T> {
             }
         }
         // Row j's values, staged so the axpy targets never alias the source.
-        let mut xj = vec![T::zero(); nrhs];
+        work.row.clear();
+        work.row.resize(nrhs, T::zero());
+        let xj = work.row.as_mut_slice();
         for blk in (0..f.block_ptr.len() - 1).rev() {
             let (bs, be) = (f.block_ptr[blk], f.block_ptr[blk + 1]);
             // L (unit lower) forward within the block. Negating the factor
@@ -245,7 +280,7 @@ impl<T: Scalar> KluSolver<T> {
                 for k in f.l_colptr[j]..f.l_colptr[j + 1] {
                     let (lr, nlv) = (f.l_rowidx[k] as usize, T::zero() - f.l_val[k]);
                     let row = &mut w[lr * nrhs..lr * nrhs + nrhs];
-                    for (r, &x) in row.iter_mut().zip(&xj) {
+                    for (r, &x) in row.iter_mut().zip(&*xj) {
                         *r = fmadd(nlv, x, *r);
                     }
                 }
@@ -264,7 +299,7 @@ impl<T: Scalar> KluSolver<T> {
                 for k in f.u_colptr[j]..f.u_colptr[j + 1] {
                     let (ur, nuv) = (f.u_rowidx[k] as usize, T::zero() - f.u_val[k]);
                     let row = &mut w[ur * nrhs..ur * nrhs + nrhs];
-                    for (r, &x) in row.iter_mut().zip(&xj) {
+                    for (r, &x) in row.iter_mut().zip(&*xj) {
                         *r = fmadd(nuv, x, *r);
                     }
                 }
@@ -275,20 +310,18 @@ impl<T: Scalar> KluSolver<T> {
                 for k in f.f_colptr[j]..f.f_colptr[j + 1] {
                     let (fr, nfv) = (f.f_rowidx[k] as usize, T::zero() - f.f_val[k]);
                     let row = &mut w[fr * nrhs..fr * nrhs + nrhs];
-                    for (r, &x) in row.iter_mut().zip(&xj) {
+                    for (r, &x) in row.iter_mut().zip(&*xj) {
                         *r = fmadd(nfv, x, *r);
                     }
                 }
             }
         }
         // Undo the column permutation.
-        let mut xout = vec![T::zero(); n * nrhs];
         for (k, &col) in f.col_perm.iter().enumerate() {
             for c in 0..nrhs {
-                xout[c * n + col] = w[k * nrhs + c];
+                x[c * n + col] = w[k * nrhs + c];
             }
         }
-        xout
     }
 
     /// The block forward/backward substitution on the permuted/scaled vector.

@@ -69,9 +69,9 @@
 //! Static pivoting ([`SolverSettings::preconditioner`]) never fails, and a
 //! drop tolerance trades fill for iterations. [`gmres`], [`gmres_block`],
 //! [`cocg`] (complex symmetric) and [`cocr`] take any [`LinearOperator`] and
-//! [`Preconditioner`] with their [`KrylovSettings`]; a `Complex<f32>`
-//! factor preconditions an `f64` iteration through
-//! [`LowPrecisionPreconditioner`].
+//! [`Preconditioner`] with their [`KrylovSettings`]; a factor of the
+//! [`demoted`](GeneralCsc::demoted) matrix preconditions an iteration in the
+//! full precision through [`MixedPrecision`], at half the factor memory.
 //!
 //! ```
 //! # fn main() -> Result<(), rslab::RslabError> {
@@ -108,9 +108,13 @@
 //!
 //! ## Diagnostics and estimates
 //!
-//! Before any numeric work, [`LdltSymbolic::estimate_memory`] (and its LU and
-//! KLU twins) predicts the factor storage, the transient peak and the flops
-//! from the structure alone ([`MemoryEstimate`]). After it, every factor
+//! Before any numeric work, [`LdltSymbolic::memory_plan`] (and its LU and KLU
+//! twins) predicts the heap a factorization under given settings needs: what
+//! the analysis and the factor will hold, the peak while factoring and a
+//! solve's work vectors ([`MemoryPlan`]), for a preflight check against the
+//! memory available and for scheduling factorizations side by side.
+//! [`LdltSymbolic::estimate_memory`] condenses it with the flops
+//! ([`MemoryEstimate`]). After it, every factor
 //! answers `diagnostics()` ([`Diagnostics`]): stage times, fill, threads, the
 //! decisions taken (ordering, scaling, pivoting), and the settings the chosen
 //! path did not read. [`logging`] has one level (`RLA_LOG`, default
@@ -135,6 +139,7 @@ pub(crate) mod error;
 pub(crate) mod inertia;
 pub(crate) mod io;
 pub mod logging;
+pub(crate) mod memory;
 // Test-matrix generators (feature `matgen`) for the benches and tests;
 // `matgen-download` adds a SuiteSparse / Matrix Market fetcher.
 #[cfg(feature = "matgen")]
@@ -167,10 +172,12 @@ pub use io::mtx::{
     read_mtx_complex, MtxLoaded, MtxMatrix,
 };
 pub use logging::{LogLevel, LogSink};
+pub use memory::MemoryPlan;
 pub use refine::{BackwardError, RefineOperator, RefineOutcome, RefinePolicy};
-pub use scalar::Scalar;
+pub use scalar::{Demote, Scalar};
 pub use scaling::ScalingStrategy;
 // The three direct solvers: `XSymbolic::analyze -> .factor -> XSolver`.
+pub use numeric::direct::SolveWork;
 pub use numeric::klu::{KluParallel, KluSettings, KluSolver, KluSymbolic};
 pub use numeric::ldlt::{LdltSolver, LdltSymbolic};
 pub use numeric::lu::{LuSolver, LuSymbolic};
@@ -183,8 +190,8 @@ pub use numeric::settings::{
 pub use numeric::krylov::{
     cocg, cocr, gmres, gmres_block, gmres_recycled, BlockKrylovResult, Factorization, FnOperator,
     FnPreconditioner, KrylovResult, KrylovSettings, LinearOperator, LowPrecisionLu,
-    LowPrecisionPreconditioner, NoPreconditioner, Preconditioner, Recycle, RecycleScalar,
-    StopReason,
+    LowPrecisionPreconditioner, MixedPrecision, NoPreconditioner, Preconditioner, Recycle,
+    RecycleScalar, StopReason,
 };
 pub use sparse::csc::{CscMatrix, CscPattern};
 pub use sparse::general::GeneralCsc;
@@ -223,11 +230,13 @@ pub mod prelude {
         LowPrecisionPreconditioner,
         LuSolver,
         LuSymbolic,
+        MixedPrecision,
         MtxMatrix,
         NoPreconditioner,
         Preconditioner,
         RslabError,
         Scalar,
+        SolveWork,
         SolverSettings,
         ZeroPivotAction,
     };

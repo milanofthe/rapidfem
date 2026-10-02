@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::error::RslabError;
 use crate::numeric::ldlt::LdltPivots;
-use crate::numeric::supernodal::panel::PanelFactor;
+use crate::numeric::supernodal::panel::{PanelFactor, PanelStorage};
 use crate::scalar::{fmadd, Scalar};
 
 const NONE: u32 = u32::MAX;
@@ -62,6 +62,9 @@ pub(crate) struct SolvePlan<T> {
     /// [`PanelFactor`]).
     val_ptr: Vec<usize>,
     vals: Vec<T>,
+    /// A row list of the factor's size, the buffer the next refactorization
+    /// emits its rows into (see [`take_storage`](Self::take_storage)).
+    spare_rows: Vec<u32>,
     /// Reciprocal diagonal per column for a non-unit triangular factor (the
     /// `U^T` of an LU); empty for a unit-diagonal factor.
     diag_inv: Vec<T>,
@@ -73,6 +76,9 @@ pub(crate) struct SolvePlan<T> {
     top_paths: Vec<Vec<u32>>,
     /// Position of a supernode in `top` (`NONE` below the cut).
     top_index: Vec<u32>,
+    /// Per ancestor level, the start of each node's accumulator in the
+    /// level's block, in slots (`level.len() + 1`).
+    top_acc_ptr: Vec<Vec<usize>>,
     /// The blocking of the sweeps.
     cfg: crate::SolveSettings,
 }
@@ -86,6 +92,8 @@ pub(crate) struct Scratch<T> {
     v: Vec<T>,
     partial: Vec<T>,
     accv: Vec<T>,
+    /// A leaf subtree's accumulator of its off-tree updates.
+    acc: Vec<T>,
 }
 
 impl<T> Default for Scratch<T> {
@@ -96,6 +104,46 @@ impl<T> Default for Scratch<T> {
             v: Vec::new(),
             partial: Vec::new(),
             accv: Vec::new(),
+            acc: Vec::new(),
+        }
+    }
+}
+
+/// The sweeps' scratch across solves (part of [`crate::SolveWork`]): a
+/// [`Scratch`] per leaf subtree and per node of the widest node-parallel
+/// ancestor level, the apex nodes' scratch, and an ancestor level's
+/// accumulator block. Sized by the first solve through a plan, reused
+/// after, so a warm sweep allocates nothing.
+pub(crate) struct PlanWork<T> {
+    subtrees: Vec<Scratch<T>>,
+    level: Vec<Scratch<T>>,
+    apex: Scratch<T>,
+    top_acc: Vec<T>,
+    /// This sweep's decision: on the pool, or on the calling thread.
+    parallel: bool,
+}
+
+impl<T> Default for PlanWork<T> {
+    fn default() -> Self {
+        Self {
+            subtrees: Vec::new(),
+            level: Vec::new(),
+            apex: Scratch::default(),
+            top_acc: Vec::new(),
+            parallel: false,
+        }
+    }
+}
+
+impl<T> PlanWork<T> {
+    /// At least a scratch per subtree and per node of the widest level of
+    /// `plan`; never shrinks, so one work serves several plans.
+    fn fit(&mut self, subtrees: usize, widest: usize) {
+        if self.subtrees.len() < subtrees {
+            self.subtrees.resize_with(subtrees, Scratch::default);
+        }
+        if self.level.len() < widest {
+            self.level.resize_with(widest, Scratch::default);
         }
     }
 }
@@ -117,7 +165,176 @@ impl<T> Shared<T> {
     }
 }
 
+/// The cut of the tree ([`SolvePlan::from_panels`]): split the heaviest
+/// subtree until every leaf subtree holds at most `1 / leaf_subtrees` of the
+/// work (or is a single supernode). `own(s)` is the work of supernode `s`,
+/// its panel entries. Returns which supernodes lie above the cut and the
+/// leaf subtree roots, ascending.
+fn cut(
+    parent: &[u32],
+    children: &[Vec<u32>],
+    leaf_subtrees: usize,
+    own: impl Fn(usize) -> u64,
+) -> (Vec<bool>, Vec<u32>) {
+    let ns = parent.len();
+    let mut work = vec![0u64; ns];
+    for s in 0..ns {
+        work[s] += own(s);
+        if parent[s] != NONE {
+            let w = work[s];
+            work[parent[s] as usize] += w;
+        }
+    }
+    let roots = || (0..ns).filter(|&s| parent[s] == NONE);
+    let leaf_cap = roots().map(|s| work[s]).sum::<u64>() / leaf_subtrees.max(1) as u64;
+    let mut heap: std::collections::BinaryHeap<(u64, std::cmp::Reverse<u32>)> = roots()
+        .map(|s| (work[s], std::cmp::Reverse(s as u32)))
+        .collect();
+    let mut is_top = vec![false; ns];
+    let mut leaf_roots: Vec<u32> = Vec::new();
+    while let Some((wk, std::cmp::Reverse(s))) = heap.pop() {
+        if wk <= leaf_cap || children[s as usize].is_empty() {
+            leaf_roots.push(s);
+        } else {
+            is_top[s as usize] = true;
+            for &c in &children[s as usize] {
+                heap.push((work[c as usize], std::cmp::Reverse(c)));
+            }
+        }
+    }
+    leaf_roots.sort_unstable();
+    (is_top, leaf_roots)
+}
+
+/// Columns of every supernode's strict ancestors, the length of its
+/// accumulator path. Parents carry larger indices than their children.
+fn columns_above(parent: &[u32], width: impl Fn(usize) -> usize) -> Vec<usize> {
+    let mut above = vec![0usize; parent.len()];
+    for s in (0..parent.len()).rev() {
+        let p = parent[s];
+        if p != NONE {
+            above[s] = above[p as usize] + width(p as usize);
+        }
+    }
+    above
+}
+
+/// The heap of a [`SolvePlan`] not built yet, for the memory plan: the
+/// schedule around the panels, its build and a solve's work vectors.
+pub(crate) struct LayoutSize {
+    /// Bytes of the schedule (all but the values and the reciprocal diagonal).
+    pub held: u64,
+    /// Peak bytes of the build's temporaries.
+    pub build: u64,
+    /// Entries of `T` per right-hand side a solve allocates besides the
+    /// right-hand side itself: the accumulators, the apex buffers and each
+    /// thread's node scratch.
+    pub solve_per_rhs: u64,
+}
+
+/// The [`LayoutSize`] of the plan [`SolvePlan::from_panels`] builds on the
+/// supernode tree (`parent`, `usize::MAX` for a root) with each supernode's
+/// width `w` and off-block row count `m`, solved on `threads` threads.
+/// Mirrors `from_panels` on a tree-nested structure.
+pub(crate) fn layout_size(
+    parent: &[usize],
+    w: &[usize],
+    m: &[usize],
+    cfg: &crate::SolveSettings,
+    threads: usize,
+) -> LayoutSize {
+    use crate::memory::pushed;
+    let ns = parent.len();
+    let n: usize = w.iter().sum();
+    let rows: usize = m.iter().sum();
+    let parent: Vec<u32> = (0..ns)
+        .map(|s| match parent[s] {
+            p if p != usize::MAX && p < ns && p > s => p as u32,
+            _ => NONE,
+        })
+        .collect();
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); ns];
+    for s in 0..ns {
+        if parent[s] != NONE {
+            children[parent[s] as usize].push(s as u32);
+        }
+    }
+    let (is_top, leaf_roots) = cut(&parent, &children, cfg.leaf_subtrees, |s| {
+        (w[s] * (w[s] + m[s])) as u64
+    });
+    let above = columns_above(&parent, |s| w[s]);
+    let mut size = vec![1usize; ns];
+    for s in 0..ns {
+        if parent[s] != NONE {
+            size[parent[s] as usize] += size[s];
+        }
+    }
+    let mut depth = vec![0usize; ns];
+    let mut level_len: Vec<usize> = Vec::new();
+    for s in (0..ns).rev().filter(|&s| is_top[s]) {
+        let p = parent[s];
+        depth[s] = if p == NONE { 0 } else { depth[p as usize] + 1 };
+        if level_len.len() <= depth[s] {
+            level_len.resize(depth[s] + 1, 0);
+        }
+        level_len[depth[s]] += 1;
+    }
+    let top: Vec<usize> = (0..ns).filter(|&s| is_top[s]).collect();
+    // sn_col, row_ptr, val_ptr (pushed by the arena), rows, ext_slot, top_index.
+    let fixed = 4 * (ns + 1) + 8 * (ns + 1) + 8 * pushed(ns + 1) + 8 * rows + 4 * ns;
+    let subtrees = leaf_roots.len() * std::mem::size_of::<Subtree>()
+        + leaf_roots
+            .iter()
+            .map(|&r| 4 * pushed(size[r as usize]) + 4 * above[r as usize])
+            .sum::<usize>();
+    let levels = level_len.len() * 24 + level_len.iter().map(|&l| 4 * pushed(l)).sum::<usize>();
+    let paths = top.len() * 24 + top.iter().map(|&t| 4 * above[t]).sum::<usize>();
+    // sn_of, the tree (parent, children), work, heap, flags and slots.
+    let build = 4 * n + ns * (4 + 24 + 4 + 8 + 16 + 1 + 4 + 4 + 4);
+    // Accumulators of the subtrees and of the widest ancestor level, the
+    // apex node's extended vector and partial slabs, and per thread the
+    // node scratch of a subtree sweep.
+    let max_ld = (0..ns).map(|s| w[s] + m[s]).max().unwrap_or(0);
+    let mut level_acc = vec![0usize; level_len.len()];
+    for &t in &top {
+        level_acc[depth[t]] += above[t];
+    }
+    let gmax = cfg.block.max(1).div_ceil(cfg.ancestor_chunk.max(1));
+    let solve_per_rhs = leaf_roots.iter().map(|&r| above[r as usize]).sum::<usize>()
+        + level_acc.iter().copied().max().unwrap_or(0)
+        + (2 + gmax) * max_ld
+        + threads.max(1) * 2 * max_ld;
+    LayoutSize {
+        held: (fixed + subtrees + levels + paths) as u64,
+        build: build as u64,
+        solve_per_rhs: solve_per_rhs as u64,
+    }
+}
+
 impl<T: Scalar> SolvePlan<T> {
+    /// Heap bytes held: the panels (the factor's values) and the schedule.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        use crate::memory::{nested_bytes, vec_bytes};
+        vec_bytes(&self.sn_col)
+            + vec_bytes(&self.row_ptr)
+            + vec_bytes(&self.rows)
+            + vec_bytes(&self.ext_slot)
+            + vec_bytes(&self.val_ptr)
+            + vec_bytes(&self.vals)
+            + vec_bytes(&self.spare_rows)
+            + vec_bytes(&self.diag_inv)
+            + vec_bytes(&self.subtrees)
+            + self
+                .subtrees
+                .iter()
+                .map(|t| vec_bytes(&t.nodes) + vec_bytes(&t.path_cols))
+                .sum::<u64>()
+            + nested_bytes(&self.top_levels)
+            + nested_bytes(&self.top_paths)
+            + vec_bytes(&self.top_index)
+            + nested_bytes(&self.top_acc_ptr)
+    }
+
     /// Build the schedule over a factor in panel form, taking the panels as
     /// the plan's storage (no copy). `supernode_parent` is the supernode
     /// tree of the analysis (`usize::MAX` for a root); an empty or
@@ -138,17 +355,6 @@ impl<T: Scalar> SolvePlan<T> {
                 sn_of[c] = s as u32;
             }
         }
-        let mut row_ptr = Vec::with_capacity(ns + 1);
-        row_ptr.push(0usize);
-        let mut rows: Vec<u32> = Vec::with_capacity(factor.rows.iter().map(|r| r.len()).sum());
-        for r in &factor.rows {
-            debug_assert!(
-                r.windows(2).all(|p| p[0] < p[1]),
-                "off-block rows ascending"
-            );
-            rows.extend_from_slice(r);
-            row_ptr.push(rows.len());
-        }
         let diag_inv: Vec<T> = if unit {
             Vec::new()
         } else {
@@ -162,7 +368,19 @@ impl<T: Scalar> SolvePlan<T> {
             }
             d
         };
-        let PanelFactor { val_ptr, vals, .. } = factor;
+        let PanelFactor {
+            rows,
+            row_ptr,
+            val_ptr,
+            vals,
+            ..
+        } = factor;
+        debug_assert!(
+            (0..ns).all(|s| rows[row_ptr[s]..row_ptr[s + 1]]
+                .windows(2)
+                .all(|p| p[0] < p[1])),
+            "off-block rows ascending"
+        );
         let known = supernode_parent.len() == ns;
 
         let mut parent = vec![NONE; ns];
@@ -184,41 +402,12 @@ impl<T: Scalar> SolvePlan<T> {
                 }
             }
         }
-        let mut work = vec![0u64; ns];
-        for s in 0..ns {
-            let w = (sn_col[s + 1] - sn_col[s]) as u64;
-            let m = (row_ptr[s + 1] - row_ptr[s]) as u64;
-            work[s] += w * (w + m);
-            if parent[s] != NONE {
-                let own = work[s];
-                work[parent[s] as usize] += own;
-            }
-        }
-        let total: u64 = (0..ns)
-            .filter(|&s| parent[s] == NONE)
-            .map(|s| work[s])
-            .sum();
-        let leaf_cap = total / cfg.leaf_subtrees.max(1) as u64;
-
-        // Cut: split the heaviest subtree until every leaf subtree is under
-        // the cap (or a single supernode).
-        let mut heap: std::collections::BinaryHeap<(u64, std::cmp::Reverse<u32>)> = (0..ns)
-            .filter(|&s| parent[s] == NONE)
-            .map(|s| (work[s], std::cmp::Reverse(s as u32)))
-            .collect();
-        let mut is_top = vec![false; ns];
-        let mut leaf_roots: Vec<u32> = Vec::new();
-        while let Some((wk, std::cmp::Reverse(s))) = heap.pop() {
-            if wk <= leaf_cap || children[s as usize].is_empty() {
-                leaf_roots.push(s);
-            } else {
-                is_top[s as usize] = true;
-                for &c in &children[s as usize] {
-                    heap.push((work[c as usize], std::cmp::Reverse(c)));
-                }
-            }
-        }
-        leaf_roots.sort_unstable();
+        let width = |s: usize| (sn_col[s + 1] - sn_col[s]) as usize;
+        let (is_top, leaf_roots) = cut(&parent, &children, cfg.leaf_subtrees, |s| {
+            let w = width(s) as u64;
+            w * (w + (row_ptr[s + 1] - row_ptr[s]) as u64)
+        });
+        let above = columns_above(&parent, width);
 
         // Subtree membership and node lists (ascending = elimination order).
         let mut subtree_of = vec![NONE; ns];
@@ -236,7 +425,7 @@ impl<T: Scalar> SolvePlan<T> {
             for &s in &nodes {
                 subtree_of[s as usize] = t as u32;
             }
-            let mut path_cols = Vec::new();
+            let mut path_cols = Vec::with_capacity(above[r as usize]);
             let mut a = parent[r as usize];
             while a != NONE {
                 path_cols.extend(sn_col[a as usize]..sn_col[a as usize + 1]);
@@ -262,7 +451,7 @@ impl<T: Scalar> SolvePlan<T> {
         let top_paths: Vec<Vec<u32>> = top
             .iter()
             .map(|&t| {
-                let mut path_cols = Vec::new();
+                let mut path_cols = Vec::with_capacity(above[t as usize]);
                 let mut a = parent[t as usize];
                 while a != NONE {
                     path_cols.extend(sn_col[a as usize]..sn_col[a as usize + 1]);
@@ -359,6 +548,19 @@ impl<T: Scalar> SolvePlan<T> {
             }
             ix
         };
+        // Per ancestor level, where each node's accumulator starts in the
+        // level's block, in slots.
+        let top_acc_ptr: Vec<Vec<usize>> = top_levels
+            .iter()
+            .map(|level| {
+                std::iter::once(0)
+                    .chain(level.iter().scan(0usize, |o, &s| {
+                        *o += top_paths[top_index[s as usize] as usize].len();
+                        Some(*o)
+                    }))
+                    .collect()
+            })
+            .collect();
         Self {
             n,
             sn_col,
@@ -372,11 +574,68 @@ impl<T: Scalar> SolvePlan<T> {
             top_levels,
             top_paths,
             top_index,
+            top_acc_ptr,
+            spare_rows: Vec::new(),
             cfg: crate::SolveSettings {
                 block: cfg.block.max(1),
                 ancestor_chunk: cfg.ancestor_chunk.max(1),
                 ..cfg
             },
+        }
+    }
+
+    /// The panels' buffer and a spare row list, taken out for the next
+    /// factorization of the same analysis to fill; [`refill`](Self::refill)
+    /// puts the result back. The plan cannot solve until then.
+    pub(crate) fn take_storage(&mut self) -> PanelStorage<T> {
+        PanelStorage {
+            vals: std::mem::take(&mut self.vals),
+            rows: std::mem::take(&mut self.spare_rows),
+        }
+    }
+
+    /// Take `factor`, the next factorization of this plan's analysis, as
+    /// [`from_panels`](Self::from_panels) would. When its supernodes and rows
+    /// are the plan's and `cfg` is unchanged, only the panels and the
+    /// reciprocal diagonal change and the schedule stays; a factorization
+    /// whose pivoting or cancellation changed the rows gets a new plan.
+    pub fn refill(
+        &mut self,
+        factor: PanelFactor<T>,
+        supernode_parent: &[usize],
+        unit: bool,
+        cfg: crate::SolveSettings,
+    ) {
+        let cfg_now = crate::SolveSettings {
+            block: cfg.block.max(1),
+            ancestor_chunk: cfg.ancestor_chunk.max(1),
+            ..cfg
+        };
+        let ns = factor.n_supernodes();
+        let same = cfg_now == self.cfg
+            && factor.n == self.n
+            && unit == self.diag_inv.is_empty()
+            && factor.sn_col == self.sn_col
+            && factor.val_ptr == self.val_ptr
+            && factor.row_ptr == self.row_ptr
+            && factor.rows == self.rows;
+        if !same {
+            *self = Self::from_panels(factor, supernode_parent, unit, cfg);
+            return;
+        }
+        // The new row list equals the plan's: kept as the next spare.
+        let PanelFactor { vals, rows, .. } = factor;
+        self.vals = vals;
+        self.spare_rows = rows;
+        if !unit {
+            for s in 0..ns {
+                let (c0, c1) = (self.sn_col[s] as usize, self.sn_col[s + 1] as usize);
+                let ld = c1 - c0 + self.row_ptr[s + 1] - self.row_ptr[s];
+                let panel = &self.vals[self.val_ptr[s]..];
+                for k in 0..c1 - c0 {
+                    self.diag_inv[c0 + k] = panel[k * ld + k].recip();
+                }
+            }
         }
     }
 
@@ -461,105 +720,149 @@ impl<T: Scalar> SolvePlan<T> {
         }
     }
 
-    /// Run `f` inside the rayon pool: every parallel section is cheap to
-    /// start from a worker and expensive to inject from outside, so a solve
-    /// enters the pool once.
-    fn in_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-        if rayon::current_thread_index().is_none() && rayon::current_num_threads() > 1 {
+    /// Run `f` inside the rayon pool when `par`: every parallel section is
+    /// cheap to start from a worker and expensive to inject from outside, so
+    /// a solve enters the pool once.
+    fn in_pool<R: Send>(par: bool, f: impl FnOnce() -> R + Send) -> R {
+        if par && rayon::current_thread_index().is_none() && rayon::current_num_threads() > 1 {
             rayon::join(f, || ()).0
         } else {
             f()
         }
     }
 
+    /// `f` over the items with their scratch, on the pool when `par`, in
+    /// order on the calling thread otherwise: the same sums either way.
+    fn each<A: Sync, S: Send>(
+        par: bool,
+        items: &[A],
+        scratch: &mut [S],
+        f: impl Fn(usize, &A, &mut S) + Sync + Send,
+    ) {
+        if par {
+            items
+                .par_iter()
+                .zip(scratch.par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (a, s))| f(i, a, s));
+        } else {
+            for (i, (a, s)) in items.iter().zip(scratch.iter_mut()).enumerate() {
+                f(i, a, s);
+            }
+        }
+    }
+
+    /// `work` fitted to a sweep of `nr` right-hand sides: a scratch per
+    /// subtree and per node of the widest ancestor level, and the decision
+    /// to run on the pool, taken on the sweep's work (panel entries times
+    /// right-hand sides up to four: a wider block gains no more from the
+    /// pool than four columns do).
+    fn fit<'w>(&self, work: &'w mut PlanWork<T>, nr: usize) -> &'w mut PlanWork<T> {
+        let widest = self.top_levels.iter().map(Vec::len).max().unwrap_or(0);
+        work.fit(self.subtrees.len(), widest);
+        work.parallel = self.vals.len().saturating_mul(nr.min(4)) >= self.cfg.par_min_work;
+        work
+    }
+
     /// Forward sweep `L y = y` in place on `nr` row-major right-hand sides.
-    pub fn forward(&self, nr: usize, y: &mut [T]) {
-        Self::in_pool(|| {
+    pub fn forward(&self, nr: usize, y: &mut [T], work: &mut PlanWork<T>) {
+        let work = self.fit(work, nr);
+        Self::in_pool(work.parallel, || {
             if nr == 1 {
-                self.forward_single(y);
+                self.forward_single(y, work);
             } else {
-                self.forward_block(nr, y);
+                self.forward_block(nr, y, work);
             }
         })
     }
 
     /// Backward sweep `L^T x = x` (or `U x = x` for a non-unit factor) in
     /// place on `nr` row-major right-hand sides.
-    pub fn backward(&self, nr: usize, x: &mut [T]) {
-        Self::in_pool(|| {
+    pub fn backward(&self, nr: usize, x: &mut [T], work: &mut PlanWork<T>) {
+        let work = self.fit(work, nr);
+        Self::in_pool(work.parallel, || {
             if nr == 1 {
-                self.backward_single(x);
+                self.backward_single(x, work);
             } else {
-                self.backward_block(nr, x);
+                self.backward_block(nr, x, work);
             }
         })
     }
 
     /// Solve `L D L^T y = y` in place on the permuted, scaled right-hand side.
-    pub fn solve_in_place(&self, f: &LdltPivots<T>, y: &mut [T]) -> Result<(), RslabError> {
-        Self::in_pool(|| self.solve_in_place_inner(f, y))
+    pub fn solve_in_place(
+        &self,
+        f: &LdltPivots<T>,
+        y: &mut [T],
+        work: &mut PlanWork<T>,
+    ) -> Result<(), RslabError> {
+        let work = self.fit(work, 1);
+        Self::in_pool(work.parallel, || self.solve_in_place_inner(f, y, work))
     }
 
-    fn solve_in_place_inner(&self, f: &LdltPivots<T>, y: &mut [T]) -> Result<(), RslabError> {
+    fn solve_in_place_inner(
+        &self,
+        f: &LdltPivots<T>,
+        y: &mut [T],
+        work: &mut PlanWork<T>,
+    ) -> Result<(), RslabError> {
         debug_assert_eq!(y.len(), self.n);
         let mut phases = PhaseTrace::start();
-        self.forward_single(y);
+        self.forward_single(y, work);
         phases.lap("forward");
         solve_diagonal(f, y, 1)?;
         phases.lap("diag");
-        self.backward_single(y);
+        self.backward_single(y, work);
         phases.lap("backward");
         phases.finish("solve");
         Ok(())
     }
 
-    fn forward_single(&self, y: &mut [T]) {
+    fn forward_single(&self, y: &mut [T], work: &mut PlanWork<T>) {
         let shared = Shared(y.as_mut_ptr(), y.len());
         let mut phases = PhaseTrace::start();
         // Forward: leaf subtrees in parallel, off-tree updates accumulated.
-        let accs: Vec<Vec<T>> = self
-            .subtrees
-            .par_iter()
-            .map_init(Scratch::default, |sc, st| {
-                let mut acc = vec![T::zero(); st.path_cols.len()];
-                // SAFETY: see `Shared`; this subtree writes only its own
-                // columns and reads only them.
-                let yv = unsafe { shared.slice() };
-                for &s in &st.nodes {
-                    self.fwd_node(s, yv, &mut acc, &mut sc.t);
-                }
-                acc
-            })
-            .collect();
+        let par = work.parallel;
+        let scratch = &mut work.subtrees[..self.subtrees.len()];
+        Self::each(par, &self.subtrees, scratch, |_, st, sc| {
+            sc.acc.clear();
+            sc.acc.resize(st.path_cols.len(), T::zero());
+            // SAFETY: see `Shared`; this subtree writes only its own
+            // columns and reads only them.
+            let yv = unsafe { shared.slice() };
+            for &s in &st.nodes {
+                self.fwd_node(s, yv, &mut sc.acc, &mut sc.t);
+            }
+        });
         phases.lap("fwd-subtrees");
-        for (st, acc) in self.subtrees.iter().zip(&accs) {
-            for (&c, &a) in st.path_cols.iter().zip(acc) {
+        for (st, sc) in self.subtrees.iter().zip(&work.subtrees) {
+            for (&c, &a) in st.path_cols.iter().zip(&sc.acc) {
                 y[c as usize] = y[c as usize] - a;
             }
         }
         phases.lap("fwd-reduce");
-        self.top_forward(1, y);
+        self.top_forward(1, y, work);
         phases.lap("fwd-top");
         phases.finish("forward");
     }
 
-    fn backward_single(&self, y: &mut [T]) {
-        let shared = Shared(y.as_mut_ptr(), y.len());
+    fn backward_single(&self, y: &mut [T], work: &mut PlanWork<T>) {
         let mut phases = PhaseTrace::start();
         // Backward: ancestors first, then the subtrees in parallel.
-        self.top_backward(1, y);
+        self.top_backward(1, y, work);
         phases.lap("bwd-top");
-        self.subtrees
-            .par_iter()
-            .for_each_init(Scratch::default, |sc, st| {
-                // SAFETY: see `Shared`; this subtree writes only its own
-                // columns and reads its own plus ancestor columns, which
-                // are final.
-                let xv = unsafe { shared.slice() };
-                for &s in st.nodes.iter().rev() {
-                    self.bwd_node(s, xv, &mut sc.g);
-                }
-            });
+        let shared = Shared(y.as_mut_ptr(), y.len());
+        let par = work.parallel;
+        let scratch = &mut work.subtrees[..self.subtrees.len()];
+        Self::each(par, &self.subtrees, scratch, |_, st, sc| {
+            // SAFETY: see `Shared`; this subtree writes only its own
+            // columns and reads its own plus ancestor columns, which
+            // are final.
+            let xv = unsafe { shared.slice() };
+            for &s in st.nodes.iter().rev() {
+                self.bwd_node(s, xv, &mut sc.g);
+            }
+        });
         phases.lap("bwd-subtrees");
         phases.finish("backward");
     }
@@ -587,33 +890,20 @@ impl<T: Scalar> SolvePlan<T> {
         w * (w + m)
     }
 
-    fn top_forward(&self, nr: usize, y: &mut [T]) {
+    fn top_forward(&self, nr: usize, y: &mut [T], work: &mut PlanWork<T>) {
+        let par = work.parallel;
         let nt = rayon::current_num_threads().max(1);
         let shared = Shared(y.as_mut_ptr(), y.len());
-        let mut acc_all: Vec<T> = Vec::new();
-        let mut apex_scratch = Scratch::default();
-        for level in self.top_levels.iter().rev() {
-            let node_par = level.len() >= nt || nt == 1;
-            // One accumulator buffer for the level, a disjoint slice per node.
-            let offsets: Vec<usize> = level
-                .iter()
-                .scan(0usize, |o, &s| {
-                    let here = *o;
-                    *o += self.top_paths[self.top_index[s as usize] as usize].len() * nr;
-                    Some(here)
-                })
-                .collect();
-            let total: usize = level
-                .iter()
-                .map(|&s| self.top_paths[self.top_index[s as usize] as usize].len() * nr)
-                .sum();
-            acc_all.clear();
-            acc_all.resize(total, T::zero());
-            let accs = Shared(acc_all.as_mut_ptr(), acc_all.len());
+        for (li, level) in self.top_levels.iter().enumerate().rev() {
+            let node_par = !par || level.len() >= nt || nt == 1;
+            // One accumulator block for the level, a disjoint slice per node.
+            let ptr = &self.top_acc_ptr[li];
+            work.top_acc.clear();
+            work.top_acc.resize(ptr[level.len()] * nr, T::zero());
+            let accs = Shared(work.top_acc.as_mut_ptr(), work.top_acc.len());
             let sweep = |i: usize, s: u32, y: &mut [T], par: bool, sc: &mut Scratch<T>| {
-                let len = self.top_paths[self.top_index[s as usize] as usize].len() * nr;
-                // SAFETY: node `i` owns `acc_all[offsets[i]..offsets[i] + len]`.
-                let acc = unsafe { &mut accs.slice()[offsets[i]..offsets[i] + len] };
+                // SAFETY: node `i` owns its range of the level's block.
+                let acc = unsafe { &mut accs.slice()[ptr[i] * nr..ptr[i + 1] * nr] };
                 if self.work(s) >= self.cfg.apex_min_work {
                     self.apex_forward(s, nr, y, acc, par, sc);
                 } else if nr == 1 {
@@ -623,23 +913,20 @@ impl<T: Scalar> SolvePlan<T> {
                 }
             };
             if node_par {
-                level
-                    .par_iter()
-                    .enumerate()
-                    .for_each_init(Scratch::default, |sc, (i, &s)| {
-                        // SAFETY: see `Shared`; the node writes only its own
-                        // columns, its off-block rows go to its accumulator.
-                        let yv = unsafe { shared.slice() };
-                        sweep(i, s, yv, false, sc);
-                    });
+                Self::each(par, level, &mut work.level[..level.len()], |i, &s, sc| {
+                    // SAFETY: see `Shared`; the node writes only its own
+                    // columns, its off-block rows go to its accumulator.
+                    let yv = unsafe { shared.slice() };
+                    sweep(i, s, yv, false, sc);
+                });
             } else {
                 for (i, &s) in level.iter().enumerate() {
-                    sweep(i, s, y, true, &mut apex_scratch);
+                    sweep(i, s, y, true, &mut work.apex);
                 }
             }
             for (i, &s) in level.iter().enumerate() {
                 let path = &self.top_paths[self.top_index[s as usize] as usize];
-                let acc = &acc_all[offsets[i]..offsets[i] + path.len() * nr];
+                let acc = &work.top_acc[ptr[i] * nr..ptr[i + 1] * nr];
                 for (k, &c) in path.iter().enumerate() {
                     sub_assign(
                         &mut y[c as usize * nr..(c as usize + 1) * nr],
@@ -650,12 +937,12 @@ impl<T: Scalar> SolvePlan<T> {
         }
     }
 
-    fn top_backward(&self, nr: usize, x: &mut [T]) {
+    fn top_backward(&self, nr: usize, x: &mut [T], work: &mut PlanWork<T>) {
+        let par = work.parallel;
         let nt = rayon::current_num_threads().max(1);
         let shared = Shared(x.as_mut_ptr(), x.len());
-        let mut apex_scratch = Scratch::default();
         for level in &self.top_levels {
-            let node_par = level.len() >= nt || nt == 1;
+            let node_par = !par || level.len() >= nt || nt == 1;
             let sweep = |s: u32, x: &mut [T], par: bool, sc: &mut Scratch<T>| {
                 if self.work(s) >= self.cfg.apex_min_work {
                     self.apex_backward(s, nr, x, par, sc);
@@ -666,7 +953,7 @@ impl<T: Scalar> SolvePlan<T> {
                 }
             };
             if node_par {
-                level.par_iter().for_each_init(Scratch::default, |sc, &s| {
+                Self::each(par, level, &mut work.level[..level.len()], |_, &s, sc| {
                     // SAFETY: see `Shared`; the node writes only its own
                     // columns and reads final ancestor columns.
                     let xv = unsafe { shared.slice() };
@@ -674,7 +961,7 @@ impl<T: Scalar> SolvePlan<T> {
                 });
             } else {
                 for &s in level {
-                    sweep(s, x, true, &mut apex_scratch);
+                    sweep(s, x, true, &mut work.apex);
                 }
             }
         }
@@ -709,18 +996,17 @@ impl<T: Scalar> SolvePlan<T> {
             if je == ld {
                 break;
             }
-            let chunks: Vec<(usize, usize)> = (jb..je)
-                .step_by(self.cfg.ancestor_chunk)
-                .map(|k| (k, (k + self.cfg.ancestor_chunk).min(je)))
-                .collect();
+            // Column chunk `g` of the block: `[jb + g * chunk, ...)`.
+            let chunk = self.cfg.ancestor_chunk;
+            let used = (je - jb).div_ceil(chunk);
             let rows = ld - je;
             let slab = rows * nr;
             partial.clear();
             partial.resize(gmax * slab, T::zero());
             let (vhead, vtail) = v.split_at_mut(je * nr);
             let vhead: &[T] = vhead;
-            let product = |&(k0, k1): &(usize, usize), out: &mut [T]| {
-                for k in k0..k1 {
+            let product = |g: usize, out: &mut [T]| {
+                for k in jb + g * chunk..(jb + (g + 1) * chunk).min(je) {
                     let vk = &vhead[k * nr..(k + 1) * nr];
                     let col = &panel[k * ld + je..(k + 1) * ld];
                     if nr == 1 {
@@ -738,7 +1024,6 @@ impl<T: Scalar> SolvePlan<T> {
                     }
                 }
             };
-            let used = chunks.len();
             let rchunk = (rows / (4 * rayon::current_num_threads().max(1))).max(64) * nr;
             let reduce = |ci: usize, vr: &mut [T], partial: &[T]| {
                 let o = ci * rchunk;
@@ -749,16 +1034,16 @@ impl<T: Scalar> SolvePlan<T> {
             if par {
                 partial[..used * slab]
                     .par_chunks_mut(slab)
-                    .zip(chunks.par_iter())
-                    .for_each(|(out, ch)| product(ch, out));
+                    .enumerate()
+                    .for_each(|(g, out)| product(g, out));
                 let partial: &[T] = partial;
                 vtail
                     .par_chunks_mut(rchunk)
                     .enumerate()
                     .for_each(|(ci, vr)| reduce(ci, vr, partial));
             } else {
-                for (out, ch) in partial[..used * slab].chunks_mut(slab).zip(&chunks) {
-                    product(ch, out);
+                for (g, out) in partial[..used * slab].chunks_mut(slab).enumerate() {
+                    product(g, out);
                 }
                 for (ci, vr) in vtail.chunks_mut(rchunk).enumerate() {
                     reduce(ci, vr, partial);
@@ -788,7 +1073,7 @@ impl<T: Scalar> SolvePlan<T> {
         let accv = &mut sc.accv;
         accv.clear();
         accv.resize(w * nr, T::zero());
-        for (jb, je) in col_blocks(w, self.cfg.block).into_iter().rev() {
+        for (jb, je) in col_blocks(w, self.cfg.block).rev() {
             if je < ld {
                 let tail: &[T] = &v[je * nr..ld * nr];
                 let dots = |c: usize, outs: &mut [T]| {
@@ -896,8 +1181,10 @@ impl<T: Scalar> SolvePlan<T> {
         f: &LdltPivots<T>,
         y: &mut [T],
         nr: usize,
+        work: &mut PlanWork<T>,
     ) -> Result<(), RslabError> {
-        Self::in_pool(|| self.solve_block_inner(f, y, nr))
+        let work = self.fit(work, nr);
+        Self::in_pool(work.parallel, || self.solve_block_inner(f, y, nr, work))
     }
 
     fn solve_block_inner(
@@ -905,62 +1192,61 @@ impl<T: Scalar> SolvePlan<T> {
         f: &LdltPivots<T>,
         y: &mut [T],
         nr: usize,
+        work: &mut PlanWork<T>,
     ) -> Result<(), RslabError> {
         debug_assert_eq!(y.len(), self.n * nr);
         let mut phases = PhaseTrace::start();
-        self.forward_block(nr, y);
+        self.forward_block(nr, y, work);
         phases.lap("forward");
         solve_diagonal(f, y, nr)?;
         phases.lap("diag");
-        self.backward_block(nr, y);
+        self.backward_block(nr, y, work);
         phases.lap("backward");
         phases.finish("solve-block");
         Ok(())
     }
 
-    fn forward_block(&self, nr: usize, y: &mut [T]) {
+    fn forward_block(&self, nr: usize, y: &mut [T], work: &mut PlanWork<T>) {
         let shared = Shared(y.as_mut_ptr(), y.len());
         let mut phases = PhaseTrace::start();
-        let accs: Vec<Vec<T>> = self
-            .subtrees
-            .par_iter()
-            .map_init(Scratch::default, |sc, st| {
-                let mut acc = vec![T::zero(); st.path_cols.len() * nr];
-                // SAFETY: see `Shared`.
-                let yv = unsafe { shared.slice() };
-                for &s in &st.nodes {
-                    self.fwd_node_block(s, nr, yv, &mut acc, &mut sc.t);
-                }
-                acc
-            })
-            .collect();
+        let par = work.parallel;
+        let scratch = &mut work.subtrees[..self.subtrees.len()];
+        Self::each(par, &self.subtrees, scratch, |_, st, sc| {
+            sc.acc.clear();
+            sc.acc.resize(st.path_cols.len() * nr, T::zero());
+            // SAFETY: see `Shared`.
+            let yv = unsafe { shared.slice() };
+            for &s in &st.nodes {
+                self.fwd_node_block(s, nr, yv, &mut sc.acc, &mut sc.t);
+            }
+        });
         phases.lap("fwd-subtrees");
-        for (st, acc) in self.subtrees.iter().zip(&accs) {
+        for (st, sc) in self.subtrees.iter().zip(&work.subtrees) {
             for (i, &c) in st.path_cols.iter().enumerate() {
                 let yr = &mut y[c as usize * nr..(c as usize + 1) * nr];
-                sub_assign(yr, &acc[i * nr..(i + 1) * nr]);
+                sub_assign(yr, &sc.acc[i * nr..(i + 1) * nr]);
             }
         }
         phases.lap("fwd-reduce");
-        self.top_forward(nr, y);
+        self.top_forward(nr, y, work);
         phases.lap("fwd-top");
         phases.finish("forward-block");
     }
 
-    fn backward_block(&self, nr: usize, y: &mut [T]) {
-        let shared = Shared(y.as_mut_ptr(), y.len());
+    fn backward_block(&self, nr: usize, y: &mut [T], work: &mut PlanWork<T>) {
         let mut phases = PhaseTrace::start();
-        self.top_backward(nr, y);
+        self.top_backward(nr, y, work);
         phases.lap("bwd-top");
-        self.subtrees
-            .par_iter()
-            .for_each_init(Scratch::default, |sc, st| {
-                // SAFETY: see `Shared`.
-                let xv = unsafe { shared.slice() };
-                for &s in st.nodes.iter().rev() {
-                    self.bwd_node_block(s, nr, xv, &mut sc.g, &mut sc.accv);
-                }
-            });
+        let shared = Shared(y.as_mut_ptr(), y.len());
+        let par = work.parallel;
+        let scratch = &mut work.subtrees[..self.subtrees.len()];
+        Self::each(par, &self.subtrees, scratch, |_, st, sc| {
+            // SAFETY: see `Shared`.
+            let xv = unsafe { shared.slice() };
+            for &s in st.nodes.iter().rev() {
+                self.bwd_node_block(s, nr, xv, &mut sc.g, &mut sc.accv);
+            }
+        });
         phases.lap("bwd-subtrees");
         phases.finish("backward-block");
     }
@@ -981,26 +1267,39 @@ fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
 /// how many right-hand sides share the sweep, which a non-flexible Krylov
 /// method needs (its update applies the solve to one column, its Arnoldi
 /// steps to a block; any difference breaks the Arnoldi relation).
+///
+/// The columns go in groups of [`DOT_COLS`] ([`dot4_cols`]), their partial
+/// sums on the stack: every column is summed alike whatever its group.
 #[inline(always)]
 fn dot4_block<T: Scalar>(out: &mut [T], col: &[T], g: &[T], nr: usize) {
-    let m = col.len().min(g.len() / nr.max(1));
-    let mut s = vec![T::zero(); 4 * nr];
-    let (s0, rest) = s.split_at_mut(nr);
-    let (s1, rest) = rest.split_at_mut(nr);
-    let (s2, s3) = rest.split_at_mut(nr);
+    for c0 in (0..nr).step_by(DOT_COLS) {
+        let w = DOT_COLS.min(nr - c0);
+        dot4_cols(&mut out[c0..c0 + w], col, g, nr, c0);
+    }
+}
+
+/// Columns per group of [`dot4_block`].
+const DOT_COLS: usize = 8;
+
+/// [`dot4_block`] for the columns `c0..c0 + out.len()` of `g`, at most
+/// [`DOT_COLS`] of them.
+#[inline(always)]
+fn dot4_cols<T: Scalar>(out: &mut [T], col: &[T], g: &[T], nr: usize, c0: usize) {
+    let (m, w) = (col.len().min(g.len() / nr.max(1)), out.len());
+    let mut s = [[T::zero(); DOT_COLS]; 4];
+    let at = |i: usize| &g[i * nr + c0..i * nr + c0 + w];
     let mut i = 0;
     while i + 4 <= m {
-        axpy(s0, col[i], &g[i * nr..(i + 1) * nr]);
-        axpy(s1, col[i + 1], &g[(i + 1) * nr..(i + 2) * nr]);
-        axpy(s2, col[i + 2], &g[(i + 2) * nr..(i + 3) * nr]);
-        axpy(s3, col[i + 3], &g[(i + 3) * nr..(i + 4) * nr]);
+        for (q, sq) in s.iter_mut().enumerate() {
+            axpy(&mut sq[..w], col[i + q], at(i + q));
+        }
         i += 4;
     }
-    for c in 0..nr {
-        out[c] = (s0[c] + s1[c]) + (s2[c] + s3[c]);
+    for (c, oc) in out.iter_mut().enumerate() {
+        *oc = (s[0][c] + s[1][c]) + (s[2][c] + s[3][c]);
     }
     while i < m {
-        axpy(out, col[i], &g[i * nr..(i + 1) * nr]);
+        axpy(out, col[i], at(i));
         i += 1;
     }
 }
@@ -1124,9 +1423,12 @@ fn tri_backward<T: Scalar>(
             ak[0] = ak[0] + dot4(col, &tail[..je - k - 1]);
         } else {
             // as the single column: the dot first, then onto the accumulator
-            let mut d = vec![T::zero(); nr];
-            dot4_block(&mut d, col, &tail[..(je - k - 1) * nr], nr);
-            add_assign(ak, &d);
+            for c0 in (0..nr).step_by(DOT_COLS) {
+                let w = DOT_COLS.min(nr - c0);
+                let mut d = [T::zero(); DOT_COLS];
+                dot4_cols(&mut d[..w], col, &tail[..(je - k - 1) * nr], nr, c0);
+                add_assign(&mut ak[c0..c0 + w], &d[..w]);
+            }
         }
         let xk = &mut head[k * nr..];
         sub_assign(xk, ak);
@@ -1138,11 +1440,8 @@ fn tri_backward<T: Scalar>(
 }
 
 /// Column blocks `[jb, je)` of width `nb` over `w` columns.
-fn col_blocks(w: usize, nb: usize) -> Vec<(usize, usize)> {
-    (0..w)
-        .step_by(nb)
-        .map(|jb| (jb, (jb + nb).min(w)))
-        .collect()
+fn col_blocks(w: usize, nb: usize) -> impl DoubleEndedIterator<Item = (usize, usize)> {
+    (0..w).step_by(nb).map(move |jb| (jb, (jb + nb).min(w)))
 }
 
 /// Dot product with four independent accumulators (fixed summation order).

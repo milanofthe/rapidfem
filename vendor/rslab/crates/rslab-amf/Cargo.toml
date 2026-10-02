@@ -1,6 +1,6 @@
 [package]
 name = "rslab-amf"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "Approximate Minimum Fill (AMF / HAMF4) fill-reducing ordering, quotient-graph algorithm (Amestoy 1999). Pure Rust, standalone."

@@ -44,7 +44,7 @@ mod symbolic;
 #[cfg(test)]
 mod tests;
 
-use factor::{diagnostics_flops, factor_csc, factor_impl, row_scale_inv};
+use factor::{diagnostics_flops, factor_csc, factor_impl, row_scale_inv_into};
 pub use settings::{KluParallel, KluSettings};
 
 const UNSET: usize = usize::MAX;
@@ -97,6 +97,63 @@ struct KluFill {
     f_nnz: u64,
     /// Gilbert-Peierls flop count (multiply-subtract pairs + divisions).
     flops: u64,
+    /// The factor's buffers as the drivers grow them, each as `(values,
+    /// other bytes)`: the sequential driver's appended arrays and its reused
+    /// block buffer, and the parallel driver's per-block buffers summed.
+    /// Independent of the scalar type, which prices the values.
+    seq_arrays: (u64, u64),
+    seq_block: (u64, u64),
+    par_blocks: (u64, u64),
+}
+
+/// Entry capacities of one block's output buffer after the driver factored
+/// a block of `bn` columns, `annz` input entries and `l`, `u`, `f` factor
+/// and off-block entries into it: mirrors `BlockOut::reset` (its reserves,
+/// skipped for a singleton) and the kernel's pushes.
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockCaps {
+    l: usize,
+    u: usize,
+    f: usize,
+    diag: usize,
+    prog: usize,
+    fin: usize,
+    colptr: [usize; 3],
+}
+
+impl BlockCaps {
+    fn fill(&mut self, bn: usize, annz: usize, l: usize, u: usize, f: usize) {
+        use crate::memory::grown;
+        let push = |cap: usize, len: usize| {
+            let mut c = cap;
+            while c < len {
+                c = (2 * c).max(4);
+            }
+            c
+        };
+        let reserve = if bn == 1 { 0 } else { annz };
+        self.fin = grown(self.fin, bn);
+        self.l = push(grown(self.l, 4 * reserve), l);
+        self.u = push(grown(self.u, 2 * reserve), u);
+        self.f = push(self.f, f);
+        self.diag = push(grown(self.diag, bn), bn);
+        self.prog = push(grown(self.prog, reserve), annz - f);
+        for c in &mut self.colptr {
+            *c = push(*c, bn + 1);
+        }
+    }
+
+    /// `(values, other bytes)`: `L`, `U` and off-block entries (a value and
+    /// a narrow index each, off-block entries also their input position) and
+    /// the diagonal; the scatter pairs, final positions and column pointers.
+    fn bytes(&self) -> (u64, u64) {
+        let vals = self.l + self.u + self.f + self.diag;
+        let other = 4 * (self.l + self.u + 2 * self.f)
+            + 8 * self.prog
+            + 4 * self.fin
+            + 8 * self.colptr.iter().sum::<usize>();
+        (vals as u64, other as u64)
+    }
 }
 
 /// The numeric KLU factorization: `P A Q = L U` per diagonal block plus the
@@ -152,6 +209,11 @@ struct KluFactors<T> {
     /// exact work/critical-path plan of [`compute_replay_plan`].
     pipelined: Vec<(usize, usize)>,
     par_refactor: bool,
+    /// The next refactor's row scaling, swapped with `rs_inv` once it
+    /// succeeds, and the sequential replay's work vector: kept so a
+    /// refactor allocates nothing.
+    rs_next: Vec<f64>,
+    replay_x: Vec<T>,
 }
 
 /// KLU solver handle: factor (or analyze+factor), then solve / refactor.

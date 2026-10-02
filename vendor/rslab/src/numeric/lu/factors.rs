@@ -26,6 +26,18 @@ pub(crate) struct LuPivots {
     pub n_perturbed: usize,
 }
 
+impl LuPivots {
+    /// Heap bytes held: the permutations, the scalings and the supernode tree.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.perm)
+            + vec_bytes(&self.perm_row)
+            + vec_bytes(&self.d_row)
+            + vec_bytes(&self.d_col)
+            + vec_bytes(&self.supernode_parent)
+    }
+}
+
 /// The numeric result of a sparse LU factorization: the unit lower `L` and
 /// the transposed upper factor `U^T` (its diagonal in the panel) in
 /// supernodal panel form (the storage the solves run on, written by the

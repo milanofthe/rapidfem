@@ -54,8 +54,8 @@ pub use cg::{cocg, cocr};
 pub use closures::{FnOperator, FnPreconditioner};
 pub use gmres::gmres;
 pub use operator::{
-    Factorization, LinearOperator, LowPrecisionLu, LowPrecisionPreconditioner, NoPreconditioner,
-    Preconditioner,
+    Factorization, LinearOperator, LowPrecisionLu, LowPrecisionPreconditioner, MixedPrecision,
+    NoPreconditioner, Preconditioner,
 };
 pub use recycle::{gmres_recycled, Recycle, RecycleScalar};
 pub use result::{KrylovResult, StopReason};

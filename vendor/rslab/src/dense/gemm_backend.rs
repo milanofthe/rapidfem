@@ -94,6 +94,24 @@ pub fn split_worthwhile(m: usize, n: usize, k: usize, conj: bool, min_ratio: usi
     !conj && m * n * k >= min_ratio * (m * k + k * n + m * n)
 }
 
+/// Real entries of the split planes a complex product of this shape takes
+/// from its thread's buffer: nonzero only for a sequential product that
+/// splits ([`complex_gemm`]). The memory plan's account of the buffer.
+pub(crate) fn split_plane_entries(
+    m: usize,
+    n: usize,
+    k: usize,
+    par: bool,
+    ks: &crate::KernelSettings,
+) -> usize {
+    if par || !split_worthwhile(m, n, k, false, ks.complex_split_min_ratio) {
+        return 0;
+    }
+    let t = ks.complex_split_tile.max(1);
+    let (mt, nt) = (m.min(t), n.min(t));
+    3 * (mt * k + k * nt + mt * nt)
+}
+
 /// Real plane scratch of one thread (grows to the largest tile seen).
 struct Planes<R> {
     buf: Vec<R>,
@@ -123,7 +141,9 @@ pub trait SplitReal:
 /// thread-local for the duration (not borrowed): a parallel real product
 /// inside `f` lets rayon's work stealing run another split on this same
 /// thread, which then gets an empty buffer of its own instead of a
-/// re-entrant borrow. The larger of the two is kept afterwards.
+/// re-entrant borrow. The larger of the two is kept afterwards, up to
+/// [`SCRATCH_KEEP`](crate::memory::SCRATCH_KEEP): the thread outlives the
+/// factorization in the pool its caller keeps.
 fn with_taken<R: SplitReal, Ret>(
     cell: &'static std::thread::LocalKey<RefCell<Planes<R>>>,
     f: impl FnOnce(&mut Vec<R>) -> Ret,
@@ -132,7 +152,8 @@ fn with_taken<R: SplitReal, Ret>(
     let out = f(&mut buf);
     cell.with(|p| {
         let mut planes = p.borrow_mut();
-        if planes.buf.capacity() < buf.capacity() {
+        let bytes = (buf.capacity() * std::mem::size_of::<R>()) as u64;
+        if planes.buf.capacity() < buf.capacity() && bytes <= crate::memory::SCRATCH_KEEP {
             planes.buf = buf;
         }
     });

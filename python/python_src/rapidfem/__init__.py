@@ -32,7 +32,7 @@ from rapidfem.excitation import GaussianPulse
 from rapidfem import io  # registers .to_network/.to_touchstone/.to_hdf5 on SweepResult
 from rapidfem import rfic  # RFIC builder helpers (Stack, microstrip, via, gsg_port, ...)
 from rapidfem import structures  # general RF structure builders (coax, microstrip, ...)
-from rapidfem import _show_capture
+from rapidfem.ui import capture as _show_capture
 
 
 _C0 = 299_792_458.0

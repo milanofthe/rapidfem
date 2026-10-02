@@ -36,8 +36,6 @@ MIN_SUPPORTED_VERSION = (0, 5, 0)
 # Substring patterns; a module is skipped if any pattern occurs in its name.
 # Excludes the CLI, native extension glue, the local UI, and example scripts.
 SKIP_PATTERNS = [
-    "_cli",
-    "_show",
     "_native",
     "_version",
     "bridge",

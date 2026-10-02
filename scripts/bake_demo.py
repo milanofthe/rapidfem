@@ -16,7 +16,7 @@ Run from the repo root:
 
 Reused machinery (single source of truth for runtime behaviour):
 - capture lifecycle           → rapidfem.ui.kernel
-- show() collector            → rapidfem._show_capture
+- show() collector            → rapidfem.ui.capture
 - serializer (display events) → rapidfem.ui.serialize / api._serialize_captures_for_protocol
 """
 from __future__ import annotations
@@ -171,14 +171,14 @@ def _bake_cell(cell: Cell, kernel) -> dict:
     """Run a single cell through the same pipeline the WS server uses and
     return a JSON-serialisable record of what happened.
 
-    Reuses the production helpers — ``_show_capture`` for ``rapidfem.show()``
+    Reuses the production helpers — ``rapidfem.ui.capture`` for ``rapidfem.show()``
     payloads, ``_capture_streams`` for native fd-level stdout/stderr,
     ``_serialize_captures_for_protocol`` for the display-event shape — so
     a baked run cannot diverge from a live run by accident.
     """
     # Imported lazily so a `python scripts/bake_demo.py` that only runs the
     # cell-splitter smoke test does not require the [ui] extra (Flask, etc.).
-    from rapidfem import _show_capture
+    from rapidfem.ui import capture as _show_capture
     from rapidfem.ui.api import (
         _capture_streams,
         _format_exception,

@@ -260,7 +260,7 @@ class ProblemFD:
             **_order_kwargs(order))
         # The native callback is (freq_idx, freq, s_matrix). Compose an optional
         # user `on_frequency` with the UI's per-frequency streaming callback.
-        from rapidfem import _show_capture
+        from rapidfem.ui import capture as _show_capture
         ui_cb = _show_capture.active_sweep_callback()
         user_cb = on_frequency
         if ui_cb is None and user_cb is None:

@@ -320,7 +320,7 @@ def run_cell(msg_id: str, code: str) -> None:
         send({"type": "error", "id": msg_id, "error": "Worker not initialized"})
         return
 
-    from rapidfem import _show_capture
+    from rapidfem.ui import capture as _show_capture
     _show_capture.start_capture(on_item=_stream_display,
                                 sweep_cb=_make_sweep_progress())
     try:

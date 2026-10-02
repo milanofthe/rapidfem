@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""rapidfem CLI, `rapidfem serve` and friends.
+"""The rapidfem CLI, `rapidfem serve` and `rapidfem demo`.
 
 Entry point registered via pyproject.toml [project.scripts].
 """
@@ -110,9 +110,7 @@ def _find_frontend_src() -> Path | None:
     included in published wheels, only the prebuilt ``frontend/dist/`` is,
     so `rapidfem demo` is a dev-only command.
     """
-    import rapidfem
-    pkg = Path(rapidfem.__file__).resolve().parent
-    candidate = pkg / "ui" / "frontend-src"
+    candidate = Path(__file__).resolve().parent / "frontend-src"
     if (candidate / "package.json").is_file():
         return candidate
     return None
@@ -169,7 +167,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rapidfem",
-        description="rapidfem, frequency-domain EM FEM solver.",
+        description="rapidfem, frequency- and time-domain EM FEM solver.",
     )
     p.add_argument("--version", action="version", version=f"rapidfem {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")

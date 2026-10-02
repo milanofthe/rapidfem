@@ -65,7 +65,7 @@ Repository = "https://github.com/milanofthe/rapidfem"
 Issues = "https://github.com/milanofthe/rapidfem/issues"
 
 [project.scripts]
-rapidfem = "rapidfem._cli:main"
+rapidfem = "rapidfem.ui.cli:main"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

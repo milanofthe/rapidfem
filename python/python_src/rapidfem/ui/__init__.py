@@ -2,9 +2,11 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""rapidfem.ui, Flask backend and bundled SvelteKit frontend.
+"""rapidfem.ui, the local UI: the ``rapidfem`` CLI, the capture slot of
+:func:`rapidfem.show`, the Flask backend and the bundled SvelteKit frontend.
 
-Available only when installed with the ``ui`` extra::
+Importing it is free of the UI's dependencies; serving needs the ``ui``
+extra::
 
     pip install rapidfem[ui]
     rapidfem serve ./my_project/

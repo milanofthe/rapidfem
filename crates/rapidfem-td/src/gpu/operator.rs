@@ -20,10 +20,11 @@ use opencl3::types::{CL_BLOCKING, cl_double, cl_float, cl_int};
 
 use super::GpuContext;
 use crate::constants::{
-    Field, KCL_A, KCL_B, KCL_BHAT, KCL_STAGES, KRYLOV_CHUNK,
+    Field, KCL_A, KCL_B, KCL_BHAT, KCL_ERR_FLOOR, KCL_NONFINITE_ERR, KCL_STAGES, KRYLOV_CHUNK,
     LSERK4_A, LSERK4_B, LSERK4_STAGES,
 };
 use crate::propagator::expm;
+use crate::session::Controller;
 use crate::rhs::MaxwellOperator;
 
 /// Apply-kernel source, with `NP` / `NFP` / `COLS` prepended at build time.
@@ -513,28 +514,6 @@ impl GpuOperator {
         gpu.download(&self.dy, self.n_dof)
     }
 
-    /// `f64` host wrapper around [`Self::apply`] for the macromodel
-    /// build: cast `f64 -> f32`, run the device matvec, cast back
-    /// `f32 -> f64`. The mixed-precision drift is bounded by
-    /// [`crate::constants::GPU_REL_TOL`] per matvec; the block-Krylov
-    /// build calls this once per basis vector and the projection
-    /// onto the orthonormal `V` averages the rounding noise to that
-    /// scale across the macromodel.
-    ///
-    /// Used by the `apply_fn` closure that
-    /// [`crate::macromodel::MacroModel::build_with_apply_fn`] takes,
-    /// so the CPU and GPU build paths share the same block-CGS2
-    /// orthogonalisation and Hessenberg loop. The GPU does the
-    /// `n_dof`-sized work; the CPU does the small dot products.
-    pub fn apply_f64(
-        &mut self,
-        gpu: &GpuContext,
-        y_host: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        let y_f32: Vec<f32> = y_host.iter().map(|&v| v as f32).collect();
-        let dy_f32 = self.apply(gpu, &y_f32)?;
-        Ok(dy_f32.into_iter().map(|v| v as f64).collect())
-    }
 
     /// Enqueue the soft-source add: `dy[source_dof] += val`.
     fn enqueue_add_source(
@@ -829,33 +808,6 @@ impl GpuOperator {
         Ok((total / n as f64).sqrt() as f32)
     }
 
-    /// Step-size update factor from the PI controller. On a rejected step
-    /// the previous-error blend is dropped (I-only); on acceptance the
-    /// PI smoothing avoids step-size oscillations across many frames.
-    fn kcl_step_factor(
-        err_norm: f32,
-        prev_err_norm: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        reject: bool,
-    ) -> f32 {
-        let f = if reject || prev_err_norm <= 0.0 {
-            safety * err_norm.powf(-pi_alpha)
-        } else {
-            safety
-                * err_norm.powf(-pi_alpha)
-                * prev_err_norm.powf(pi_beta)
-        };
-        if reject {
-            f.max(shrink_limit)
-        } else {
-            f.max(shrink_limit).min(growth_limit)
-        }
-    }
-
     /// KCL adaptive transient (free system `dy/dt = A·y`), state device-
     /// resident, state-vector trajectory returned flat `[(steps+1) * n_dof]`
     /// with row 0 the initial state. The Rust-side PI controller decides
@@ -871,18 +823,10 @@ impl GpuOperator {
         y0: &[f32],
         dt: f32,
         steps: usize,
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
+        ctl: &Controller,
     ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
         self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
+            gpu, y0, dt, steps, ctl,
             DrivenMode::Free,
         )
     }
@@ -900,14 +844,7 @@ impl GpuOperator {
         steps: usize,
         b_src: &[f32],
         g_values: &[f32],
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
+        ctl: &Controller,
     ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
         assert_eq!(b_src.len(), self.n_dof, "source length mismatch");
         assert_eq!(g_values.len(), steps, "g_values must have `steps` entries");
@@ -918,8 +855,7 @@ impl GpuOperator {
         }
         .map_err(|e| format!("source upload failed: {e}"))?;
         self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
+            gpu, y0, dt, steps, ctl,
             DrivenMode::Vector { g_values },
         )
     }
@@ -934,20 +870,12 @@ impl GpuOperator {
         steps: usize,
         source_dof: usize,
         g_values: &[f32],
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
+        ctl: &Controller,
     ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
         assert!(source_dof < self.n_dof, "source_dof out of range");
         assert_eq!(g_values.len(), steps, "g_values must have `steps` entries");
         self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
+            gpu, y0, dt, steps, ctl,
             DrivenMode::Point { source_dof, g_values },
         )
     }
@@ -959,14 +887,7 @@ impl GpuOperator {
         y0: &[f32],
         dt: f32,
         steps: usize,
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
+        ctl: &Controller,
         mode: DrivenMode<'_>,
     ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
         assert_eq!(y0.len(), self.n_dof, "state length mismatch");
@@ -984,7 +905,7 @@ impl GpuOperator {
         // Controller state, carried across output frames.
         let mut h = dt;
         let mut prev_err = 0.0_f32;
-        let h_min = min_step_factor * dt;
+        let h_min = ctl.min_step_factor as f32 * dt;
         let mut n_acc = 0_usize;
         let mut n_rej = 0_usize;
         let mut h_min_log = f32::INFINITY;
@@ -1014,17 +935,16 @@ impl GpuOperator {
                     DrivenMode::Vector { .. } => self
                         .enqueue_kcl_step_driven_vec(gpu, h_try, g_val)?,
                 }
-                let err_norm = self.read_kcl_err_norm(gpu, atol, rtol)?;
+                let err_norm =
+                    self.read_kcl_err_norm(gpu, ctl.atol as f32, ctl.rtol as f32)?;
                 let accept = err_norm.is_finite() && err_norm <= 1.0;
                 if accept {
                     t_rel += h_try;
                     n_acc += 1;
-                    let factor = Self::kcl_step_factor(
-                        err_norm.max(1e-12), prev_err, safety, growth_limit,
-                        shrink_limit, pi_alpha, pi_beta, false,
-                    );
+                    let factor =
+                        ctl.factor(err_norm as f64, prev_err as f64, false) as f32;
                     h = h_try * factor;
-                    prev_err = err_norm.max(1e-12);
+                    prev_err = err_norm.max(KCL_ERR_FLOOR as f32);
                     h_min_log = h_min_log.min(h);
                     h_max_log = h_max_log.max(h);
                 } else {
@@ -1033,19 +953,17 @@ impl GpuOperator {
                     let probe = if err_norm.is_finite() {
                         err_norm
                     } else {
-                        10.0
+                        KCL_NONFINITE_ERR as f32
                     };
-                    let factor = Self::kcl_step_factor(
-                        probe, prev_err, safety, growth_limit, shrink_limit,
-                        pi_alpha, pi_beta, true,
-                    );
+                    let factor = ctl.factor(probe as f64, prev_err as f64, true) as f32;
                     h = h_try * factor;
                 }
                 if h < h_min {
                     return Err(format!(
                         "GPU KCL: step size collapsed below \
-                         {min_step_factor:e}·dt after {n_acc} accepted, \
-                         {n_rej} rejected substeps"
+                         {:e}·dt after {n_acc} accepted, \
+                         {n_rej} rejected substeps",
+                        ctl.min_step_factor
                     ));
                 }
             }
@@ -1909,29 +1827,6 @@ impl GpuOperator {
         Ok(result)
     }
 
-    /// Exponential-warmup hybrid transient: the first `warmup` steps use
-    /// the exact exponential propagator, the rest the cheaper explicit
-    /// LSERK4 stepper. The exact integrator carries the opening transient,
-    /// then hands the smooth state to the explicit stepper.
-    pub fn transient_hybrid(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        warmup: usize,
-        krylov_dim: usize,
-    ) -> Result<Vec<f32>, String> {
-        let warmup = warmup.min(steps);
-        // Warmup: exact exponential steps in f64.
-        let mut y: Vec<f64> = y0.iter().map(|&v| v as f64).collect();
-        for _ in 0..warmup {
-            y = self.expmv(gpu, &y, dt as f64, krylov_dim)?;
-        }
-        // Remainder: device-resident explicit LSERK4.
-        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
-        self.transient(gpu, &y32, dt, steps - warmup)
-    }
 
 }
 
@@ -2015,7 +1910,6 @@ mod tests {
         // produces a trajectory that tracks the CPU adaptive run frame by
         // frame, within the f32 GPU_REL_TOL budget. Both controllers start
         // from the same atol/rtol/seed so the substep paths line up.
-        use crate::explicit_adaptive::KclWorkspace;
 
         let gpu = match GpuContext::new() {
             Ok(g) => g,
@@ -2044,82 +1938,32 @@ mod tests {
         let dt = 1.0 / rho;
         let steps = 60;
 
-        // Controller params shared between CPU and GPU. atol/rtol loose
-        // enough that f32 GPU noise doesn't make the two paths diverge.
-        let atol = 1e-6_f32;
-        let rtol = 1e-3_f32;
-        let safety = 0.9_f32;
-        let growth = 5.0_f32;
-        let shrink = 0.2_f32;
-        let alpha = 0.7 / 4.0_f32;
-        let beta = 0.4 / 4.0_f32;
-        let min_step = 1e-10_f32;
+        // One controller for both runs, atol/rtol loose enough that the
+        // f32 GPU noise does not make the two paths diverge.
+        let ctl = Controller { atol: 1e-6, rtol: 1e-3, ..Controller::default() };
 
-        // CPU reference using the same controller logic (mirrored locally
-        // since the CPU controller lives in Python). The trajectory only
-        // needs to match at output cadence, not substep-by-substep.
-        let mut y_cpu = y0.clone();
-        let mut ws = KclWorkspace::new();
-        let mut err = vec![0.0; n];
-        let mut h_cpu = dt;
-        let mut prev_err = 0.0_f64;
-        let mut traj_cpu = Vec::with_capacity((steps + 1) * n);
-        traj_cpu.extend_from_slice(&y_cpu);
-        for _ in 0..steps {
-            let mut t_rel = 0.0_f64;
-            while t_rel < dt {
-                let h_try = h_cpu.min(dt - t_rel);
-                let y_pre = y_cpu.clone();
-                ws.step_into(
-                    |x, ax| op.apply_into(x, ax),
-                    &mut y_cpu, &mut err, h_try,
-                );
-                let mut s2 = 0.0_f64;
-                for i in 0..n {
-                    let scale = atol as f64
-                        + rtol as f64
-                            * y_pre[i].abs().max(y_cpu[i].abs());
-                    let r = err[i] / scale;
-                    s2 += r * r;
-                }
-                let err_norm = (s2 / n as f64).sqrt();
-                if err_norm <= 1.0 && err_norm.is_finite() {
-                    t_rel += h_try;
-                    let f = if prev_err <= 0.0 {
-                        safety as f64
-                            * err_norm.max(1e-12).powf(-(alpha as f64))
-                    } else {
-                        safety as f64
-                            * err_norm.max(1e-12).powf(-(alpha as f64))
-                            * prev_err.powf(beta as f64)
-                    };
-                    let f = f.max(shrink as f64).min(growth as f64);
-                    h_cpu = h_try * f;
-                    prev_err = err_norm.max(1e-12);
-                } else {
-                    y_cpu = y_pre;
-                    let probe = if err_norm.is_finite() {
-                        err_norm
-                    } else {
-                        10.0
-                    };
-                    let f = (safety as f64
-                        * probe.max(1e-12).powf(-(alpha as f64)))
-                        .max(shrink as f64);
-                    h_cpu = h_try * f;
-                }
-            }
-            traj_cpu.extend_from_slice(&y_cpu);
-        }
+        // CPU reference: the session's adaptive run on the same operator.
+        let mut session =
+            crate::session::TdSession::new(MaxwellOperator::new(&mesh, 2, 1.0), 1.0);
+        let opts = crate::session::RunOptions {
+            method: crate::session::Method::Adaptive,
+            verbose: false,
+            controller: ctl,
+            ..Default::default()
+        };
+        let traj_cpu = session
+            .transient(
+                Some(&y0), dt, steps, crate::session::Drive::Free, None,
+                crate::session::Record::States, &opts, &mut || Ok(()),
+            )
+            .expect("CPU adaptive run")
+            .data;
 
         // GPU run with matched parameters.
         let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
         let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
         let (traj_gpu, n_acc, n_rej, h_min, h_max) = gop
-            .transient_kcl_traj(
-                &gpu, &y0_32, dt as f32, steps, atol, rtol, safety,
-                growth, shrink, alpha, beta, min_step,
-            )
+            .transient_kcl_traj(&gpu, &y0_32, dt as f32, steps, &ctl)
             .expect("transient_kcl_traj");
 
         eprintln!(
@@ -2388,73 +2232,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gpu_hybrid_transient_matches_cpu() {
-        // P2.4 gate: the GPU exponential-warmup hybrid matches a CPU hybrid
-        // (warmup expmv steps, then LSERK4) within GPU_REL_TOL.
-        use crate::explicit::LserkWorkspace;
-        use crate::propagator::expmv;
-
-        let gpu = match GpuContext::new() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skipping GPU test: {e}");
-                return;
-            }
-        };
-        let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
-        let n = op.n_dof();
-        let y0: Vec<Field> =
-            (0..n).map(|i| (0.15 + i as Field * 0.009).sin()).collect();
-
-        let mut v = y0.clone();
-        let mut rho = 1.0;
-        for _ in 0..30 {
-            let av = op.apply(&v);
-            rho = av.iter().map(|x| x * x).sum::<Field>().sqrt();
-            let inv = 1.0 / rho;
-            for (vi, &a) in v.iter_mut().zip(&av) {
-                *vi = a * inv;
-            }
-        }
-        let dt = 1.0 / rho;
-        let (steps, warmup, m) = (120, 10, 40);
-
-        // CPU hybrid: warmup exponential steps, then LSERK4.
-        let mut y_cpu = y0.clone();
-        for _ in 0..warmup {
-            y_cpu = expmv(|x| op.apply(x), &y_cpu, dt, m);
-        }
-        let mut ws = LserkWorkspace::new();
-        for _ in 0..(steps - warmup) {
-            ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_cpu, dt);
-        }
-
-        // GPU hybrid.
-        let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
-        let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
-        let y_gpu = match gop
-            .transient_hybrid(&gpu, &y0_32, dt as f32, steps, warmup, m)
-        {
-            Ok(o) => o,
-            Err(e) if fp64_unavailable(&e) => {
-                eprintln!("skipping GPU hybrid test (no fp64): {e}");
-                return;
-            }
-            Err(e) => panic!("hybrid transient: {e}"),
-        };
-
-        let rel = rel_l2(&y_gpu, &y_cpu);
-        eprintln!(
-            "GPU hybrid transient vs CPU [{warmup}+{} steps]: rel L2 = {rel:.3e}",
-            steps - warmup
-        );
-        assert!(
-            rel < GPU_REL_TOL,
-            "GPU hybrid rel.err {rel:.3e} exceeds GPU_REL_TOL",
-        );
-    }
 
     #[test]
     fn gpu_etd_step_matches_cpu() {

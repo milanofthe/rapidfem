@@ -21,4 +21,5 @@ pub mod gpu;
 pub mod mesh_gen;
 pub mod propagator;
 pub mod rhs;
+pub mod session;
 pub mod waveguide;

@@ -34,6 +34,9 @@ pub use operator::GpuOperator;
 pub struct GpuContext {
     /// Human-readable device name, for logging.
     pub device_name: String,
+    /// Whether the device has double precision (`cl_khr_fp64`), which the
+    /// exponential propagator needs; the explicit paths run in f32.
+    pub fp64: bool,
     context: Context,
     queue: CommandQueue,
 }
@@ -49,6 +52,9 @@ impl GpuContext {
         let device = Device::new(device_id);
         let device_name =
             device.name().map_err(|e| format!("device name: {e}"))?;
+        let fp64 = device
+            .extensions()
+            .is_ok_and(|ext| ext.split_whitespace().any(|e| e == "cl_khr_fp64"));
         let context = Context::from_device(&device)
             .map_err(|e| format!("context creation failed: {e}"))?;
         let queue = CommandQueue::create_default(
@@ -56,7 +62,7 @@ impl GpuContext {
             CL_QUEUE_PROFILING_ENABLE,
         )
         .map_err(|e| format!("command queue creation failed: {e}"))?;
-        Ok(GpuContext { device_name, context, queue })
+        Ok(GpuContext { device_name, fp64, context, queue })
     }
 
     /// Build an OpenCL program from kernel source. The `Err` carries the

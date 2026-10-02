@@ -11,14 +11,14 @@ license = "AGPL-3.0-only"
 doctest = false
 
 [dependencies]
+# Dense eigensolver for the cavity resonances.
+faer = { version = "0.24", default-features = false, features = ["std"] }
+num-complex = "0.4.6"
 opencl3 = { version = "0.12.3", optional = true }
 rapidfem-core = { path = "../rapidfem-core" }
 rayon = "1.11.0"
-
-[dev-dependencies]
-# Dense eigensolver — only the cavity-mode validation gate (tests) uses
-# it directly now; the wave-port mode solver lives in rapidfem-core.
-faer = "0.24"
+# Spectra of the transfer function.
+realfft = "3.5"
 
 [features]
 # Optional OpenCL GPU backend. Off by default; the CPU path is unaffected.

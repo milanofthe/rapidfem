@@ -283,3 +283,73 @@ def mesh_to_payload(g: Any, *, maxh: float) -> dict:
             "mesh_time_s": t_mesh,
         },
     }
+
+
+def td_timeseries_payload(obj) -> dict[str, Any]:
+    """``TdResponse`` / ``TdTransfer`` → a line-plot payload.
+
+    A response carries real probe samples on a time axis; a transfer
+    function carries a complex ``H`` on a frequency axis. ``domain``
+    tells the frontend which it is.
+    """
+    import numpy as np
+
+    cls = type(obj).__name__
+    if cls == "TdResponse":
+        x = np.asarray(obj.times, dtype=float).ravel()
+        resp = np.asarray(obj.responses, dtype=float)
+        labels = list(obj.probe_labels) or [
+            f"probe {k}" for k in range(resp.shape[0])
+        ]
+        series = [
+            {"label": labels[k], "y": resp[k].astype(float).tolist()}
+            for k in range(resp.shape[0])
+        ]
+        return {
+            "domain": "time",
+            "x_label": "Time",
+            "x": x.tolist(),
+            "series": series,
+            "source_label": obj.source_label,
+        }
+    # TdTransfer, complex frequency response
+    x = np.asarray(obj.frequencies, dtype=float).ravel()
+    H = np.asarray(obj.H)
+    return {
+        "domain": "freq",
+        "x_label": "Frequency (Hz)",
+        "x": x.tolist(),
+        "series": [{
+            "label": f"H · {obj.probe_label}",
+            "y_re": np.real(H).astype(float).tolist(),
+            "y_im": np.imag(H).astype(float).tolist(),
+        }],
+        "source_label": obj.source_label,
+    }
+
+
+def td_trajectory_payload(traj, *, max_frames: int = 180) -> dict[str, Any]:
+    """``TdTrajectory`` -> the DG-corner mesh with per-node |E|, |H| frames.
+
+    The element corners merge into a continuous node set with tet
+    connectivity; per kept frame (at most ``max_frames``) every node carries
+    |E| and |H|, averaged over its corners and quantised to integers
+    0..1000 of the per-channel maximum ``field_max``, which the viewer holds
+    fixed across the animation. The frontend samples its point cloud from
+    this mesh at runtime (see ``TdSession.viewer_trajectory``).
+    """
+    import numpy as np
+
+    p = getattr(traj, "_problem", None)
+    if p is None:
+        raise RuntimeError(
+            "trajectory carries no ProblemTD reference, it must come "
+            "straight from ProblemTD.transient()"
+        )
+    states = np.atleast_2d(np.ascontiguousarray(traj, dtype=np.float64))
+    out = p._op.viewer_trajectory(states, max_frames)
+    frames = out.pop("frames")
+    dt = getattr(traj, "_dt", None)
+    out["times"] = [f * dt if dt else float(f) for f in frames]
+    out["n_snapshots"] = len(frames)
+    return out

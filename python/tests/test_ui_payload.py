@@ -55,12 +55,12 @@ def test_td_trajectory_payload():
     per-node |E|, |H| frames, decimated to max_frames."""
     import numpy as np
     import rapidfem as rf
-    from rapidfem.ui.api import _td_trajectory_payload
+    from rapidfem.ui.serialize import td_trajectory_payload
 
     p = rf.ProblemTD.box(size=(1, 1, 1), cells=(2, 2, 2), order=2)
     y0 = np.random.default_rng(0).standard_normal(p.n_dofs)
     traj = p.transient(y0, dt=0.05, steps=9, method="explicit", verbose=False)
-    out = _td_trajectory_payload(traj, max_frames=4)
+    out = td_trajectory_payload(traj, max_frames=4)
     n = out["n_node"]
     # a 2x2x2 box: 3 x 3 x 3 corner nodes shared by all tets
     assert n == 27 and len(out["nodes"]) == 3 * n

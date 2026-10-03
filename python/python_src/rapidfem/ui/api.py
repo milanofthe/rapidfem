@@ -143,76 +143,6 @@ def _capture_streams(on_line):
         t_err.join(timeout=1.0)
 
 
-def _td_timeseries_payload(obj) -> dict[str, Any]:
-    """``TdResponse`` / ``TdTransfer`` → a line-plot payload.
-
-    A response carries real probe samples on a time axis; a transfer
-    function carries a complex ``H`` on a frequency axis. ``domain``
-    tells the frontend which it is.
-    """
-    import numpy as np
-
-    cls = type(obj).__name__
-    if cls == "TdResponse":
-        x = np.asarray(obj.times, dtype=float).ravel()
-        resp = np.asarray(obj.responses, dtype=float)
-        labels = list(obj.probe_labels) or [
-            f"probe {k}" for k in range(resp.shape[0])
-        ]
-        series = [
-            {"label": labels[k], "y": resp[k].astype(float).tolist()}
-            for k in range(resp.shape[0])
-        ]
-        return {
-            "domain": "time",
-            "x_label": "Time",
-            "x": x.tolist(),
-            "series": series,
-            "source_label": obj.source_label,
-        }
-    # TdTransfer, complex frequency response
-    x = np.asarray(obj.frequencies, dtype=float).ravel()
-    H = np.asarray(obj.H)
-    return {
-        "domain": "freq",
-        "x_label": "Frequency (Hz)",
-        "x": x.tolist(),
-        "series": [{
-            "label": f"H · {obj.probe_label}",
-            "y_re": np.real(H).astype(float).tolist(),
-            "y_im": np.imag(H).astype(float).tolist(),
-        }],
-        "source_label": obj.source_label,
-    }
-
-
-def _td_trajectory_payload(traj, *, max_frames: int = 180) -> dict[str, Any]:
-    """``TdTrajectory`` -> the DG-corner mesh with per-node |E|, |H| frames.
-
-    The element corners merge into a continuous node set with tet
-    connectivity; per kept frame (at most ``max_frames``) every node carries
-    |E| and |H|, averaged over its corners and quantised to integers
-    0..1000 of the per-channel maximum ``field_max``, which the viewer holds
-    fixed across the animation. The frontend samples its point cloud from
-    this mesh at runtime (see ``TdSession.viewer_trajectory``).
-    """
-    import numpy as np
-
-    p = getattr(traj, "_problem", None)
-    if p is None:
-        raise RuntimeError(
-            "trajectory carries no ProblemTD reference, it must come "
-            "straight from ProblemTD.transient()"
-        )
-    states = np.atleast_2d(np.ascontiguousarray(traj, dtype=np.float64))
-    out = p._op.viewer_trajectory(states, max_frames)
-    frames = out.pop("frames")
-    dt = getattr(traj, "_dt", None)
-    out["times"] = [f * dt if dt else float(f) for f in frames]
-    out["n_snapshots"] = len(frames)
-    return out
-
-
 # Capture kinds whose display payload is built from a single item, with no
 # sim+result pairing, so they can be streamed the instant show() runs.
 _STREAMABLE_KINDS = frozenset({
@@ -229,7 +159,8 @@ def _serialize_streamable(item) -> dict[str, Any] | None:
     event on failure), or ``None`` for kinds deferred to
     :func:`_serialize_paired`. Never raises.
     """
-    from rapidfem.ui.serialize import geometry_to_payload
+    from rapidfem.ui.serialize import (
+        geometry_to_payload, td_timeseries_payload, td_trajectory_payload)
 
     if item.kind == "geometry":
         try:
@@ -243,9 +174,9 @@ def _serialize_streamable(item) -> dict[str, Any] | None:
         # A transfer function reuses the time-series payload builder (it sets
         # domain="freq" itself).
         _td_builder = {
-            "td_timeseries": _td_timeseries_payload,
-            "td_transfer": _td_timeseries_payload,
-            "td_trajectory": _td_trajectory_payload,
+            "td_timeseries": td_timeseries_payload,
+            "td_transfer": td_timeseries_payload,
+            "td_trajectory": td_trajectory_payload,
         }[item.kind]
         try:
             return {"kind": item.kind, "name": item.name,

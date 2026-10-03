@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Dielectric resonator — a high-εr fill loads a metal cavity and lowers its
+"""Dielectric resonator, a high-εr fill loads a metal cavity and lowers its
 resonance.
 
 A dielectric resonator (DR) is a puck of high-permittivity ceramic that stores
@@ -89,7 +89,7 @@ def test_dielectric_filled_cavity_resonance():
         f"{[round(m.frequency_hz / 1e9, 4) for m in modes]} GHz)"
     )
 
-    # Physics sanity: the εr=37 fill drops the resonance to f_empty/√εr — well
+    # Physics sanity: the εr=37 fill drops the resonance to f_empty/√εr, well
     # below the empty cavity (here ≈6.16× lower).
     f_comp = _lowest_physical(modes, f0).frequency_hz
     assert f_comp < 0.5 * f0_empty, (

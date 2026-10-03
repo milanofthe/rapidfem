@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""WR-90 rectangular waveguide — S-parameters of a matched straight section.
+"""WR-90 rectangular waveguide, S-parameters of a matched straight section.
 
 EXEMPLAR for the phenomenon suite: a matched, lossless WR-90 (X-band) section
 transmits its TE10 mode with near-zero reflection, and the insertion phase of
@@ -17,7 +17,7 @@ import pytest
 import rapidfem as rf
 from harness import case, references as ref
 
-# WR-90 (X-band, 8.2–12.4 GHz)
+# WR-90 (X-band, 8.2-12.4 GHz)
 A, B = 22.86e-3, 10.16e-3
 LENGTH = 30e-3
 

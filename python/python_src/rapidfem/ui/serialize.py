@@ -22,15 +22,12 @@ from typing import Any
 def _material_label(material) -> str | None:
     """Render a tracked entity's ``.material`` into a JSON-safe display string.
 
-    Accepts a legacy string (``"fr4"``), a :class:`rapidfem.Material`
-    instance, or ``None``. For Material instances we return a short label
-    like ``"Dielectric (εr=4.4)"`` so the UI legend shows something
-    meaningful without dragging the whole object into the JSON payload.
+    A short label like ``"Dielectric (εr=4.4)"`` so the UI legend shows
+    something meaningful without dragging the whole object into the JSON
+    payload; ``None`` without a material.
     """
     if material is None:
         return None
-    if isinstance(material, str):
-        return material
     cls = type(material).__name__
     er = getattr(material, "er", None)
     er_diag = getattr(material, "er_diag", None)
@@ -70,10 +67,6 @@ def _material_color(material) -> list[float]:
     """Signature-palette color for a Material instance."""
     if material is None:
         return _COL_NEUTRAL
-    if isinstance(material, str):
-        # Legacy string, keep the old hash-color so existing rfic.Stack flows
-        # don't suddenly recolor on import.
-        return _color_from_name(material)
     cls = type(material).__name__
     if cls == "Air":
         return _COL_AIR
@@ -138,18 +131,15 @@ def _entity_resolution(g, ent):
     # Volumes: material-typed, indexed per material class (matches the mesh).
     if ent.dim == 3:
         mat = ent.material
-        if mat is not None and not isinstance(mat, str):
+        if mat is not None:
             cls = type(mat).__name__.lower()
             order: list[int] = []
             for e in getattr(g, "_entities", []):
                 m = e.material
-                if (m is not None and not isinstance(m, str)
-                        and type(m).__name__.lower() == cls and id(m) not in order):
+                if m is not None and type(m).__name__.lower() == cls and id(m) not in order:
                     order.append(id(m))
             idx = (order.index(id(mat)) + 1) if id(mat) in order else 1
             return f"{cls}_{idx}", _material_color(mat)
-        if isinstance(mat, str):
-            return mat, _color_from_name(mat)
         if ent.name:
             return ent.name, _color_from_name(ent.name)
         return None, _COL_NEUTRAL

@@ -14,7 +14,7 @@
 //!   p_E = min { p_K : K contains E }
 //!
 //! Each entity takes the lowest order of any cell touching it. A cell then uses,
-//! on each of its entities, only the functions up to that entity's order — so a
+//! on each of its entities, only the functions up to that entity's order, so a
 //! `p = 2` cell next to a `p = 1` cell simply drops the second function on the
 //! shared edge. Both cells then see the same trace, and conformity is automatic
 //! with no constraint equations, no hanging-node machinery and no projection.
@@ -25,7 +25,7 @@
 //!
 //! **This requires the hierarchical basis**, and is why it is the only basis. The
 //! rule assumes that "the functions up to order p" is a meaningful subset of the
-//! DOFs — that the order-1 space is a coordinate subspace of the order-2 space. It
+//! DOFs, that the order-1 space is a coordinate subspace of the order-2 space. It
 //! is, because mode 0 of an edge is exactly the Whitney function
 //! (`tet_assembly::edge_fns`). The interpolatory basis, whose mode-0 block was
 //! disjoint from the Whitney space, could not do this and was removed.
@@ -104,7 +104,7 @@ impl OrderMap {
         OrderMap { cell, edge, face }
     }
 
-    /// True when every cell is at the same order — the case in which the element
+    /// True when every cell is at the same order, the case in which the element
     /// is the plain uniform one and the interpolatory basis is still valid.
     pub fn is_uniform(&self, p: u8) -> bool {
         self.cell.iter().all(|&q| q == p)
@@ -206,15 +206,15 @@ pub fn cell_wavenumbers(
 /// ```
 ///
 /// The reasoning is the dispersion error, which for an order-p element scales as
-/// `(k·h)^{2p}`. Where `k·h` is already tiny — a cell shrunk to resolve a gap, a
-/// fillet, a thin trace, not to resolve a wave — the order-1 error `(k·h)²` is
+/// `(k·h)^{2p}`. Where `k·h` is already tiny, a cell shrunk to resolve a gap, a
+/// fillet, a thin trace, not to resolve a wave, the order-1 error `(k·h)²` is
 /// below anything the rest of the model can deliver, and buying `(k·h)⁴` there is
 /// paying six DOFs an edge for accuracy nobody can measure. Those cells go to
 /// order 1 and give their DOFs back.
 ///
 /// This needs no solve: it is a-priori, computable from the mesh, the materials and
 /// the frequency alone. (A p-decay indicator, which *is* free with a hierarchical
-/// basis — the magnitude of an element's top-mode coefficients — is the a-posteriori
+/// basis, the magnitude of an element's top-mode coefficients, is the a-posteriori
 /// refinement of this, and is not implemented yet.)
 ///
 /// The minimum rule then propagates the reduction to the entities, which means it
@@ -308,6 +308,6 @@ mod tests {
 
         // The reduction costs DOFs: 6 edges lose one each, 4 faces lose two each.
         let full = OrderMap::uniform(&mesh, 2);
-        assert_eq!(full.n_dofs() - o.n_dofs(), 6 * 1 + 4 * 2);
+        assert_eq!(full.n_dofs() - o.n_dofs(), 6 + 4 * 2);
     }
 }

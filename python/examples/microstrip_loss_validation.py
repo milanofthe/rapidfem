@@ -32,8 +32,8 @@ here: loss orders of magnitude off, negative, or with the wrong √f scaling.
 References
 ----------
 E. Hammerstad, O. Jensen, "Accurate Models for Microstrip Computer-Aided
-Design," IEEE MTT-S Digest, 1980 — Z0(u,εr), εeff(u,εr).
-D. M. Pozar, "Microwave Engineering", 4th ed., §3.8 — microstrip attenuation.
+Design," IEEE MTT-S Digest, 1980, Z0(u,εr), εeff(u,εr).
+D. M. Pozar, "Microwave Engineering", 4th ed., §3.8, microstrip attenuation.
 
 Usage
 -----
@@ -112,7 +112,7 @@ def solve(freq, *, metal, tand):
            air.faces.min(axis="x"), air.faces.max(axis="x"), air.faces.max(axis="z"))
     g.mesh()
     prob = rf.ProblemFD(g)
-    res = prob.sweep(np.array([freq]), z0=50.0)
+    res = prob.sweep(np.array([freq]))
     s11 = abs(res.sparams[0, 0, 0]); s21 = abs(res.sparams[0, 1, 0])
     pdiss = 1.0 - s11 ** 2 - s21 ** 2
     return dict(s11=s11, s21=s21,

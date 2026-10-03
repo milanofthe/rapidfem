@@ -39,7 +39,7 @@ fn rel_l2(got: &[Field], reference: &[f64]) -> f64 {
     let err: f64 = got
         .iter()
         .zip(reference)
-        .map(|(&a, &b)| (a as f64 - b).powi(2))
+        .map(|(&a, &b)| (a - b).powi(2))
         .sum::<f64>()
         .sqrt();
     let scale: f64 = reference.iter().map(|b| b * b).sum::<f64>().sqrt();
@@ -88,7 +88,7 @@ fn main() {
     if size_of::<Field>() == 8 {
         let mut bytes = Vec::with_capacity(2 * n * 8);
         for &v in dy.iter().chain(y.iter()) {
-            bytes.extend_from_slice(&(v as f64).to_le_bytes());
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(&path, bytes).expect("write reference");
         println!("  wrote f64 reference           {}", path.display());
@@ -96,8 +96,10 @@ fn main() {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let r: Vec<f64> = bytes
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_le_bytes(*c))
                     .collect();
                 assert_eq!(r.len(), 2 * n, "reference dof count mismatch");
                 println!(

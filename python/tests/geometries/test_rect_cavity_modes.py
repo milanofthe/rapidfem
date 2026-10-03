@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Closed rectangular PEC cavity — resonant eigenfrequencies.
+"""Closed rectangular PEC cavity, resonant eigenfrequencies.
 
 A source-free, air-filled metal box has a discrete spectrum of bound
 eigenmodes whose frequencies are known in closed form,

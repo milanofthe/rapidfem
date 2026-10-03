@@ -28,6 +28,18 @@ jobs:
       - name: Build (gpu feature)
         run: cargo build -p rapidfem-td --features gpu
 
+      # Lints, every warning fails the job. The lint policy for the numeric
+      # kernels is [workspace.lints] in Cargo.toml.
+      - name: Clippy
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy -p rapidfem-td --features gpu --all-targets -- -D warnings
+
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --exclude rapidfem-python
+
       # core/fd unit + sympy golden tests (element, coefficients, tri-mass,
       # waveguide-modal, port_eigen cutoffs, Debye, material tensors, interp),
       # geometry on rapidmesh (scene ops, solver mesh groups, MSH round trip).
@@ -35,7 +47,7 @@ jobs:
         run: cargo test --release -p rapidfem-core -p rapidfem-fd -p rapidfem-geom
 
       # TD sympy/analytical kernel goldens (fast). The full DGTD transient
-      # validation suite is slow (real meshes) — run it locally with
+      # validation suite is slow (real meshes), run it locally with
       # `cargo test -p rapidfem-td`.
       - name: Test td kernel goldens
         run: >
@@ -46,7 +58,7 @@ jobs:
           --test lserk4_convergence_test
 
   python-fast:
-    name: pytest (kernel + fast, no solves)
+    name: pytest (fast, not slow)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -57,11 +69,11 @@ jobs:
           python-version: "3.12"
       - name: Build + install rapidfem (with test extras)
         run: pip install "./python[test]"
-      - name: Fast tests (renormalization math, no FEM solves)
+      - name: Fast tests (everything not marked slow)
         run: cd python && python3 -m pytest -m "not slow" -q
 
   # The full physics suite (`slow`-marked tests) runs REAL FEM solves on real
-  # geometries — minutes of compute per run. It is deliberately NOT a CI job: CI
+  # geometries, minutes of compute per run. It is deliberately NOT a CI job: CI
   # must stay fast and never burn a solver. Those tests still exist and are run
   # locally / on demand with `cd python && pytest -m slow`. The mixed-order driven
   # path is guarded in CI cheaply by the Rust `driven_order_test` (a mini WR-90

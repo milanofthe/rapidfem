@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""PML termination — a matched absorber reflects almost nothing.
+"""PML termination, a matched absorber reflects almost nothing.
 
 A WR-90 (X-band) section is driven by a single RectWaveguidePort at z=min.
 The opposite end is *not* a second port but a short air slab carrying a
@@ -21,7 +21,7 @@ import pytest
 import rapidfem as rf
 from harness import case
 
-# WR-90 (X-band, 8.2–12.4 GHz)
+# WR-90 (X-band, 8.2-12.4 GHz)
 A, B = 22.86e-3, 10.16e-3
 L_INNER = 40.0e-3      # driven air section
 PML_T = 15.0e-3        # PML slab thickness

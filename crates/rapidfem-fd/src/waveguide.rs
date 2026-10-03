@@ -148,7 +148,7 @@ impl RectWaveguide {
     }
 
     /// Incident-wave source term for the port excitation vector.
-    /// Returns -2j * beta * port_mode_3d_global(...) as complex [3] vector.
+    /// Returns `-2j * beta * port_mode_3d_global(...)` as a complex 3-vector.
     pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
         let (ex, ey, ez) = self.port_mode_3d_global(x, y, z, exc);
         let factor = C64::new(0.0, -2.0 * self.get_beta(exc));
@@ -236,7 +236,7 @@ impl FloquetPort {
 
         // Uniform transverse mode field, valid only at normal incidence (θ=0),
         // which `build_ports` enforces. Oblique scan additionally needs the
-        // transverse Bloch phase exp(-j·k_t·r) and periodic side-wall BCs — see
+        // transverse Bloch phase exp(-j·k_t·r) and periodic side-wall BCs, see
         // issue #14.
         let ex_l = e0 * (-s * sin_p - p * cos_t * cos_p);
         let ey_l = e0 * (s * cos_p - p * cos_t * sin_p);
@@ -385,17 +385,17 @@ pub fn cs_from_origin_zaxis(origin: [f64; 3], z_axis: [f64; 3]) -> CoordinateSys
 ///
 /// The finite-thickness correction Zs = Zs,∞·coth(γₘ·t_eff) has two regimes:
 ///
-/// * `two_sided = false` — the sheet is exposed to fields on one side only
+/// * `two_sided = false`: the sheet is exposed to fields on one side only
 ///   (e.g. a ground plane on the domain boundary). The face owns the full
 ///   metal cross-section: t_eff = t, and Zs → 1/(σt) at DC.
-/// * `two_sided = true` — the face is one side of a conductor carrying SIBC
+/// * `two_sided = true`: the face is one side of a conductor carrying SIBC
 ///   on opposing faces (a shell around an extruded trace). Each face owns
 ///   half the metal: t_eff = t/2, so per-face Zs → 2/(σt) at DC and the two
 ///   opposing faces in parallel recover the physical 1/(σt). This is
 ///   algebraically identical to Palace's (sinh ν ± sin ν)/(cosh ν − cos ν)
 ///   thin-sheet correction with ν = t/δ.
 ///
-/// * `sheet = true` — a zero-thickness sheet embedded in the volume with
+/// * `sheet = true`: a zero-thickness sheet embedded in the volume with
 ///   fields on both sides, standing in for a strip of thickness t. The two
 ///   faces of the strip carry the current in parallel:
 ///   Z = Zs,∞·coth(γₘ·t/2)/2 (the even mode of the slab two-port), 1/(σt) at
@@ -483,7 +483,7 @@ impl SurfaceImpedance {
             let eps_c = C64::new(eps, -self.sigma / w0);
             let mu_c = C64::new(mu, 0.0);
             let gamma_m = C64::new(0.0, w0) * (mu_c * eps_c).sqrt();
-            r = r / (gamma_m * C64::from(t_eff)).tanh();
+            r /= (gamma_m * C64::from(t_eff)).tanh();
         }
         if self.sheet {
             r *= 0.5;
@@ -513,11 +513,10 @@ impl LumpedElement {
     pub fn impedance(&self, exc: &Excitation) -> C64 {
         let omega = exc.omega;
         let mut z = C64::new(self.r, omega * self.l);
-        if let Some(c) = self.c {
-            if c > 0.0 {
+        if let Some(c) = self.c
+            && c > 0.0 {
                 z += C64::new(0.0, -1.0 / (omega * c));
             }
-        }
         z
     }
 
@@ -540,7 +539,7 @@ impl LumpedElement {
 pub struct LumpedPort {
     pub port_number: usize,
     pub power: f64,
-    /// Reference resistance R (Ω) — S-parameters and incident power normalise to this.
+    /// Reference resistance R (Ω), S-parameters and incident power normalise to this.
     pub z0: f64,
     /// Series inductance L (H); 0 ⇒ no inductor.
     pub l: f64,
@@ -557,11 +556,10 @@ impl LumpedPort {
     pub fn impedance(&self, exc: &Excitation) -> C64 {
         let omega = exc.omega;
         let mut z = C64::new(self.z0, omega * self.l);
-        if let Some(c) = self.c {
-            if c > 0.0 {
+        if let Some(c) = self.c
+            && c > 0.0 {
                 z += C64::new(0.0, -1.0 / (omega * c));
             }
-        }
         z
     }
 

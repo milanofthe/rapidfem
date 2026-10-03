@@ -108,7 +108,7 @@ fn volume_basis(mesh: &Mesh) -> (Vec<BasisFn>, [V3; 4]) {
 
 /// The trace-carrying volume DOFs of face `f`, in the surface element's DOF order:
 /// the local volume index whose GLOBAL DOF is the surface element's local DOF `s`.
-/// This is the correspondence the assembler relies on — a shared global index —
+/// This is the correspondence the assembler relies on, a shared global index, 
 /// not one re-derived here.
 fn trace_dofs(basis: &NedelecBasis, tri: usize) -> [usize; 8] {
     let tet_dofs = basis.tet_dofs(0);

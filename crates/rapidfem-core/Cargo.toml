@@ -23,3 +23,6 @@ faer = { version = "0.24", default-features = false, features = ["std"] }
 rapidmesh-topo = { path = "../../vendor/rapidmesh/crates/rapidmesh-topo" }
 hashbrown = "0.16.1"
 num-complex = "0.4.6"
+
+[lints]
+workspace = true

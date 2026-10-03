@@ -29,6 +29,7 @@ use rapidmesh::shapes::{Shape, Sheet};
 use std::collections::BTreeMap;
 
 use crate::fem_mesh::Group;
+use crate::sheet_ops::{self, SheetOp};
 use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, SurfaceOptions, Object as RmObject, Scope, Solid, Topology, Transform};
 
 /// Index of an object in its [`Geometry`].
@@ -39,6 +40,9 @@ pub type ObjId = usize;
 pub enum Item {
     Solid(Shape),
     Sheet(Sheet),
+    /// Several pieces of one sheet, the result of a sheet boolean that
+    /// falls apart; they share the object's tag and transforms.
+    Sheets(Vec<Sheet>),
     /// The solid a sheet sweeps along `vector`; the sheet stays as its
     /// bottom face. The object's first `placed` transforms move the sheet
     /// before the sweep, the rest move both after it.
@@ -152,10 +156,7 @@ fn matches(solids: &[Option<Solid>], s: &FaceSel, f: &Face) -> bool {
     if f.origin != s.origin {
         return false;
     }
-    let region = |o: ObjId| match solids.get(o).copied().flatten() {
-        Some(sol) => Some(sol.region),
-        _ => None,
-    };
+    let region = |o: ObjId| solids.get(o).copied().flatten().map(|sol| sol.region);
     let Some(side) = s.side.and_then(region) else { return true };
     if !f.regions.contains(&side) {
         return false;
@@ -243,7 +244,6 @@ impl Geometry {
 
     /// Turns solids into holes: they carve their region as before, and the
     /// region is removed from the solver mesh, leaving its walls as boundary.
-    /// before them and their walls become boundary faces.
     pub fn make_void(&mut self, ids: &[ObjId]) {
         for &i in ids {
             self.objects[i].void = true;
@@ -259,6 +259,33 @@ impl Geometry {
             self.objects[i].priority = self.top_priority;
         }
         self.changed();
+    }
+
+    /// Combines the sheet `target` with the sheets `tools` in their common
+    /// plane (see [`crate::sheet_ops`]): the target becomes the result, the
+    /// tools are used up.
+    pub fn sheet_boolean(&mut self, op: SheetOp, target: ObjId, tools: &[ObjId]) -> Result<(), String> {
+        let pieces = |id: ObjId| -> Result<&[Sheet], String> {
+            match &self.objects[id].item {
+                Item::Sheet(s) => Ok(std::slice::from_ref(s)),
+                Item::Sheets(v) => Ok(v),
+                _ => Err(format!("object {id} is not a sheet")),
+            }
+        };
+        let operand = |id: ObjId| pieces(id).map(|p| (p, self.objects[id].transforms.as_slice()));
+        let tool_ops = tools.iter().map(|&i| operand(i)).collect::<Result<Vec<_>, _>>()?;
+        let (mut sheets, placement) = sheet_ops::boolean(op, operand(target)?, &tool_ops)?;
+        self.objects[target].item = if sheets.len() == 1 {
+            Item::Sheet(sheets.pop().expect("one piece"))
+        } else {
+            Item::Sheets(sheets)
+        };
+        self.objects[target].transforms = placement;
+        for &i in tools {
+            self.objects[i].alive = false;
+        }
+        self.changed();
+        Ok(())
     }
 
     /// Removes an object from the scene.
@@ -334,8 +361,10 @@ impl Geometry {
     /// Turns a sheet into the solid it sweeps along `vector` (the object
     /// keeps its id; the sheet stays as the bottom face).
     pub fn extrude(&mut self, id: ObjId, vector: [f64; 3]) -> Result<(), String> {
-        let Item::Sheet(sheet) = &self.objects[id].item else {
-            return Err(format!("object {id} is not a sheet"));
+        let sheet = match &self.objects[id].item {
+            Item::Sheet(sheet) => sheet,
+            Item::Sheets(_) => return Err(format!("sheet {id} has several pieces; extrude them one by one")),
+            _ => return Err(format!("object {id} is not a sheet")),
         };
         let sheet = sheet.clone();
         let placed = self.objects[id].transforms.len();
@@ -374,6 +403,13 @@ impl Geometry {
                     (vec![s.into()], 0)
                 }
                 Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?.into()], 0),
+                Item::Sheets(sheets) => (
+                    sheets
+                        .iter()
+                        .map(|s| g.add_sheet(s, sheet_tag(i), o.maxh).map(Into::into).map_err(e))
+                        .collect::<Result<Vec<RmObject>, String>>()?,
+                    0,
+                ),
                 Item::Extrusion { sheet, vector, placed } => {
                     let r = g.add_sheet(sheet, sheet_tag(i), o.maxh).map_err(e)?;
                     for &tr in &o.transforms[..*placed] {
@@ -514,7 +550,7 @@ impl Geometry {
         let r = self.realized()?;
         let o = &self.objects[id];
         let mut out: Vec<FaceSel> = match (&o.item, r.solids[id]) {
-            (Item::Sheet(_), _) => {
+            (Item::Sheet(_) | Item::Sheets(_), _) => {
                 vec![FaceSel { origin: FaceOrigin::Sheet { object: id }, side: None, across: None }]
             }
             (Item::Solid(_) | Item::Extrusion { .. } | Item::Step { .. }, Some(s)) => r
@@ -557,7 +593,7 @@ impl Geometry {
                 out.push(([a.min(b), a.max(b)], e.midpoint));
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.sort_by_key(|a| a.0);
         out.dedup_by(|a, b| a.0 == b.0);
         Ok(out)
     }

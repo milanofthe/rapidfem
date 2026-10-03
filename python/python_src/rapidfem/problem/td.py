@@ -6,7 +6,7 @@
 
 `ProblemTD` is the time-domain counterpart of :class:`ProblemFD`. Where
 `ProblemFD` is an analysis tool (geometry in, S-parameters out), `ProblemTD`
-is a *model-export* tool: it compiles a cavity into a linear ODE
+is a *model-export* tool: it compiles the meshed structure into a linear ODE
 ``dy/dt = A·y`` and exposes it at every level of abstraction,
 
 * :meth:`transient`           : turnkey, propagate an initial state,
@@ -14,8 +14,9 @@ is a *model-export* tool: it compiles a cavity into a linear ODE
 * :meth:`rhs` / :meth:`jacobian`, the ODE right-hand side / constant Jacobian,
 * :meth:`state_space`         : the verbatim sparse operator ``A``.
 
-The current backend meshes a structured box cavity with PEC walls; general
-geometry support follows the frequency-domain ``(mesh, TOML)`` path.
+The operator is built from the same meshed geometry and typed model as
+:class:`ProblemFD`; :meth:`ProblemTD.box` is a structured PEC cavity for
+validation. The runs themselves live in Rust (``rapidfem_td::session``).
 """
 from __future__ import annotations
 
@@ -60,7 +61,7 @@ class TdODE:
 
     def __init__(self, problem):
         self._p = problem
-        self.n_dof = problem.n_dof
+        self.n_dofs = problem.n_dofs
 
     def rhs(self, t, y):
         """``dy/dt`` at state ``y``. The ``t`` argument is ignored, the
@@ -73,7 +74,7 @@ class TdODE:
         return self._p.state_space()
 
     def __repr__(self):
-        return f"TdODE(n_dof={self.n_dof})"
+        return f"TdODE(n_dofs={self.n_dofs})"
 
 
 class TdStepper:
@@ -182,7 +183,7 @@ class TdTransfer:
 
 
 class TdTrajectory(np.ndarray):
-    """A time-domain field trajectory, ``[n_snapshot, n_dof]``.
+    """A time-domain field trajectory, ``[n_snapshot, n_dofs]``.
 
     For every numerical purpose this *is* a :class:`numpy.ndarray`,
     indexing, slicing, ``.shape``, arithmetic and
@@ -238,7 +239,7 @@ class ProblemTD:
     Note
     ----
     The geometry must already be meshed (via ``g.mesh()``) before the
-    ProblemTD is constructed, construction snapshots the mesh bytes.
+    ProblemTD is constructed; it keeps the solver mesh of that moment.
     Re-meshing the geometry afterwards has no effect on an existing
     ProblemTD; construct a new one instead. :meth:`box` is a shortcut that
     builds directly on a structured box cavity, bypassing the geometry
@@ -264,8 +265,8 @@ class ProblemTD:
 
     Attributes
     ----------
-    n_dof : int
-        state-vector length, ``6·Np·n_elem``
+    n_dofs : int
+        state-vector length, ``6·Np·n_tets`` plus the dispersive block
     order : int
         the DG polynomial order the operator was built at
     flux : str
@@ -317,7 +318,7 @@ class ProblemTD:
         self._geometry = geometry
         self.order = order
         self.flux = flux
-        _log(f"operator built - {self.n_dof} DOFs, order {order}, flux={flux}")
+        _log(f"operator built - {self.n_dofs} DOFs, order {order}, flux={flux}")
 
     @classmethod
     def box(cls, *, size, cells, order=2, flux="upwind", c=1.0):
@@ -347,20 +348,21 @@ class ProblemTD:
         obj.size = tuple(size)
         obj.cells = tuple(cells)
         _log(
-            f"operator built (box) - {obj.n_dof} DOFs, order {order}, "
+            f"operator built (box) - {obj.n_dofs} DOFs, order {order}, "
             f"flux={flux}"
         )
         return obj
 
     @property
-    def n_dof(self):
-        """State-vector length, ``6·Np·n_elem``."""
-        return self._op.n_dof()
+    def n_dofs(self):
+        """State-vector length, ``6·Np·n_tets`` plus the auxiliary block of
+        dispersive materials."""
+        return self._op.n_dofs()
 
     @property
-    def n_dofs(self):
-        """Alias of :attr:`n_dof`, matching ProblemFD's attribute name."""
-        return self.n_dof
+    def n_tets(self):
+        """Number of tetrahedra (DG elements)."""
+        return self._op.n_tets()
 
     # -- low level: the ODE -------------------------------------------------
     def rhs(self, y):
@@ -403,7 +405,7 @@ class ProblemTD:
         Parameters
         ----------
         state : array_like
-            A state vector ``[n_dof]``. Trailing auxiliary DOFs beyond the
+            A state vector ``[n_dofs]``. Trailing auxiliary DOFs beyond the
             ``6*Np*n_elem`` E,H block are ignored.
 
         Returns
@@ -436,7 +438,7 @@ class ProblemTD:
         """Export the problem as an explicit linear ODE ``dy/dt = A·y``.
 
         Returns a :class:`TdODE` carrying everything an external
-        integrator needs, ``n_dof``, a matrix-free ``rhs(t, y)`` with
+        integrator needs, ``n_dofs``, a matrix-free ``rhs(t, y)`` with
         the :func:`scipy.integrate.solve_ivp` signature, and
         ``jacobian()``.
         """
@@ -499,18 +501,18 @@ class ProblemTD:
         Parameters
         ----------
         y : array_like
-            Current state, shape ``[n_dof]``.
+            Current state, shape ``[n_dofs]``.
         h : float
             Proposed step size in physical time units.
 
         Returns
         -------
         y_new : ndarray
-            The advanced state, shape ``[n_dof]``, the fourth-order main
+            The advanced state, shape ``[n_dofs]``, the fourth-order main
             solution.
         err : ndarray
             Per-DOF embedded-error vector ``y_4 − y_3``, shape
-            ``[n_dof]``. A controller compares its weighted L2 norm
+            ``[n_dofs]``. A controller compares its weighted L2 norm
             against 1: smaller means the step was easy and the next one
             can grow, above 1 means the step must be rejected and shrunk.
             The controller of :meth:`transient` uses ``atol = 1e-8``,
@@ -702,7 +704,7 @@ class ProblemTD:
         Parameters
         ----------
         traj : ndarray
-            A ``[n_snapshot, n_dof]`` field trajectory, e.g. the return of
+            A ``[n_snapshot, n_dofs]`` field trajectory, e.g. the return of
             :meth:`transient`.
         ports : list
             Modal port physics objects (RectWaveguidePort / CoaxPort /
@@ -763,11 +765,6 @@ class ProblemTD:
             exponential integrator samples the waveform once per output
             frame, explicit once per substep, adaptive once per substep on
             the CPU and once per frame on the GPU.
-
-            *Adaptive vs the frequency-domain* :class:`~rapidfem.Adaptive`
-            *class*: unrelated, :class:`~rapidfem.Adaptive` drives mesh /
-            order h-p refinement in :meth:`ProblemFD.sweep`; here the
-            argument selects a *time integrator*.
         warmup : int
             Output steps to run with the exponential integrator before
             handing off to ``method``. With ``method="explicit"`` this
@@ -787,7 +784,7 @@ class ProblemTD:
         Returns
         -------
         TdTrajectory
-            The field trajectory, shape ``[steps + 1, n_dof]``. It *is* a
+            The field trajectory, shape ``[steps + 1, n_dofs]``. It *is* a
             :class:`numpy.ndarray` for every numerical purpose (indexing,
             slicing, :meth:`export_vtk`); passing it to
             :func:`rapidfem.show` plays it back as a 3-D field animation
@@ -824,8 +821,8 @@ class ProblemTD:
         Parameters
         ----------
         states : ndarray
-            A single state ``[n_dof]`` or a trajectory
-            ``[n_snapshots, n_dof]``, e.g. the return of
+            A single state ``[n_dofs]`` or a trajectory
+            ``[n_snapshots, n_dofs]``, e.g. the return of
             :meth:`transient`.
         path : str or os.PathLike
             Output base path. ``<path>.pvd`` and ``<path>_NNNN.vtu`` are

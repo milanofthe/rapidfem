@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Coaxial line — S-parameters of a matched air-filled TEM section.
+"""Coaxial line, S-parameters of a matched air-filled TEM section.
 
 A matched, lossless coax carries a pure TEM mode (no cutoff): it transmits
 with near-zero reflection and the insertion phase of S21 equals −β·L with

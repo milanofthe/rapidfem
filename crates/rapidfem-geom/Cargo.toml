@@ -18,4 +18,9 @@ rapidmesh-step = { path = "../../vendor/rapidmesh/crates/rapidmesh-step" }
 rapidmesh-geom = { path = "../../vendor/rapidmesh/crates/rapidmesh-geom" }
 rapidmesh-tet = { path = "../../vendor/rapidmesh/crates/rapidmesh-tet" }
 rapidmesh-topo = { path = "../../vendor/rapidmesh/crates/rapidmesh-topo" }
+# Sheet booleans until rapidmesh has them (milanofthe/rapidmesh-dev#292).
+i_overlay = "1.9"
 hashbrown = "0.16.1"
+
+[lints]
+workspace = true

@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Coplanar-waveguide characteristic impedance — from a 50 Ω reflection.
+"""Coplanar-waveguide characteristic impedance, from a 50 Ω reflection.
 
 A centre signal strip flanked by two coplanar ground strips on the same
 dielectric surface (air above, substrate below) is a quasi-TEM line whose
@@ -13,7 +13,7 @@ characteristic impedance follows the classic conformal-mapping result
 with εeff = (εr+1)/2 in the thick-substrate limit and K the complete elliptic
 integral of the first kind (Simons/Wadell). Z0 depends only on the *ratio* k
 and εr, so the cross-section is scaled up to ease meshing without moving Z0.
-The dimensions here put Z0 ≈ 83 Ω — a deliberate, strong mismatch against the
+The dimensions here put Z0 ≈ 83 Ω, a deliberate, strong mismatch against the
 50 Ω port reference (NOT an accidental match).
 
 Like the stripline test, the line is fed by `rf.LumpedPort(z0=50)` delta-gaps
@@ -35,7 +35,7 @@ connected shield that ties both ground strips to a common potential (so the
 odd/slotline mode is suppressed and a single-slot feed drives the pure CPW
 mode). The signal is recessed by GAP_IN from each y-end so the feed bridges are
 *interior* coplanar delta-gaps (signal→ground across one slot, on the
-substrate/air interface) rather than boundary faces — otherwise the default-PEC
+substrate/air interface) rather than boundary faces, otherwise the default-PEC
 end walls would short the line. The asymmetric single-slot feed still measures
 the full CPW mode: V = signal-to-ground across the slot, I = signal current, so
 V/I = Z0 (verified lossless, |S11|²+|S21|² ≈ 1).
@@ -120,8 +120,8 @@ def _build_cpw(g):
     # that commons the grounds) ride on the default-PEC exterior. The feed
     # plates are interior → they carry the lumped ports (E across the slot, +x).
     rf.PEC(signal, gnd_l, gnd_r)
-    rf.LumpedPort(feed_a, direction=(1, 0, 0), z0=ZREF)
-    rf.LumpedPort(feed_b, direction=(1, 0, 0), z0=ZREF)
+    rf.LumpedPort(feed_a, direction=(1, 0, 0))
+    rf.LumpedPort(feed_b, direction=(1, 0, 0))
     return feed_a, feed_b
 
 
@@ -136,10 +136,10 @@ def test_cpw_impedance_from_reflection():
     _build_cpw(g)
 
     # εeff ≈ (εr+1)/2 = 2.5 puts the quarter-wave peak (θ = π/2) near 4.7 GHz
-    # for this length; sweep 2–9 GHz so the |S11| envelope rises to its peak and
+    # for this length; sweep 2-9 GHz so the |S11| envelope rises to its peak and
     # falls toward the half-wave null, resolving the peak inside the band.
     freqs = np.linspace(2.0e9, 9.0e9, 15)
-    prob, res = case.sweep(g, freqs, z0=ZREF)
+    prob, res = case.sweep(g, freqs)
 
     s11 = np.abs(res.sparams[:, 0, 0])
     s21 = np.abs(res.sparams[:, 1, 0])
@@ -151,7 +151,7 @@ def test_cpw_impedance_from_reflection():
 
     # A genuine standing-wave envelope: a clear reflection peak and a deep dip
     # as θ sweeps through π/2 toward π (not a flat matched line). A ~73 Ω FEM
-    # line against the 50 Ω reference gives a peak near 0.37 — well clear of a
+    # line against the 50 Ω reference gives a peak near 0.37, well clear of a
     # matched line's ≈0, so a 0.30 floor confirms a real envelope.
     p_peak = float(s11.max())
     assert p_peak > 0.30, f"reflection envelope too weak, peak |S11|={p_peak:.3f}"

@@ -4,7 +4,7 @@
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 """
-RapidFEM docs — API extraction build.
+RapidFEM docs, API extraction build.
 
 For every released git tag (>= MIN_SUPPORTED_VERSION) this extracts the
 RapidFEM Python API via griffe static analysis and writes:
@@ -12,14 +12,14 @@ RapidFEM Python API via griffe static analysis and writes:
     static/api/<tag>.json     full API data for that version
     static/api/latest.json    copy of the newest version
     static/api/versions.json  manifest (latest tag + ordered version list)
-    src/lib/api/versions.json  same manifest, importable by the app
+    src/lib/docs/api/versions.json  same manifest, importable by the app
 
 Each tag is materialised in a detached git worktree so the working tree
 is never touched. RapidFEM does not need to be installed.
 
 Usage:
-    python scripts/build.py            # extract all supported tags
-    python scripts/build.py --head     # also extract the current worktree
+    python scripts/api_ref/build.py            # extract all supported tags
+    python scripts/api_ref/build.py --head     # also extract the current worktree
 """
 
 import argparse
@@ -131,7 +131,7 @@ def main() -> int:
         api = extract_ref(tag)
         n_modules = write_api(api, tag, api_dir)
         if n_modules == 0:
-            print("no API — skipped")
+            print("no API, skipped")
             continue
         dates[tag] = run_git("log", "-1", "--format=%cs", tag)
         extracted.append(tag)
@@ -147,7 +147,7 @@ def main() -> int:
         print("  dev (working tree) ...", end=" ", flush=True)
         api = extract_head()
         n_modules = write_api(api, "dev", api_dir)
-        print(f"{n_modules} modules" if n_modules else "no API — skipped")
+        print(f"{n_modules} modules" if n_modules else "no API, skipped")
         if n_modules:
             dates["dev"] = run_git("log", "-1", "--format=%cs")
 

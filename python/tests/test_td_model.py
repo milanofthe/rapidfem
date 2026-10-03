@@ -31,23 +31,17 @@ def _guide(port=rf.RectWaveguidePort):
 
 def test_driven_transient_from_the_model():
     g, p_in = _guide()
-    try:
-        ptd = rf.ProblemTD(g, order=1, flux="upwind")
-        assert ptd.n_dof > 0
-        pulse = rf.GaussianPulse(t0=90e-12, tau=22e-12, f0=10e9)
-        traj = ptd.transient(port=p_in, waveform=pulse, dt=3e-12, steps=40,
-                             method="explicit", device="cpu", verbose=False)
-        amp = np.linalg.norm(traj, axis=1)
-        assert np.all(np.isfinite(traj))
-        assert amp[0] == 0.0 and amp.max() > 0.0, "the port must inject the pulse"
-    finally:
-        g.close()
+    ptd = rf.ProblemTD(g, order=1, flux="upwind")
+    assert ptd.n_dofs > 0
+    pulse = rf.GaussianPulse(t0=90e-12, tau=22e-12, f0=10e9)
+    traj = ptd.transient(port=p_in, waveform=pulse, dt=3e-12, steps=40,
+                         method="explicit", device="cpu", verbose=False)
+    amp = np.linalg.norm(traj, axis=1)
+    assert np.all(np.isfinite(traj))
+    assert amp[0] == 0.0 and amp.max() > 0.0, "the port must inject the pulse"
 
 
 def test_lumped_port_is_refused():
     g, _ = _guide(port=rf.LumpedPort)
-    try:
-        with pytest.raises(RuntimeError, match="LumpedPort is not supported"):
-            rf.ProblemTD(g, order=1)
-    finally:
-        g.close()
+    with pytest.raises(RuntimeError, match="LumpedPort is not supported"):
+        rf.ProblemTD(g, order=1)

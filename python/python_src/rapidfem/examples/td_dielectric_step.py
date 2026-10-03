@@ -48,7 +48,7 @@ rf.show(g)
 
 # %% Build the time-domain problem
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
-print(f"DGTD dielectric step - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD dielectric step - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"slab er={ER}, drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive TE10 at the input and watch it split at the slab

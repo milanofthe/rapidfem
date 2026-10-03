@@ -63,7 +63,7 @@ rf.show(layout.geometry)
 # %% Sweep across the RF band
 FREQS_HZ = np.linspace(1e9, 50e9, 20)
 
-prob = rf.Problem(layout.geometry)
+prob = rf.ProblemFD(layout.geometry)
 result = prob.sweep(FREQS_HZ)
 rf.show(prob)
 rf.show(result)

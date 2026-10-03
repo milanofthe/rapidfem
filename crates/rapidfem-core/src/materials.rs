@@ -103,7 +103,7 @@ pub fn build_material_tensors_wo_sigma(
 
 /// Per-tet bulk-conductivity tensors σ (S/m, real values on the diagonal).
 /// Assembled as a mass matrix this yields B_σ; the sweep adds it per
-/// frequency as +j·k₀²/(ω·ε₀)·B_σ — algebraically identical to rebuilding
+/// frequency as +j·k₀²/(ω·ε₀)·B_σ, algebraically identical to rebuilding
 /// εr*(ω) = … − j·σ/(ω·ε₀) at every frequency.
 pub fn build_sigma_tensors(n_tets: usize, materials: &[Material]) -> Vec<[[C64; 3]; 3]> {
     let zero3x3 = [[C64::new(0.0, 0.0); 3]; 3];

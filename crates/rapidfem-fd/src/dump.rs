@@ -33,7 +33,6 @@ pub(crate) fn target() -> Option<(PathBuf, String)> {
 /// - `n`, `rows`, `cols`, `vals`: the full `n x n` matrix as COO triplets,
 ///   both triangles, duplicates allowed (they are summed).
 /// - `rhs`: right-hand sides, each of length `n`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_system(
     (dir, tag): &(PathBuf, String),
     index: usize,

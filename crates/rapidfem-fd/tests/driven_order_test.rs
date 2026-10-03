@@ -14,8 +14,8 @@
 // The reduction here is HAND-PICKED, not taken from the policy: cells near the side
 // walls, where the TE10 field ~ sin(πx/a) is close to zero, so dropping them to
 // order 1 must barely move the S-parameters. That isolates the question this test
-// exists for — does the driven assembly handle a mixed-order map, including the
-// reduced-order port-face DOFs the minimum rule produces — from the separate
+// exists for, does the driven assembly handle a mixed-order map, including the
+// reduced-order port-face DOFs the minimum rule produces, from the separate
 // question of whether the policy chooses well (which cavity_spectrum settles).
 
 mod common;
@@ -130,7 +130,7 @@ fn mixed_order_gives_the_same_s_matrix_as_uniform_order_2() {
     let orders: Vec<u8> = (0..mesh.n_tets())
         .map(|t| {
             let xc: f64 = mesh.tets[t].iter().map(|&n| mesh.nodes[n][0]).sum::<f64>() / 4.0;
-            if xc < 0.18 * A || xc > 0.82 * A {
+            if !(0.18 * A..=0.82 * A).contains(&xc) {
                 1
             } else {
                 2
@@ -155,7 +155,7 @@ fn mixed_order_gives_the_same_s_matrix_as_uniform_order_2() {
     let s_mixed = solve_s(&mesh, OrderMap::from_cells(&mesh, orders));
 
     // Compare the whole 2x2. The reduced cells sit where the field is small, so the
-    // S-matrix must barely move — but this is a coarse mesh and order 1 vs 2 near a
+    // S-matrix must barely move, but this is a coarse mesh and order 1 vs 2 near a
     // wall is a real change, so allow a few percent rather than machine precision.
     // A broken driven mixed-order path (wrong Robin block size, a mis-scattered
     // reduced port face) would move S by O(1), not O(1e-2).

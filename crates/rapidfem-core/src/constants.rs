@@ -33,7 +33,7 @@ pub const POINT_IN_TET_EPS: f64 = 1e-8;
 pub const SLIVER_NORMVOL_FLOOR: f64 = 1e-9;
 
 /// Normalized tet volume below which a mesh-load quality warning is emitted
-/// (cond ≳ 1e12 — a real conditioning concern, well before the hard floor).
+/// (cond ≳ 1e12, a real conditioning concern, well before the hard floor).
 pub const SLIVER_NORMVOL_WARN: f64 = 1e-6;
 
 /// Lanczos lucky-breakdown threshold for the eigenmode solver: the Krylov

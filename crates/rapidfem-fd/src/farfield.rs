@@ -89,7 +89,6 @@ pub struct ImagePlane {
 ///
 /// `accepted_fraction`: the fraction of the incident power the antenna
 /// accepts, for the realized gain; `None` makes the gain the directivity.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_farfield(
     mesh: &Mesh,
     basis: &NedelecBasis,
@@ -103,8 +102,8 @@ pub fn compute_farfield(
     accepted_fraction: Option<f64>,
 ) -> RadiationPattern {
     let exc = crate::excitation::Excitation::new(frequency, mesh.l0);
-    // Lever ④: the near-to-far transform is done entirely in physical units —
-    // surface points/fields are converted to physical below — so use the
+    // Lever ④: the near-to-far transform is done entirely in physical units, 
+    // surface points/fields are converted to physical below, so use the
     // physical k₀ here (= κ/L₀), not the length-normalized κ.
     let l0 = mesh.l0;
     let k0 = exc.k0 / l0;

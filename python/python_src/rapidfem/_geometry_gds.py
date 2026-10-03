@@ -41,7 +41,6 @@ class _GdsMixin:
         flatten: bool = True,
         merge: bool = True,
         thin_conductors: bool = False,
-        scale: float = 1e-6,
     ) -> "Geometry":
         """Load a GDSII layout and extrude all matching polygons into 3D primitives.
 
@@ -63,8 +62,6 @@ class _GdsMixin:
                 True), so touching traces carry no internal faces.
             thin_conductors: If True, metal layers become 2D sheets at the
                 layer's bottom z (thin-conductor approximation, t << w).
-            scale: accepted for compatibility; the mesher works with exact
-                predicates at any scale.
         """
         from .geometry import Geometry
         try:

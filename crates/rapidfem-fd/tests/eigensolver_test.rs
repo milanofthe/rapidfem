@@ -6,7 +6,7 @@
 //
 // `eigenmode::solve_eigenmode` runs a shift-invert Lanczos. Nothing pinned what it
 // returned: not the eigenvalues, not the eigenvectors, and above all not whether a
-// returned "mode" was an eigenpair at all. It was not — it reported ghost modes
+// returned "mode" was an eigenpair at all. It was not, it reported ghost modes
 // below the fundamental and eigenvectors with an O(1) eigenpair residual.
 //
 // The reference here is `common::dense_spectrum`, which computes the WHOLE spectrum
@@ -18,7 +18,7 @@
 //   1. Every eigenvalue the solver returns is one of the true ones.
 //   2. It returns the ones NEAREST THE TARGET, which is what shift-invert is for.
 //   3. Every eigenPAIR it returns actually satisfies E·x = λ·B·x. An eigenvalue that
-//      is right by luck, carried by a vector that solves nothing, is not a mode —
+//      is right by luck, carried by a vector that solves nothing, is not a mode, 
 //      and it is exactly what a Lanczos run in the wrong inner product produces, with
 //      or without reorthogonalisation.
 
@@ -100,7 +100,7 @@ fn every_returned_mode_is_an_eigenpair() {
 }
 
 /// Every eigenvalue returned is a true eigenvalue, and they are the ones nearest the
-/// target. A ghost — a Ritz value that matches nothing in the true spectrum — fails
+/// target. A ghost, a Ritz value that matches nothing in the true spectrum, fails
 /// the first check. A solver that converges on the wrong end of the spectrum fails
 /// the second.
 #[test]
@@ -194,7 +194,7 @@ fn the_static_kernel_is_not_reported_as_a_resonance() {
 
 /// The lossy path, which is the whole reason the inner product is BILINEAR.
 ///
-/// With loss, E and B are complex SYMMETRIC — not Hermitian — so the form the
+/// With loss, E and B are complex SYMMETRIC, not Hermitian, so the form the
 /// operator is self-adjoint in is xᵀBy without a conjugate. A Hermitian Lanczos here
 /// would not merely be less accurate; it would be solving a different problem.
 ///
@@ -204,7 +204,7 @@ fn the_static_kernel_is_not_reported_as_a_resonance() {
 ///     k₀ = √λ = √λ_vac / √εr,   1/√εr ≈ (1 + j·tanδ/2)/√ε'   for small tanδ,
 ///
 /// so Re(f)/Im(f) = 2/tanδ and the solver's Q = ½·Re(f)/|Im(f)| = 1/tanδ, exactly, to
-/// first order. It depends on nothing about the mesh or the element — only on the
+/// first order. It depends on nothing about the mesh or the element, only on the
 /// complex arithmetic being right.
 #[test]
 fn a_uniformly_lossy_cavity_has_q_equal_to_one_over_tan_delta() {
@@ -259,7 +259,7 @@ fn a_uniformly_lossy_cavity_has_q_equal_to_one_over_tan_delta() {
 
 /// The reachable band, pinned.
 ///
-/// This is not a bug being tolerated — it is a property of shift-invert on a pencil
+/// This is not a bug being tolerated, it is a property of shift-invert on a pencil
 /// with a huge null space, and the solver's usage depends on knowing it. The discrete
 /// gradients all sit at λ = 0, which shift-invert maps to |μ| = 1/σ. A mode at λ is
 /// ahead of that cluster only when |λ − σ| < σ, i.e. f < √2·f_target. Beyond it, the
@@ -267,11 +267,11 @@ fn a_uniformly_lossy_cavity_has_q_equal_to_one_over_tan_delta() {
 ///
 /// The test states the consequence and checks it both ways: a target on the lowest
 /// mode reaches only the lowest few, and a target in the middle of the band reaches
-/// modes on both sides of it — INCLUDING ones below the target, which is the part
+/// modes on both sides of it, INCLUDING ones below the target, which is the part
 /// that would be surprising if the mechanism were anything else.
 #[test]
 fn the_reachable_band_is_below_root_two_times_the_target() {
-    let (mesh, pec, f101) = cavity();
+    let (mesh, pec, _f101) = cavity();
     let basis = NedelecBasis::new(&mesh);
     let (truth, kernel) = resonances(&basis, &mesh, &pec);
     assert!(kernel > 0, "no kernel: this test checks nothing");
@@ -294,7 +294,7 @@ fn the_reachable_band_is_below_root_two_times_the_target() {
     assert_eq!(modes.len(), 4, "a mid-band target must reach all four");
 
     // Every one of the four is a true resonance, and at least one lies BELOW the
-    // target — which only happens because the band is two-sided in λ, not because the
+    // target, which only happens because the band is two-sided in λ, not because the
     // solver walks upward from the shift.
     let mut below = 0;
     for m in &modes {

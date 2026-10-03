@@ -5,7 +5,7 @@
 #########################################################################################
 ##
 ##                                  PROBLEM
-##                                 (problem.py)
+##                                  (fd.py)
 ##
 #########################################################################################
 
@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import Iterable
 
 import numpy as np
@@ -38,9 +37,9 @@ class ErrorIndicator:
 
     Note
     ----
-    The indicator is purely diagnostic, calling
-    :meth:`ProblemFD.element_errors` does **not** re-mesh or re-solve.
-    The adaptive sweep that consumes it is tracked in issue #43.
+    The indicator is diagnostic: calling :meth:`ProblemFD.element_errors`
+    does **not** re-mesh or re-solve. Refine where it points with the
+    static size controls (``maxh``, :meth:`Geometry.refine_near_points`).
 
 
     Attributes
@@ -85,44 +84,6 @@ class ErrorIndicator:
                 f"freq={self.freq_hz/1e9:.3f} GHz)")
 
 
-# ADAPTIVE REFINEMENT ===================================================================
-
-class Adaptive:
-    """Adaptive-mesh-refinement settings for :meth:`ProblemFD.sweep`.
-
-    Drives a Dörfler-marking loop on top of the driven sweep, elements
-    carrying the highest residual error get their local mesh size cut
-    by ``refinement_ratio`` and the sweep is repeated.
-
-
-    Note
-    ----
-    The refinement loop is not wired yet (issue #43): passing an
-    ``Adaptive`` to :meth:`ProblemFD.sweep` warns and runs the sweep on
-    the given mesh. :meth:`ProblemFD.element_errors` gives the indicator.
-
-
-    Example
-    -------
-    .. code-block:: python
-
-        result = prob.sweep(freqs, adaptive=rf.Adaptive(theta=0.6))
-
-
-    Parameters
-    ----------
-    theta : float
-        Dörfler-marking fraction (elements carrying the top
-        :math:`\\theta` of the residual error are marked)
-    refinement_ratio : float
-        local size reduction applied to marked elements
-    """
-
-    def __init__(self, *, theta: float = 0.5, refinement_ratio: float = 0.5):
-        self.theta = float(theta)
-        self.refinement_ratio = float(refinement_ratio)
-
-
 # PROBLEM ===============================================================================
 
 class ProblemFD:
@@ -136,8 +97,8 @@ class ProblemFD:
     - :meth:`eigenmode` for modal / resonator analysis
     - :meth:`farfield` for post-sweep radiation patterns
 
-    Each analysis re-assembles the TOML config from the geometry's
-    physics registry and hands it to the native Rust solver. The most
+    Each analysis builds the typed model from the geometry's physics
+    registry and hands it to the native Rust solver. The most
     recent native :class:`Simulation` instance is cached so follow-ups
     like :meth:`farfield` reuse the same assembly without re-solving.
 
@@ -145,28 +106,30 @@ class ProblemFD:
     Note
     ----
     The geometry must already be meshed (via ``g.mesh()``) before the
-    ProblemFD is constructed, the ProblemFD snapshot copies the mesh
-    bytes on init. Re-meshing the geometry afterwards has no effect on
-    an existing ProblemFD; construct a new one instead.
+    ProblemFD is constructed; it keeps the solver mesh of that moment.
+    Re-meshing the geometry afterwards has no effect on an existing
+    ProblemFD; construct a new one instead.
 
 
     Example
     -------
-    Three analyses on a single dielectric resonator problem:
+    A WR-90 section, swept and re-referenced to 50 ohm:
 
     .. code-block:: python
 
-        g = rf.Geometry(maxh=rf.lambda_maxh(f_max=3e9))
-        air = g.box(W, W, H, material=rf.Air())
-        rf.PEC(air.faces.min(axis="x"), air.faces.max(axis="x"),
-               air.faces.min(axis="y"), air.faces.max(axis="y"),
-               air.faces.min(axis="z"), air.faces.max(axis="z"))
+        g = rf.Geometry(maxh=rf.lambda_maxh(f_max=12e9))
+        air = g.box(22.86e-3, 10.16e-3, 30e-3, material=rf.Air())
+        rf.RectWaveguidePort(air.faces.min(axis="z"))
+        rf.RectWaveguidePort(air.faces.max(axis="z"))
+        rf.PEC(*air.faces.unassigned)
         g.mesh()
 
         prob = rf.ProblemFD(g)
-        modes  = prob.eigenmode(target_frequency=2e9, n_modes=5)
-        result = prob.sweep(np.linspace(1.8e9, 2.2e9, 21))
-        pattern = prob.farfield(result, freq_idx=10, port_idx=0)
+        result = prob.sweep(np.linspace(8e9, 12e9, 21))
+        s50 = prob.renormalize(result, 50.0)
+
+    The same object runs :meth:`eigenmode` on a closed cavity and
+    :meth:`farfield` on a radiating structure.
 
 
     Parameters
@@ -197,8 +160,6 @@ class ProblemFD:
     # ── Analyses ──────────────────────────────────────────────────────────
 
     def sweep(self, frequencies: Iterable[float], *,
-              z0: float = 50.0,
-              adaptive: Adaptive | None = None,
               order: "int | str" = 2,
               on_frequency=None):
         """run a driven frequency sweep and return the SweepResult
@@ -220,18 +181,15 @@ class ProblemFD:
         Parameters
         ----------
         frequencies : iterable of float
-            sweep points in Hz, in evaluation order
-        z0 : float
-            label only: every port reports S-parameters against its own
-            reference (lumped ports their ``z0``, modal ports their mode
-            impedance); :meth:`renormalize` re-references to a fixed value
-        adaptive : Adaptive, optional
-            adaptive-mesh-refinement settings (``None`` disables it)
+            sweep points in Hz, in evaluation order. Every port reports
+            S-parameters against its own reference (lumped ports their
+            ``z0``, modal ports their mode impedance); :meth:`renormalize`
+            re-references to a fixed value
         order : int or "adaptive"
             Nédélec element order. ``2`` (default) is uniform order 2, the
             accuracy the solver is validated at; ``1`` is uniform order 1
             (one DOF per edge, ~5x fewer DOFs on a tet mesh, lower
-            accuracy — quick scans and mesh shakeout); ``"adaptive"``
+            accuracy, quick scans and mesh shakeout); ``"adaptive"``
             applies the a-priori wavelength policy (order 1 where the mesh
             is geometry-fine, i.e. ``k*h < theta``). Note the caveat in the
             solver docs: near singular conductor edges the adaptive policy
@@ -252,9 +210,6 @@ class ProblemFD:
         freqs = [float(f) for f in frequencies]
         if not freqs:
             raise ValueError("sweep needs at least one frequency")
-        if adaptive is not None:
-            warnings.warn("adaptive refinement is not wired yet (issue #43), "
-                          "the sweep runs on the given mesh", stacklevel=2)
         self._native = _NativeSimulation(
             self._fem_mesh, build_model(self._geometry), freqs,
             **_order_kwargs(order))
@@ -298,8 +253,7 @@ class ProblemFD:
 
         Modal ports (waveguide / wave) report S-parameters self-referenced to
         their modal impedance, so a matched modal line reads |S11|≈0 against
-        that reference regardless of its characteristic impedance, and the
-        ``z0`` passed to :meth:`sweep` only *labels* the output. This returns
+        that reference regardless of its characteristic impedance. This returns
         the S-matrix re-referenced to ``z_ref`` (e.g. 50 Ω) so mismatches
         against a standard reference appear. Lumped ports (already at a fixed
         z0) are a no-op. Returns a ``(n_freq, n_driven, n_driven)`` array;
@@ -310,8 +264,7 @@ class ProblemFD:
         return io.renormalize_sparams(result.sparams, z_old, z_ref)
 
     def eigenmode(self, target_frequency: float, *,
-                  n_modes: int = 6,
-                  z0: float = 50.0):
+                  n_modes: int = 6):
         """run a modal solve around ``target_frequency``
 
         Uses shift-invert Lanczos with the rslab LDLᵀ factorisation as the
@@ -338,9 +291,6 @@ class ProblemFD:
             returned
         n_modes : int
             number of eigenpairs requested
-        z0 : float
-            accepted for signature symmetry with :meth:`sweep`; eigenmodes
-            do not depend on it
 
         Returns
         -------
@@ -433,7 +383,6 @@ class ProblemFD:
             result = prob.sweep(np.linspace(2e9, 3e9, 11))
             errs = prob.element_errors(result, freq_idx=5, theta=0.3)
             print(errs)         # ErrorIndicator(n_tets=..., marked=...)
-            rf.show(errs)       # 3-D field of η over the mesh
 
 
         Parameters
@@ -610,11 +559,6 @@ class ProblemFD:
         return self._native.n_dofs
 
     @property
-    def n_dof(self) -> int:
-        """Alias of :attr:`n_dofs`, matching ProblemTD's attribute name."""
-        return self.n_dofs
-
-    @property
     def n_tets(self) -> int:
         """tetrahedron count of the mesh used by the last-assembled solver"""
         if self._native is None:
@@ -645,4 +589,4 @@ def _order_kwargs(order) -> dict:
     raise ValueError(f"order must be 1, 2 or 'adaptive', got {order!r}")
 
 
-__all__ = ["ProblemFD", "Adaptive", "ErrorIndicator"]
+__all__ = ["ProblemFD", "ErrorIndicator"]

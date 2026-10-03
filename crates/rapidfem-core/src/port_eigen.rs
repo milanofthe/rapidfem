@@ -6,7 +6,7 @@
 //!
 //! A modal port injects and extracts a known transverse field profile
 //! `(e_t, h_t)`. For a rectangular waveguide or a coaxial line that
-//! profile is analytic ([`crate::waveguide`]); for an *arbitrary*
+//! profile is analytic (`rapidfem_fd::waveguide`); for an *arbitrary*
 //! cross-section (a ridged guide, an L-shaped duct, a microstrip or
 //! coplanar line) the profile has no closed form and is computed here by
 //! a 2D eigensolve on the port-face triangulation. Backend-agnostic,
@@ -36,15 +36,18 @@
 /// A port face flattened to its 2D cross-section: nodes in the port
 /// plane's local `(u, v)` coordinates, the triangles connecting them,
 /// and which nodes lie on the boundary (PEC wall) of the cross-section.
+/// Rim edges on a PMC wall (a symmetry plane of a half model) are left to
+/// the natural condition.
 #[derive(Clone, Debug)]
 pub struct PortMesh2D {
     /// Local 2D coordinates of each distinct cross-section node.
     pub nodes: Vec<[f64; 2]>,
     /// Triangles as triples of indices into `nodes`.
     pub tris: Vec<[usize; 3]>,
-    /// `true` for a node on the outer boundary of the cross-section,
-    /// a boundary edge is one used by exactly one triangle. These get
-    /// the Dirichlet condition for `TM` modes.
+    /// `true` for a node on the PEC part of the outer boundary of the
+    /// cross-section: a boundary edge is one used by exactly one triangle,
+    /// and it is PEC unless both its ends lie on a PMC wall. These get the
+    /// Dirichlet condition for `TM` modes.
     pub on_boundary: Vec<bool>,
     /// `true` for a node lying on an *internal* PEC conductor (e.g. a
     /// microstrip trace cutting through the cross-section). These carry
@@ -52,6 +55,9 @@ pub struct PortMesh2D {
     /// with both endpoints on the conductor is a PEC edge. Empty / all
     /// false when the cross-section has no internal conductor.
     pub on_pec: Vec<bool>,
+    /// `true` for a node on a PMC wall; a rim edge with both ends on it
+    /// carries the natural condition. All false without PMC.
+    pub on_pmc: Vec<bool>,
     /// The local frame `(û, v̂)` and origin, so a solved mode profile
     /// can be lifted back to 3D global coordinates.
     pub u_hat: [f64; 3],
@@ -93,6 +99,19 @@ impl PortMesh2D {
         face_tris: &[[usize; 3]],
         inward_normal: [f64; 3],
         pec_global: Option<&[bool]>,
+    ) -> PortMesh2D {
+        Self::from_face_with_pmc(global_nodes, face_tris, inward_normal, pec_global, None)
+    }
+
+    /// [`from_face`](Self::from_face) with `pmc_global`, a per-global-node
+    /// mask of the PMC walls the port face meets: rim edges along them
+    /// are not PEC.
+    pub fn from_face_with_pmc(
+        global_nodes: &[[f64; 3]],
+        face_tris: &[[usize; 3]],
+        inward_normal: [f64; 3],
+        pec_global: Option<&[bool]>,
+        pmc_global: Option<&[bool]>,
     ) -> PortMesh2D {
         // Normalise the out-of-plane axis.
         let nl = dot3(inward_normal, inward_normal).sqrt();
@@ -153,9 +172,14 @@ impl PortMesh2D {
             }
             None => vec![false; nodes.len()],
         };
+        let on_pmc: Vec<bool> = match pmc_global {
+            Some(mask) => local_to_global.iter().map(|&g| mask[g]).collect(),
+            None => vec![false; nodes.len()],
+        };
 
         // Boundary edges are used by exactly one triangle. Tally each
-        // undirected edge; mark the endpoints of singly-used edges.
+        // undirected edge; mark the endpoints of singly-used edges that
+        // are not on a PMC wall.
         let mut edge_count: std::collections::HashMap<(usize, usize), u32> =
             std::collections::HashMap::new();
         let key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
@@ -166,13 +190,13 @@ impl PortMesh2D {
         }
         let mut on_boundary = vec![false; nodes.len()];
         for (&(a, b), &c) in &edge_count {
-            if c == 1 {
+            if c == 1 && !(on_pmc[a] && on_pmc[b]) {
                 on_boundary[a] = true;
                 on_boundary[b] = true;
             }
         }
 
-        PortMesh2D { nodes, tris, on_boundary, on_pec, u_hat, v_hat, origin }
+        PortMesh2D { nodes, tris, on_boundary, on_pec, on_pmc, u_hat, v_hat, origin }
     }
 
     /// Number of cross-section nodes.
@@ -453,7 +477,7 @@ fn krylov_lowest(
 
 /// A solved numerical port mode, ready to be sampled as a transverse
 /// `(e_t, h_t)` profile at arbitrary points on the port face, the
-/// drop-in replacement for an analytic [`crate::waveguide::RectPort`]
+/// drop-in replacement for an analytic `rapidfem_fd::waveguide::RectWaveguide`
 /// profile when the cross-section has no closed-form mode.
 ///
 /// The transverse fields follow from the scalar potential `ψ` by the
@@ -833,7 +857,7 @@ fn wedge2(a: [f64; 2], b: [f64; 2]) -> f64 {
 /// two bubbles both give the 8-dimensional Nédélec first-kind order-2 space on
 /// the triangle. The difference is the BASIS, not the space: this one is
 /// hierarchical (mode 0 is the Whitney function itself, mode 1 the order-2
-/// increment), which is what lets the orientation sign attach to mode 0 alone —
+/// increment), which is what lets the orientation sign attach to mode 0 alone, 
 /// mode 1 is even under edge reversal.
 #[inline]
 fn ned2_edge_basis(
@@ -981,9 +1005,9 @@ fn p2_grad(dof: usize, g: &[[f64; 2]; 3], l: [f64; 3]) -> [f64; 2] {
 /// actual surface integral). Used by the Ned-2 + P2 element-matrix assembly.
 const NED2_QPTS_DEG5: [(f64, f64, f64, f64); 7] = [
     (0.225,                  1.0/3.0,            1.0/3.0,            1.0/3.0),
-    (0.13239415278850618,    0.05971587178976982, 0.4701420641051151,  0.4701420641051151),
-    (0.13239415278850618,    0.4701420641051151,  0.05971587178976982, 0.4701420641051151),
-    (0.13239415278850618,    0.4701420641051151,  0.4701420641051151,  0.05971587178976982),
+    (0.132_394_152_788_506_2,    0.05971587178976982, 0.4701420641051151,  0.4701420641051151),
+    (0.132_394_152_788_506_2,    0.4701420641051151,  0.05971587178976982, 0.4701420641051151),
+    (0.132_394_152_788_506_2,    0.4701420641051151,  0.4701420641051151,  0.05971587178976982),
     (0.12593918054482717,    0.7974269853530873,  0.10128650732345633, 0.10128650732345633),
     (0.12593918054482717,    0.10128650732345633, 0.7974269853530873,  0.10128650732345633),
     (0.12593918054482717,    0.10128650732345633, 0.10128650732345633, 0.7974269853530873),
@@ -1025,7 +1049,7 @@ fn build_edges(mesh: &PortMesh2D) -> (usize, Vec<TriEdges>, Vec<u32>) {
 ///
 /// A node is constrained on the outer wall or an internal conductor. An edge
 /// is constrained if it is an outer-boundary edge (used by a single triangle)
-/// or if both endpoints lie on an internal conductor, in which case the edge
+/// not lying on a PMC wall, or if both endpoints lie on an internal conductor, in which case the edge
 /// runs along the trace surface where tangential E must vanish. The internal
 /// rule keys on `on_pec` (not the node mask) so two outer-boundary nodes
 /// joined by an interior chord are not spuriously constrained.
@@ -1038,12 +1062,16 @@ fn vector_mode_pec_masks(
     let on_pec = |i: usize| mesh.on_pec.get(i).copied().unwrap_or(false);
     let node_pec: Vec<bool> =
         (0..n_node).map(|i| mesh.on_boundary[i] || on_pec(i)).collect();
+    let on_pmc = |i: usize| mesh.on_pmc.get(i).copied().unwrap_or(false);
     let mut edge_pec = edge_use.iter().map(|&c| c == 1).collect::<Vec<_>>();
     for (ti, &t) in mesh.tris.iter().enumerate() {
         let te = &tri_edges[ti];
         for e in 0..3 {
             let a = t[(e + 1) % 3];
             let b = t[(e + 2) % 3];
+            if edge_use[te.gidx[e]] == 1 && on_pmc(a) && on_pmc(b) {
+                edge_pec[te.gidx[e]] = false;
+            }
             if on_pec(a) && on_pec(b) {
                 edge_pec[te.gidx[e]] = true;
             }
@@ -1106,7 +1134,7 @@ fn vector_mode_tem_supported(
 /// of `(A − σB)⁻¹ B`, then `λ = σ + 1/ν`. Dense, sized for one face.
 /// Port characteristic length ℓ for the non-dimensionalization wrapper:
 /// √(total cross-section area), i.e. the PORT size (not the mesh resolution).
-/// This keeps the electrical size κ = k0·ℓ faithful — a µm RFIC port maps to
+/// This keeps the electrical size κ = k0·ℓ faithful, a µm RFIC port maps to
 /// O(1) coordinates with its true (tiny) κ, while an already-O(1) cross-section
 /// stays in its natural regime. `n_eff` is ℓ-invariant, so any O(port-size)
 /// length is valid; this one preserves the conditioning across scales.
@@ -1147,6 +1175,7 @@ pub fn solve_vector_modes(
         tris: mesh.tris.clone(),
         on_boundary: mesh.on_boundary.clone(),
         on_pec: mesh.on_pec.clone(),
+        on_pmc: mesh.on_pmc.clone(),
         u_hat: mesh.u_hat,
         v_hat: mesh.v_hat,
         origin: mesh.origin,
@@ -1860,6 +1889,37 @@ mod tests {
         assert!(rel < 0.04, "TM₁₁ k_c = {kc:.4}, want {want:.4} (rel {rel:.3})");
     }
 
+    /// The nodes of `rect_mesh` on the wall `x = a`, as a PMC mask.
+    fn pmc_at_x(nodes: &[[f64; 3]], a: f64) -> Vec<bool> {
+        nodes.iter().map(|n| (n[0] - a).abs() < 1e-12).collect()
+    }
+
+    #[test]
+    fn pmc_wall_halves_the_guide() {
+        // A PMC wall at x = a makes the a×b guide the half of a 2a×b one
+        // with the field symmetric about the cut. TM: E_z free on the PMC
+        // wall, lowest k_c = π·√((1/2a)² + (1/b)²) for a = b = 1.
+        let (nodes, tris) = rect_mesh(1.0, 1.0, 16, 16);
+        let pmc = pmc_at_x(&nodes, 1.0);
+        let pm = PortMesh2D::from_face_with_pmc(&nodes, &tris, [0.0, 0.0, 1.0], None, Some(&pmc));
+        // the PMC side's interior nodes are free, its corners stay PEC
+        assert_eq!(pm.on_boundary.iter().filter(|&&x| x).count(), 4 * 16 - 15);
+        let kc = solve_modes(&pm, ModeKind::Tm, 1)[0].k_c;
+        let want = PI * 1.25_f64.sqrt();
+        assert!((kc - want).abs() / want < 0.04, "TM k_c = {kc:.4}, want {want:.4}");
+        // Vector: TE₁₀ of the 4×1 guide lives in the 2×1 half with a PMC
+        // wall, k_c = π/4 instead of the PEC box's π/2.
+        let (nodes, tris) = rect_mesh(2.0, 1.0, 20, 10);
+        let pmc = pmc_at_x(&nodes, 2.0);
+        let pm = PortMesh2D::from_face_with_pmc(&nodes, &tris, [0.0, 0.0, 1.0], None, Some(&pmc));
+        let k0 = 1.2; // above π/4, below the PEC box's π/2
+        let modes = solve_vector_modes(&pm, &vec![1.0; pm.tris.len()], k0, 1);
+        assert!(!modes.is_empty(), "no propagating mode in the PMC half guide");
+        let want = (1.0 - (PI / 4.0 / k0).powi(2)).sqrt();
+        let got = modes[0].n_eff;
+        assert!((got - want).abs() / want < 0.05, "n_eff = {got:.4}, want {want:.4}");
+    }
+
     #[test]
     fn vector_solver_recovers_te10_neff_homogeneous() {
         // Full-vector solve on a homogeneous (ε=1) 2×1 rectangular metallic
@@ -2105,7 +2165,7 @@ mod tests {
         // even though the physics is identical to the O(1) "natural" scale. The
         // port-local non-dimensionalization makes the solve scale-invariant.
         // Asserting natural == µm at the SAME (coarse) mesh is what matters and
-        // is mesh-accuracy-independent — the absolute n_eff need not be
+        // is mesh-accuracy-independent, the absolute n_eff need not be
         // converged here; the well-resolved value is pinned by the
         // `microstrip_quasi_tem_natural_scale` test above.
         let n_natural = microstrip_neff_at_scale(1.0);          // O(1) coords
@@ -2113,7 +2173,7 @@ mod tests {
         eprintln!("[scale-invariance] n_eff: natural={n_natural:.5} µm={n_micron:.5}");
         let rel = (n_micron - n_natural).abs() / n_natural;
         assert!(rel < 1e-3, "n_eff drifted with scale: µm {n_micron:.5} vs natural \
-            {n_natural:.5} ({:.3}% — solve is not scale-invariant)", 100.0 * rel);
+            {n_natural:.5} ({:.3}%, solve is not scale-invariant)", 100.0 * rel);
     }
 
     /// Reference triangle for basis-evaluator tests: v0=(0,0), v1=(1,0),

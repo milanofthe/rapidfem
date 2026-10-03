@@ -20,8 +20,8 @@ from typing import Any, NamedTuple
 class CapturedItem(NamedTuple):
     name: str
     obj: Any
-    kind: str  # "geometry" | "builder" | "simulation" | "result"
-               # | "td_timeseries" | "td_transfer"
+    kind: str  # what classify() returns: "geometry" | "simulation" | "result"
+               # | "eigenmode" | "eigenmodes" | "td_timeseries" | "td_transfer"
                # | "td_trajectory" | "unknown"
 
 
@@ -91,11 +91,9 @@ def classify(obj: Any) -> str:
     mod = getattr(type(obj), "__module__", "") or ""
     if cls == "Geometry" and mod.startswith("rapidfem"):
         return "geometry"
-    # `Problem` is a backward-compatible alias of `ProblemFD`, so a
-    # `rf.Problem(g)` instance reports its class name as "ProblemFD",
-    # match both. (The time-domain `ProblemTD` is not a UI "simulation":
-    # its results render through the td_* wrappers instead.)
-    if cls in ("Problem", "ProblemFD") and mod.startswith("rapidfem"):
+    # The time-domain `ProblemTD` is not a UI "simulation": its results
+    # render through the td_* wrappers instead.
+    if cls == "ProblemFD" and mod.startswith("rapidfem"):
         return "simulation"
     if cls == "Simulation":
         return "simulation"

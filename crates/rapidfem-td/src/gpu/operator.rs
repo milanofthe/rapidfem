@@ -816,7 +816,6 @@ impl GpuOperator {
     /// accepted frame) cross the bus.
     ///
     /// Returns `(traj, n_accepted, n_rejected, h_min, h_max)`.
-    #[allow(clippy::too_many_arguments)]
     pub fn transient_kcl_traj(
         &mut self,
         gpu: &GpuContext,
@@ -835,7 +834,6 @@ impl GpuOperator {
     /// the modal-port injection path. `b` is uploaded once into the device-
     /// resident source buffer; `g_values[k]` is the waveform sampled at
     /// `k*dt` and held across the substeps inside output frame `k`.
-    #[allow(clippy::too_many_arguments)]
     pub fn transient_kcl_traj_driven_vec(
         &mut self,
         gpu: &GpuContext,
@@ -861,7 +859,6 @@ impl GpuOperator {
     }
 
     /// KCL adaptive transient with point source `dy/dt = A·y + e_dof·g(t)`.
-    #[allow(clippy::too_many_arguments)]
     pub fn transient_kcl_traj_driven(
         &mut self,
         gpu: &GpuContext,
@@ -880,7 +877,6 @@ impl GpuOperator {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn transient_kcl_traj_impl(
         &mut self,
         gpu: &GpuContext,
@@ -1329,7 +1325,6 @@ impl GpuOperator {
     /// device Hessenberg, the norm is finished on the device, so the
     /// Hessenberg is the *only* thing the host reads back, once, at the
     /// end. Fixed dimension `m` (no breakdown check).
-    #[allow(clippy::too_many_arguments)]
     fn arnoldi(
         &self,
         gpu: &GpuContext,
@@ -1806,7 +1801,7 @@ impl GpuOperator {
         }
 
         // exp(tau·H) on the host; out_vec = beta·Σ_i basis_vec[i]·exp[i,0]
-        //, the first n components of the augmented result. The augmented
+        //the first n components of the augmented result. The augmented
         // scalar component is preserved at 1 and discarded.
         let dim = m;
         let mut th = vec![0.0_f64; dim * dim];
@@ -1848,11 +1843,11 @@ mod tests {
         let err: f64 = cpu
             .iter()
             .zip(gpu)
-            .map(|(&c, &g)| (c as f64 - g as f64).powi(2))
+            .map(|(&c, &g)| (c - g as f64).powi(2))
             .sum::<f64>()
             .sqrt();
         let scale: f64 =
-            cpu.iter().map(|&c| (c as f64).powi(2)).sum::<f64>().sqrt();
+            cpu.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
         err / scale
     }
 

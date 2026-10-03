@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Stripline characteristic impedance — extracted from a 50 Ω reflection.
+"""Stripline characteristic impedance, extracted from a 50 Ω reflection.
 
 A center strip between two ground planes in a homogeneous dielectric is a TEM
 line of impedance ``Z0 = ref.stripline_z0(w, b, er)``. Here the line is fed by
@@ -18,7 +18,7 @@ electrical length and whose ENVELOPE peaks at the quarter-wave point
 for Z0 < Zref (the design case). We sweep across the band to capture that
 envelope peak P and invert it for Z0, then compare to the Cohn/Wheeler closed
 form. (The single-interface number |(Z0−Zref)/(Z0+Zref)| is NOT the two-port
-peak — a quarter-wave section doubles the impedance-transform, so the envelope
+peak, a quarter-wave section doubles the impedance-transform, so the envelope
 peak is the larger Z0²-form above.)
 
 Phenomena exercised: TEM stripline propagation, the quarter-wave impedance
@@ -41,7 +41,7 @@ import pytest
 import rapidfem as rf
 from harness import case, references as ref
 
-# Stripline design: er and (w, b) chosen so the analytic Z0 ≈ 30 Ω — a
+# Stripline design: er and (w, b) chosen so the analytic Z0 ≈ 30 Ω, a
 # deliberate, strong mismatch against the 50 Ω port reference.
 ER = 4.0
 SUB_H = 1.0e-3        # b: ground-plane spacing (strip sits at b/2)
@@ -57,7 +57,7 @@ def _build_stripline(g):
 
     Two dielectric halves meet at the strip plane (z = b/2); the strip is
     recessed by ``GAP_IN`` from both ends so the feed plates are *interior*
-    delta-gaps (strip→lower ground) rather than boundary faces — that keeps the
+    delta-gaps (strip→lower ground) rather than boundary faces, that keeps the
     line from being shorted by the default-PEC end walls. Returns the two feed
     plates (the lumped-port faces)."""
     hb = SUB_H / 2.0
@@ -77,8 +77,8 @@ def _build_stripline(g):
     # shields, and the dead end caps behind the recess) ride on the default-PEC
     # exterior. The feed plates are interior → they carry the lumped ports.
     rf.PEC(trace)
-    rf.LumpedPort(feed_a, direction=(0, 0, 1), z0=ZREF)
-    rf.LumpedPort(feed_b, direction=(0, 0, 1), z0=ZREF)
+    rf.LumpedPort(feed_a, direction=(0, 0, 1))
+    rf.LumpedPort(feed_b, direction=(0, 0, 1))
     return feed_a, feed_b
 
 
@@ -93,10 +93,10 @@ def test_stripline_impedance_from_reflection():
     _build_stripline(g)
 
     # The quarter-wave peak (θ = π/2) sits near 5 GHz for this length/εr; sweep
-    # 2–9 GHz so the |S11| envelope rises to its peak and falls toward the
+    # 2-9 GHz so the |S11| envelope rises to its peak and falls toward the
     # half-wave null, resolving the peak well inside the band.
     freqs = np.linspace(2.0e9, 9.0e9, 15)
-    prob, res = case.sweep(g, freqs, z0=ZREF)
+    prob, res = case.sweep(g, freqs)
 
     s11 = np.abs(res.sparams[:, 0, 0])
     s21 = np.abs(res.sparams[:, 1, 0])

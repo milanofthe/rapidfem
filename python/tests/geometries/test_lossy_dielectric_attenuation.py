@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Dielectric (volume) loss in a filled rectangular waveguide — TE10 αd.
+"""Dielectric (volume) loss in a filled rectangular waveguide, TE10 αd.
 
 Filling a matched rectangular guide with a *lossy* dielectric (εr, tanδ)
 turns it into a matched lossy line whose only loss mechanism is the volume

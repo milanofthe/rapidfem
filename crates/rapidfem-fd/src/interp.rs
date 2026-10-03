@@ -198,19 +198,9 @@ fn point_in_tet(mesh: &Mesh, itet: usize, x: f64, y: f64, z: f64) -> bool {
     u >= -eps && v >= -eps && w >= -eps && u + v + w <= 1.0 + eps
 }
 
-/// Brute-force fallback for find_containing_tet.
+/// Brute-force fallback of the grid search: every tet in turn.
 fn find_containing_tet_brute(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize> {
-    for itet in 0..mesh.n_tets() {
-        if point_in_tet(mesh, itet, x, y, z) {
-            return Some(itet);
-        }
-    }
-    None
-}
-
-/// Find the tet containing a point (brute force, for backward compatibility).
-pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize> {
-    find_containing_tet_brute(mesh, x, y, z)
+    (0..mesh.n_tets()).find(|&itet| point_in_tet(mesh, itet, x, y, z))
 }
 
 /// Analytic curl of the FEM E-field inside a known tet at point `(x, y, z)`.

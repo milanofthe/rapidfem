@@ -21,8 +21,8 @@
 //!   ⟨x, y⟩_B = xᵀ·B·y      (bilinear, NOT conjugated: E and B are complex
 //!                           SYMMETRIC under loss, not Hermitian)
 //!
-//! Run it in the Euclidean form instead — `α = vᵀw`, `β = ‖w‖₂`, and both the
-//! reorthogonalisation and the normalisation to match — and it is a three-term
+//! Run it in the Euclidean form instead, `α = vᵀw`, `β = ‖w‖₂`, and both the
+//! reorthogonalisation and the normalisation to match, and it is a three-term
 //! recurrence for an operator that has no three-term recurrence. The tridiagonal
 //! matrix it produces is not similar to anything, its Ritz values are not
 //! eigenvalues, and its Ritz vectors solve nothing.
@@ -51,7 +51,7 @@
 //! This is a property of the problem, not a shortcoming of the implementation, and
 //! it decides how the solver must be *used*.
 //!
-//! The curl operator has an enormous null space — the discrete gradients, one per
+//! The curl operator has an enormous null space, the discrete gradients, one per
 //! interior node and, at order 2, one per interior edge. On a 400 k-DOF mesh that is
 //! some 200 000 eigenvalues sitting at exactly `λ = 0`. Under shift-invert they all
 //! land on the single point
@@ -66,8 +66,8 @@
 //! A mode outside that band sits BEHIND ~200 000 identical Ritz values, and no
 //! Krylov space of any affordable size will reach it. Measured on a 410 k-DOF cavity:
 //! targeting the fundamental at 8.24 GHz and asking for four modes gives ONE, after
-//! 92 Lanczos steps; moving the target to 12 GHz — which puts all four inside the
-//! band — gives five, in 30 steps and a third of the time.
+//! 92 Lanczos steps; moving the target to 12 GHz, which puts all four inside the
+//! band, gives five, in 30 steps and a third of the time.
 //!
 //! So: **put the target in the middle of the frequency range you care about**, not on
 //! the lowest mode of it. The solver says so when it cannot deliver.
@@ -89,7 +89,7 @@ use std::collections::HashSet;
 /// there is nothing in between to calibrate against.
 pub const EIGEN_RESIDUAL_TOL: f64 = 1e-8;
 
-/// The curl operator's kernel — the discrete gradients — sits at `λ = 0`. Those are
+/// The curl operator's kernel, the discrete gradients, sits at `λ = 0`. Those are
 /// genuine eigenpairs and would sail through the residual test, but they are static
 /// fields, not resonances. Anything with `|λ|` below this fraction of the shift is
 /// one of them.
@@ -112,7 +112,7 @@ pub struct Eigenmode {
 /// A sparse matrix as COO triplets over the free DOFs.
 ///
 /// The assembly emits the FULL n×n block of every element, so both `(i,j)` and
-/// `(j,i)` are already present. A matvec must therefore NOT add the transpose — the
+/// `(j,i)` are already present. A matvec must therefore NOT add the transpose, the
 /// old one did, and silently computed `(2B − diag B)·x` instead of `B·x`.
 struct Coo {
     rows: Vec<usize>,
@@ -234,7 +234,7 @@ pub fn solve_eigenmode(
     //
     // Only the Lanczos vectors are stored, not B·v alongside them. ⟨v_k, w⟩_B is
     // v_kᵀ·(B·w) just as much as it is (B·v_k)ᵀ·w, and one B·w serves the whole
-    // reorthogonalisation sweep — so a single extra sparse matvec per pass buys back
+    // reorthogonalisation sweep, so a single extra sparse matvec per pass buys back
     // half the memory, which on a large problem is the difference between fitting and
     // not.
     // ---------------------------------------------------------------------
@@ -242,7 +242,7 @@ pub fn solve_eigenmode(
     // The Krylov space may grow well past the number of modes wanted, because on a
     // large problem the shift-invert spectrum crowds and a short space resolves
     // nothing. It is affordable because the loop STOPS as soon as enough modes have
-    // actually converged — the cap is a ceiling, not a plan.
+    // actually converged, the cap is a ceiling, not a plan.
     let m_max = (8 * n_modes + 60).min(n_free).min(400);
     const CHECK_EVERY: usize = 10;
     // A few more candidates than asked for: a mode may converge out of order, and one
@@ -284,7 +284,7 @@ pub fn solve_eigenmode(
         // The three-term recurrence, then re-establish B-orthogonality against the
         // whole basis. The recurrence is exact in theory and loses orthogonality in
         // practice, and it is precisely that loss which manufactures ghost Ritz
-        // values — the defect this rewrite exists to remove.
+        // values, the defect this rewrite exists to remove.
         for i in 0..n_free {
             w[i] -= alpha * v[i] + beta_prev * v_prev[i];
         }
@@ -334,7 +334,7 @@ pub fn solve_eigenmode(
         // Stop as soon as enough modes are genuinely converged. Checking costs an
         // eigendecomposition of a tiny tridiagonal plus two sparse matvecs per
         // candidate, against a Krylov step that costs a sparse back-substitution and
-        // an O(m·n) sweep — cheap enough to do often, and it turns the cap above from
+        // an O(m·n) sweep, cheap enough to do often, and it turns the cap above from
         // a cost into a ceiling.
         let m = alphas.len();
         if m >= n_modes + 2 && (j + 1) % CHECK_EVERY == 0 {
@@ -410,7 +410,6 @@ pub fn solve_eigenmode(
 ///
 /// Returns the modes, sorted by distance to the shift, plus how many candidates were
 /// rejected as unconverged and how many as static.
-#[allow(clippy::too_many_arguments)]
 fn extract_modes(
     alphas: &[C64],
     betas: &[C64],

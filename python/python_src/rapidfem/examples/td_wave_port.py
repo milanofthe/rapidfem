@@ -25,7 +25,7 @@ MAXH = rf.lambda_maxh(f_max=13.0e9)
 # %% Geometry: a hollow circular waveguide, WavePorts on the two ends
 g = rf.Geometry(maxh=MAXH)
 guide = g.cylinder(radius=R, height=L, position=(0, 0, 0), material=rf.Air())
-p_in = rf.WavePort(guide.faces.min(axis="z"))    # numerical TE11 (te=True, mode 0)
+p_in = rf.WavePort(guide.faces.min(axis="z"))    # numerical TE11 (scalar TE path, mode 0)
 p_out = rf.WavePort(guide.faces.max(axis="z"))
 rf.PEC(*guide.faces.unassigned)
 g.mesh()
@@ -35,7 +35,7 @@ rf.show(g)
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
 # Circular-guide TE11 cutoff: f_c = 1.841 c / (2 pi R).
 fc = 1.841 * ptd.c / (2.0 * np.pi * R)
-print(f"DGTD circular guide - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD circular guide - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"TE11 cutoff {fc / 1e9:.2f} GHz, drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive the numerically-solved TE11 mode and watch it propagate

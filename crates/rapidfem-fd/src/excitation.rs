@@ -6,7 +6,7 @@
 //!
 //! Before this existed, every site that needed a wavenumber recomputed
 //! `k0 = 2π·freq/c0` (9 call sites) and every port that needed the angular
-//! frequency recovered it as `ω = k0·c0` (4 sites) — a round-trip that is both
+//! frequency recovered it as `ω = k0·c0` (4 sites), a round-trip that is both
 //! duplicated and, once `k0` is non-dimensionalized, wrong. `Excitation` is the
 //! single source of truth: build it once per frequency, pass `&Excitation` to
 //! assembly and ports, read `k0` for wavenumbers and `omega` for the angular
@@ -31,7 +31,7 @@ pub struct Excitation {
     /// k₀ = ω/c₀ (rad/m). This is the quantity the wave operator and the
     /// propagation constants β must use to stay consistent with the geometry.
     pub k0: f64,
-    /// Angular frequency ω = 2πf (rad/s). The true physical ω — used by the
+    /// Angular frequency ω = 2πf (rad/s). The true physical ω, used by the
     /// frequency-dependent material/circuit terms (skin depth, R+jωL+1/jωC),
     /// which are *not* length-coupled and must see the real frequency.
     pub omega: f64,

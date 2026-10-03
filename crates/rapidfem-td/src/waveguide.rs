@@ -439,7 +439,7 @@ impl FloquetPort {
     /// in-plane scan direction `(cosφ·û + sinφ·v̂)`, tilted by `scan_theta`
     /// out of the port plane along `−ŵ` for `θ > 0` (so its E·E stays unit
     /// length). The transverse phase factor `e^{-j·k_t·r_t}` is **dropped**
-    ///, see the struct doc.
+    ///see the struct doc.
     fn polarisation_vec(&self) -> [Field; 3] {
         if let Some(p) = self.e_override {
             return p;
@@ -580,7 +580,7 @@ pub enum PortMode {
     /// wave port for an arbitrary (ridged, circular, ...) cross-section
     /// whose profile has no closed form. See
     /// [`rapidfem_core::port_eigen`].
-    Numerical(rapidfem_core::port_eigen::NumericalMode),
+    Numerical(Box<rapidfem_core::port_eigen::NumericalMode>),
 }
 
 impl PortMode {

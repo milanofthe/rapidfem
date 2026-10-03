@@ -34,7 +34,7 @@ use std::sync::Mutex;
 ///
 /// `field` holds `3·Np` values (`field[node*3 + comp]`); the result has the
 /// same layout and contains `∇×field` sampled at the element nodes. This is
-/// the allocating wrapper around [`element_curl_into`], the hot path uses
+/// the allocating wrapper around `element_curl_into`, the hot path uses
 /// the scratch-buffer form.
 pub fn element_curl(
     re: &ReferenceElement,
@@ -165,7 +165,7 @@ impl PortSpec {
         Self::from_mesh_tag_with_z0(mesh, face_tag, mode, direction, 1.0)
     }
 
-    /// Like [`from_mesh_tag`] but with an explicit reference impedance
+    /// Like [`Self::from_mesh_tag`] but with an explicit reference impedance
     /// `z0` for the lumped `(0, 0)` mode (operator units, so a 50 ohm
     /// physical port is `z0 = 50.0 / 377.0`). Ignored for `TE_mn`
     /// modes whose impedance is dispersive.
@@ -439,13 +439,13 @@ impl PortSpec {
             let modes = solve_vector_modes(&pm, &eps_face, k0, mode_index + 1);
             let mode = modes.get(mode_index)?;
             let nm = NumericalMode::from_vector(pm, mode);
-            return Some(PortSpec { tris, mode: Some(PortMode::Numerical(nm)) });
+            return Some(PortSpec { tris, mode: Some(PortMode::Numerical(Box::new(nm))) });
         }
         let kind = if te { ModeKind::Te } else { ModeKind::Tm };
         let modes = solve_modes(&pm, kind, mode_index + 1);
         let mode = modes.get(mode_index)?;
         let nm = NumericalMode::from_scalar(pm, mode, kind);
-        Some(PortSpec { tris, mode: Some(PortMode::Numerical(nm)) })
+        Some(PortSpec { tris, mode: Some(PortMode::Numerical(Box::new(nm))) })
     }
 
     /// Build a Floquet plane-wave port from a face group tag, collecting
@@ -1124,7 +1124,6 @@ impl MaxwellOperator {
     /// The numerical flux on a periodic face is then the existing
     /// interior-face flux, no kernel change. With `periodic` empty the
     /// operator is byte-identical to the non-periodic build.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_with_materials_ports_dispersive_periodic(
         mesh: &Mesh,
         order: usize,
@@ -1147,7 +1146,6 @@ impl MaxwellOperator {
     /// sides; this lets microstrip / RFIC traces, ground planes, and
     /// other thin internal conductors be modelled as zero-thickness
     /// perfect conductors.
-    #[allow(clippy::too_many_arguments)]
     pub fn new_full(
         mesh: &Mesh,
         order: usize,
@@ -1368,6 +1366,11 @@ impl MaxwellOperator {
     /// which the appended polarisation block begins.
     fn eh_len(&self) -> usize {
         6 * self.re.n_nodes * self.n_elem
+    }
+
+    /// Number of tetrahedra (DG elements).
+    pub fn n_elem(&self) -> usize {
+        self.n_elem
     }
 
     /// Number of Debye dispersive elements (P-block slots).
@@ -1604,7 +1607,7 @@ impl MaxwellOperator {
     /// Evaluate `dy/dt = A·y` into the caller's buffer, the allocation-free
     /// hot path. The per-element work is independent (each element writes
     /// only its own slice of `dy`), so it runs in parallel across cores;
-    /// every worker reuses a pooled [`Scratch`], so after the first call
+    /// every worker reuses a pooled `Scratch`, so after the first call
     /// this performs no heap allocation at all.
     ///
     /// With Debye dispersive materials the appended polarisation block is

@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Physics-phenomenon geometry tests — one module per phenomenon.
+"""Physics-phenomenon geometry tests, one module per phenomenon.
 
 Each module builds a parametric geometry, solves via `harness.case`, and
 asserts an extracted quantity (S-params, fields, modes, loss, conservation)

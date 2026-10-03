@@ -19,7 +19,7 @@
 //! surface element.
 //!
 //! `build_surface_basis` therefore calls `tet_assembly::edge_fns` and
-//! `face_fns` — the same generators the volume element is built from — on the
+//! `face_fns`, the same generators the volume element is built from, on the
 //! triangle's own three nodes. It does not restate the functions, so it cannot
 //! disagree with the volume element about their sign. (It used to restate them,
 //! with a comment claiming the signs had been matched by hand.) The identity is
@@ -27,7 +27,7 @@
 //! the volume element on real tetrahedra in `tests/face_trace_test.rs`.
 //!
 //! The Robin term ∫ γ (n̂×φ_i)·(n̂×φ_j) dA reduces, for tangential fields, to
-//! γ ∫ φ_i·φ_j dA — the surface mass matrix. The forcing is ∫ φ_i·u_inc dA. Both
+//! γ ∫ φ_i·φ_j dA, the surface mass matrix. The forcing is ∫ φ_i·u_inc dA. Both
 //! integrate exactly with the barycentric area coefficients; no quadrature is
 //! needed for the mass.
 //!
@@ -43,9 +43,9 @@ use crate::tet_assembly::{edge_fns, face_fns, BasisFn};
 
 type V2 = [f64; 2];
 
-/// Number of DOFs on the surface element at uniform order 2: 3 edges × 2 modes
-/// + 1 face × 2. Under the minimum rule it can be less; ask the DOF map, do not
-/// assume this.
+/// Number of DOFs on the surface element at uniform order 2: 3 edges with 2
+/// modes each plus 2 face modes. Under the minimum rule it can be less; ask the
+/// DOF map, do not assume this.
 pub const N_TRI_DOFS_P2: usize = 8;
 
 #[inline]
@@ -121,7 +121,7 @@ fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
 ///
 /// Built from the volume element's own generators on the triangle's three nodes
 /// (see the module docs). The triangle has no fourth node, so `exps[3]` is zero
-/// and no term gradients it — asserted below, because that is precisely the trace
+/// and no term gradients it, asserted below, because that is precisely the trace
 /// property the construction relies on.
 pub fn build_surface_basis(
     owners: &[DofOwner],

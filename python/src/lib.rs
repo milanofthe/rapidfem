@@ -33,7 +33,7 @@ struct PySimulation {
     inner: Simulation,
 }
 
-/// Result of a frequency sweep — frequencies and S-parameters.
+/// Result of a frequency sweep, frequencies and S-parameters.
 #[pyclass(name = "SweepResult")]
 struct PySweepResult {
     inner: SweepResult,
@@ -93,7 +93,7 @@ impl PySimulation {
     /// `(n_driven, n_driven)` complex128 numpy array. Used by the UI to stream
     /// partial results; it does not change the returned SweepResult.
     #[pyo3(signature = (callback=None))]
-    fn run_sweep(&self, callback: Option<PyObject>) -> PyResult<PySweepResult> {
+    fn run_sweep(&self, callback: Option<Py<PyAny>>) -> PyResult<PySweepResult> {
         // No callback: release the GIL for the (potentially long) sweep so
         // other Python threads run. `Python::allow_threads` wants `Send`, but
         // Simulation is `unsendable` (Box<dyn Port> is not Send), so we drop to
@@ -112,13 +112,13 @@ impl PySimulation {
         // With a callback we must call back into Python per frequency, so keep
         // the GIL held for the whole sweep (mixing PyEval_SaveThread with
         // re-acquiring the GIL on the same thread is unsound). The hook
-        // re-enters via `Python::with_gil`, which is cheap when the GIL is
+        // re-enters via `Python::attach`, which is cheap when the GIL is
         // already held. A genuine exception from the callback (anything other
         // than KeyboardInterrupt) is stashed here, stops the sweep, and is
         // re-raised after run_sweep returns rather than silently swallowed.
         let cb_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
         let hook = |fi: usize, freq: f64, s: &[Vec<Complex64>]| -> bool {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let n = s.len();
                 let mut flat: Vec<NpC64> = Vec::with_capacity(n * n);
                 for row in s {
@@ -128,7 +128,7 @@ impl PySimulation {
                 }
                 let arr = numpy::ndarray::Array2::from_shape_vec((n, n), flat)
                     .expect("square s-matrix")
-                    .into_pyarray_bound(py);
+                    .into_pyarray(py);
                 match cb.call1(py, (fi, freq, arr)) {
                     Ok(_) => {}
                     Err(e) => {
@@ -143,7 +143,7 @@ impl PySimulation {
                 }
                 // Also honour a Ctrl-C / UI interrupt that landed between
                 // callbacks (check_signals clears it on Err).
-                !py.check_signals().is_err()
+                py.check_signals().is_ok()
             })
         };
         let hook_dyn: &dyn Fn(usize, f64, &[Vec<Complex64>]) -> bool = &hook;
@@ -216,7 +216,7 @@ impl PySimulation {
             flat.extend_from_slice(&[p[0] * l0, p[1] * l0, p[2] * l0]);
         }
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), flat).expect("shape");
-        arr.into_pyarray_bound(py)
+        arr.into_pyarray(py)
     }
 
     /// Mesh tetrahedra as a `(n_tets, 4)` int64 numpy array of node indices.
@@ -230,7 +230,7 @@ impl PySimulation {
             }
         }
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 4), flat).expect("shape");
-        arr.into_pyarray_bound(py)
+        arr.into_pyarray(py)
     }
 
     /// FEM E-field interpolated at every mesh node for a given (freq_idx, port_idx).
@@ -247,7 +247,7 @@ impl PySimulation {
         let n = self.inner.mesh.n_nodes();
         let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray_bound(py))
+        Some(arr.into_pyarray(py))
     }
 
     /// Loss-equivalent current density J = σ_eff · E at every mesh node for
@@ -266,7 +266,7 @@ impl PySimulation {
         let n = self.inner.mesh.n_nodes();
         let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray_bound(py))
+        Some(arr.into_pyarray(py))
     }
 
     /// Magnetic field H = ∇×E / (jωμ₀μ_r) at every mesh node for a given
@@ -284,12 +284,12 @@ impl PySimulation {
         let n = self.inner.mesh.n_nodes();
         let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray_bound(py))
+        Some(arr.into_pyarray(py))
     }
 
     /// Same as ``field_at_nodes`` but for an :class:`Eigenmode`. Returns a
     /// `(n_nodes, 3)` complex128 numpy array of (Ex, Ey, Ez) at each mesh
-    /// node. Field magnitude is not normalised — eigenmodes are defined up
+    /// node. Field magnitude is not normalised, eigenmodes are defined up
     /// to a global scale.
     fn mode_field_at_nodes<'py>(
         &self,
@@ -300,14 +300,14 @@ impl PySimulation {
         let n = self.inner.mesh.n_nodes();
         let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
         let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray_bound(py))
+        Some(arr.into_pyarray(py))
     }
 
     /// Monk-style residual error indicator η per tetrahedron at
     /// ``(freq_idx, port_idx)``. Returns a dict ``{eta, total, marked,
     /// volume_residuals, face_jumps}`` with ``eta`` shape ``(n_tets,)``
     /// float64, ``marked`` an int64 array of Dörfler-selected tet
-    /// indices at fraction ``theta``. Diagnostic only — does not
+    /// indices at fraction ``theta``. Diagnostic only, does not
     /// re-mesh.
     #[pyo3(signature = (result, freq_idx=0, port_idx=0, theta=0.5))]
     fn element_errors<'py>(
@@ -319,18 +319,18 @@ impl PySimulation {
         theta: f64,
     ) -> Option<Bound<'py, pyo3::types::PyDict>> {
         let est = self.inner.element_errors_at(&result.inner, freq_idx, port_idx, theta)?;
-        let dict = pyo3::types::PyDict::new_bound(py);
-        let eta = est.element_errors.clone().into_pyarray_bound(py);
-        let volr = est.volume_residuals.clone().into_pyarray_bound(py);
-        let fj = est.face_jumps.clone().into_pyarray_bound(py);
+        let dict = pyo3::types::PyDict::new(py);
+        let eta = est.element_errors.clone().into_pyarray(py);
+        let volr = est.volume_residuals.clone().into_pyarray(py);
+        let fj = est.face_jumps.clone().into_pyarray(py);
         // h_k lives in mesh-internal units (l0-normalised); every other
         // length crossing this boundary (mesh_nodes, refine_near_points)
         // is in meters, so convert here.
         let l0 = self.inner.mesh.l0;
         let h_k: Vec<f64> = est.h_k.iter().map(|&h| h * l0).collect();
-        let h_k = h_k.into_pyarray_bound(py);
+        let h_k = h_k.into_pyarray(py);
         let marked: Vec<i64> = est.marked_elements.iter().map(|&i| i as i64).collect();
-        let marked_arr = marked.into_pyarray_bound(py);
+        let marked_arr = marked.into_pyarray(py);
         dict.set_item("eta", eta).ok()?;
         dict.set_item("volume_residuals", volr).ok()?;
         dict.set_item("face_jumps", fj).ok()?;
@@ -362,7 +362,7 @@ impl PySweepResult {
     /// Frequencies in Hz, shape `[n_freq]`, dtype float64.
     #[getter]
     fn frequencies<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.frequencies.clone().into_pyarray_bound(py)
+        self.inner.frequencies.clone().into_pyarray(py)
     }
 
     /// S-parameter matrix, shape `[n_freq, n_driven, n_driven]`, dtype complex128.
@@ -383,7 +383,7 @@ impl PySweepResult {
         }
         let arr = numpy::ndarray::Array3::from_shape_vec((n_freq, n, n), flat)
             .expect("shape matches data");
-        arr.into_pyarray_bound(py)
+        arr.into_pyarray(py)
     }
 
     /// Number of driven ports (S-matrix dimension).
@@ -413,7 +413,7 @@ impl PyEigenmode {
     #[getter]
     fn field<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<NpC64>> {
         let conv: Vec<NpC64> = self.inner.field.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        conv.into_pyarray_bound(py)
+        conv.into_pyarray(py)
     }
 }
 
@@ -422,13 +422,13 @@ impl PyRadiationPattern {
     /// Theta angles (radians, 0..pi).
     #[getter]
     fn theta_rad<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.theta.clone().into_pyarray_bound(py)
+        self.inner.theta.clone().into_pyarray(py)
     }
 
     /// Phi angles (radians, 0..2pi).
     #[getter]
     fn phi_rad<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.inner.phi.clone().into_pyarray_bound(py)
+        self.inner.phi.clone().into_pyarray(py)
     }
 
     /// Directivity D(theta, phi) in dBi, shape `[n_phi, n_theta]`, float64.
@@ -498,7 +498,7 @@ fn flatten_2d<'py>(grid: &[Vec<f64>], py: Python<'py>) -> Bound<'py, PyArray2<f6
         flat.extend_from_slice(row);
     }
     let arr = numpy::ndarray::Array2::from_shape_vec((n_phi, n_theta), flat).expect("shape");
-    arr.into_pyarray_bound(py)
+    arr.into_pyarray(py)
 }
 
 fn flatten_2d_complex<'py>(grid: &[Vec<Complex64>], py: Python<'py>) -> Bound<'py, PyArray2<NpC64>> {
@@ -511,10 +511,10 @@ fn flatten_2d_complex<'py>(grid: &[Vec<Complex64>], py: Python<'py>) -> Bound<'p
         }
     }
     let arr = numpy::ndarray::Array2::from_shape_vec((n_phi, n_theta), flat).expect("shape");
-    arr.into_pyarray_bound(py)
+    arr.into_pyarray(py)
 }
 
-/// rapidfem — frequency- and time-domain EM FEM solver.
+/// rapidfem, frequency- and time-domain EM FEM solver.
 #[pymodule]
 #[pyo3(name = "_native")]
 fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {

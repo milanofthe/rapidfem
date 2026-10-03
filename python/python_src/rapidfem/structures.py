@@ -504,29 +504,24 @@ def cpw(g: "Geometry", *,
 class Stripline:
     """Result of :func:`stripline`.
 
-    The dielectric is split into a lower and an upper half meeting at the
-    trace plane, so the trace plate lies on the shared interface (no
-    embedded floating sheet); both halves carry the same fill material.
-
     Attributes
     ----------
-    lower, upper : GeoObject
-        the lower and upper dielectric halves (below / above the trace)
+    fill : GeoObject
+        the dielectric the trace is embedded in
     trace : GeoObject
-        the centre signal trace on the mid-height interface
-    port_a, port_b : tuple[EntityCollection, EntityCollection]
-        the (lower, upper) cross-section faces at each end
+        the centre signal trace, a sheet at mid-height
+    port_a, port_b : EntityCollection
+        the cross-section faces at each end
     pec : object or None
         the PEC over trace + both grounds + side walls when ``add_ports``
     ports : list
         the two wave ports when ``add_ports`` (else empty)
     """
 
-    lower: "GeoObject"
-    upper: "GeoObject"
+    fill: "GeoObject"
     trace: "GeoObject"
-    port_a: "tuple[EntityCollection, EntityCollection]"
-    port_b: "tuple[EntityCollection, EntityCollection]"
+    port_a: "EntityCollection"
+    port_b: "EntityCollection"
     pec: object = None
     ports: list = field(default_factory=list)
 
@@ -606,37 +601,23 @@ def stripline(g: "Geometry", *,
 
     ox, oy, oz = origin
     eff_sub_maxh = sub_maxh if sub_maxh is not None else sub_h / _SUBSTRATE_MESH_DIVISIONS
-    half_h = sub_h / 2
 
-    # Split the fill into a lower and an upper half meeting at the trace plane.
-    # The trace then lies on the shared interface (a full partition surface),
-    # not as a floating embedded sheet, which would crash the mesh optimizer.
-    diel_lo = Dielectric(er=er, tand=tand, maxh=eff_sub_maxh)
-    diel_hi = Dielectric(er=er, tand=tand, maxh=eff_sub_maxh)
-    lower = g.box(sub_w, line_l, half_h, position=(ox - sub_w / 2, oy, oz),
-                  material=diel_lo)
-    upper = g.box(sub_w, line_l, half_h,
-                  position=(ox - sub_w / 2, oy, oz + half_h), material=diel_hi)
-    trace = g.xy_plate(line_w, line_l, position=(ox - line_w / 2, oy, oz + half_h))
+    fill = g.box(sub_w, line_l, sub_h, position=(ox - sub_w / 2, oy, oz),
+                 material=Dielectric(er=er, tand=tand, maxh=eff_sub_maxh))
+    trace = g.xy_plate(line_w, line_l, position=(ox - line_w / 2, oy, oz + sub_h / 2))
+    g.fragment(fill, trace)
 
-    g.fragment(lower, upper, trace)
-
-    port_a = (lower.faces.min(axis="y"), upper.faces.min(axis="y"))
-    port_b = (lower.faces.max(axis="y"), upper.faces.max(axis="y"))
-    line = Stripline(lower=lower, upper=upper, trace=trace,
-                     port_a=port_a, port_b=port_b)
+    line = Stripline(fill=fill, trace=trace,
+                     port_a=fill.faces.min(axis="y"), port_b=fill.faces.max(axis="y"))
 
     if add_ports:
-        # Trace + the four enclosing walls: bottom ground (lower z-min), top
-        # ground (upper z-max), and the side walls on both halves.
+        # Trace + the four enclosing walls: both ground planes and both side
+        # walls.
         strip = PEC(trace,
-                    lower.faces.min(axis="z"), upper.faces.max(axis="z"),
-                    lower.faces.min(axis="x"), lower.faces.max(axis="x"),
-                    upper.faces.min(axis="x"), upper.faces.max(axis="x"))
-        p0 = WavePort(port_a[0], port_a[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
-        p1 = WavePort(port_b[0], port_b[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
+                    fill.faces.min(axis="z"), fill.faces.max(axis="z"),
+                    fill.faces.min(axis="x"), fill.faces.max(axis="x"))
+        p0 = WavePort(line.port_a, f0=f0, mode_kind="auto", pec=[strip], power=power)
+        p1 = WavePort(line.port_b, f0=f0, mode_kind="auto", pec=[strip], power=power)
         line.pec = strip
         line.ports = [p0, p1]
 

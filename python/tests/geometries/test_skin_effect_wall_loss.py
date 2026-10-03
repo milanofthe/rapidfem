@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Skin-effect wall loss in a WR-90 section — Leontovich surface impedance.
+"""Skin-effect wall loss in a WR-90 section, Leontovich surface impedance.
 
 A matched, finite-conductivity WR-90 (X-band) section attenuates its TE10
 mode purely through conductor (wall) loss. Replacing the four PEC side walls

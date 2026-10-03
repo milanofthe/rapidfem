@@ -13,7 +13,7 @@ use rapidfem_core::model::{
     Debye, Drude, FaceSpec, MaterialSpec, Model, PmlSpec, WaveKind,
 };
 
-#[pyclass(name = "Model", module = "rapidfem._native")]
+#[pyclass(name = "Model", module = "rapidfem._native", skip_from_py_object)]
 #[derive(Clone, Default)]
 pub struct PyModel {
     pub inner: Model,
@@ -31,7 +31,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (volume_tag, *, er, ur, tand, conductivity, cond_diag=None, er_diag=None, ur_diag=None, debye=None, drude=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_material(
         &mut self,
         volume_tag: i32,
@@ -115,7 +114,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (tag, *, ri, ro, er, power, origin=None, z_axis=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_coax_port(
         &mut self,
         tag: i32,
@@ -130,7 +128,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (tag, *, z0, l, direction, width, height, power, c=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_lumped_port(
         &mut self,
         tag: i32,
@@ -146,7 +143,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (tag, *, r, l, direction, width, height, c=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_lumped_element(
         &mut self,
         tag: i32,
@@ -186,7 +182,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (tag, *, conductivity, mur, er, thickness=None, two_sided=false, sheet=false, zs=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_surface_impedance(
         &mut self,
         tag: i32,
@@ -211,7 +206,6 @@ impl PyModel {
     }
 
     #[pyo3(signature = (volume_tag, *, direction, inner_face, thickness, er_base, ur_base, exponent, delta_max))]
-    #[allow(clippy::too_many_arguments)]
     fn add_pml(
         &mut self,
         volume_tag: i32,

@@ -6,8 +6,8 @@ the matched output port with no reflection. The 3-D animation shows the
 half-sine TE10 field profile propagating along the guide in time.
 
 This is the modal-port injection path: `transient(port=...)` drives the
-operator with the port's own mode pattern (`dy/dt = A·y + b·g(t)`), the
-same machinery `sparams` uses, rather than a hacky point source. Both
+operator with the port's own mode pattern (`dy/dt = A·y + b·g(t)`)
+rather than a point source. Both
 guide ends are characteristic (absorbing) ports, so the pulse enters and
 exits cleanly; PEC walls are the TD operator's default on every non-port
 face.
@@ -34,7 +34,7 @@ rf.show(g)
 # %% Build the time-domain problem
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
 fc = ptd.c / (2.0 * A)
-print(f"DGTD WR-90 guide - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD WR-90 guide - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"TE10 cutoff {fc / 1e9:.2f} GHz, drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive the TE10 mode at the input port and watch the pulse propagate

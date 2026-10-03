@@ -9,7 +9,7 @@
 // against, so it must not share any machinery with it. It is built from first
 // principles: assemble E and B, eliminate the constrained DOFs, and solve the dense
 // generalised symmetric problem E·x = λ·B·x by reducing it to standard form with a
-// Cholesky factor of B. No shift, no iteration, no convergence criterion — the whole
+// Cholesky factor of B. No shift, no iteration, no convergence criterion, the whole
 // spectrum, exactly.
 
 #![allow(dead_code)] // each test file uses a subset
@@ -198,7 +198,7 @@ pub fn to_ghz(lambda: f64) -> f64 {
     C0 * lambda.max(0.0).sqrt() / (2.0 * std::f64::consts::PI) / 1e9
 }
 
-/// k₀² for a frequency in Hz — the eigenvalue the pencil actually carries.
+/// k₀² for a frequency in Hz, the eigenvalue the pencil actually carries.
 pub fn to_lambda(f_hz: f64) -> f64 {
     (2.0 * std::f64::consts::PI * f_hz / C0).powi(2)
 }

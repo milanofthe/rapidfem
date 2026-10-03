@@ -6,7 +6,7 @@
 Configuration for the RapidFEM docs build system.
 
 Single package. API documentation is extracted statically (griffe,
-allow_inspection=False) from the RapidFEM Python source — RapidFEM itself
+allow_inspection=False) from the RapidFEM Python source, RapidFEM itself
 does not need to be installed.
 """
 

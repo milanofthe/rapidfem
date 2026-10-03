@@ -9,7 +9,7 @@
 //! field enters from two faces, and the ratio of the tangential E along the
 //! edge to the surface current along it rises to about 2 Zs at the edge. The
 //! ratio is universal in r/δ (r the distance to the edge) once the conductor
-//! is a few δ thick: [`G_TABLE`], from the 2D magneto-quasistatic solution of
+//! is a few δ thick: `G_TABLE`, from the 2D magneto-quasistatic solution of
 //! rectangular conductors (`derivations/sibc_edge/`), the same within 2 % for
 //! aspect ratios 1:3 to 1:20 and t/δ from 14 to 50.
 //!
@@ -217,7 +217,7 @@ const FADE_FULL: f64 = 4.0;
 const FADE_NONE: f64 = 3.0;
 
 /// The share of the edge correction a conductor `size_over_delta` skin
-/// depths across takes: a smoothstep from [`FADE_NONE`] to [`FADE_FULL`].
+/// depths across takes: a smoothstep from `FADE_NONE` to `FADE_FULL`.
 pub fn fade(size_over_delta: f64) -> f64 {
     let s = ((size_over_delta - FADE_NONE) / (FADE_FULL - FADE_NONE)).clamp(0.0, 1.0);
     s * s * (3.0 - 2.0 * s)
@@ -303,11 +303,10 @@ impl RayGrid {
                     for dz in -1..=1 {
                         let Some(list) = self.cells.get(&[key[0] + dx, key[1] + dy, key[2] + dz]) else { continue };
                         for &t in list {
-                            if t != skip && seen.insert(t) {
-                                if let Some(d) = ray_tri(origin, dir, tris[t]) {
+                            if t != skip && seen.insert(t)
+                                && let Some(d) = ray_tri(origin, dir, tris[t]) {
                                     best = best.min(d);
                                 }
-                            }
                         }
                     }
                 }
@@ -340,10 +339,10 @@ fn ray_tri(o: [f64; 3], dir: [f64; 3], t: [[f64; 3]; 3]) -> Option<f64> {
 
 fn gauss_legendre_16() -> ([f64; 16], [f64; 16]) {
     let x = [
-        -0.9894009349916499, -0.9445750230732326, -0.8656312023878318, -0.7554044083550030,
+        -0.9894009349916499, -0.9445750230732326, -0.8656312023878318, -0.755_404_408_355_003,
         -0.6178762444026438, -0.4580167776572274, -0.2816035507792589, -0.0950125098376374,
         0.0950125098376374, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438,
-        0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499,
+        0.755_404_408_355_003, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499,
     ];
     let w = [
         0.0271524594117541, 0.0622535239386479, 0.0951585116824928, 0.1246289712555339,

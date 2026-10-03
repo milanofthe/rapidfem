@@ -5,7 +5,7 @@
 Electromagnetic FEM solver written in Rust, distributed as a Python package on PyPI. Two backends sit
 behind one geometry / material / physics API: a frequency-domain solver (Nédélec first-kind
 curl-conforming elements, complex-symmetric sparse linear algebra) and a time-domain DGTD solver
-(nodal discontinuous Galerkin, Krylov/ETD exponential time integration, model-order reduction). The
+(nodal discontinuous Galerkin, Krylov/ETD exponential, explicit and adaptive time integration). The
 geometry is non-dimensionalised before assembly, so sub-micron RFIC passives and metre-scale
 structures use the same numerical path. An optional Flask-based local UI provides a code editor and a
 live viewer.
@@ -40,7 +40,7 @@ rf.PEC(*air.faces.unassigned)
 g.mesh()
 
 # Define the problem once, run any number of analyses on it
-prob = rf.Problem(g)                      # Problem is the frequency-domain ProblemFD
+prob = rf.ProblemFD(g)                      # the frequency-domain problem
 result = prob.sweep(np.linspace(8e9, 12e9, 21))
 print(result.frequencies.shape, result.sparams.shape)
 
@@ -90,7 +90,7 @@ rf.RectWaveguidePort(scene.group("port_in"))
 rf.RectWaveguidePort(scene.group("port_out"))
 rf.PEC(scene.group("walls"))
 g.mesh()
-result = rf.Problem(g).sweep(np.linspace(8e9, 12e9, 21))
+result = rf.ProblemFD(g).sweep(np.linspace(8e9, 12e9, 21))
 ```
 
 IGES and BREP are not supported; export STEP. `examples/fd_stl_import.py` is a full STL-driven
@@ -109,16 +109,17 @@ frequency and port. `rapidfem.show(g)` sends a geometry to the viewer.
 
 ## Features
 
-- Geometry builder: OpenCASCADE primitives with boolean ops, transforms, and fillet/chamfer.
+- Geometry builder on the vendored rapidmesh: primitives with boolean ops, transforms, and
+  fillet/chamfer.
   Ready-made RF structures in `rf.structures` (coax, microstrip, CPW, stripline, waveguides, helix)
   build geometry and ports in one call.
-- External CAD / mesh import: `g.load(path)` pulls in STEP / IGES / BREP solids as composable
-  primitives, heals STL surfaces into meshable solids, or loads a pre-built `.msh` and exposes its
-  named physical groups for material / physics binding.
+- External CAD / mesh import: `g.load(path)` pulls in STEP solids as composable primitives, closed
+  STL / OBJ surfaces as solids, or loads a pre-built `.msh` and exposes its named groups for
+  material / physics binding.
 - RFIC / GDS: `rapidfem.rfic` process stacks and `Geometry.from_gds` build on-chip passives, solved
   after non-dimensionalisation down to sub-micron features.
 - Element: Nédélec first-kind curl-conforming tetrahedral elements, order 2 (20 DOFs per cell), in a
-  hierarchical basis. Opt-in per-cell mixed order (1-2) via `[element] order_policy = "adaptive"`;
+  hierarchical basis. Opt-in per-cell mixed order (1-2) via `ProblemFD.sweep(order="adaptive")`;
   the default is uniform order 2.
 - Excitations: rectangular waveguide ports (arbitrary TE modes), lumped ports (TEM, multi-line
   voltage integral), coax and wave ports, Floquet plane-wave port (normal incidence), first-order
@@ -143,20 +144,22 @@ frequency and port. `rapidfem.show(g)` sends a geometry to the viewer.
 exposes it as a model at every level:
 
 - DGTD: nodal discontinuous Galerkin on tetrahedra, upwind or energy-conserving central flux.
-- Exponential time integration: matrix-free Krylov/ETD propagator, exact for the linear system at any
-  step size (no CFL limit).
-- Model export / reduction: the RHS, the verbatim sparse operator `A`, an exponential stepper, or
-  Krylov-projected reduced models.
+- Time integration: matrix-free Krylov/ETD propagator, exact for the linear system at any step
+  size (no CFL limit); explicit LSERK4 substepped within the CFL limit; embedded KCL RK4(3) with
+  PI step control. CPU or OpenCL GPU.
+- Model export: the RHS, the verbatim sparse operator `A`, an exponential stepper.
 - Materials: heterogeneous, lossy, anisotropic, and Debye-dispersive media; matched absorbing layers;
   periodic boundaries.
 - Output: field probes, RFT transfer function, VTK field-animation export.
 
 ```python
+import numpy as np
 import rapidfem as rf
 
 ptd  = rf.ProblemTD.box(size=(1, 1, 1), cells=(2, 2, 2), order=2)
+y0   = np.random.default_rng(0).standard_normal(ptd.n_dofs)
 traj = ptd.transient(y0, dt=0.02, steps=200)   # turnkey transient
-rom  = ptd.reduce(y0, dim=60)                   # model-order reduction
+f    = ptd.resonances(n=4)                      # cavity resonances
 A    = ptd.state_space()                        # the verbatim operator
 ```
 

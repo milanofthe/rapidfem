@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""WR-90 TE10 mode profile — transverse E-field follows sin(pi x / a).
+"""WR-90 TE10 mode profile, transverse E-field follows sin(pi x / a).
 
 A propagating TE10 mode in a rectangular guide has a single transverse field
 component (E_y, along the short dimension b) whose amplitude varies as

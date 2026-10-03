@@ -60,7 +60,7 @@ fn check_memory<T: Scalar>(
     if peak > budget {
         return Err(format!(
             "rslab: estimated factorisation peak {:.0} MB exceeds {:.0}% of system \
-             RAM ({:.0} MB) — refine the mesh less, or run on a bigger machine \
+             RAM ({:.0} MB), refine the mesh less, or run on a bigger machine \
              ({line})",
             peak as f64 / 1e6,
             MEM_BUDGET_FRACTION * 100.0,
@@ -260,7 +260,6 @@ impl<T: Scalar> SymmetricSolver<T> {
     /// no factorisation yet or any right-hand side misses the relative
     /// residual `tol` within `max_iter` iterations; the caller then refactors.
     /// Also returns the largest iteration count.
-    #[allow(clippy::too_many_arguments)]
     pub fn solve_nearby(
         &mut self,
         n: usize,
@@ -405,7 +404,7 @@ mod tests {
         let near = system(0.31);
         let b: Vec<C64> = (0..n).map(|i| C64::new(1.0 + i as f64 * 0.01, 0.0)).collect();
         let (xs, iters) = solver
-            .solve_nearby(n, &rows, &cols, &near, &[b.clone()], 1e-12, 200)
+            .solve_nearby(n, &rows, &cols, &near, std::slice::from_ref(&b), 1e-12, 200)
             .expect("COCG must converge on a nearby system");
         let mut direct = SymmetricSolver::<C64>::new();
         direct.factorize(n, &rows, &cols, &near).unwrap();

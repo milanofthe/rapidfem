@@ -15,9 +15,8 @@ soon as the 3-D view opens) and ``field`` (field and trajectory data,
 fetched only when the field viewer is shown), replacing each array with
 a compact ``$bin`` reference. The JSON that remains is pure structure.
 
-Both the static-demo bake and the live WebSocket protocol use this one
-packer; only what they do with the returned buffers differs (sidecar
-files vs. binary frames).
+The static-demo bake (``scripts/bake_demo.py``) writes the returned
+buffers as sidecar files next to the JSON.
 
 ``$bin`` reference shapes
 -------------------------

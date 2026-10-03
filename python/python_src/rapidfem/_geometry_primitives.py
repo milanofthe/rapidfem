@@ -6,22 +6,12 @@ rapidmesh scene. Mixed into ``Geometry``; kept apart to keep geometry.py
 navigable."""
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING, Iterable
 
 import numpy as np
 
 if TYPE_CHECKING:
     from .geometry import GeoObject
-
-_FULL_TURN = 2 * math.pi
-
-
-def _full_turn(angle: float, what: str) -> None:
-    if abs(angle - _FULL_TURN) > 1e-12:
-        raise NotImplementedError(
-            f"{what}: partial sweeps are not available yet (build the solid "
-            f"with Geometry.revolve from a profile instead)")
 
 
 class _PrimitivesMixin:
@@ -77,15 +67,13 @@ class _PrimitivesMixin:
     def cylinder(self, radius: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
                  axis: tuple[float, float, float] = (0, 0, 1),
-                 angle: float = 2 * math.pi,
                  *,
                  material=None,
                  maxh: float | None = None) -> "GeoObject":
-        """add a (partial-sweep) cylinder primitive
+        """add a cylinder primitive
 
-        Curved surfaces honour ``Mesh.MeshSizeFromCurvature`` so the
-        cylinder side wall meshes into geometry-accurate facets without
-        manual refinement.
+        The side wall is meshed on the true surface, refined to the
+        curvature without manual sizing.
 
 
         Example
@@ -109,9 +97,6 @@ class _PrimitivesMixin:
             base centre (defaults to origin)
         axis : tuple[float, float, float]
             cylinder axis direction (defaults to +z)
-        angle : float
-            sweep angle in radians; defaults to :math:`2\\pi` (full
-            cylinder), :math:`<2\\pi` gives a partial cylinder
         material : rapidfem.Material, optional
             volume material
         maxh : float, optional
@@ -122,7 +107,6 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        _full_turn(angle, "cylinder")
         oid = self._native.add_cylinder(radius, height, list(position), list(axis), maxh)
         return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
@@ -130,8 +114,7 @@ class _PrimitivesMixin:
                position: tuple[float, float, float] = (0, 0, 0),
                *,
                material=None,
-               maxh: float | None = None,
-               center: tuple[float, float, float] | None = None) -> "GeoObject":
+               maxh: float | None = None) -> "GeoObject":
         """add a sphere primitive
 
         Parameters
@@ -144,22 +127,18 @@ class _PrimitivesMixin:
             volume material
         maxh : float, optional
             per-volume mesh size override
-        center : tuple[float, float, float], optional
-            deprecated alias for ``position``
 
         Returns
         -------
         GeoObject
             volume
         """
-        c = center if center is not None else position
-        oid = self._native.add_sphere(radius, list(c), maxh)
+        oid = self._native.add_sphere(radius, list(position), maxh)
         return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     def cone(self, r1: float, r2: float, height: float,
              position: tuple[float, float, float] = (0, 0, 0),
              axis: tuple[float, float, float] = (0, 0, 1),
-             angle: float = 2 * math.pi,
              *,
              material=None,
              maxh: float | None = None) -> "GeoObject":
@@ -175,8 +154,6 @@ class _PrimitivesMixin:
             base centre (defaults to origin)
         axis : tuple[float, float, float]
             cone axis direction (defaults to +z)
-        angle : float
-            sweep angle in radians (defaults to :math:`2\\pi`)
         material : rapidfem.Material, optional
             volume material
         maxh : float, optional
@@ -187,7 +164,6 @@ class _PrimitivesMixin:
         GeoObject
             volume
         """
-        _full_turn(angle, "cone")
         oid = self._native.add_cone(r1, r2, height, list(position), list(axis), maxh)
         return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
@@ -228,11 +204,9 @@ class _PrimitivesMixin:
 
     def torus(self, major_radius: float, minor_radius: float,
               position: tuple[float, float, float] = (0, 0, 0),
-              angle: float = 2 * math.pi,
-              *,
+               *,
               material=None,
-              maxh: float | None = None,
-              center: tuple[float, float, float] | None = None) -> "GeoObject":
+              maxh: float | None = None) -> "GeoObject":
         """add a torus primitive
 
         Parameters
@@ -243,23 +217,17 @@ class _PrimitivesMixin:
             tube radius in metres
         position : tuple[float, float, float]
             torus centre (defaults to origin); axis is along +z
-        angle : float
-            sweep angle in radians; :math:`<2\\pi` gives a partial torus
         material : rapidfem.Material, optional
             volume material
         maxh : float, optional
             per-volume mesh size override
-        center : tuple[float, float, float], optional
-            deprecated alias for ``position``
 
         Returns
         -------
         GeoObject
             volume
         """
-        _full_turn(angle, "torus")
-        c = center if center is not None else position
-        oid = self._native.add_torus(major_radius, minor_radius, list(c), [0.0, 0.0, 1.0], maxh)
+        oid = self._native.add_torus(major_radius, minor_radius, list(position), [0.0, 0.0, 1.0], maxh)
         return self._wrap(oid, sheet=False, material=material, maxh=maxh)
 
     # ── sheets ──────────────────────────────────────────────────────────────

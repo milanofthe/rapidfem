@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Scattering-matrix energy conservation — unitarity and passivity.
+"""Scattering-matrix energy conservation, unitarity and passivity.
 
 Two structures probe the same conservation law from opposite sides.
 
@@ -13,8 +13,8 @@ Two structures probe the same conservation law from opposite sides.
 
        |S11|² + |S21|² = 1   and   |S12|² + |S22|² = 1   at EVERY frequency.
 
-   The step is a real discontinuity (|S11| ≈ 0.17–0.43 across the band, so the
-   power genuinely splits between reflection and transmission) — this is a far
+   The step is a real discontinuity (|S11| ≈ 0.17-0.43 across the band, so the
+   power genuinely splits between reflection and transmission), this is a far
    stronger statement than mere passivity (≤ 1): with no loss path the column
    power must land exactly on 1. Asserted within 1.5 %.
 
@@ -25,8 +25,8 @@ Two structures probe the same conservation law from opposite sides.
 
        0.90 < |S11|² + |S21|² < 1.0.
 
-   Operated in the lower X-band (7–9 GHz, nearer the 6.56 GHz cutoff where the
-   conductor attenuation αc is largest) the loss is a clear ~0.3–0.6 %, well
+   Operated in the lower X-band (7-9 GHz, nearer the 6.56 GHz cutoff where the
+   conductor attenuation αc is largest) the loss is a clear ~0.3-0.6 %, well
    above the lossless numerical floor (~0.04 %) and far inside the 0.90 floor.
 
 Both meshes stay under the harness DOF budget (< 100 000): the step is
@@ -73,7 +73,7 @@ def test_lossless_step_unitarity():
     rf.RectWaveguidePort(box1.faces.min(axis="z"))
     rf.RectWaveguidePort(box2.faces.max(axis="z"), width=A2, height=B)
 
-    # PEC the lateral walls of both sections plus the step "ring" — the part of
+    # PEC the lateral walls of both sections plus the step "ring", the part of
     # box1's top face that sits outside the narrow guide's footprint. The
     # central A2×B overlap is an interior air↔air interface (the fields pass
     # through it), so it must stay un-PEC'd or the output port is walled off.
@@ -123,7 +123,7 @@ def test_lossy_section_passivity():
     # Leontovich skin-effect BC (Z_s = (1+j)R_s) on the four side walls.
     rf.SurfaceImpedance(*air.faces.unassigned, conductivity=SIGMA)
 
-    # Lower X-band, above the 6.56 GHz cutoff — αc is largest here, so the
+    # Lower X-band, above the 6.56 GHz cutoff, αc is largest here, so the
     # (still small) loss is comfortably above the lossless numerical floor.
     freqs = np.array([7.0e9, 7.5e9, 8.0e9, 8.5e9, 9.0e9])
     prob, res = case.sweep(g, freqs)
@@ -132,7 +132,7 @@ def test_lossy_section_passivity():
     assert s11.max() < 0.01, f"|S11| rose to {s11.max():.4f} (not matched)"
 
     # Passive but lossy: each incident column power is < 1 (power dissipated in
-    # the walls) yet bounded — a passive network never amplifies, and copper is
+    # the walls) yet bounded, a passive network never amplifies, and copper is
     # a good conductor so the loss stays modest (well above the 0.90 floor).
     worst_loss = 0.0
     for i, f in enumerate(freqs):

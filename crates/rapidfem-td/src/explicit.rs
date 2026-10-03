@@ -197,7 +197,7 @@ mod tests {
             let mut y = [1.0_f64, 0.4_f64];
             let mut ws = LserkWorkspace::new();
             for _ in 0..nsteps {
-                ws.step_into(&matvec, &mut y, dt);
+                ws.step_into(matvec, &mut y, dt);
             }
             y
         };

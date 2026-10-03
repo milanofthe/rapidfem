@@ -304,7 +304,7 @@ impl Progress {
     }
 
     fn frame(&self, done: usize) {
-        if self.verbose && done % self.every == 0 && done < self.steps {
+        if self.verbose && done.is_multiple_of(self.every) && done < self.steps {
             let el = self.t0.elapsed().as_secs_f64();
             let eta = el / done as f64 * (self.steps - done) as f64;
             log(true, format!(
@@ -545,7 +545,6 @@ impl TdSession {
     /// by `drive·waveform(t)`, keeping `record` per frame (`steps + 1`
     /// rows, the first the initial state). `hook` runs once per frame (and
     /// per GPU chunk); its error aborts the run.
-    #[allow(clippy::too_many_arguments)]
     pub fn transient(
         &mut self,
         y0: Option<&[f64]>,
@@ -570,11 +569,10 @@ impl TdSession {
         if !matches!(drive, Drive::Free) && waveform.is_none() {
             return Err("a driven run needs a waveform".into());
         }
-        if let Record::Dofs(d) = record {
-            if let Some(&bad) = d.iter().find(|&&i| i >= n) {
+        if let Record::Dofs(d) = record
+            && let Some(&bad) = d.iter().find(|&&i| i >= n) {
                 return Err(format!("probe DOF {bad} out of range (n_dof = {n})"));
             }
-        }
         let warmup = opts.warmup.min(steps);
         if opts.method == Method::Adaptive && warmup > 0 {
             return Err("warmup is not supported with method='adaptive' (the controller \
@@ -718,7 +716,6 @@ impl TdSession {
 
     /// One output frame of the CPU adaptive controller: as many KCL
     /// substeps as it takes to cover `dt`, the waveform sampled per substep.
-    #[allow(clippy::too_many_arguments)]
     fn adaptive_frame(
         &mut self,
         y: &mut Vec<f64>,
@@ -832,7 +829,6 @@ impl TdSession {
     /// interrupts come through; only the chunk-boundary state crosses the
     /// bus.
     #[cfg(feature = "gpu")]
-    #[allow(clippy::too_many_arguments)]
     fn gpu_explicit(
         &mut self,
         y: &mut Vec<f64>,
@@ -886,7 +882,6 @@ impl TdSession {
     }
 
     #[cfg(not(feature = "gpu"))]
-    #[allow(clippy::too_many_arguments)]
     fn gpu_explicit(
         &mut self, _: &mut Vec<f64>, _: usize, _: usize, _: f64, _: usize, _: Drive,
         _: &mut dyn FnMut(f64) -> Result<f64, String>, _: &mut Recorder, _: &Progress, _: &mut Hook,
@@ -897,7 +892,6 @@ impl TdSession {
     /// The adaptive run on the GPU: the controller on the host, the state
     /// and the error reduction on the device, the waveform held per frame.
     #[cfg(feature = "gpu")]
-    #[allow(clippy::too_many_arguments)]
     fn gpu_adaptive(
         &mut self,
         y: &mut Vec<f64>,
@@ -938,7 +932,6 @@ impl TdSession {
     }
 
     #[cfg(not(feature = "gpu"))]
-    #[allow(clippy::too_many_arguments)]
     fn gpu_adaptive(
         &mut self, _: &mut Vec<f64>, _: usize, _: f64, _: Drive,
         _: &mut dyn FnMut(f64) -> Result<f64, String>, _: &Controller, _: &mut Recorder,
@@ -951,7 +944,6 @@ impl TdSession {
     /// FFT, `H` zero where the drive spectrum is below
     /// `TRANSFER_BAND_FRACTION` of its peak. Returns the frequencies (Hz
     /// for an SI operator) and `H`.
-    #[allow(clippy::too_many_arguments)]
     pub fn transfer_function(
         &mut self,
         source: usize,
@@ -1010,7 +1002,7 @@ impl TdSession {
     /// `[ports][rows]`.
     pub fn port_signals(&self, states: &[f64], ports: &[usize]) -> Result<Vec<f64>, String> {
         let n = self.n_dof();
-        if states.len() % n != 0 {
+        if !states.len().is_multiple_of(n) {
             return Err(format!("the trajectory length {} is not a multiple of n_dof = {n}", states.len()));
         }
         if let Some(&p) = ports.iter().find(|&&p| p >= self.op.n_ports() || !self.op.port_has_mode(p)) {
@@ -1029,7 +1021,7 @@ impl TdSession {
     pub fn export_vtk(&self, states: &[f64], times: &[f64], base: &Path) -> io::Result<PathBuf> {
         let n = self.n_dof();
         let invalid = |m: String| io::Error::new(io::ErrorKind::InvalidInput, m);
-        if states.len() % n != 0 {
+        if !states.len().is_multiple_of(n) {
             return Err(invalid(format!("states carry {} values, not a multiple of n_dof = {n}", states.len())));
         }
         let n_snap = states.len() / n;
@@ -1037,7 +1029,7 @@ impl TdSession {
             return Err(invalid(format!("times has {} entries, expected {n_snap}", times.len())));
         }
         let coords = self.op.node_coords();
-        let n_elem = self.op.n_elem;
+        let n_elem = self.op.n_elem();
         let np = coords.len() / n_elem;
         let corners = self.op.corner_local_nodes();
         if let Some(parent) = base.parent().filter(|p| !p.as_os_str().is_empty()) {

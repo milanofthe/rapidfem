@@ -15,7 +15,7 @@ Run from the repo root:
     python scripts/bake_demo.py
 
 Reused machinery (single source of truth for runtime behaviour):
-- capture lifecycle           → rapidfem.ui.kernel
+- capture lifecycle           → rapidfem.ui.worker
 - show() collector            → rapidfem.ui.capture
 - serializer (display events) → rapidfem.ui.serialize / api._serialize_captures_for_protocol
 """
@@ -38,7 +38,7 @@ from typing import Iterable
 BAKE_TIMEOUT_S = 600   # kill + retry an example that runs longer than this
 BAKE_ATTEMPTS = 3      # attempts per example before it is skipped
 
-# Bumped whenever the meta.json schema changes — older meta files are
+# Bumped whenever the meta.json schema changes, older meta files are
 # treated as missing and force a re-bake.
 META_SCHEMA = 2
 
@@ -54,7 +54,7 @@ _BAKE_ENV = {
     "OPENBLAS_NUM_THREADS": "1",
 }
 
-# The curated web-demo set — only these examples are baked into the static
+# The curated web-demo set, only these examples are baked into the static
 # demo. Every other script under `examples/` stays a package example
 # (runnable, listed in the live `rapidfem serve` notebook) but is left out
 # of the web demo: numbers-only validation/benchmark scripts and near-
@@ -71,7 +71,7 @@ DEMO_EXAMPLES = frozenset({
     "fd_dielectric_resonator",
     # RFIC layout import
     "fd_rfic_spiral_from_json",
-    # time-domain — driven modal-port families + complex structures, each a
+    # time-domain, driven modal-port families + complex structures, each a
     # field animation plus a transient port/probe plot
     "td_rect_waveguide",
     "td_coax_line",
@@ -82,7 +82,7 @@ DEMO_EXAMPLES = frozenset({
     "td_coax_open",
 })
 
-# Windows console defaults to cp1252 — print() falls over on the unicode
+# Windows console defaults to cp1252, print() falls over on the unicode
 # box-drawing chars we use in summaries. Force UTF-8 on the std streams.
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -98,7 +98,7 @@ _MARKER_RE = re.compile(r"^\s*#\s*%%")
 
 @dataclass
 class Cell:
-    """One notebook cell — body text plus its marker line (if any)."""
+    """One notebook cell, body text plus its marker line (if any)."""
 
     text: str
     marker: str | None  # the `# %%` line that introduces this cell, or None
@@ -150,7 +150,7 @@ def split_cells(source: str) -> list[Cell]:
 
 
 def serialize_cells(cells: Iterable[Cell]) -> str:
-    """Inverse of split_cells — round-trip-safe within a tolerance.
+    """Inverse of split_cells, round-trip-safe within a tolerance.
 
     Reassembles the source from cells; intended as a sanity check, not
     as a canonical formatter. Reproduces the same shape Notebook.svelte's
@@ -171,9 +171,9 @@ def _bake_cell(cell: Cell, kernel) -> dict:
     """Run a single cell through the same pipeline the WS server uses and
     return a JSON-serialisable record of what happened.
 
-    Reuses the production helpers — ``rapidfem.ui.capture`` for ``rapidfem.show()``
+    Reuses the production helpers, ``rapidfem.ui.capture`` for ``rapidfem.show()``
     payloads, ``_capture_streams`` for native fd-level stdout/stderr,
-    ``_serialize_captures_for_protocol`` for the display-event shape — so
+    ``_serialize_captures_for_protocol`` for the display-event shape, so
     a baked run cannot diverge from a live run by accident.
     """
     # Imported lazily so a `python scripts/bake_demo.py` that only runs the
@@ -197,7 +197,7 @@ def _bake_cell(cell: Cell, kernel) -> dict:
             try:
                 exec(compile(cell.text, kernel.file_path or "<cell>", "exec"),
                      kernel.namespace)
-            except BaseException as e:  # noqa: BLE001 — same shape as kernel_ws
+            except BaseException as e:  # noqa: BLE001, same shape as the UI worker
                 err = e
     finally:
         captured = _show_capture.stop_capture()
@@ -235,12 +235,11 @@ def _bake_cell(cell: Cell, kernel) -> dict:
 
 def _extract_payloads_to_bin(record: dict, bin_dir: Path) -> list[Path]:
     """Lift every bulk numeric array out of a baked record into the two
-    binary sidecars — ``<name>.geo.bin`` (mesh / geometry) and
-    ``<name>.field.bin`` (field / trajectory data) — replacing each array
+    binary sidecars, ``<name>.geo.bin`` (mesh / geometry) and
+    ``<name>.field.bin`` (field / trajectory data), replacing each array
     in the record with a ``$bin`` reference.
 
-    Reuses :mod:`rapidfem.ui.binpack`, the single packer the live
-    WebSocket protocol shares. Returns the bin files actually written; a
+    Uses :mod:`rapidfem.ui.binpack`. Returns the bin files actually written; a
     buffer holding nothing but its 8-byte header (an example with no mesh,
     or no field data) is skipped.
     """
@@ -267,11 +266,11 @@ def bake_example(path: Path) -> dict:
     """Bake one example file end-to-end.
 
     Returns ``{name, source, cells: [<cell records>]}``. Cells run
-    sequentially against a single persistent namespace — the same model
+    sequentially against a single persistent namespace, the same model
     the live notebook uses, so variables defined in cell N are visible
     in cell N+1.
     """
-    # The bake runs in-process — we don't need the subprocess kernel from
+    # The bake runs in-process, we don't need the subprocess kernel from
     # rapidfem.ui.runner, just a tiny namespace + the show-capture +
     # serialize pipeline. Live serving uses a real worker subprocess.
     import rapidfem
@@ -383,9 +382,9 @@ _PACKAGE_HASH_CACHE: str | None = None
 
 def _package_source_hash() -> str:
     """Stable hash over every `.py` under `rapidfem/` (excluding examples/)
-    plus this bake script. Detects shared-code edits — a fix in
+    plus this bake script. Detects shared-code edits, a fix in
     `problem/fd.py` invalidates every FD example, a tweak to
-    `geometry.py` invalidates all examples that touch meshing — without
+    `geometry.py` invalidates all examples that touch meshing, without
     cascading on per-example edits, which `examples/` is carved out for
     (per-example `src_hash` already handles those).
 
@@ -435,7 +434,7 @@ def _write_meta(name: str, out_dir: Path, meta: dict) -> None:
 def _bake_config(name: str) -> dict:
     """Per-example orchestrator config from `<name>.bake.json` next to the
     example source. JSON (not TOML) so we stay stdlib-only on Python 3.10.
-    Controls *orchestrator behaviour* only — retries, timeout. Runtime
+    Controls *orchestrator behaviour* only, retries, timeout. Runtime
     behaviour of the example (mesh kwargs, solver kwargs) stays in the
     example file so it remains runnable as a plain Python script.
 
@@ -558,7 +557,7 @@ def _bake_subprocess(name: str, log: Path) -> BakeOutcome:
     Retries and timeout come from the per-example config in
     `<name>.bake.json` if present, falling back to `BAKE_ATTEMPTS` and
     `BAKE_TIMEOUT_S`. Setting `retries=1` for examples with known
-    deterministic failures (e.g. Netgen heap corruption) avoids burning
+    deterministic failures (a crash in native code) avoids burning
     three attempts on something that will fail the same way every time.
     """
     cfg = _bake_config(name)
@@ -591,7 +590,7 @@ def _bake_subprocess(name: str, log: Path) -> BakeOutcome:
             _append_log(log, name, attempt, outcome, proc.stdout, proc.stderr)
         except subprocess.TimeoutExpired as e:
             dt = time.perf_counter() - t0
-            outcome = f"TIMED OUT after {timeout_s}s — killed"
+            outcome = f"TIMED OUT after {timeout_s}s, killed"
             detail = (e.stderr or b"").decode("utf-8", "replace") \
                 if isinstance(e.stderr, bytes) else (e.stderr or "")
             exit_code = -1  # sentinel: process killed by timeout
@@ -710,7 +709,7 @@ def bake_all(force: bool = False) -> dict:
                 and meta.get("status") == "failed" \
                 and meta.get("src_hash") == _hash_source_file(path) \
                 and meta.get("package_hash") == package_hash:
-            print(f"── skipping {path.name} — same source as last failed "
+            print(f"── skipping {path.name}, same source as last failed "
                   f"attempt (status={meta.get('exit_code')!r}; "
                   f"edit src or run with --force)", file=sys.stderr)
             skipped.append(path.name)
@@ -719,7 +718,7 @@ def bake_all(force: bool = False) -> dict:
         print(f"\n── baking {path.name}", file=sys.stderr)
         outcome = _bake_subprocess(path.stem, bake_log)
         if outcome.success_seconds is None:
-            print(f"!! FAILED {path.name} — {outcome.attempts} attempt(s); "
+            print(f"!! FAILED {path.name}, {outcome.attempts} attempt(s); "
                   f"recording failure in meta (see {bake_log.name})",
                   file=sys.stderr)
             _write_meta(path.stem, out_dir, {
@@ -742,7 +741,7 @@ def bake_all(force: bool = False) -> dict:
             skipped.append(path.name)
             continue
 
-        # Success — the subprocess wrote meta + bins + json; nothing more
+        # Success, the subprocess wrote meta + bins + json; nothing more
         # to do here per-example. Print a one-line size summary.
         post_meta = _read_meta(path.stem, out_dir) or {}
         print(
@@ -801,7 +800,7 @@ def _bake_one(name: str) -> int:
     for i, c in enumerate(record["cells"]):
         head = (c["marker"] or "").strip() or "(implicit)"
         ds = c.get("display_events", [])
-        kinds = ",".join(d.get("kind", "?") for d in ds) or "—"
+        kinds = ",".join(d.get("kind", "?") for d in ds) or ", "
         sl = len(c.get("stream_lines", []))
         status = c["status"]
         print(f"  [{i}] {head:30s}  status={status:5s}  display=[{kinds}]  stream={sl}",
@@ -859,7 +858,7 @@ def _bootstrap_meta() -> int:
     """One-shot migration: synthesise `<name>.meta.json` files for every
     existing baked artefact under `static/demo/`, using the current source
     hashes. Lets the hash-based freshness check see pre-existing artefacts
-    as fresh on the first run after the meta-schema refactor — without
+    as fresh on the first run after the meta-schema refactor, without
     forcing a 30-minute re-bake of everything.
     """
     out_dir = _output_dir()

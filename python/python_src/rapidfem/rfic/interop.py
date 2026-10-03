@@ -56,20 +56,19 @@ class FemLayoutResult:
 
     Typical usage::
 
-        from rapidfem import rfic, PEC, LumpedPort, ABC, Problem
+        from rapidfem import rfic, PEC, LumpedPort, ABC, ProblemFD
         layout = rfic.from_fem_json("spiral.fem.json")
         all_conductors = [v for vs in layout.conductors.values() for v in vs]
-        PEC(*(v.faces for v in all_conductors), layout.ground)
+        PEC(*(v.faces for v in all_conductors), *layout.ground_patches)
         for port in layout.ports.values():
             LumpedPort(port, direction=(0, 0, 1), z0=50.0)
         ABC(*layout.air.faces.outer)
         layout.geometry.mesh()
-        result = Problem(layout.geometry).sweep([1e9, 10e9, 50e9])
+        result = ProblemFD(layout.geometry).sweep([1e9, 10e9, 50e9])
     """
     geometry: "Geometry"
     conductors: dict[str, list["GeoObject"]]   # stack-layer id → 3-D conductor volumes
     ports: dict[str, "GeoObject"]               # port name → 2-D port plate
-    ground: "GeoObject"                         # alias for the first ground patch
     ground_patches: list                        # one local ground per port (may merge)
     substrate: "GeoObject"
     oxide: "GeoObject"
@@ -187,8 +186,9 @@ def from_fem_json(
     ox_tand          = oxide_doc.get("tand", 0.0)
 
     if stack is not None:
-        sub_er, sub_sigma = stack.substrate_er, stack.substrate_sigma
-        ox_er, ox_tand    = stack.oxide_er, stack.oxide_tand
+        slab = stack._single_slab()
+        sub_er, sub_sigma = slab["substrate"]["er"], slab["substrate"]["sigma"]
+        ox_er, ox_tand    = slab["oxide"]["er"], slab["oxide"]["tand"]
 
     silicon = _Dielectric(er=sub_er, conductivity=sub_sigma)
     sio2    = _Dielectric(er=ox_er,  tand=ox_tand)
@@ -457,12 +457,6 @@ def from_fem_json(
         gnd_patch.name = "gnd_" + "_".join(resolved_ports[i][0] for i in members)
         ground_patches.append(gnd_patch)
 
-    ground = ground_patches[0] if ground_patches else g.xy_plate(
-        1e-6, 1e-6,
-        position=(cx_m, cy_m,
-                  (metals_by_z[0]['z_um'] + metals_by_z[0]['thickness_um']) * 1e-6),
-        maxh=port_maxh)
-
     # One conformal fragment over everything that lives inside oxide + air.
     g.fragment(oxide, substrate, *all_conductors,
                *ground_patches, *port_objects.values(), air)
@@ -471,7 +465,6 @@ def from_fem_json(
         geometry=g,
         conductors=conductor_objects,
         ports=port_objects,
-        ground=ground,
         ground_patches=ground_patches,
         substrate=substrate,
         oxide=oxide,

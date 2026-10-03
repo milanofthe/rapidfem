@@ -215,7 +215,7 @@ impl BasisFn {
 ///     minimum rule keeps "the functions up to order p", which is only a subset if
 ///     the low-order space nests).
 ///   * Mode 1 is a pure gradient, so `∇×φ_e1 = 0` exactly and the curl kernel is
-///     explicit in the element matrix — the local exact-sequence property
+///     explicit in the element matrix, the local exact-sequence property
 ///     (Schöberl & Zaglmayr, COMPEL 24 (2005) 374).
 ///
 /// The interpolatory pair `{ℓ·L_a·W_ab, ℓ·L_b·W_ab}` spanned the same total 20-dim
@@ -252,8 +252,8 @@ pub fn face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [BasisFn
 
 /// Build one basis function per entry of `owners`.
 ///
-/// The element does not enumerate its own DOFs. The owner list — produced by
-/// `basis::tet_dof_owners` from the entity orders — says which entity each local
+/// The element does not enumerate its own DOFs. The owner list, produced by
+/// `basis::tet_dof_owners` from the entity orders, says which entity each local
 /// DOF belongs to and which of that entity's functions it is, and this reads that
 /// list off. So a DOF exists in the element exactly when it exists in the DOF map,
 /// in the same position, whatever the orders happen to be. There is no second
@@ -526,7 +526,7 @@ mod tests {
          [C64::new(0.0,0.0),C64::new(0.0,0.0),C64::new(1.0,0.0)]]
     }
 
-    /// A fully coplanar (degenerate) tet must not produce inf/NaN gradients —
+    /// A fully coplanar (degenerate) tet must not produce inf/NaN gradients, 
     /// the volume floor keeps 1/6V finite.
     #[test]
     fn degenerate_tet_grads_are_finite() {

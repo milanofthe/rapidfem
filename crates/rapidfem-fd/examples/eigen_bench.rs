@@ -6,7 +6,7 @@
 //!
 //! The rewritten solver reorthogonalises the Lanczos basis fully, in the B inner
 //! product, twice per step. That is O(m²·n) and is the price of not producing ghost
-//! modes — but it is a price, so measure it against the factorisation it sits next to
+//! modes, but it is a price, so measure it against the factorisation it sits next to
 //! rather than assume it is negligible.
 //!
 //!   cargo run --release -p rapidfem-fd --example eigen_bench [N] [MODES]

@@ -5,7 +5,7 @@
 """Analytical reference solutions for the phenomenon test suite.
 
 Every geometry test asserts the solver against a *closed form* or a
-conservation law — never against another solver. This module collects the
+conservation law, never against another solver. This module collects the
 shared closed forms (transmission-line, waveguide, cavity, loss, dispersion).
 Niche one-off formulas can live in the test module that uses them; put a
 formula here only once a second test needs it, to keep parallel edits

@@ -108,7 +108,7 @@ class _Physics:
 
     The physics object is purely declarative, it holds no state about
     the mesh. The geometry's :meth:`Geometry.mesh` step turns it into a
-    tagged group of mesh faces or tets, and :class:`rapidfem.Problem`
+    tagged group of mesh faces or tets, and :class:`rapidfem.ProblemFD`
     reads that group tag back when it builds the model.
     """
     _expected_dim: int = 2
@@ -129,7 +129,7 @@ class _Physics:
         model : rapidfem._native.Model
             the model being built
         tag : int
-            physical-group tag assigned by ``Geometry.mesh()``
+            mesh tag assigned by ``Geometry.mesh()``
         """
         raise NotImplementedError
 
@@ -210,7 +210,7 @@ class LumpedPort(_Physics):
     .. math::
 
         V = \\frac{1}{w} \\int_{\\text{port}}
-            \\mathbf{E} \\cdot \\hat{\\ell}\\; dS ,
+            \\mathbf{E} \\cdot \\hat{\\ell}\\; dS,
 
     (with :math:`w = A/\\ell` the port width), which stays well defined for
     tall / non-TEM ports where a single line integral would degenerate.
@@ -361,14 +361,15 @@ class WavePort(_Physics):
 
     Two solver paths, selected via ``mode_kind``:
 
-    - ``"auto"`` / ``"vector"`` / ``"hybrid"`` (default), **full-vector
+    - ``"auto"`` (default), **full-vector
       hybrid** eigenproblem (mixed Nédélec-edge :math:`E_t` + Lagrange-
       nodal :math:`E_z`). Honours per-element :math:`\\varepsilon_r` so
       the inhomogeneous quasi-TEM mode of a microstrip-class line is
       captured directly. Pair with ``pec=`` to mark any internal PEC
       conductor (the trace) that bisects the cross-section. Dispersion
       uses :math:`\\beta(k_0) = n_{\\mathrm{eff}}(f_0) \\cdot k_0`
-      throughout the sweep, set ``f0`` near band centre.
+      throughout the sweep, set ``f0`` near band centre. Without ``f0``
+      (the time-domain backend) ``"auto"`` takes the scalar TE path.
     - ``"te"`` / ``"tm"``, **scalar Helmholtz** TE / TM modes on the
       homogeneously filled hollow cross-section. Cutoff and dispersion
       come from the scalar :math:`k_c`; weak frequency dependence so
@@ -408,9 +409,8 @@ class WavePort(_Physics):
     targets : GeoObject or EntityCollection
         port face(s), multiple faces are merged into one cross-section
     mode_kind : str, optional
-        ``"auto"`` / ``"vector"`` / ``"hybrid"`` (default) for the
-        full-vector hybrid solve, ``"te"`` / ``"tm"`` for the scalar
-        Helmholtz path.
+        ``"auto"`` (default) for the full-vector hybrid solve,
+        ``"te"`` / ``"tm"`` for the scalar Helmholtz path.
     mode_index : int
         which mode to use, ordered by descending :math:`n_{\\mathrm{eff}}`
         (vector path) or ascending cutoff (scalar path). ``0`` = dominant.
@@ -425,38 +425,36 @@ class WavePort(_Physics):
         this is only for *internal* PEC.
     power : float
         incident power in watts (default ``1.0``)
-    te : bool, optional
-        legacy backwards-compat flag, superseded by ``mode_kind``.
     """
 
+    _MODE_KINDS = ("auto", "te", "tm")
+
     def __init__(self, *targets,
-                 te: bool = True,
                  mode_index: int = 0,
                  f0: float | None = None,
                  power: float = 1.0,
-                 mode_kind: str | None = None,
+                 mode_kind: str = "auto",
                  pec: "Iterable | None" = None):
         super().__init__(*targets)
-        self.te = bool(te)
+        if mode_kind not in self._MODE_KINDS:
+            raise ValueError(f"WavePort mode_kind must be one of {self._MODE_KINDS}, "
+                             f"got {mode_kind!r}")
         self.mode_index = int(mode_index)
         self.f0 = None if f0 is None else float(f0)
         self.power = float(power)
-        if mode_kind is not None:
-            self.mode_kind = str(mode_kind).lower()
-        else:
-            self.mode_kind = "auto"
+        self.mode_kind = mode_kind
         self.pec = list(pec) if pec is not None else []
 
     def _add_to(self, model, tag) -> None:
         # The cross-section solve: an explicit te / tm, otherwise the vector
-        # solve at f0, or without f0 the scalar solve picked by ``te``.
+        # solve at f0, or without f0 (time domain) the scalar TE solve.
         if self.mode_kind in ("te", "tm"):
             kind = self.mode_kind
         elif self.f0 is None:
-            kind = "te" if self.te else "tm"
+            kind = "te"
         else:
             kind = "vector"
-        # Attached PEC objects resolve to their physical-group tags so the
+        # Attached PEC objects resolve to their mesh tags so the
         # cross-section eigensolve can mark those nodes as internal
         # conductors; Geometry.mesh() populates `_physics_tags`.
         geom = self._geometry
@@ -505,8 +503,10 @@ class UserDefinedPort(_Physics):
 class FloquetPort(_Physics):
     """Floquet plane-wave port for periodic unit cells.
 
-    Drives a periodic structure with an oblique plane wave at scan
-    angles :math:`(\\theta, \\phi)`. The Floquet mode has the form
+    Drives a periodic structure with a plane wave at scan angles
+    :math:`(\\theta, \\phi)`. The frequency-domain solver takes normal
+    incidence only (:math:`\\theta = 0`); oblique scan needs periodic side
+    walls with a phase shift (issue #14). The Floquet mode has the form
 
     .. math::
 
@@ -540,7 +540,7 @@ class FloquetPort(_Physics):
     scan_phi_deg : float
         azimuth scan angle :math:`\\phi` in degrees
     mode_nr : int
-        Floquet mode index (1 = fundamental)
+        polarisation of the plane wave: 1 = TE (s-pol), 2 = TM (p-pol)
     er : float
         relative permittivity of the port medium
     power : float
@@ -579,15 +579,13 @@ class PEC(_Physics):
 
     on every targeted face. Variadic constructor: pass any mix of
     :class:`GeoObject`, :class:`EntityCollection`, or single faces;
-    they all share one :class:`Problem`-level ``[pec]`` block.
+    they all become one PEC group of the solver mesh.
 
 
     Note
     ----
-    Multiple ``rf.PEC(...)`` calls in the same problem are aggregated
-    into one TOML ``[pec]`` block when :class:`Problem` assembles the
-    config, so you can spread declarations across several lines for
-    readability without worrying about runtime overhead.
+    Every ``rf.PEC(...)`` call becomes its own face group, so
+    declarations can be spread over several lines without cost.
 
 
     Example
@@ -691,7 +689,7 @@ class FarFieldSurface(_Physics):
     equivalent electric and magnetic currents
     :math:`\\mathbf{J}_s = \\hat{\\mathbf{n}} \\times \\mathbf{H}`,
     :math:`\\mathbf{M}_s = -\\hat{\\mathbf{n}} \\times \\mathbf{E}` are
-    sampled. :meth:`rapidfem.Problem.farfield` propagates those currents
+    sampled. :meth:`rapidfem.ProblemFD.farfield` propagates those currents
     to the far zone via the Stratton-Chu integral.
 
     When the domain is truncated by an :class:`ABC`, its outer boundary
@@ -766,11 +764,11 @@ class SurfaceImpedance(_Physics):
 
     The finite-thickness correction depends on where the face sits:
 
-    * ``two_sided=False`` (default) — a **boundary** face with fields on one
+    * ``two_sided=False`` (default): a **boundary** face with fields on one
       side only (a ground plane on the domain boundary). The face owns the
       full metal, :math:`Z = Z_{s,\\infty} \\coth(\\gamma_m t)`,
       :math:`1/(\\sigma t)` at DC.
-    * ``two_sided=True`` — a **wall** of a conductor that carries the BC on
+    * ``two_sided=True``: a **wall** of a conductor that carries the BC on
       opposing faces (the walls of a conductor cut out of the mesh). Each
       face owns half the metal, :math:`Z = Z_{s,\\infty}
       \\coth(\\gamma_m t/2)`; opposing faces in parallel recover
@@ -778,7 +776,7 @@ class SurfaceImpedance(_Physics):
       volume-to-surface thickness :math:`t_\\mathrm{eff} = w t/(w + t)`
       (``2V/S``), not the layer thickness, or the sidewalls add conductance
       and the DC resistance comes out a factor :math:`w/(w+t)` low.
-    * ``sheet=True`` — a zero-thickness **sheet** embedded in the volume
+    * ``sheet=True``: a zero-thickness **sheet** embedded in the volume
       with fields on both sides, standing in for a strip of thickness
       :math:`t`: :math:`Z = Z_{s,\\infty} \\coth(\\gamma_m t/2)/2`, the
       even mode of the slab (the two faces in parallel), :math:`1/(\\sigma t)`
@@ -1112,7 +1110,7 @@ class PeriodicBoundary(_Physics):
         # _Physics, but we need two (one per face) for a periodic pair.
         # Store the two entity lists separately and overload the geometry
         # registration: a single PeriodicBoundary registers as two
-        # physical-group tags, one per face.
+        # mesh tags, one per face.
         self._entities_a = ents_a
         self._entities_b = ents_b
         # _entities is kept (the union) so downstream tag walkers still see

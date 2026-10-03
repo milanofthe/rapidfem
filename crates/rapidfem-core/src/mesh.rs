@@ -11,7 +11,7 @@
 //! vertex keys they give every shared edge/face a consistent orientation
 //! across elements, required by the curl-conforming Nédélec DOFs. They hold
 //! the same edges (face vertex sets) per slot as rapidmesh's local orders,
-//! the faces in another slot order ([`FACE_OF_TOPOLOGY`]).
+//! the faces in another slot order (`FACE_OF_TOPOLOGY`).
 
 use hashbrown::HashMap;
 use rapidmesh_topo::{TetTopology, Tets, NONE};
@@ -50,13 +50,13 @@ pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [
 
 #[derive(Clone)]
 pub struct Mesh {
-    /// Node coordinates: nodes[i] = [x, y, z]
+    /// Node coordinates: `nodes[i] = [x, y, z]`
     pub nodes: Vec<[f64; 3]>,
-    /// Edges: edges[e] = [n1, n2] sorted (min, max)
+    /// Edges: `edges[e] = [n1, n2]` sorted (min, max)
     pub edges: Vec<[usize; 2]>,
-    /// Triangles: tris[t] = [n1, n2, n3] sorted
+    /// Triangles: `tris[t] = [n1, n2, n3]` sorted
     pub tris: Vec<[usize; 3]>,
-    /// Tetrahedra: tets[t] = [n1, n2, n3, n4], positively oriented
+    /// Tetrahedra: `tets[t] = [n1, n2, n3, n4]`, positively oriented
     pub tets: Vec<[usize; 4]>,
 
     /// Per-tet: 6 edge indices in TET_EDGE_LOCAL order
@@ -145,8 +145,8 @@ impl Mesh {
     /// on O(1) coordinates regardless of the mesh's physical scale. Returns L₀.
     ///
     /// Idempotent: a no-op if already normalized (`l0 != 1.0`) or degenerate
-    /// (zero mean edge). The transform is exactly reversible — physical
-    /// coordinates are `node * l0` — so callers restore physical units for
+    /// (zero mean edge). The transform is exactly reversible, physical
+    /// coordinates are `node * l0`, so callers restore physical units for
     /// output by multiplying back. Connectivity is coordinate-independent and
     /// untouched; `edge_lengths` is rescaled in step.
     pub fn normalize_characteristic_length(&mut self) -> f64 {
@@ -154,7 +154,7 @@ impl Mesh {
             return self.l0;
         }
         let mean: f64 = self.edge_lengths.iter().sum::<f64>() / self.edge_lengths.len() as f64;
-        if !(mean > 0.0) {
+        if mean.is_nan() || mean <= 0.0 {
             return 1.0;
         }
         let inv = 1.0 / mean;

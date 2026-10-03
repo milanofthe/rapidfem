@@ -195,7 +195,7 @@ rf.show(g)
 
 
 # %% Problem + sweep
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 result = prob.sweep(FREQUENCIES)
 rf.show(result)
 

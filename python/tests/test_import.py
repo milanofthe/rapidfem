@@ -199,13 +199,13 @@ def test_msh_bake_and_solve(wg_msh):
     assert stats.n_tets == n_tets
     assert len(g._material_tags) == 1
     assert len(g._physics_tags) == 3  # two ports + the PEC walls
-    res = rf.Problem(g).sweep(f)
+    res = rf.ProblemFD(g).sweep(f)
     assert res.sparams.shape == (3, 2, 2)
 
     ref = rf.Geometry(maxh=4 * MM)
     _waveguide(ref)
     ref.mesh()
-    res_ref = rf.Problem(ref).sweep(f)
+    res_ref = rf.ProblemFD(ref).sweep(f)
     np.testing.assert_allclose(res.sparams, res_ref.sparams, atol=1e-9)
     # matched air-filled guide: low reflection in band
     assert np.all(20 * np.log10(np.abs(res.sparams[:, 0, 0])) < -20)

@@ -21,7 +21,7 @@ def test_power_flows_from_the_driven_port():
     rf.RectWaveguidePort(air.faces.max(axis="z"))
     rf.PEC(*air.faces.unassigned)
     g.mesh()
-    prob = rf.Problem(g)
+    prob = rf.ProblemFD(g)
     res = prob.sweep([10e9])
     z = np.asarray(prob.mesh_nodes)[:, 2]
     mid = (z > 10 * MM) & (z < 30 * MM)

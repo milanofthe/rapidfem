@@ -89,14 +89,14 @@ impl Simulation {
         // Lever ④: non-dimensionalize the geometry to O(1) coordinates so the
         // assembly and its absolute tolerances are unit-/scale-invariant. The
         // transform is reversed at the output boundary (field/coord rescaling).
-        // `RAPIDFEM_NO_NORMALIZE` keeps physical units (l0 = 1) — used to prove
+        // `RAPIDFEM_NO_NORMALIZE` keeps physical units (l0 = 1), used to prove
         // the normalized path is bit-identical on the solver's outputs.
         if std::env::var_os("RAPIDFEM_NO_NORMALIZE").is_none() {
             let l0 = mesh.normalize_characteristic_length();
             eprintln!("  Geometry normalized: L0 = {:.6e} m (mean edge length)", l0);
         }
         // Materials before ports so `wave_numerical` can consult per-tet ε_r
-        // when running the vector-hybrid mode solve on the port face — and before
+        // when running the vector-hybrid mode solve on the port face, and before
         // the basis, because the order policy reads them.
         let materials = build_materials(&mesh, &model);
 
@@ -218,7 +218,7 @@ impl Simulation {
             }
         }
         sum.into_iter()
-            .zip(count.into_iter())
+            .zip(count)
             .map(|(s, c)| if c == 0 { 0.0 } else { (s / c as f64) as f32 })
             .collect()
     }
@@ -260,7 +260,7 @@ impl Simulation {
                 count[tet[k]] += 1;
             }
         }
-        sum.into_iter().zip(count.into_iter()).map(|(s, c)| {
+        sum.into_iter().zip(count).map(|(s, c)| {
             if c == 0 { [0.0, 0.0, 0.0] }
             else {
                 let inv = 1.0 / c as f64;
@@ -402,7 +402,7 @@ impl Simulation {
                     port_dyn[obs_pi].lumped_voltage_params(),
                     port_dyn[obs_pi].port_height(),
                 ) {
-                    // Area-averaged mode projection V = (l/A)∫E·l̂ dS — robust
+                    // Area-averaged mode projection V = (l/A)∫E·l̂ dS, robust
                     // for tall / non-TEM ports (derivations/lumped_port/).
                     let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi]
                         .iter()
@@ -754,6 +754,13 @@ fn build_ports(
 ) -> Result<(Vec<Box<dyn Port>>, Vec<Vec<usize>>), String> {
     let mut ports: Vec<Box<dyn Port>> = Vec::new();
     let mut port_tris: Vec<Vec<usize>> = Vec::new();
+    // PMC walls a wave port meets (the symmetry plane of a half model) are
+    // natural on the port rim too.
+    let pmc_tags: Vec<i32> = model
+        .faces
+        .iter()
+        .filter_map(|f| if let FaceSpec::Pmc { tag } = f { Some(*tag) } else { None })
+        .collect();
 
     for pc in &model.faces {
         match pc {
@@ -764,7 +771,7 @@ fn build_ports(
                     continue;
                 }
                 let (cs, det_w, det_h) = detect_rect_port(mesh, &tri_ids);
-                // Config dims are physical lengths; the mesh (and det_*) are in
+                // The model's dims are physical lengths; the mesh (and det_*) are in
                 // L₀ units, so normalize config dims to match (lever ④).
                 let w = if *width > 0.0 { *width / mesh.l0 } else { det_w };
                 let h = if *height > 0.0 { *height / mesh.l0 } else { det_h };
@@ -790,7 +797,7 @@ fn build_ports(
                     continue;
                 }
                 let (cs_detected, _, _) = detect_rect_port(mesh, &tri_ids);
-                // Config origin is a physical coordinate; normalize to L₀ units.
+                // The model's origin is a physical coordinate; normalize to L₀ units.
                 let org = origin
                     .map(|o| [o[0] / mesh.l0, o[1] / mesh.l0, o[2] / mesh.l0])
                     .unwrap_or(cs_detected.origin);
@@ -850,14 +857,14 @@ fn build_ports(
                 // scan needs periodic side-wall BCs and a complex mode field
                 // (issue #14). Reject θ≠0 rather than silently returning wrong
                 // S-parameters.
-                assert!(
-                    scan_theta_deg.abs() < 1e-9,
-                    "FloquetPort: oblique scan (θ={:.3}°) is not yet supported in \
-                     the frequency-domain solver — it requires periodic side-wall \
-                     boundary conditions and a complex mode field (see issue #14). \
-                     Only normal incidence (θ=0) is valid.",
-                    scan_theta_deg
-                );
+                if scan_theta_deg.abs() >= 1e-9 {
+                    return Err(format!(
+                        "FloquetPort: oblique scan (θ={scan_theta_deg:.3}°) is not supported in \
+                         the frequency-domain solver, it needs periodic side-wall boundary \
+                         conditions and a complex mode field (issue #14); only normal \
+                         incidence (θ=0) is valid"
+                    ));
+                }
                 let tri_ids = mesh.tris_for_tag(*tag).to_vec();
                 if tri_ids.is_empty() {
                     eprintln!("  WARNING: tag {} has no triangles, skipping FloquetPort", tag);
@@ -917,7 +924,7 @@ fn build_ports(
                     s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided; s.sheet = *sheet;
                     if !*sheet && f_min.is_finite() && f_min > 0.0 {
                         let delta = s.skin_depth(&crate::excitation::Excitation::new(f_min, mesh.l0));
-                        s.edges = crate::sibc_edge::EdgeProfile::build(&mesh, &tri_ids, crate::sibc_edge::REACH * delta / mesh.l0);
+                        s.edges = crate::sibc_edge::EdgeProfile::build(mesh, &tri_ids, crate::sibc_edge::REACH * delta / mesh.l0);
                     }
                     s
                 };
@@ -949,7 +956,7 @@ fn build_ports(
                 let port_num = ports.len() + 1;
                 let pn = build_wave_numerical(
                     mesh, materials, &tri_ids, f0, *mode_index, *kind,
-                    pec_tags, *power, port_num,
+                    pec_tags, &pmc_tags, *power, port_num,
                 );
                 match pn {
                     Some(port) => {
@@ -980,7 +987,7 @@ fn build_pec_tris(mesh: &Mesh, model: &Model) -> Vec<usize> {
 
     // Default boundary condition: every EXTERIOR boundary face (one adjacent
     // tet) that carries no explicit port / BC becomes PEC (tangential E = 0).
-    // A magnetic wall — the bare natural BC of the curl-curl form — is opt-in
+    // A magnetic wall, the bare natural BC of the curl-curl form, is opt-in
     // via an explicit PMC. This makes a closed metal box the default and
     // removes the footgun where an untagged outer wall silently leaks (acts as
     // a magnetic wall). Interior faces (two adjacent tets) are never touched.
@@ -1006,8 +1013,7 @@ fn build_materials(mesh: &Mesh, model: &Model) -> Vec<Material> {
     model.materials.iter().map(|mc| {
         let tet_indices = mesh
             .vtag_to_tet
-            .get(&mc.volume_tag)
-            .map(|v| v.clone())
+            .get(&mc.volume_tag).cloned()
             .unwrap_or_default();
         if tet_indices.is_empty() {
             eprintln!("  WARNING: volume tag {} has no tets", mc.volume_tag);
@@ -1044,8 +1050,7 @@ fn build_pml_regions(mesh: &Mesh, model: &Model) -> Vec<PmlRegion> {
     model.pml.iter().map(|pc| {
         let tet_indices = mesh
             .vtag_to_tet
-            .get(&pc.volume_tag)
-            .map(|v| v.clone())
+            .get(&pc.volume_tag).cloned()
             .unwrap_or_default();
         if tet_indices.is_empty() {
             eprintln!("  WARNING: PML volume tag {} has no tets", pc.volume_tag);
@@ -1124,12 +1129,12 @@ fn face_inward_normal(mesh: &Mesh, t0: usize) -> Option<[f64; 3]> {
 }
 
 /// Build a per-global-node boolean mask: `true` for nodes that lie on any of
-/// the listed PEC physical groups. Used by `PortMesh2D::from_face` to mark
-/// internal-conductor (e.g. microstrip trace) nodes as PEC inside the
-/// cross-section eigensolve.
-fn build_internal_pec_mask(mesh: &Mesh, pec_tags: &[i32]) -> Vec<bool> {
+/// the listed physical groups. Marks internal-conductor (e.g. microstrip
+/// trace) nodes as PEC and PMC-wall nodes as natural in the cross-section
+/// eigensolve.
+fn tag_node_mask(mesh: &Mesh, tags: &[i32]) -> Vec<bool> {
     let mut mask = vec![false; mesh.nodes.len()];
-    for &tag in pec_tags {
+    for &tag in tags {
         for &ti in mesh.tris_for_tag(tag) {
             for &v in &mesh.tris[ti] {
                 mask[v] = true;
@@ -1151,16 +1156,19 @@ fn build_wave_numerical(
     mode_index: usize,
     kind: WaveKind,
     pec_tags: &[i32],
+    pmc_tags: &[i32],
     power: f64,
     port_num: usize,
 ) -> Option<NumericalWavePort> {
     let t0 = *tri_ids.first()?;
     let nrm = face_inward_normal(mesh, t0)?;
-    let pec_mask = build_internal_pec_mask(mesh, pec_tags);
+    let pec_mask = tag_node_mask(mesh, pec_tags);
     let pec_opt = if pec_tags.is_empty() { None } else { Some(pec_mask.as_slice()) };
+    let pmc_mask = tag_node_mask(mesh, pmc_tags);
+    let pmc_opt = if pmc_tags.is_empty() { None } else { Some(pmc_mask.as_slice()) };
 
     let face_tris: Vec<[usize; 3]> = tri_ids.iter().map(|&t| mesh.tris[t]).collect();
-    let pm = PortMesh2D::from_face(&mesh.nodes, &face_tris, nrm, pec_opt);
+    let pm = PortMesh2D::from_face_with_pmc(&mesh.nodes, &face_tris, nrm, pec_opt, pmc_opt);
 
     let k0 = crate::excitation::Excitation::new(f0, mesh.l0).k0;
 

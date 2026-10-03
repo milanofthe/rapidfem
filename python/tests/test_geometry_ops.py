@@ -2,7 +2,8 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 """Placement and boolean operations of ``rapidfem.Geometry``: transforms,
-copies, arrays, intersection and extrusion along any direction."""
+copies, arrays, intersection, sheet booleans and extrusion along any
+direction."""
 from __future__ import annotations
 
 import math
@@ -121,3 +122,51 @@ def test_sweep_along_path_and_helix():
     assert g.mesh_stats.n_tets > 0
     with pytest.raises(ValueError, match="disc"):
         st.sweep_along_path(g, g.xy_plate(1 * MM, 1 * MM), pts)
+
+
+def _sheet_area(g, phys) -> float:
+    """Meshed area of the face group a physics object tags."""
+    nodes, tris, tags, _, _ = g._fem_mesh.viewer()
+    p = np.asarray(nodes).reshape(-1, 3)
+    t = np.asarray(tris).reshape(-1, 3)[np.asarray(tags) == g._physics_tags[id(phys)]]
+    return 0.5 * np.linalg.norm(np.cross(p[t[:, 1]] - p[t[:, 0]], p[t[:, 2]] - p[t[:, 0]]), axis=1).sum()
+
+
+def test_sheet_cut_leaves_a_slot_and_fuse_merges_strips():
+    g = rf.Geometry(maxh=2 * MM)
+    _air(g)
+    # a disc enters the boolean as a 96-gon whose short edges the mesher
+    # only keeps at a size near the hole's (rapidmesh-dev#292)
+    ground = g.xy_plate(8 * MM, 8 * MM, position=(-4 * MM, -4 * MM, 0), maxh=0.25 * MM)
+    slot = g.xy_plate(1 * MM, 6 * MM, position=(-0.5 * MM, -4 * MM, 0))
+    hole = g.disc(1 * MM, position=(2 * MM, 2 * MM, 0))
+    g.cut(ground, slot, hole)
+    strip = g.xy_plate(3 * MM, 1 * MM, position=(-4 * MM, 5 * MM, 0))
+    g.fuse(strip, g.xy_plate(3 * MM, 1 * MM, position=(-1 * MM, 5 * MM, 0)))
+    pec_ground, pec_strip = rf.PEC(ground), rf.PEC(strip)
+    g.mesh()
+    want = 64 - 6 - math.pi
+    assert abs(_sheet_area(g, pec_ground) / (want * MM**2) - 1) < 2e-3, _sheet_area(g, pec_ground)
+    assert abs(_sheet_area(g, pec_strip) / (6 * MM**2) - 1) < 1e-6
+
+
+def test_sheet_booleans_need_one_plane_and_sheets():
+    g = rf.Geometry(maxh=2 * MM)
+    _air(g)
+    a = g.xy_plate(2 * MM, 2 * MM)
+    with pytest.raises(ValueError, match="one plane"):
+        g.fuse(a, g.xy_plate(2 * MM, 2 * MM, position=(0, 0, 1 * MM)))
+    with pytest.raises(ValueError, match="sheets only"):
+        g.cut(a, g.box(1 * MM, 1 * MM, 1 * MM))
+
+
+def test_sheet_intersection_in_a_tilted_plane():
+    g = rf.Geometry(maxh=2 * MM)
+    _air(g)
+    a = g.yz_plate(4 * MM, 4 * MM, position=(1 * MM, -2 * MM, -2 * MM))
+    b = g.yz_plate(4 * MM, 4 * MM, position=(1 * MM, 0, 0))
+    g.intersect(a, b)
+    pec = rf.PEC(a)
+    g.mesh()
+    assert abs(_sheet_area(g, pec) / (4 * MM**2) - 1) < 1e-6
+    np.testing.assert_allclose(_box_of(a), np.array([1, 0, 0, 1, 2, 2]) * MM, atol=1e-9)

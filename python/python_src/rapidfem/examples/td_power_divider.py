@@ -47,7 +47,7 @@ rf.show(g)
 # %% Build the time-domain problem
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
 fc = ptd.c / (2.0 * W)
-print(f"DGTD H-plane tee - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD H-plane tee - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"TE10 cutoff {fc / 1e9:.2f} GHz, drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive the stem port and watch the pulse split into the two arms

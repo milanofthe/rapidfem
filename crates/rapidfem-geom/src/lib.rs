@@ -8,3 +8,4 @@ pub mod fem_mesh;
 pub mod geometry;
 pub mod msh;
 pub mod path;
+pub mod sheet_ops;

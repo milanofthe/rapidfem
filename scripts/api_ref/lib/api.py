@@ -143,7 +143,7 @@ def _extract_module_obj(obj: griffe.Object, module_path: str) -> dict:
 
 
 def _should_skip_member(name: str) -> bool:
-    """Skip private members — only the public API is documented.
+    """Skip private members, only the public API is documented.
 
     `__init__` is kept so constructor parameters can be extracted; every
     other underscore-prefixed name (dunders and single-underscore privates)

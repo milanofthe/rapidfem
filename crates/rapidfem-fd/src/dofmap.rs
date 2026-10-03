@@ -172,7 +172,7 @@ mod tests {
     fn variable_counts_are_contiguous_and_complete() {
         // 3 edges with 1, 2, 3 DOFs; 2 faces with 0 and 2; 1 cell with 3.
         let m = DofMap::new(3, 2, 1, |e| (e + 1) as u32, |f| (f * 2) as u32, |_| 3);
-        assert_eq!(m.n_field, (1 + 2 + 3) + (0 + 2) + 3);
+        assert_eq!(m.n_field, (1 + 2 + 3) + 2 + 3);
 
         let mut seen = vec![0u32; m.n_field];
         for e in 0..3 {
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn empty_entities_take_no_space() {
         let m = DofMap::new(1, 3, 0, |_| 1, |f| if f == 1 { 0 } else { 2 }, |_| 0);
-        assert_eq!(m.n_field, 1 + 2 + 0 + 2);
+        assert_eq!(m.n_field, (1 + 2) + 2);
         assert_eq!(m.n_face_dofs(1), 0);
         // face 2 follows face 0 immediately, because face 1 is empty
         assert_eq!(m.face_dof(2, 0), m.face_dof(0, 1) + 1);

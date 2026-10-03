@@ -235,14 +235,14 @@ fn global_assembly_is_pinned_anisotropic_material() {
 // The four abs-sum / Frobenius pins are the real oracle: they are invariant under a
 // relabelling of the unknowns, and they catch a wrong VALUE. They DID change when
 // the interpolatory basis was replaced by the hierarchical one, because the element
-// matrices are genuinely different numbers there — a change of discretisation, not
+// matrices are genuinely different numbers there, a change of discretisation, not
 // a relabelling, so it is correct that the values moved.
 //
 // PATTERN_HASH, by contrast, is a property of the DOF INDEX pattern, not of the
 // values, so it is basis-independent: it did NOT move when the basis changed
 // (0x2cb6abad262c36f9, the same as under the interpolatory basis). It moved only
 // once, at stage 1, when the DOF numbering went from mode-major to entity-major
-// (from 0xc6a1417eefe03ae5) — a permutation, licensed by
+// (from 0xc6a1417eefe03ae5), a permutation, licensed by
 // `numbering_is_a_relabelling_of_the_mode_major_layout`. It moved a second
 // time when the mesh topology came to rapidmesh's `TetTopology`
 // (from 0x2cb6abad262c36f9): the faces are numbered in the order rapidmesh
@@ -251,12 +251,12 @@ fn global_assembly_is_pinned_anisotropic_material() {
 // ---------------------------------------------------------------------------
 const PATTERN_HASH: u64 = 0x4ff3_6f06_58ab_bd61;
 
-const E_ABS_IDENT: f64 = 3.58422713063467370e2;
-const E_FRO_IDENT: f64 = 1.98545509756439778e1;
-const B_ABS_IDENT: f64 = 3.10596093031259670e1;
-const B_FRO_IDENT: f64 = 1.09328760066954711e0;
+const E_ABS_IDENT: f64 = 3.584_227_130_634_673_7e2;
+const E_FRO_IDENT: f64 = 1.985_455_097_564_397_8e1;
+const B_ABS_IDENT: f64 = 3.105_960_930_312_596_7e1;
+const B_FRO_IDENT: f64 = 1.093_287_600_669_547;
 
-const E_ABS_ANISO: f64 = 2.88239703038341986e2;
-const E_FRO_ANISO: f64 = 1.68450665062772273e1;
-const B_ABS_ANISO: f64 = 5.59367322150814488e1;
-const B_FRO_ANISO: f64 = 2.07187233015066408e0;
+const E_ABS_ANISO: f64 = 2.882_397_030_383_42e2;
+const E_FRO_ANISO: f64 = 1.684_506_650_627_722_7e1;
+const B_ABS_ANISO: f64 = 5.593_673_221_508_145e1;
+const B_FRO_ANISO: f64 = 2.071_872_330_150_664;

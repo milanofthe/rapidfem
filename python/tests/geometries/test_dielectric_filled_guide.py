@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Dielectric-filled rectangular waveguide — TE10 dispersion shift.
+"""Dielectric-filled rectangular waveguide, TE10 dispersion shift.
 
 Filling a rectangular guide with a lossless dielectric (εr) lowers the TE10
 cutoff by √εr and raises β at a given frequency. This test drives a guide whose
@@ -10,7 +10,7 @@ operating band sits *between* the air cutoff and the dielectric cutoff: the band
 only propagates because the solver carries εr in the wave operator. Phenomena
 exercised: dielectric loading, cutoff shift, analytic (filled) phase slope.
 
-Reference: Pozar, *Microwave Engineering*, §3.3 — a guide filled with εr behaves
+Reference: Pozar, *Microwave Engineering*, §3.3, a guide filled with εr behaves
 like an air guide with k0 → √εr·k0, so β = sqrt(εr·k0² − k_c²).
 """
 import numpy as np
@@ -50,7 +50,7 @@ def test_dielectric_filled_te10_dispersion():
     s21 = np.abs(res.sparams[:, 1, 0])
 
     # Matched, lossless filled guide: near-total transmission, low reflection.
-    # This band is BELOW the air cutoff — high |S21| here is the dielectric
+    # This band is BELOW the air cutoff, high |S21| here is the dielectric
     # loading at work; an air-filled operator would give an evanescent stop-band.
     assert s21.min() > 0.95, f"|S21| dipped to {s21.min():.3f}"
     assert s11.max() < 0.08, f"|S11| rose to {s11.max():.3f}"

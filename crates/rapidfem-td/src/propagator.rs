@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn expm_of_zero_is_identity() {
-        let e = expm(&vec![0.0; 9], 3);
+        let e = expm(&[0.0; 9], 3);
         for i in 0..3 {
             for j in 0..3 {
                 let want = if i == j { 1.0 } else { 0.0 };

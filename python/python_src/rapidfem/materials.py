@@ -147,9 +147,8 @@ class Material:
     ----
     Materials are attached to volumes at construction time via the
     primitive's ``material=`` keyword. Multiple volumes can share one
-    ``Material`` instance, they then end up in the same physical
-    group at mesh time, which compresses the TOML config the Rust
-    solver consumes.
+    ``Material`` instance, they then share one material tag of the
+    solver mesh.
 
 
     Example
@@ -242,7 +241,7 @@ class Material:
         model : rapidfem._native.Model
             the model being built
         volume_tag : int
-            physical-group tag of the volume this material is attached to
+            mesh tag of the volume this material is attached to
         """
         debye = drude = None
         if self.debye is not None:

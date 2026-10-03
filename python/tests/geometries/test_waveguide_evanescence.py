@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Below-cutoff waveguide attenuator — evanescent decay rate α.
+"""Below-cutoff waveguide attenuator, evanescent decay rate α.
 
 A wave squeezed through a guide section whose TE10 cutoff lies *above* the
 operating frequency does not propagate: it tunnels, with the field amplitude
@@ -11,7 +11,7 @@ falling off as exp(−α·z), α = sqrt(k_c² − k0²). This is the rectangular
 
 To keep the driving ports well defined we never drive a below-cutoff port.
 Instead a WR-90 cross-section (cutoff ≈ 6.56 GHz) feeds and collects the wave at
-both ends — both ports propagate cleanly at 9–10 GHz — while a NARROW central
+both ends, both ports propagate cleanly at 9-10 GHz, while a NARROW central
 section (a_narrow = 11 mm, cutoff ≈ 13.6 GHz) is the evanescent region. The
 through-transmission is |S21| = |T_step| · exp(−α·L_c) with the two step
 junctions contributing a length-independent coupling |T_step|. Measuring two
@@ -31,7 +31,7 @@ import pytest
 import rapidfem as rf
 from harness import case, references as ref
 
-# WR-90 feed/collect cross-section (TE10 cutoff ≈ 6.56 GHz → propagates 9–10 GHz)
+# WR-90 feed/collect cross-section (TE10 cutoff ≈ 6.56 GHz → propagates 9-10 GHz)
 A_WIDE, B = 22.86e-3, 10.16e-3
 # Narrow central section: TE10 cutoff ≈ 13.6 GHz → evanescent across the band.
 A_NARROW = 11.0e-3
@@ -118,8 +118,8 @@ def test_below_cutoff_evanescent_decay_rate():
     analytic = np.array([np.exp(_alpha_below_cutoff(f, A_NARROW) * d_lc)
                          for f in FREQS])
 
-    # The measured length-ratio must match exp(+α·ΔL_c) — the pure evanescent
-    # decay of the narrow guide — within 15 % across the band.
+    # The measured length-ratio must match exp(+α·ΔL_c), the pure evanescent
+    # decay of the narrow guide, within 15 % across the band.
     err = np.abs(measured - analytic) / analytic
     assert err.max() < 0.15, (
         f"evanescent decay mismatch: measured ratio {measured}, "

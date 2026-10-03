@@ -218,11 +218,13 @@ def _td_trajectory_payload(
     states = np.ascontiguousarray(traj, dtype=np.float64)
     if states.ndim == 1:
         states = states[None, :]
-    n_snap, n_dof = states.shape
+    n_snap = states.shape[0]
 
     o = int(p.order)
     np_ = (o + 1) * (o + 2) * (o + 3) // 6
-    n_elem = n_dof // (6 * np_)
+    n_elem = p.n_tets
+    # the E,H block; a dispersive material appends its polarisation after it
+    states = states[:, :6 * np_ * n_elem]
     corners = np.asarray(p._op.corner_local_nodes(), dtype=np.int64)
     coords = np.asarray(p._op.node_coords(), dtype=float).reshape(n_elem, np_, 3)
     corner_xyz = coords[:, corners, :]                     # [n_elem, 4, 3]
@@ -347,7 +349,7 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
     passes ``eager_fields=True`` to embed every field inline; ``binpack`` then
     lifts them into ``<name>.field.bin`` for the static web demo.
 
-    ``kind="simulation"`` covers :class:`rapidfem.Problem`; we extract its
+    ``kind="simulation"`` covers :class:`rapidfem.ProblemFD`; we extract its
     ``.native`` here once, so the rest of the function works with the
     Rust-side accessors directly (``mesh_nodes``, ``field_at_nodes``, ...).
     """
@@ -364,7 +366,7 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
         if item.kind == "geometry":
             last_geo = item.obj
         elif item.kind == "simulation":
-            # Captured object is a rapidfem.Problem; reach into its native
+            # Captured object is a rapidfem.ProblemFD; reach into its native
             # solver for mesh + field accessors. If the user show()ed the
             # Problem before running any analysis, .native raises, surface
             # that as a display-level error rather than crashing the bake.
@@ -702,13 +704,8 @@ def register(app: Flask) -> None:
         except OSError as e:
             return jsonify({"ok": False, "error": str(e)}), 500
         # Drop the kernel so a future file at the same path starts fresh.
-        # Tolerate either the new runner module or absence (legacy single
-        # in-process kernel was removed).
-        try:
-            from rapidfem.ui import runner
-            runner._remove(str(target))
-        except Exception:
-            pass
+        from rapidfem.ui import runner
+        runner._remove(str(target))
         return jsonify({"ok": True, "path": rel})
 
     @app.post("/api/files/rename")

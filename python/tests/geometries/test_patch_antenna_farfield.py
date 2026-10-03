@@ -2,10 +2,10 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Edge-fed microstrip patch antenna — broadside far-field radiation.
+"""Edge-fed microstrip patch antenna, broadside far-field radiation.
 
 PHENOMENON: a rectangular patch on a grounded FR-4 substrate is a *broadside*
-radiator — over the radiating (upper) hemisphere its main lobe points up, away
+radiator, over the radiating (upper) hemisphere its main lobe points up, away
 from the ground plane, with a directivity in the few-dBi range typical of a
 single patch. There is no simple closed form for the full pattern, so this test
 gates on physical *plausibility* (directivity magnitude, broadside lobe) and on

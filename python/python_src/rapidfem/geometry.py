@@ -22,6 +22,7 @@ from typing import Callable, Iterable
 import numpy as np
 
 from . import _native
+from .materials import Material
 from ._geometry_gds import _GdsMixin
 from ._geometry_import import _ImportMixin
 from ._geometry_primitives import _PrimitivesMixin
@@ -57,9 +58,20 @@ class _Entity:
         self.origin = origin
         # a named group of a loaded mesh (mesh mode)
         self.group = group
-        self.material = None
+        self._material = None
         self.name: str | None = None
         self.maxh: float | None = None
+
+    @property
+    def material(self):
+        return self._material
+
+    @material.setter
+    def material(self, value) -> None:
+        if value is not None and not isinstance(value, Material):
+            raise TypeError(f"material must be a rapidfem Material (rf.Air(), "
+                            f"rf.Dielectric(...), ...), got {type(value).__name__}")
+        self._material = value
 
     def __repr__(self) -> str:
         if self.group is not None:
@@ -459,11 +471,11 @@ class MeshStats:
     """Size and quality report of the last generated mesh.
 
     Stored on ``geometry.mesh_stats`` by :meth:`Geometry.mesh`. The DOF
-    numbers are exact bounds for the FD solver's p-adaptive Nédélec space:
-    ``dofs_min`` is the uniform order-1 count (one DOF per edge),
-    ``dofs_max`` the uniform order-2 count (two per edge plus two per
-    triangular face). The solver's wavelength policy lands in between, so
-    the bounds gate RAM/runtime budgets before any assembly happens.
+    numbers bound the FD solver's Nédélec space: ``dofs_min`` is the
+    uniform order-1 count (one DOF per edge), ``dofs_max`` the uniform
+    order-2 count (two per edge plus two per triangular face), the
+    default of :meth:`ProblemFD.sweep`; ``order="adaptive"`` lands in
+    between. The bounds gate RAM and runtime before any assembly.
     ``quality_min`` is the smallest dihedral angle in degrees (the sliver
     indicator that governs the conditioning), ``n_slivers`` the number of
     tets below the sliver threshold.
@@ -493,7 +505,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     (:class:`rapidfem.RectWaveguidePort`, :class:`rapidfem.PEC`, ...)
     pointing at faces or volumes. When the description is complete,
     call :meth:`mesh` and feed the geometry to a
-    :class:`rapidfem.Problem` for analysis.
+    :class:`rapidfem.ProblemFD` for analysis.
 
     A solid added later carves its region out of the solids added before
     it, and the mesh is always conformal: overlapping objects need no
@@ -519,20 +531,16 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     maxh : float, optional
         global maximum tet edge length in metres; used by
         :meth:`mesh` when no explicit override is passed
-    scale : float
-        accepted for compatibility; the mesher works with exact predicates
-        at any length scale
     grading : bool
         grade element sizes from fine features into the bulk
     name : str, optional
         model name (for diagnostic / log output)
     """
 
-    def __init__(self, *, maxh: float | None = None, scale: float = 1.0,
-                 grading: bool = True, name: str = "rapidfem"):
+    def __init__(self, *, maxh: float | None = None, grading: bool = True,
+                 name: str = "rapidfem"):
         self._native = _native.Geometry(maxh)
         self._maxh = maxh
-        self._scale = 1.0
         self._grading = bool(grading)
         self.name = name
         self._objects: list[GeoObject] = []
@@ -549,18 +557,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         # Mesh options a builder (rfic.build) sets for the geometries it makes.
         self._mesh_defaults: dict = {}
         self.mesh_stats: MeshStats | None = None
-
-    # ── lifecycle ───────────────────────────────────────────────────────────
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-    def close(self):
-        """Release the scene. Kept for the context-manager protocol; the
-        native scene holds no global state."""
 
     # ── scene bookkeeping ───────────────────────────────────────────────────
 
@@ -638,6 +634,17 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         if faces:
             self._native.set_face_maxh([f for f in faces if f[1] >= 0], h)
 
+    def _sheet_boolean(self, op: str, target: GeoObject, tools) -> None:
+        """The sheet ``target`` combined with the sheets ``tools`` in their
+        common plane; the tools are used up."""
+        if any(t.dim != 2 for t in tools):
+            raise ValueError(f"{op}: a sheet combines with sheets only")
+        self._native.sheet_boolean(op, target._id, [t._id for t in tools])
+        # the outline kept for loft / revolve no longer describes the sheet
+        getattr(self, "_profiles", {}).pop(target._id, None)
+        for t in tools:
+            getattr(self, "_profiles", {}).pop(t._id, None)
+
     def _solid_ids(self, objs) -> list[int]:
         ids = []
         for o in objs:
@@ -708,7 +715,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         self._sync_maxh(ent)
         return face
 
-    def loft(self, face_a: GeoObject, face_b: GeoObject, ruled: bool = True,
+    def loft(self, face_a: GeoObject, face_b: GeoObject,
              *,
              material=None,
              maxh: float | None = None) -> GeoObject:
@@ -718,13 +725,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         perimeter of ``face_b``. Both faces must have the same number
         of edges in their outer boundary (a 4-edge rectangle lofts to
         a 4-edge rectangle, producing a frustum with 4 trapezoidal
-        sides).
+        sides). The side surfaces are ruled (flat between the two
+        outlines), the shape of pyramidal / frustum-style horns.
 
 
         Note
         ----
-        The input faces are absorbed into the new volume's boundary
-        and remain tracked as cap faces.
+        The two profile sheets are consumed: the loft's own end faces
+        replace them.
 
 
         Example
@@ -744,10 +752,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ----------
         face_a, face_b : GeoObject
             two 2-D faces to bridge
-        ruled : bool
-            ``True`` (default) gives flat side surfaces, the right
-            choice for pyramidal / frustum-style horns; ``False`` fits
-            a spline through the section profiles
         material : rapidfem.Material, optional
             volume material
         maxh : float, optional
@@ -858,10 +862,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     def cut(self, target: GeoObject, *tools: GeoObject) -> None:
         """subtract ``tools``, leaving holes
 
-        Each tool becomes a void: it is cut out of every solid added before
-        it (``target`` among them) and its walls become boundary faces that
-        physics can address (``tool`` stays usable as a selection handle, its
-        ``faces`` are the walls). Boundary faces without physics are PEC.
+        Solids: each tool becomes a void: it is cut out of every solid added
+        before it (``target`` among them) and its walls become boundary faces
+        that physics can address (``tool`` stays usable as a selection handle,
+        its ``faces`` are the walls). Boundary faces without physics are PEC.
+
+        Sheets: ``target`` and the tools must lie in one plane; the target
+        becomes its outline minus the tools (a slot in a ground plane), the
+        tools are used up. Discs take part as 96-sided polygons.
 
 
         Parameters
@@ -871,13 +879,18 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to subtract
         """
+        if target.dim == 2:
+            self._sheet_boolean("difference", target, tools)
+            return
         self._native.make_void(self._solid_ids(tools))
 
     def fuse(self, target: GeoObject, *tools: GeoObject) -> None:
         """boolean union ``target ∪ tools``
 
         Merges the operands into a single connected body assigned back
-        to ``target``.
+        to ``target``. Sheets must lie in one plane; their union may fall
+        apart into several pieces, which stay one object, and the tools are
+        used up.
 
 
         Note
@@ -896,6 +909,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             operands to merge in
         """
+        if target.dim == 2:
+            self._sheet_boolean("union", target, tools)
+            return
         self._native.fuse(self._solid_ids((target, *tools)))
 
     def intersect(self, target: GeoObject, *tools: GeoObject) -> None:
@@ -903,7 +919,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
         Carves the intersection of ``target`` with every member of
         ``tools`` and assigns it back to ``target``. The tools are
-        consumed by the operation.
+        consumed by the operation. Sheets intersect in their common plane.
 
 
         Note
@@ -928,6 +944,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to intersect with (consumed)
         """
+        if target.dim == 2:
+            self._sheet_boolean("intersection", target, tools)
+            return
         ids = self._solid_ids((target, *tools))
         self._native.intersect(ids[0], ids[1:])
         for tool in tools:
@@ -1341,13 +1360,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         resolution: int = 3,
         min_maxh: float | None = None,
     ) -> dict[str, float]:
-        """auto-assign per-volume ``maxh`` for any volume thinner than
-        ``base_maxh``
+        """auto-assign a per-object ``maxh`` for any volume or sheet
+        narrower than ``base_maxh``
 
-        Walks every 3-D volume in the geometry. For each, computes the
-        smallest bbox dimension (the "feature size"). If that dimension
-        is smaller than ``base_maxh`` *and* the user hasn't already
-        set ``vol.maxh`` explicitly, sets
+        Walks every volume and sheet in the geometry. For each, computes
+        the smallest non-zero bbox extent (the "feature size": a volume's
+        thinnest axis, a sheet's narrowest in-plane width). If that is
+        smaller than ``base_maxh`` *and* the user hasn't already set the
+        object's ``maxh`` explicitly, sets
 
         .. math::
 
@@ -1356,8 +1376,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                 \\mathrm{min\\_maxh}
             \\right)
 
-        so the volume is resolved with at least ``resolution`` tets
-        across its thinnest axis.
+        so the feature is resolved with at least ``resolution`` elements
+        across it.
 
 
         Note
@@ -1379,7 +1399,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         Parameters
         ----------
         base_maxh : float
-            reference size, volumes wider than this in all directions
+            reference size, objects wider than this in all directions
             are left untouched
         resolution : int
             target number of tets across the thinnest dimension (3 is
@@ -1392,13 +1412,13 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         Returns
         -------
         dict[str, float]
-            map ``{volume_descriptor: assigned_maxh}`` for the volumes
-            touched (descriptor is the volume's ``name`` if set, else
-            ``"vol@(cx,cy,cz)"``)
+            map ``{descriptor: assigned_maxh}`` for the objects touched
+            (the object's ``name`` if set, else ``"vol@(cx,cy,cz)"`` or
+            ``"sheet@(cx,cy,cz)"``)
         """
         assigned: dict[str, float] = {}
         for obj in self._objects:
-            if obj.dim != 3 or obj.maxh is not None:
+            if obj.maxh is not None:
                 continue
             if getattr(obj.material, "maxh", None) is not None:
                 continue  # sized by its material
@@ -1415,18 +1435,17 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                 h = max(h, min_maxh)
             obj.maxh = h
             c = self._object_info(obj._id)[0]
-            desc = obj.name or f"vol@({c[0]*1e3:.1f},{c[1]*1e3:.1f},{c[2]*1e3:.1f})mm"
+            kind = "vol" if obj.dim == 3 else "sheet"
+            desc = obj.name or f"{kind}@({c[0]*1e3:.1f},{c[1]*1e3:.1f},{c[2]*1e3:.1f})mm"
             assigned[desc] = h
         return assigned
 
-    def refine_near_points(self, points, h: float,
-                           distance: float | None = None) -> None:
+    def refine_near_points(self, points, h: float) -> None:
         """register a local mesh-size refinement around a point cloud
 
         Every point becomes a size source of target ``h``; the size grows
         from there along the grading, so the element size reaches the
-        surrounding target over a distance that follows from the grading
-        (``distance`` is accepted for compatibility).
+        surrounding target over a distance that follows from the grading.
 
 
         Parameters
@@ -1435,8 +1454,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             points in metres
         h : float
             element size at the points
-        distance : float, optional
-            accepted for compatibility
         """
         for p in np.asarray(points, dtype=float).reshape(-1, 3):
             self._native.add_size_point([float(v) for v in p], float(h))
@@ -1445,8 +1462,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
     def _assign_groups(self):
         """Tag every material and physics object and build the face and
-        volume groups the solver mesh carries (what gmsh physical groups
-        were): one tag per Material instance over its solids, one per
+        volume groups the solver mesh carries: one tag per Material
+        instance over its solids, one per
         physics object over its faces or volumes, two for a periodic pair.
         """
         next_tag = 1
@@ -1533,9 +1550,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
     def mesh(
         self,
         maxh: float | None = None,
-        transition_distance: float | None = None,
-        algorithm: str = "hxt",
-        optimize: bool | str = True,
         *,
         cells_across: float | None = None,
         target_elements: int | None = None,
@@ -1554,9 +1568,6 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ----------
         maxh : float, optional
             global size override for this call
-        transition_distance, algorithm, optimize : optional
-            accepted for compatibility (the size field grades by itself;
-            there is one algorithm, and it needs no optimizer pass)
         cells_across : float, optional
             elements across the thickness of every region, so a thin layer
             gets proper tets through it; off by default (a stack of layers far

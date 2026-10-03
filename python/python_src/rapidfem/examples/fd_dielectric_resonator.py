@@ -39,8 +39,8 @@ resonator = g.cylinder(radius=D_RES / 2, height=L_RES, position=(0, 0, L_SUP),
 g.fragment(air, support, resonator)
 
 # Only the 6 axis-aligned cavity walls are PEC. Selecting min/max along each
-# axis avoids tagging the cylinder-air interface faces that fragment exposes
-#, the air→puck and air→support interfaces must stay un-walled.
+# axis avoids tagging the cylinder-air interface faces that fragment exposes:
+# the air-puck and air-support interfaces must stay un-walled.
 rf.PEC(air.faces.min(axis="x"), air.faces.max(axis="x"),
        air.faces.min(axis="y"), air.faces.max(axis="y"),
        air.faces.min(axis="z"), air.faces.max(axis="z"))
@@ -54,7 +54,7 @@ rf.show(g)
 
 
 # %% Eigenmode
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 modes = prob.eigenmode(target_frequency=F_TARGET, n_modes=N_MODES)
 rf.show(prob)
 rf.show(modes)

@@ -4,9 +4,9 @@
 
 //! rapidfem-td, time-domain DGTD backend.
 //!
-//! The DG spatial operator, the Krylov/ETD exponential propagator, the
-//! state-space export and model-order reduction land here. See
-//! issue #27 for the work-package breakdown.
+//! The DG spatial operator, the exponential, explicit and adaptive
+//! steppers, the state-space export, the GPU backend and the runs on top
+//! ([`session`]).
 
 pub mod absorber;
 pub mod build;

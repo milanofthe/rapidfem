@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Quasi-static reference for a rectangular conductor in a rectangular PEC shield.
+"""Quasi-static reference for rectangular conductors in a rectangular PEC shield.
 
 Solves the 2D magnetic diffusion problem of a straight line, independent of the
 FEM code, on a graded tensor grid whose lines follow the conductor edges:
@@ -47,25 +47,33 @@ def _axis(breaks: list[float], h0: float, rate: float, hmax: float) -> np.ndarra
     return np.unique(np.concatenate(parts))
 
 
-class ShieldedStrip:
-    """Rectangular conductor `[x0, x0+w] x [y0, y0+t]` inside the PEC shield
-    `[0, W] x [0, H]`, conductivity `sigma`, homogeneous dielectric `er`.
+class ShieldedStrips:
+    """Rectangular conductors ``(x0, y0, w, t)`` inside the PEC shield
+    ``[0, W] x [0, H]``, conductivity `sigma`, homogeneous dielectric `er`.
+
+    The per-unit-length matrices come from one solve per conductor: a unit
+    applied field on conductor k alone gives the currents of every
+    conductor (a column of Y', and Z' = Y'^-1), a unit potential on
+    conductor k alone gives the charges (a column of C').
 
     `h0` is the cell size at the conductor edges, `rate` the geometric growth.
     """
 
-    def __init__(self, *, W, H, x0, y0, w, t, sigma, er=1.0,
-                 h0=None, rate=1.2, hmax=None):
-        self.w, self.t, self.sigma, self.er = w, t, sigma, er
-        h0 = h0 or min(w, t) / 200
+    def __init__(self, *, W, H, strips, sigma, er=1.0, h0=None, rate=1.2, hmax=None):
+        self.strips, self.sigma, self.er = list(strips), sigma, er
+        h0 = h0 or min(min(w, t) for _, _, w, t in self.strips) / 200
         hmax = hmax or max(W, H) / 20
-        self.xe = _axis([0.0, x0, x0 + w, W], h0, rate, hmax)
-        self.ye = _axis([0.0, y0, y0 + t, H], h0, rate, hmax)
+        xb = sorted({0.0, W, *(x for x0, _, w, _ in self.strips for x in (x0, x0 + w))})
+        yb = sorted({0.0, H, *(y for _, y0, _, t in self.strips for y in (y0, y0 + t))})
+        self.xe = _axis(xb, h0, rate, hmax)
+        self.ye = _axis(yb, h0, rate, hmax)
         xc = 0.5 * (self.xe[1:] + self.xe[:-1])
         yc = 0.5 * (self.ye[1:] + self.ye[:-1])
         self.dx, self.dy = np.diff(self.xe), np.diff(self.ye)
-        self.metal = ((xc[:, None] > x0) & (xc[:, None] < x0 + w)
-                      & (yc[None, :] > y0) & (yc[None, :] < y0 + t)).ravel()
+        self.masks = [((xc[:, None] > x0) & (xc[:, None] < x0 + w)
+                       & (yc[None, :] > y0) & (yc[None, :] < y0 + t)).ravel()
+                      for x0, y0, w, t in self.strips]
+        self.metal = np.logical_or.reduce(self.masks)
         self.area = (self.dx[:, None] * self.dy[None, :]).ravel()
         self._lap = self._laplacian()
 
@@ -96,27 +104,53 @@ class ShieldedStrip:
         n = nx * ny
         return (sp.csr_matrix((vals, (rows, cols)), shape=(n, n)) + sp.diags(diag)).tocsr()
 
-    def series_impedance(self, f: float) -> complex:
-        """Z' = R' + j w L' in ohm/m at frequency `f` (f = 0 gives R'_dc)."""
+    def impedance_matrix(self, f: float) -> np.ndarray:
+        """Z' = R' + j w L' in ohm/m at frequency `f` (f = 0 gives the DC
+        resistances, no coupling)."""
+        n = len(self.strips)
         if f == 0.0:
-            return 1.0 / (self.sigma * self.w * self.t)
+            return np.diag([1.0 / (self.sigma * w * t) for _, _, w, t in self.strips]).astype(complex)
         w = 2 * np.pi * f
         s = self.sigma * self.metal
-        K = self._lap + sp.diags(1j * w * MU0 * s * self.area)
-        A = spla.spsolve(K.tocsc(), MU0 * s * self.area * 1.0)
-        current = np.sum(s * (1.0 - 1j * w * A) * self.area)
-        return 1.0 / current
+        lu = spla.splu((self._lap + sp.diags(1j * w * MU0 * s * self.area)).tocsc())
+        Y = np.zeros((n, n), complex)
+        for k, mk in enumerate(self.masks):
+            e0 = mk.astype(float)
+            A = lu.solve(MU0 * s * self.area * e0)
+            j = s * (e0 - 1j * w * A) * self.area
+            Y[:, k] = [j[m].sum() for m in self.masks]
+        return np.linalg.inv(Y)
+
+    def capacitance_matrix(self) -> np.ndarray:
+        """C' in F/m: electrostatics with one conductor at 1 V at a time."""
+        free = ~self.metal
+        K = self._lap
+        Kff = spla.splu(K[free][:, free].tocsc())
+        n = len(self.strips)
+        C = np.zeros((n, n))
+        for k, mk in enumerate(self.masks):
+            v = mk.astype(float)
+            v[free] = Kff.solve(-(K[free][:, mk] @ np.ones(mk.sum())))
+            q = K @ v
+            C[:, k] = [q[m].sum() for m in self.masks]
+        return EPS0 * self.er * C
+
+
+class ShieldedStrip(ShieldedStrips):
+    """One rectangular conductor ``[x0, x0+w] x [y0, y0+t]`` in the shield."""
+
+    def __init__(self, *, W, H, x0, y0, w, t, sigma, er=1.0, h0=None, rate=1.2, hmax=None):
+        super().__init__(W=W, H=H, strips=[(x0, y0, w, t)], sigma=sigma, er=er,
+                         h0=h0, rate=rate, hmax=hmax)
+        self.w, self.t = w, t
+
+    def series_impedance(self, f: float) -> complex:
+        """Z' = R' + j w L' in ohm/m at frequency `f` (f = 0 gives R'_dc)."""
+        return complex(self.impedance_matrix(f)[0, 0])
 
     def capacitance(self) -> float:
         """C' in F/m: electrostatics with the conductor cells held at 1 V."""
-        free = ~self.metal
-        K = self._lap
-        Kff = K[free][:, free]
-        rhs = -K[free][:, self.metal] @ np.ones(self.metal.sum())
-        v = np.ones(len(self.metal))
-        v[free] = spla.spsolve(Kff.tocsc(), rhs)
-        charge = (K @ v)[self.metal].sum()
-        return EPS0 * self.er * charge
+        return float(self.capacitance_matrix()[0, 0])
 
     def gamma(self, f: float) -> complex:
         """Propagation constant alpha + j beta in 1/m."""

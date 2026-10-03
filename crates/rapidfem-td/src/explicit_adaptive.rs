@@ -304,7 +304,7 @@ mod tests {
             let mut err = [0.0_f64, 0.0_f64];
             let mut ws = KclWorkspace::new();
             for _ in 0..nsteps {
-                ws.step_into(&matvec, &mut y, &mut err, dt);
+                ws.step_into(matvec, &mut y, &mut err, dt);
             }
             y
         };
@@ -334,7 +334,7 @@ mod tests {
             let mut y = [1.0_f64, 0.4_f64];
             let mut err = [0.0_f64, 0.0_f64];
             let mut ws = KclWorkspace::new();
-            ws.step_into(&matvec, &mut y, &mut err, dt);
+            ws.step_into(matvec, &mut y, &mut err, dt);
             (err[0] * err[0] + err[1] * err[1]).sqrt()
         };
         let e1 = probe(0.05);

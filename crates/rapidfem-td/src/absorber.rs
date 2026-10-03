@@ -9,8 +9,8 @@
 //! crosses the interface without reflection and then decays inside the layer;
 //! ramping the loss up from zero keeps that entry smooth. This is a
 //! matched-layer absorber, not a true PML: its reflectionlessness holds only
-//! near normal incidence. A coordinate-stretched (CFS-)PML — reflectionless at
-//! *all* incidence angles, via auxiliary differential equations — is a further
+//! near normal incidence. A coordinate-stretched (CFS-)PML, reflectionless at
+//! *all* incidence angles, via auxiliary differential equations, is a further
 //! extension.
 
 use crate::constants::Field;

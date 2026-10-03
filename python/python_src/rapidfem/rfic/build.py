@@ -68,7 +68,7 @@ class MeshSpec:
     def derive(stack: Stack, layer_names, preset: str = "balanced") -> "MeshSpec":
         """Mesh policy derived from the stack, no hand-tuned numbers.
 
-        ``layer_names`` are the layers actually drawn in the layout — the
+        ``layer_names`` are the layers actually drawn in the layout, the
         full stack carries thin auxiliary layers (MIM, single vias) that are
         usually absent from an RF layout and would drag the conductor size
         down by an order of magnitude for nothing.
@@ -83,8 +83,8 @@ class MeshSpec:
           wants a couple of elements across the gap.
         - ``global_h`` = 8x the conductor size, the far-field filler.
         - background slabs default to ``global_h``. Slab sizing is nearly
-          free here — sweeping the passivation slab from 37.5 um down to
-          1.5 um moved minSICN by less than 0.001 while costing 6x the DOFs.
+          free here: refining the passivation slab from 37.5 um down to
+          1.5 um cost 6x the DOFs for no gain in element quality.
         - the substrate is graded: the top third at ``global_h`` (that is
           where the fields still are), the rest at twice that.
 
@@ -108,7 +108,7 @@ class MeshSpec:
 
         graded = {}
         for d in stack.dielectrics:
-            mat = stack.materials.get(d.material, StackMaterial(d.material))
+            mat = stack.material_of(d)
             if mat.kind == "semiconductor" and d.thickness > 1.5 * global_h:
                 graded[d.name] = [(d.thickness / 3.0, global_h),
                                   (d.thickness, 2.0 * global_h)]
@@ -335,7 +335,7 @@ def build(
     mesh : MeshSpec or {"fast", "balanced", "accurate"}, optional
         Mesh sizing policy. A preset name (or the default ``None``, which
         means ``"balanced"``) derives every size from the stack and the
-        layers actually drawn in the GDS — see :meth:`MeshSpec.derive`.
+        layers actually drawn in the GDS, see :meth:`MeshSpec.derive`.
         Pass a `MeshSpec` to take full control instead.
     passivation : {"planar", "conformal", "none"}
         "planar" keeps the stackup-XML sheet (the gds2palace / Momentum
@@ -386,14 +386,14 @@ def build(
 
     # The passivation sheet of the stack: topmost non-air dielectric slab.
     def _is_air(d):
-        m = stack.materials.get(d.material, StackMaterial(d.material))
+        m = stack.material_of(d)
         return m.kind != "conductor" and m.er == 1.0 and m.sigma == 0.0
 
     pass_slab = None
     if passivation != "planar":
         cands = [d for d in stack.dielectrics
                  if not _is_air(d)
-                 and stack.materials.get(d.material, StackMaterial(d.material)).kind == "dielectric"]
+                 and stack.material_of(d).kind == "dielectric"]
         pass_slab = cands[-1] if cands else None
         if pass_slab is None:
             raise ValueError("stack has no passivation slab to modify")
@@ -436,7 +436,7 @@ def build(
     z_bot = stack.dielectrics[0].z
     z_top = stack.dielectrics[-1].z_top
     for d in stack.dielectrics:
-        mat = stack.materials.get(d.material, StackMaterial(d.material))
+        mat = stack.material_of(d)
         is_air_like = (mat.kind != "conductor" and mat.er == 1.0
                        and mat.sigma == 0.0)
         thickness = d.thickness
@@ -484,8 +484,7 @@ def build(
 
     # ── conformal passivation shell + polygon air prisms ───────────────────
     if passivation == "conformal":
-        pass_mat = stack.materials.get(pass_slab.material,
-                                       StackMaterial(pass_slab.material))
+        pass_mat = stack.material_of(pass_slab)
         air_slab = stack.dielectrics[-1]
         h_pass = mesh.slab_h(pass_slab.name)
         h_air = mesh.h(mesh.global_h)
@@ -518,7 +517,7 @@ def build(
         # (zm_lo + t_top) and the shell top (zm_hi + t_top) has to follow the
         # metal outline; everything above it is one plain box. Running the
         # polygon prisms all the way to z_top instead would stamp the metal
-        # outline through the full air region — vertical interfaces between
+        # outline through the full air region, vertical interfaces between
         # air and air, metres of aspect ratio, and the mesher resolving the
         # trace width over the whole height.
         z_shell_top = zm_hi + pass_t_top
@@ -567,7 +566,10 @@ def build(
             elif t == "volume_iso":
                 o.material = Dielectric(er=1.0, conductivity=layer.sigma)
             else:
-                o.material = Dielectric(er=stack.oxide_er, tand=stack.oxide_tand)
+                # a hole after the fragment: the background around the layer
+                bg = stack.dielectric_at(layer.z + layer.thickness / 2)
+                m = stack.material_of(bg) if bg is not None else StackMaterial("air")
+                o.material = Dielectric(er=m.er, tand=m.tand)
             o.maxh = h
 
     # ── port plates (before fragmenting, so everything is conformal) ───────

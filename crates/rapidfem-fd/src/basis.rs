@@ -25,7 +25,7 @@
 //! mode-major order the goldens are pinned to:
 //!
 //!   tet:  [0..6] edges m0, [6..10] faces m0, [10..16] edges m1, [16..20] faces m1
-//!   tri:  [0..3] edges m0, [3] face m0,      [4..7] edges m1,   [7] face m1
+//!   tri:  `[0..3]` edges m0, `[3]` face m0,  `[4..7]` edges m1, `[7]` face m1
 //!
 //! Under the minimum rule an entity that did not reach a given mode is simply
 //! skipped, and both counts shrink. Nothing outside this module may assume 20 or 8.
@@ -38,13 +38,13 @@ use crate::order::{self, OrderMap};
 ///
 /// **This list IS the element definition.** `tet_assembly::build_basis` builds
 /// one basis function per entry, by asking the entity's generator for its `k`-th
-/// function — it does not enumerate anything itself. So the basis and the DOF map
+/// function, it does not enumerate anything itself. So the basis and the DOF map
 /// cannot disagree about how many DOFs there are, which ones they are, or what
 /// order they come in. With a variable order that is not a nicety; it is the only
 /// way to keep the two in step.
 ///
-/// The order within the list is mode-major — all entities' function 0, then all
-/// entities' function 1 — because that is the order the uniform order-2 element
+/// The order within the list is mode-major, all entities' function 0, then all
+/// entities' function 1, because that is the order the uniform order-2 element
 /// has always used and the goldens are pinned to. Entities whose order does not
 /// reach a given mode are simply skipped.
 ///
@@ -283,7 +283,7 @@ impl NedelecBasis {
 
 /// Convert global node indices in edge/tri arrays to local tet indices (0-3).
 ///
-/// Given tet vertex IDs [v0,v1,v2,v3] and a set of global node IDs,
+/// Given tet vertex IDs `[v0, v1, v2, v3]` and a set of global node IDs,
 /// returns the local index (0-3) of each node within the tet.
 pub fn local_mapping(tet_verts: &[usize; 4], global_ids: &[[usize; 2]; 6]) -> [[usize; 2]; 6] {
     let mut out = [[0usize; 2]; 6];

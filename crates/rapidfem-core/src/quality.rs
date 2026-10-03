@@ -12,7 +12,7 @@
 //!
 //! (see `derivations/conditioning/`). This module measures q per tet so a bad
 //! mesh is flagged at load time rather than silently producing an
-//! ill-conditioned — or NaN-poisoned — system. It is diagnostic only; the
+//! ill-conditioned, or NaN-poisoned, system. It is diagnostic only; the
 //! assembly floors degenerate volumes independently (`SLIVER_NORMVOL_FLOOR`).
 
 use crate::constants::SLIVER_NORMVOL_WARN;
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn regular_tet_has_unit_order_q() {
-        // Near-regular tet → q ≈ 0.5–0.7.
+        // Near-regular tet → q ≈ 0.5-0.7.
         let v = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
                  [0.5, 0.866_025, 0.0], [0.5, 0.288_675, 0.816_497]];
         let q = tet_normalized_volume(&v);

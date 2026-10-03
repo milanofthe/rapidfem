@@ -278,7 +278,7 @@ pub fn assemble_and_solve_with_pml(
 /// Frequency sweep: solve at multiple frequencies.
 ///
 /// For frequency-independent materials, caches E and B matrices.
-/// Returns solutions per frequency: Vec<SolveResult>.
+/// Returns the solutions per frequency (`Vec<SolveResult>`).
 pub fn frequency_sweep(
     mesh: &Mesh,
     basis: &NedelecBasis,
@@ -318,7 +318,7 @@ pub fn frequency_sweep_with_pml(
     // Bulk conductivity also makes εr* frequency-dependent (−j·σ/(ω·ε₀)),
     // but linearly enough to avoid re-assembly: on the cached path the σ term
     // is kept OUT of B and carried in a separate mass matrix B_σ, added per
-    // frequency as +j·k₀²/(ω·ε₀)·B_σ — algebraically identical to rebuilding
+    // frequency as +j·k₀²/(ω·ε₀)·B_σ, algebraically identical to rebuilding
     // εr*(ω) every frequency. On the dispersive path the full rebuild already
     // evaluates σ at each frequency, so no split is needed there.
     let sigma_split = !materials_dispersive
@@ -403,7 +403,7 @@ pub fn frequency_sweep_with_pml(
     // to the PORT triangles: only they carry a Robin term, and the port set
     // is frequency-independent. The COO entries at these indices are then
     // emitted UNCONDITIONALLY per frequency (no skip of exact-zero values),
-    // so the sparsity pattern is guaranteed stable across the sweep — which
+    // so the sparsity pattern is guaranteed stable across the sweep, which
     // the numeric-only `refactorize` (rslab frozen-pattern factor) relies on.
     let mut robin_free_indices: Vec<usize> = port_tri_indices
         .iter()
@@ -416,7 +416,7 @@ pub fn frequency_sweep_with_pml(
         })
         .collect();
     // Ports share no triangles by construction; dedup defends the pattern
-    // (and the entry values) against a config that lists one twice.
+    // (and the entry values) against a model that lists one twice.
     robin_free_indices.sort_unstable();
     robin_free_indices.dedup();
 
@@ -458,7 +458,7 @@ pub fn frequency_sweep_with_pml(
 
         // Robin BC (γ frequency-dependent), reuse bempty buffer
         bempty.fill(C64::new(0.0, 0.0));
-        for (_, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
+        for (port, tri_ids) in ports.iter().zip(port_tri_indices.iter()) {
             let gamma = port.get_gamma(&exc);
             for (k, &ti) in tri_ids.iter().enumerate() {
                 let tri = &mesh.tris[ti];
@@ -582,15 +582,14 @@ pub fn frequency_sweep_with_pml(
             how,
         );
         results.push(SolveResult { solutions, n_field });
-        if let Some(cb) = on_solve.as_deref_mut() {
-            if !cb(fi, freq, results.last().unwrap()) {
+        if let Some(cb) = on_solve.as_deref_mut()
+            && !cb(fi, freq, results.last().unwrap()) {
                 eprintln!(
                     "  sweep stopped early after frequency {}/{} (interrupt)",
                     fi + 1, frequencies.len(),
                 );
                 break;
             }
-        }
     }
 
     Ok(results)

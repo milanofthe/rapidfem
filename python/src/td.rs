@@ -65,7 +65,7 @@ fn options(method: &str, device: &str, krylov_dim: usize, warmup: usize, verbose
 }
 
 fn matrix<'py>(py: Python<'py>, rows: usize, cols: usize, data: Vec<f64>) -> Bound<'py, PyArray2<f64>> {
-    Array2::from_shape_vec((rows, cols), data).expect("row-major data").into_pyarray_bound(py)
+    Array2::from_shape_vec((rows, cols), data).expect("row-major data").into_pyarray(py)
 }
 
 /// The DGTD operator of a problem with its steppers and runs, see
@@ -94,7 +94,6 @@ impl PyTdSession {
     /// 0 central), `c` the speed of light in the box's unit.
     #[staticmethod]
     #[pyo3(signature = (nx, ny, nz, lx, ly, lz, order, flux_alpha = 1.0, c = 1.0))]
-    #[allow(clippy::too_many_arguments)]
     fn box_cavity(nx: usize, ny: usize, nz: usize, lx: f64, ly: f64, lz: f64, order: usize, flux_alpha: f64, c: f64) -> Self {
         let mesh = rapidfem_td::mesh_gen::structured_box(nx, ny, nz, lx, ly, lz);
         let op = rapidfem_td::rhs::MaxwellOperator::new(&mesh, order, flux_alpha);
@@ -111,8 +110,13 @@ impl PyTdSession {
     }
 
     /// State length: `6·Np·n_elem`, plus `3·Np` per dispersive element.
-    fn n_dof(&self) -> usize {
+    fn n_dofs(&self) -> usize {
         self.s.n_dof()
+    }
+
+    /// Number of tetrahedra.
+    fn n_tets(&self) -> usize {
+        self.s.op().n_elem()
     }
 
     fn n_dispersive(&self) -> usize {
@@ -125,7 +129,7 @@ impl PyTdSession {
         if y.len() != self.s.n_dof() {
             return Err(PyValueError::new_err("y must have length n_dof"));
         }
-        Ok(self.s.op().apply(y).into_pyarray_bound(py))
+        Ok(self.s.op().apply(y).into_pyarray(py))
     }
 
     /// `A·y` into `out`.
@@ -152,19 +156,18 @@ impl PyTdSession {
     /// `exp(h·A)·y` by the Krylov propagator.
     #[pyo3(signature = (y, h, krylov_dim = 40, tol = KRYLOV_TOL))]
     fn step<'py>(&mut self, py: Python<'py>, y: PyReadonlyArray1<'py, f64>, h: f64, krylov_dim: usize, tol: f64) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.s.step(slice(&y)?, h, krylov_dim, tol).map_err(PyValueError::new_err)?.into_pyarray_bound(py))
+        Ok(self.s.step(slice(&y)?, h, krylov_dim, tol).map_err(PyValueError::new_err)?.into_pyarray(py))
     }
 
     /// One LSERK4 step.
     fn step_explicit<'py>(&mut self, py: Python<'py>, y: PyReadonlyArray1<'py, f64>, h: f64) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.s.step_explicit(slice(&y)?, h).map_err(PyValueError::new_err)?.into_pyarray_bound(py))
+        Ok(self.s.step_explicit(slice(&y)?, h).map_err(PyValueError::new_err)?.into_pyarray(py))
     }
 
     /// One KCL step: `(y_new, err)`.
-    #[allow(clippy::type_complexity)]
     fn step_adaptive<'py>(&mut self, py: Python<'py>, y: PyReadonlyArray1<'py, f64>, h: f64) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
         let (y, e) = self.s.step_adaptive(slice(&y)?, h).map_err(PyValueError::new_err)?;
-        Ok((y.into_pyarray_bound(py), e.into_pyarray_bound(py)))
+        Ok((y.into_pyarray(py), e.into_pyarray(py)))
     }
 
     /// The largest stable LSERK4 step, cached.
@@ -186,7 +189,6 @@ impl PyTdSession {
     #[pyo3(signature = (y0 = None, *, dt, steps, source_dof = None, source = None, waveform = None,
                         probes = None, method = "exponential", device = "cpu", krylov_dim = 40,
                         warmup = 0, verbose = true))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn transient<'py>(
         &mut self,
         py: Python<'py>,
@@ -228,7 +230,6 @@ impl PyTdSession {
     /// `source_dof` to `probe_dof` under `pulse`.
     #[pyo3(signature = (source_dof, probe_dof, pulse, *, dt, steps, method = "exponential",
                         device = "cpu", krylov_dim = 40, verbose = true))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn transfer_function<'py>(
         &mut self,
         py: Python<'py>,
@@ -248,13 +249,13 @@ impl PyTdSession {
             s.transfer_function(source_dof, probe_dof, w.expect("pulse"), dt, steps, &opts, hook)
         })?;
         let h: Vec<NpC64> = h.into_iter().map(|z| NpC64::new(z.re, z.im)).collect();
-        Ok((f.into_pyarray_bound(py), h.into_pyarray_bound(py)))
+        Ok((f.into_pyarray(py), h.into_pyarray(py)))
     }
 
     /// The `n` lowest distinct cavity resonances (Hz for an SI operator).
     #[pyo3(signature = (n = 8))]
     fn resonances<'py>(&self, py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        Ok(self.s.resonances(n).map_err(rt)?.into_pyarray_bound(py))
+        Ok(self.s.resonances(n).map_err(rt)?.into_pyarray(py))
     }
 
     /// Operator index of the `k`-th modal port.
@@ -310,7 +311,7 @@ impl PyTdSession {
 
     /// The source pattern `b` that drives port `idx`.
     fn port_source<'py>(&self, py: Python<'py>, idx: usize) -> Bound<'py, PyArray1<f64>> {
-        self.s.op().port_source(idx).into_pyarray_bound(py)
+        self.s.op().port_source(idx).into_pyarray(py)
     }
 
     /// `(P_e, P_h)` of port `idx` for the state `y`.
@@ -319,12 +320,11 @@ impl PyTdSession {
     }
 
     /// `A` as CSR `(n, row_ptr, col_idx, values)`.
-    #[allow(clippy::type_complexity)]
     fn state_space<'py>(&self, py: Python<'py>) -> (usize, Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>) {
         let csr = self.s.op().assemble_sparse();
         let row_ptr: Vec<i64> = csr.row_ptr.iter().map(|&x| x as i64).collect();
         let col_idx: Vec<i64> = csr.col_idx.iter().map(|&x| x as i64).collect();
-        (csr.n, row_ptr.into_pyarray_bound(py), col_idx.into_pyarray_bound(py), csr.values.into_pyarray_bound(py))
+        (csr.n, row_ptr.into_pyarray(py), col_idx.into_pyarray(py), csr.values.into_pyarray(py))
     }
 
     /// `A` dense, `[n, n]` (small meshes only).

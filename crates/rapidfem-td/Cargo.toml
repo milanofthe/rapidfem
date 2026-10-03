@@ -29,3 +29,6 @@ gpu = ["dep:opencl3"]
 [[example]]
 name = "gpu_bench"
 required-features = ["gpu"]
+
+[lints]
+workspace = true

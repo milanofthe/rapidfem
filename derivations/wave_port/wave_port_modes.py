@@ -11,19 +11,19 @@ longitudinal E_z, generalized EVP `A x = λ B x` with `λ = −β²`). What fail
 µm-scale RFIC cross-sections is the NUMERICS around it. Here we derive, from
 primary scaling + spectral-transform theory, the four robustness fixes:
 
-  (1) PORT-LOCAL non-dimensionalization — scale the 2-D solve by the PORT's own
+  (1) PORT-LOCAL non-dimensionalization, scale the 2-D solve by the PORT's own
       characteristic length ℓ (NOT the global mesh L0), so the matrix entries
       are O(1) and the conditioning is independent of how small the port is
       relative to the rest of the 3-D mesh. (rapidfem's own Lever ④, applied to
       the port instead of inheriting the global one.)
   (2) The shift-invert spectral map and WHY a single shift at εmax is wrong for
       inhomogeneous lines (it targets the curl-free spurious cluster, not the
-      genuine quasi-TEM at εeff) — so the band is probed with a shift sweep.
+      genuine quasi-TEM at εeff), so the band is probed with a shift sweep.
   (3) SCALE-INVARIANT tolerances (relative, not absolute k0²-scaled).
   (4) Recovery n_eff = √(−λ̃)/κ, invariant to the choice of ℓ.
 
 The IMPLEMENTED fix is (1) port-local non-dimensionalization (the scale-
-invariance lever). The electrically-small κ≪1 RFIC regime is flagged OPEN — it
+invariance lever). The electrically-small κ≪1 RFIC regime is flagged OPEN, it
 needs gradient-null-space deflation (divergence cleaning), out of scope here.
 
 Conventions match the kernel: e^{+iωt}, e^{−iβz} propagation, λ = −β²,
@@ -80,7 +80,7 @@ print("    L0 (≫ port for RFIC) does NOT, leaving κ tiny and S̃≫κ²M̃ il
 
 
 # ---------------------------------------------------------------------------
-section("(2) Shift-invert spectral map — and why a single shift is NOT enough")
+section("(2) Shift-invert spectral map, and why a single shift is NOT enough")
 # ---------------------------------------------------------------------------
 # Propagating modes have 0 < n_eff² ≤ εmax, i.e.  λ̃ = −κ²·n_eff² ∈ [−κ²εmax, 0).
 # Shift-and-invert with shift σ maps λ̃ → μ = 1/(λ̃ − σ): the modes nearest σ are
@@ -100,7 +100,7 @@ ratio = sp.simplify(mu_top / mu_cutoff)
 print(f"  μ(εmax)/μ(0) = {ratio}  → a shift at εmax amplifies the TOP of the band 11×")
 assert sp.simplify(ratio - 11) == 0
 print("""
-  CAVEAT (the integrity correction — why σ=−1.1εmax·κ² alone is WRONG):
+  CAVEAT (the integrity correction, why σ=−1.1εmax·κ² alone is WRONG):
   For an INHOMOGENEOUS cross-section the genuine quasi-TEM mode sits at
   n_eff² = εeff < εmax, while the CURL-FREE SPURIOUS modes (gradient null-space
   of the curl-curl, E = ∇φ) sit at the material values n_eff² = εr, INCLUDING
@@ -111,7 +111,7 @@ print("""
   σ across fractions of εmax) and REJECT curl-free (k_t² ≈ 0) spurious modes.
   The electrically-small κ≪1 limit, where the genuine quasi-TEM is itself nearly
   curl-free and spectrally buried in the spurious cluster, is NOT solved by any
-  single shift OR sweep — it needs gradient-null-space deflation (divergence
+  single shift OR sweep, it needs gradient-null-space deflation (divergence
   cleaning), which is out of scope here.""")
 
 
@@ -138,7 +138,7 @@ section("(4) Scale-invariant acceptance thresholds")
 # The current code rejects modes with absolute, k0²-scaled floors
 #   β² ≤ 1e-3·k0²   and   k_t² ≤ 1e-3·k0² .
 # In the port-normalized variables these become PURE-NUMBER thresholds on n_eff²
-# (β̃²/κ² = n_eff²) and on the transverse wavenumber fraction — independent of
+# (β̃²/κ² = n_eff²) and on the transverse wavenumber fraction, independent of
 # the port's physical size, so they no longer trip at µm scale:
 neff2_floor = sp.Rational(1, 1000)       # accept propagating modes with n_eff² > 1e-3
 print("  propagating test:   n_eff² = β̃²/κ² > 1e-3   (dimensionless, scale-free)")
@@ -155,11 +155,11 @@ print("""Self-derived & validated:
     This is the fix that makes the solve scale-invariant.
   • recovery λ̃ = σ + 1/μ ; homogeneous fill → n_eff = √εr (exact).
   • shift-invert map μ = 1/(λ̃−σ) is monotone in n_eff² (each shift amplifies the
-    modes nearest it) — but a SINGLE shift at εmax targets the curl-free spurious
+    modes nearest it), but a SINGLE shift at εmax targets the curl-free spurious
     cluster, not the genuine quasi-TEM at εeff < εmax (inhomogeneous lines). The
     band is therefore probed with a shift sweep + curl-free spurious rejection.
   • OPEN: the electrically-small κ≪1 regime (real RFIC ports) is NOT solved here
-    — the genuine quasi-TEM is nearly curl-free and buried in the spurious
+   the genuine quasi-TEM is nearly curl-free and buried in the spurious
     cluster, needing gradient-null-space deflation (divergence cleaning).""")
 print("\nOK: wave-port scale-invariance derivation self-consistent "
       "(shift strategy + κ≪1 deflation flagged as open).")

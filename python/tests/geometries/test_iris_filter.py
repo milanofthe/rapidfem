@@ -2,14 +2,14 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""WR-90 iris-coupled cavity filter — resonant transmission of a lossless 2-port.
+"""WR-90 iris-coupled cavity filter, resonant transmission of a lossless 2-port.
 
 Two thin inductive irises (PEC strips that partially block the guide
 cross-section, leaving a centred aperture) inside a WR-90 section form a
 single resonant cavity. Each iris is a strong, reactive (lossless) reflector,
 so the structure is the textbook iris-coupled bandpass resonator:
 
-  * AT resonance the cavity between the irises is matched — the two reflections
+  * AT resonance the cavity between the irises is matched: the two reflections
     cancel and the TE10 mode tunnels through, |S21| → 1.
   * OFF resonance the irises simply reflect, |S11| → 1 and |S21| collapses.
 
@@ -74,8 +74,8 @@ def test_iris_coupled_cavity_filter():
 
     rf.RectWaveguidePort(air.faces.min(axis="z"))
     rf.RectWaveguidePort(air.faces.max(axis="z"))
-    # Everything still unassigned after the ports — outer guide walls AND the
-    # iris plate faces — is metal.
+    # Everything still unassigned after the ports, outer guide walls AND the
+    # iris plate faces, is metal.
     rf.PEC(*air.faces.unassigned)
 
     # Band spanning the cavity resonance (above the 6.56 GHz cutoff).

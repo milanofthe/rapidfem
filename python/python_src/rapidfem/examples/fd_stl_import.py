@@ -61,7 +61,7 @@ rf.show(g)
 
 # %% Mesh + sweep
 g.mesh()
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 result = prob.sweep(FREQUENCIES)
 rf.show(result)
 

@@ -2,7 +2,7 @@
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-"""Bulk conductivity across a frequency sweep — sweep equals single solves.
+"""Bulk conductivity across a frequency sweep, sweep equals single solves.
 
 εr*(ω) carries −j·σ/(ω·ε₀), so a material with bulk σ is frequency-dependent
 even without Debye/Drude dispersion. The cached sweep path splits the σ term

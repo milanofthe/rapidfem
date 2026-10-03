@@ -96,7 +96,7 @@ class PdkLayer:
     er: float = 1.0
     ur: float = 1.0
     tand: float = 0.0
-    sigma: float = 0.0       # bulk conductivity (S/m); 0 ⇒ treat as PEC for metals
+    sigma: float = 0.0       # bulk conductivity (S/m); 1e10 and above is PEC (is_pec)
     material: str | None = None   # optional name in Stack.materials
 
     @property
@@ -122,24 +122,15 @@ class Stack:
     ``Stack.sky130()`` / ``Stack.sg13g2()`` for built-in presets, or
     construct manually from a list of `PdkLayer`s.
 
-    The scalar ``substrate_*`` / ``oxide_*`` fields are the legacy
-    single-slab description used by :meth:`create_substrate` and the
-    rapidpassives JSON shape. When ``dielectrics`` is populated (XML path)
-    they are derived from it and kept consistent automatically.
+    The background ``dielectrics`` (bottom to top, materials in
+    ``materials``) are the whole vertical cross-section around the
+    patterned layers.
     """
     name: str
     layers: list[PdkLayer]
-    # Background dielectric slabs, bottom-to-top (may be empty for legacy
-    # scalar-only stacks).
+    # Background dielectric slabs, bottom-to-top.
     dielectrics: list[DielectricLayer] = field(default_factory=list)
     materials: dict[str, StackMaterial] = field(default_factory=dict)
-    # Substrate slab below the lowest layer (silicon wafer).
-    substrate_thickness: float = 300e-6   # m
-    substrate_er: float = 11.9
-    substrate_sigma: float = 10.0          # S/m (lossy silicon)
-    # Bulk dielectric between metals (often modeled as a single effective er)
-    oxide_er: float = 4.2
-    oxide_tand: float = 0.0
 
     # ── Construction helpers ───────────────────────────────────────────────
 
@@ -147,33 +138,24 @@ class Stack:
         # Sort layers bottom-to-top by z for deterministic iteration
         self.layers = sorted(self.layers, key=lambda l: (l.z, l.thickness))
         self.dielectrics = sorted(self.dielectrics, key=lambda d: d.z)
-        if self.dielectrics:
-            self._derive_legacy_scalars()
 
-    def _derive_legacy_scalars(self) -> None:
-        """Fill the scalar substrate/oxide fields from the dielectric stack.
-
-        Deterministic rules, documented so the derived values are
-        predictable: the substrate is the set of semiconductor slabs (total
-        thickness, er/sigma of the thickest one); the oxide is the thickest
-        non-air dielectric slab.
-        """
-        def mat(d: DielectricLayer) -> StackMaterial:
-            return self.materials.get(d.material, StackMaterial(d.material))
-
-        semis = [d for d in self.dielectrics if mat(d).kind == "semiconductor"]
-        if semis:
-            self.substrate_thickness = sum(d.thickness for d in semis)
-            main = max(semis, key=lambda d: d.thickness)
-            self.substrate_er = mat(main).er
-            self.substrate_sigma = mat(main).sigma
-
+    def _single_slab(self) -> dict:
+        """The rapidpassives single-slab view of the background: the
+        semiconductor slabs as one substrate (total thickness, er and sigma
+        of the thickest), the thickest non-air dielectric as the oxide."""
+        um = 1e-6
+        semis = [d for d in self.dielectrics if self.material_of(d).kind == "semiconductor"]
         oxides = [d for d in self.dielectrics
-                  if mat(d).kind == "dielectric" and mat(d).er > 1.0]
+                  if self.material_of(d).kind == "dielectric" and self.material_of(d).er > 1.0]
+        out: dict = {}
+        if semis:
+            main = self.material_of(max(semis, key=lambda d: d.thickness))
+            out["substrate"] = {"thickness_um": sum(d.thickness for d in semis) / um,
+                                "er": main.er, "sigma": main.sigma}
         if oxides:
-            main = max(oxides, key=lambda d: d.thickness)
-            self.oxide_er = mat(main).er
-            self.oxide_tand = mat(main).tand
+            main = self.material_of(max(oxides, key=lambda d: d.thickness))
+            out["oxide"] = {"er": main.er, "tand": main.tand}
+        return out
 
     @staticmethod
     def from_pdk(name: str) -> "Stack":
@@ -306,12 +288,29 @@ class Stack:
             PdkLayer("via4",   71, 44,  3.86 * um, 0.505 * um, "#7a7a84", "via",     sigma=4.1e7),
             PdkLayer("met5",   72, 20,  4.365 * um, 1.26 * um, "#e8944a", "metal",   sigma=4.1e7),
         ]
-        return Stack(
-            name="SKY130", layers=layers,
-            substrate_thickness=300 * um,
-            substrate_er=11.9, substrate_sigma=10.0,
-            oxide_er=4.2, oxide_tand=0.0,
-        )
+        return Stack._with_single_slab(
+            "SKY130", layers, substrate_thickness=300 * um, substrate_er=11.9,
+            substrate_sigma=10.0, oxide_er=4.2, oxide_tand=0.0)
+
+    @staticmethod
+    def _with_single_slab(name: str, layers: list[PdkLayer], *, substrate_thickness: float,
+                          substrate_er: float, substrate_sigma: float, oxide_er: float,
+                          oxide_tand: float) -> "Stack":
+        """A stack whose background is one substrate slab below the lowest
+        layer and one oxide slab up to the highest (the rapidpassives shape)."""
+        bottom = min(l.z for l in layers)
+        top = max(l.z_top for l in layers)
+        materials = {
+            "substrate": StackMaterial("substrate", "semiconductor", er=substrate_er,
+                                       sigma=substrate_sigma),
+            "oxide": StackMaterial("oxide", "dielectric", er=oxide_er, tand=oxide_tand),
+        }
+        dielectrics = [
+            DielectricLayer("substrate", "substrate", z=bottom - substrate_thickness,
+                            thickness=substrate_thickness),
+            DielectricLayer("oxide", "oxide", z=bottom, thickness=top - bottom),
+        ]
+        return Stack(name=name, layers=layers, dielectrics=dielectrics, materials=materials)
 
     @staticmethod
     def sg13g2() -> "Stack":
@@ -375,8 +374,7 @@ class Stack:
 
     @property
     def bottom_z(self) -> float:
-        """z of the highest substrate top (where active devices sit). Substrate
-        slab itself sits below this at [bottom_z - substrate_thickness, bottom_z]."""
+        """z of the lowest patterned layer."""
         return min((l.z for l in self.layers), default=0.0)
 
     # ── JSON interop with rapidpassives ────────────────────────────────────
@@ -388,12 +386,7 @@ class Stack:
             "id": self.name.lower(),
             "name": self.name,
             "description": f"rapidfem stack: {self.name}",
-            "substrate": {
-                "thickness_um": self.substrate_thickness / um,
-                "er": self.substrate_er,
-                "sigma": self.substrate_sigma,
-            },
-            "oxide": {"er": self.oxide_er, "tand": self.oxide_tand},
+            **self._single_slab(),
             "layers": [
                 {
                     "name": l.name, "gds": l.gds, "datatype": l.datatype,
@@ -425,8 +418,6 @@ class Stack:
     @staticmethod
     def from_dict(d: dict) -> "Stack":
         um = 1e-6
-        sub = d.get("substrate", {})
-        ox = d.get("oxide", {})
         layers = [
             PdkLayer(
                 name=l["name"], gds=l["gds"], datatype=l["datatype"],
@@ -453,74 +444,16 @@ class Stack:
             )
             for mname, mm in d.get("materials", {}).items()
         }
-        return Stack(
-            name=d["name"], layers=layers,
-            dielectrics=dielectrics, materials=materials,
-            substrate_thickness=sub.get("thickness_um", 300) * um,
-            substrate_er=sub.get("er", 11.9), substrate_sigma=sub.get("sigma", 10.0),
-            oxide_er=ox.get("er", 4.2), oxide_tand=ox.get("tand", 0.0),
-        )
-
-    # ── Geometry helpers ───────────────────────────────────────────────────
-
-    def create_substrate(
-        self,
-        g: "Geometry",
-        footprint: tuple[float, float],
-        center: bool = True,
-        z_substrate_top: float | None = None,
-        fragment_existing: bool = True,
-    ) -> dict[str, "GeoObject"]:
-        """Instantiate the silicon substrate slab and a bulk-oxide slab spanning
-        from the substrate top to the stack's top.
-
-        Each block is created with a fully-instantiated ``rf.Dielectric``
-        derived from the stack constants, drop the returned objects straight
-        into the Problem API, no extra material wiring needed.
-
-        Returns a dict of named GeoObjects (`substrate`, `oxide`). If
-        ``fragment_existing=True`` (the default) and the geometry already
-        contains 3D primitives (e.g. metal traces from `Geometry.from_gds`),
-        they are fragmented into the new oxide slab so the resulting mesh is
-        conformal at every interface.
-        """
-        # Local import, avoids a circular at module load (rapidfem.__init__
-        # imports rapidfem.rfic).
-        from rapidfem.materials import Dielectric
-
-        wx, wy = footprint
-        x0 = -wx / 2 if center else 0.0
-        y0 = -wy / 2 if center else 0.0
-        z_top = z_substrate_top if z_substrate_top is not None else self.bottom_z
-
-        # Snapshot existing 3D objects BEFORE adding substrate/oxide
-        existing_3d = [o for o in g._objects if o.dim == 3]
-
-        silicon = Dielectric(er=self.substrate_er, conductivity=self.substrate_sigma)
-        sio2 = Dielectric(er=self.oxide_er, tand=self.oxide_tand)
-
-        sub = g.box(wx, wy, self.substrate_thickness,
-                    position=(x0, y0, z_top - self.substrate_thickness),
-                    material=silicon)
-        sub.name = "substrate"
-
-        oxide_height = self.top_z - z_top
-        ox = None
-        if oxide_height > 0:
-            ox = g.box(wx, wy, oxide_height, position=(x0, y0, z_top),
-                       material=sio2)
-            ox.name = "oxide"
-
-        # Fragment with all pre-existing 3D primitives so interfaces are conformal.
-        # Critical: do this in ONE call. Two sequential fragment ops carve the
-        # second target against the same tools but leave the first one in a
-        # half-resolved state, re-resolution by (cog, bbox) then misattributes
-        # the first volume's name to the wrong sub-piece (#64).
-        if fragment_existing and existing_3d:
-            others = existing_3d + ([ox] if ox is not None else [])
-            g.fragment(sub, *others)
-
-        return {"substrate": sub} | ({"oxide": ox} if ox is not None else {})
+        if not dielectrics:
+            # a rapidpassives Pdk: one substrate and one oxide slab
+            sub, ox = d.get("substrate", {}), d.get("oxide", {})
+            return Stack._with_single_slab(
+                d["name"], layers,
+                substrate_thickness=sub.get("thickness_um", 300) * um,
+                substrate_er=sub.get("er", 11.9), substrate_sigma=sub.get("sigma", 10.0),
+                oxide_er=ox.get("er", 4.2), oxide_tand=ox.get("tand", 0.0))
+        return Stack(name=d["name"], layers=layers,
+                     dielectrics=dielectrics, materials=materials)
 
 
 __all__ = ["Stack", "PdkLayer", "DielectricLayer", "StackMaterial",

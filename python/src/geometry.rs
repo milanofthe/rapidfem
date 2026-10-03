@@ -15,6 +15,7 @@ use rapidfem_geom::fem_mesh::{fem_mesh, viewer_mesh, Group};
 use rapidfem_geom::msh::{write_msh, MeshScene};
 use rapidfem_geom::path::spline;
 use rapidfem_geom::geometry::{Across, EdgeOp, FaceOrigin, FaceSel, Geometry, Item, ObjId};
+use rapidfem_geom::sheet_ops::SheetOp;
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Helix, Import, Loft, Prism, Revolve, Sheet, Sphere, Sweep, Torus, Wedge};
 use rapidmesh::{EdgeCut, EdgePick, MeshOptions, Transform};
 
@@ -200,7 +201,6 @@ impl PyGeometry {
 
     /// A helical coil of round wire about +z through `position`.
     #[pyo3(signature = (radius, pitch, turns, wire_radius, position=[0.0; 3], points_per_turn=24, segments=12, maxh=None))]
-    #[allow(clippy::too_many_arguments)]
     fn add_helix(
         &mut self,
         radius: f64,
@@ -288,6 +288,19 @@ impl PyGeometry {
         self.inner.fuse(ids);
     }
 
+    /// Combines the sheet `target` with the sheets `tools` in their common
+    /// plane: `op` is "union", "difference" or "intersection"; the tools
+    /// are used up.
+    fn sheet_boolean(&mut self, op: &str, target: ObjId, tools: Vec<ObjId>) -> PyResult<()> {
+        let op = match op {
+            "union" => SheetOp::Union,
+            "difference" => SheetOp::Difference,
+            "intersection" => SheetOp::Intersection,
+            _ => return Err(PyValueError::new_err(format!("unknown sheet boolean {op:?}"))),
+        };
+        self.inner.sheet_boolean(op, target, &tools).map_err(PyValueError::new_err)
+    }
+
     fn set_face_maxh(&mut self, origins: Vec<PySel>, h: f64) {
         self.inner.set_face_maxh(origins.into_iter().map(sel_of).collect(), h);
     }
@@ -331,7 +344,7 @@ impl PyGeometry {
     }
 
     fn is_sheet(&self, id: ObjId) -> bool {
-        matches!(self.inner.object(id).item, Item::Sheet(_))
+        matches!(self.inner.object(id).item, Item::Sheet(_) | Item::Sheets(_))
     }
 
     fn is_void(&self, id: ObjId) -> bool {
@@ -516,7 +529,7 @@ impl PyMeshScene {
 }
 
 /// The solver mesh (nodes, tets, derived edges and faces, tag groups).
-#[pyclass(name = "FemMesh", module = "rapidfem._native")]
+#[pyclass(name = "FemMesh", module = "rapidfem._native", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyFemMesh {
     pub inner: rapidfem_core::mesh::Mesh,
@@ -544,7 +557,6 @@ impl PyFemMesh {
         self.inner.edges.len()
     }
 
-    /// Tets and faces per tag, `(tag -> n_tets, tag -> n_tris)`.
     /// What a viewer draws: `(nodes, tris, tri_tags, tets, tet_tags)`,
     /// flat; the triangles on the boundary or in a face group, each with
     /// its group's tag (0 for none), every tet with its volume group's tag.
@@ -560,6 +572,7 @@ impl PyFemMesh {
         )
     }
 
+    /// Tets and faces per tag, `(tag -> n_tets, tag -> n_tris)`.
     fn group_sizes(&self) -> (Vec<(i32, usize)>, Vec<(i32, usize)>) {
         let mut v: Vec<(i32, usize)> = self.inner.vtag_to_tet.iter().map(|(&t, s)| (t, s.len())).collect();
         let mut f: Vec<(i32, usize)> = self.inner.ftag_to_tri.iter().map(|(&t, s)| (t, s.len())).collect();

@@ -7,7 +7,7 @@
 Every geometry test follows the same shape: build a parametric geometry, attach
 physics, solve, and assert an extracted quantity against `harness.references`.
 These helpers carry the shared plumbing so a test module stays a geometry plus
-its physics assertion. The DOF budget (< 100 000) is enforced on every solve so
+its physics assertion. The DOF budget (`DOF_BUDGET`) is enforced on every solve so
 the suite always runs on a laptop.
 
 Usage (in tests/geometries/test_<name>.py):
@@ -54,28 +54,28 @@ def geometry(maxh, **kw) -> "rf.Geometry":
     return rf.Geometry(maxh=maxh, **kw)
 
 
-def _enforce_budget(prob) -> int:
+def _enforce_budget(prob, budget: int = DOF_BUDGET) -> int:
+    """Raise if the problem has `budget` DOFs or more. A test may pass a
+    larger budget where its physics needs it (and says why)."""
     n = int(prob.n_dofs)
-    if n >= DOF_BUDGET:
+    if n >= budget:
         raise DofBudgetExceeded(
-            f"{n} DOF ≥ budget {DOF_BUDGET}; coarsen maxh "
+            f"{n} DOF ≥ budget {budget}; coarsen maxh "
             f"({prob.n_tets} tets)"
         )
     return n
 
 
-def sweep(g, frequencies, *, z0: float = 50.0, dof_budget: int = DOF_BUDGET):
+def sweep(g, frequencies, *, dof_budget: int = DOF_BUDGET):
     """Mesh `g`, run an FD frequency sweep, enforce the DOF budget.
 
     Returns `(prob, result)` where `result.sparams` has shape
-    `(n_freq, n_driven, n_driven)`. Do NOT call `g.mesh()` first — this does.
+    `(n_freq, n_driven, n_driven)`. Do NOT call `g.mesh()` first, this does.
     """
     g.mesh()
     prob = rf.ProblemFD(g)
-    result = prob.sweep(np.asarray(frequencies, dtype=float), z0=z0)
-    n = _enforce_budget(prob)
-    if n >= dof_budget:
-        raise DofBudgetExceeded(f"{n} DOF ≥ requested budget {dof_budget}")
+    result = prob.sweep(np.asarray(frequencies, dtype=float))
+    _enforce_budget(prob, dof_budget)
     return prob, result
 
 
@@ -88,9 +88,7 @@ def eigenmodes(g, target_frequency: float, *, n_modes: int = 6,
     g.mesh()
     prob = rf.ProblemFD(g)
     modes = prob.eigenmode(target_frequency, n_modes=n_modes)
-    n = _enforce_budget(prob)
-    if n >= dof_budget:
-        raise DofBudgetExceeded(f"{n} DOF ≥ requested budget {dof_budget}")
+    _enforce_budget(prob, dof_budget)
     return prob, modes
 
 

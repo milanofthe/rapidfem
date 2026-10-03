@@ -149,7 +149,7 @@ fn integrate(a: &[f64], y0: &[f64], t_end: f64, nsteps: usize) -> Vec<f64> {
     let mut y = y0.to_vec();
     let mut ws = LserkWorkspace::new();
     for _ in 0..nsteps {
-        ws.step_into(|x, ax| matvec(a, x, ax), &mut y, dt);
+        ws.step_into(|x, ax| matvec(a, x, ax), &mut y, dt, None);
     }
     y
 }

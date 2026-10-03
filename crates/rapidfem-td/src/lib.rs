@@ -8,7 +8,6 @@
 //! steppers, the state-space export, the GPU backend and the runs on top
 //! ([`session`]).
 
-pub mod absorber;
 pub mod build;
 pub mod constants;
 pub mod dg_basis;

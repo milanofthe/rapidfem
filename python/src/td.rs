@@ -96,7 +96,7 @@ impl PyTdSession {
     #[pyo3(signature = (nx, ny, nz, lx, ly, lz, order, flux_alpha = 1.0, c = 1.0))]
     fn box_cavity(nx: usize, ny: usize, nz: usize, lx: f64, ly: f64, lz: f64, order: usize, flux_alpha: f64, c: f64) -> Self {
         let mesh = rapidfem_td::mesh_gen::structured_box(nx, ny, nz, lx, ly, lz);
-        let op = rapidfem_td::rhs::MaxwellOperator::new(&mesh, order, flux_alpha);
+        let op = rapidfem_td::rhs::MaxwellOperator::new(&mesh, order, flux_alpha, Default::default());
         PyTdSession { s: TdSession::new(op, c) }
     }
 
@@ -117,10 +117,6 @@ impl PyTdSession {
     /// Number of tetrahedra.
     fn n_tets(&self) -> usize {
         self.s.op().n_elem()
-    }
-
-    fn n_dispersive(&self) -> usize {
-        self.s.op().n_dispersive()
     }
 
     /// `A·y`.
@@ -279,43 +275,9 @@ impl PyTdSession {
         Ok(pvd.to_string_lossy().into_owned())
     }
 
-    fn n_ports(&self) -> usize {
-        self.s.op().n_ports()
-    }
-
-    /// Whether port `idx` carries a mode (false for an absorbing-only face).
-    fn port_has_mode(&self, idx: usize) -> bool {
-        self.s.op().port_has_mode(idx)
-    }
-
-    /// Cutoff angular frequency of port `idx`'s mode (operator units).
-    fn port_cutoff(&self, idx: usize) -> f64 {
-        self.s.op().port_cutoff(idx)
-    }
-
-    /// Modal wave impedance of port `idx` at `omega` (operator units).
-    fn port_impedance(&self, idx: usize, omega: f64) -> f64 {
-        self.s.op().port_impedance(idx, omega)
-    }
-
-    /// (element, face) pairs of port `idx`.
-    fn port_n_faces(&self, idx: usize) -> usize {
-        self.s.op().port_n_faces(idx)
-    }
-
-    /// Of those, the ones with a neighbour behind the port.
-    fn port_n_interior_faces(&self, idx: usize) -> usize {
-        self.s.op().port_n_interior_faces(idx)
-    }
-
     /// The source pattern `b` that drives port `idx`.
     fn port_source<'py>(&self, py: Python<'py>, idx: usize) -> Bound<'py, PyArray1<f64>> {
         self.s.op().port_source(idx).into_pyarray(py)
-    }
-
-    /// `(P_e, P_h)` of port `idx` for the state `y`.
-    fn port_projections(&self, y: PyReadonlyArray1<'_, f64>, idx: usize) -> PyResult<(f64, f64)> {
-        Ok(self.s.op().port_modal_projections(slice(&y)?, idx))
     }
 
     /// `A` as CSR `(n, row_ptr, col_idx, values)`.
@@ -324,18 +286,6 @@ impl PyTdSession {
         let row_ptr: Vec<i64> = csr.row_ptr.iter().map(|&x| x as i64).collect();
         let col_idx: Vec<i64> = csr.col_idx.iter().map(|&x| x as i64).collect();
         (csr.n, row_ptr.into_pyarray(py), col_idx.into_pyarray(py), csr.values.into_pyarray(py))
-    }
-
-    /// `A` dense, `[n, n]` (small meshes only).
-    fn assemble_dense<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let n = self.s.n_dof();
-        matrix(py, n, n, self.s.op().assemble_dense())
-    }
-
-    /// The energy mass matrix, `½ yᵀ M y` the field energy, dense `[n, n]`.
-    fn assemble_energy_mass<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let n = self.s.n_dof();
-        matrix(py, n, n, self.s.op().assemble_energy_mass())
     }
 
     /// DG node coordinates `[n_elem·Np, 3]` in state order.
@@ -354,10 +304,5 @@ impl PyTdSession {
     /// Whether a GPU backend can be built.
     fn gpu_available(&mut self) -> bool {
         self.s.gpu_device().is_ok()
-    }
-
-    /// The GPU device name.
-    fn gpu_device(&mut self) -> PyResult<String> {
-        self.s.gpu_device().map_err(rt)
     }
 }

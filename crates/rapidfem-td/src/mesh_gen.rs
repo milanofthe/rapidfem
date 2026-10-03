@@ -6,7 +6,7 @@
 //!
 //! A box mesher via the conforming Kuhn (Freudenthal) triangulation, six
 //! tets per cell through a fixed main diagonal, which keeps shared cell faces
-//! matched. [`structured_box_jittered`] perturbs the interior to produce
+//! matched. A test-only jittered variant perturbs the interior to produce
 //! irregular meshes for validating the solver on non-uniform elements.
 
 use rapidfem_core::mesh::Mesh;
@@ -80,9 +80,10 @@ pub fn structured_box(
 /// The box shape stays exact, a displacement component is zeroed whenever
 /// the node lies on that axis's boundary face, so the cavity is unchanged,
 /// but every tetrahedron becomes irregular and skewed. For validating the
-/// solver on non-uniform meshes. `amplitude` is a fraction of the cell size
-/// (keep `< 0.5` to avoid inverted elements).
-pub fn structured_box_jittered(
+/// solver on non-uniform meshes, test code only. `amplitude` is a fraction
+/// of the cell size (keep `< 0.5` to avoid inverted elements).
+#[cfg(test)]
+pub(crate) fn structured_box_jittered(
     nx: usize,
     ny: usize,
     nz: usize,
@@ -119,6 +120,7 @@ pub fn structured_box_jittered(
 }
 
 /// Deterministic pseudo-random displacement in `[-1,1]³` from a node index.
+#[cfg(test)]
 fn jitter_offset(i: usize, j: usize, k: usize, seed: u64) -> [f64; 3] {
     let mix = |mut x: u64| -> f64 {
         x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -167,16 +169,11 @@ mod tests {
     }
 
     fn mesh_volume(m: &Mesh) -> f64 {
+        use rapidfem_core::geom::{cross, dot, sub};
         let mut vol = 0.0;
-        for tet in &m.tets {
-            let v: Vec<[f64; 3]> = tet.iter().map(|&n| m.nodes[n]).collect();
-            let e = |a: [f64; 3]| {
-                [a[0] - v[0][0], a[1] - v[0][1], a[2] - v[0][2]]
-            };
-            let (a, b, c) = (e(v[1]), e(v[2]), e(v[3]));
-            let det = a[0] * (b[1] * c[2] - b[2] * c[1])
-                - a[1] * (b[0] * c[2] - b[2] * c[0])
-                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        for &tet in &m.tets {
+            let v = tet.map(|n| m.nodes[n]);
+            let det = dot(sub(v[1], v[0]), cross(sub(v[2], v[0]), sub(v[3], v[0])));
             vol += det.abs() / 6.0;
         }
         vol

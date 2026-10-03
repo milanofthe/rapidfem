@@ -48,7 +48,7 @@ fn rel_l2(got: &[Field], reference: &[f64]) -> f64 {
 
 fn main() {
     let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-    let op = MaxwellOperator::new(&mesh, 2, 1.0); // upwind, the common case
+    let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default()); // upwind, the common case
     let n = op.n_dof();
 
     // A deterministic initial state.
@@ -75,7 +75,7 @@ fn main() {
     let mut y = y0.clone();
     let mut ws = LserkWorkspace::new();
     for _ in 0..STEPS {
-        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt);
+        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt, None);
     }
 
     println!(

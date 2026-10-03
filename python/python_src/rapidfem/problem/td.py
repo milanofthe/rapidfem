@@ -682,10 +682,10 @@ class ProblemTD:
 
     def _port_operator_index(self, port):
         """Operator port index of a modal port physics object, the index
-        :meth:`port_source` / :meth:`port_projections` take. Resolves the
-        port's position among the modal ports (declaration order) and maps
-        it onto the operator's modal subset (``port_has_mode``), so
-        absorbing-only ABC faces in between are skipped."""
+        the native port source and port signals take. Resolves the port's
+        position among the modal ports (declaration order) and maps it onto
+        the operator's modal subset, so absorbing-only ABC faces in between
+        are skipped."""
         modal = self._modal_ports()
         k = next((i for i, p in enumerate(modal) if p is port), None)
         if k is None:

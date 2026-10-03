@@ -29,31 +29,14 @@ use rayon::prelude::*;
 use std::sync::Mutex;
 use rapidfem_core::geom::{cross, dot};
 
-/// Physical curl of a vector field on a single element.
+/// Physical curl of a vector field on a single element, writing into
+/// caller-provided buffers, no allocation.
 ///
-/// `field` holds `3·Np` values (`field[node*3 + comp]`); the result has the
-/// same layout and contains `∇×field` sampled at the element nodes. This is
-/// the allocating wrapper around `element_curl_into`, the hot path uses
-/// the scratch-buffer form.
+/// `field` holds `3·Np` values (`field[node*3 + comp]`); `out` (`3·Np`, same
+/// layout) receives `∇×field` sampled at the element nodes. `rd` (`3·Np`)
+/// and `pd` (`9·Np`) are scratch: `rd[k·n+i]` holds the `ξ_k` reference
+/// derivative, `pd[(p·3+c)·n+i]` holds `∂(field_c)/∂x_p`.
 pub fn element_curl(
-    re: &ReferenceElement,
-    gf: &GeometricFactors,
-    field: &[Field],
-) -> Vec<Field> {
-    let n = re.n_nodes;
-    let mut out = vec![0.0; 3 * n];
-    let mut rd = vec![0.0; 3 * n];
-    let mut pd = vec![0.0; 9 * n];
-    element_curl_into(re, gf, field, &mut out, &mut rd, &mut pd);
-    out
-}
-
-/// Physical curl, writing into caller-provided buffers, no allocation.
-///
-/// `out` (`3·Np`) receives `∇×field`; `rd` (`3·Np`) and `pd` (`9·Np`) are
-/// scratch. `rd[k·n+i]` holds the `ξ_k` reference derivative; `pd[(p·3+c)·n+i]`
-/// holds `∂(field_c)/∂x_p`.
-fn element_curl_into(
     re: &ReferenceElement,
     gf: &GeometricFactors,
     field: &[Field],
@@ -118,13 +101,6 @@ pub(crate) struct FaceInfo {
     pub(crate) port: usize,
 }
 
-/// A port, a set of mesh boundary faces carrying a waveguide mode.
-///
-/// Identified by the mesh triangle indices on the port plane (a face group
-/// tag resolves to exactly such a set via `Mesh::ftag_to_tri`). With
-/// `mode = None` the port is a pure characteristic absorbing boundary;
-/// `Some` attaches a waveguide mode (rectangular `TE_mn` or coaxial TEM)
-/// for injection / extraction.
 /// The triangles of face group `face_tag`, their distinct node coordinates
 /// and the inward unit normal of the first one; `None` for an empty tag.
 fn port_face(mesh: &Mesh, face_tag: i32) -> Option<(Vec<usize>, Vec<[Field; 3]>, [Field; 3])> {
@@ -134,6 +110,12 @@ fn port_face(mesh: &Mesh, face_tag: i32) -> Option<(Vec<usize>, Vec<[Field; 3]>,
     Some((tris, coords, nrm))
 }
 
+/// A port, a set of mesh boundary faces carrying a waveguide mode.
+///
+/// Identified by the mesh triangle indices on the port plane (a face group
+/// tag resolves to exactly such a set via `Mesh::ftag_to_tri`). With
+/// `mode = None` the port is a pure characteristic absorbing boundary;
+/// `Some` attaches a waveguide mode for injection / extraction.
 #[derive(Clone, Debug)]
 pub struct PortSpec {
     /// Mesh triangle indices forming this port's boundary faces.
@@ -145,49 +127,14 @@ pub struct PortSpec {
 impl PortSpec {
     /// Build a waveguide port from a face group tag, collecting the port
     /// triangles and fitting the rectangular-waveguide `TE_mn` mode to the
-    /// face.
-    ///
-    /// `direction`, if given, is a lumped port's voltage-integration axis;
-    /// it overrides the auto-fit transverse field axis. Returns `None` if
-    /// the tag carries no triangles, or if `direction` is zero or parallel
-    /// to the face normal (it then has no in-plane part).
+    /// face. Returns `None` if the tag carries no triangles.
     pub fn from_mesh_tag(
         mesh: &Mesh,
         face_tag: i32,
         mode: (usize, usize),
-        direction: Option<[Field; 3]>,
-    ) -> Option<PortSpec> {
-        Self::from_mesh_tag_with_z0(mesh, face_tag, mode, direction, 1.0)
-    }
-
-    /// Like [`Self::from_mesh_tag`] but with an explicit reference impedance
-    /// `z0` for the lumped `(0, 0)` mode (operator units, so a 50 ohm
-    /// physical port is `z0 = 50.0 / 377.0`). Ignored for `TE_mn`
-    /// modes whose impedance is dispersive.
-    pub fn from_mesh_tag_with_z0(
-        mesh: &Mesh,
-        face_tag: i32,
-        mode: (usize, usize),
-        direction: Option<[Field; 3]>,
-        z0: Field,
     ) -> Option<PortSpec> {
         let (tris, coords, nrm) = port_face(mesh, face_tag)?;
-        // A lumped port's voltage-integration direction, if supplied,
-        // becomes the port's transverse field axis. Reject one that is
-        // zero or parallel to the face normal (no in-plane part to use).
-        if let Some(d) = direction {
-            let dl = dot(d, d).sqrt();
-            if dl < 1e-12 {
-                return None;
-            }
-            let dn = [d[0] / dl, d[1] / dl, d[2] / dl];
-            let perp = dot(dn, nrm);
-            if 1.0 - perp * perp < 1e-9 {
-                return None;
-            }
-        }
-        let mut rect = RectPort::from_face(&coords, nrm, mode, direction);
-        rect.z0 = z0;
+        let rect = RectPort::from_face(&coords, nrm, mode);
         Some(PortSpec { tris, mode: Some(PortMode::Rect(rect)) })
     }
 
@@ -278,10 +225,7 @@ impl PortSpec {
     /// `scan_theta`, `scan_phi` parametrise the incident-wave direction
     /// (radians, measured from the port inward normal / port-plane
     /// azimuth respectively); `scan_theta = 0` is the validated normal
-    /// incidence case. `polarisation_override`, if `Some`, supplies an
-    /// explicit in-plane polarisation direction; it is projected into the
-    /// port plane and normalised. Returns `None` if the tag carries no
-    /// triangles.
+    /// incidence case. Returns `None` if the tag carries no triangles.
     ///
     /// The transverse Floquet phase factor `e^{-j·k_t·r_t}` is **dropped**
     /// at oblique scan, see [`FloquetPort`]'s docstring. Normal incidence
@@ -293,7 +237,6 @@ impl PortSpec {
         polarisation: FloquetPolarisation,
         scan_theta: Field,
         scan_phi: Field,
-        polarisation_override: Option<[Field; 3]>,
     ) -> Option<PortSpec> {
         let (tris, coords, nrm) = port_face(mesh, face_tag)?;
         let floquet = FloquetPort::from_face(
@@ -302,7 +245,6 @@ impl PortSpec {
             polarisation,
             scan_theta,
             scan_phi,
-            polarisation_override,
         );
         Some(PortSpec { tris, mode: Some(PortMode::Floquet(floquet)) })
     }
@@ -388,7 +330,9 @@ struct PortData {
 
 /// Per-thread working buffers for [`MaxwellOperator::apply_element`], the
 /// fixed-size scratch, allocated once and reused so the operator hot path
-/// performs no per-element heap allocation.
+/// performs no per-element heap allocation. `Default` is the empty,
+/// non-allocating placeholder swapped in when a real one returns to the pool.
+#[derive(Default)]
 struct Scratch {
     /// Element E / H fields, deinterleaved (`3·Np` each).
     ee: Vec<Field>,
@@ -396,7 +340,7 @@ struct Scratch {
     /// Curl results dE / dH (`3·Np` each).
     de: Vec<Field>,
     dh: Vec<Field>,
-    /// `element_curl_into` scratch, reference (`3·Np`) and physical (`9·Np`)
+    /// `element_curl` scratch, reference (`3·Np`) and physical (`9·Np`)
     /// derivatives.
     rd: Vec<Field>,
     pd: Vec<Field>,
@@ -413,19 +357,6 @@ impl Scratch {
             pd: vec![0.0; 9 * np],
         }
     }
-
-    /// A non-allocating placeholder, the value swapped in when a real
-    /// `Scratch` is returned to the pool.
-    fn empty() -> Self {
-        Scratch {
-            ee: Vec::new(),
-            hh: Vec::new(),
-            de: Vec::new(),
-            dh: Vec::new(),
-            rd: Vec::new(),
-            pd: Vec::new(),
-        }
-    }
 }
 
 /// Checkout handle for a pooled [`Scratch`]; returns it to the pool on drop,
@@ -437,7 +368,7 @@ struct ScratchGuard<'a> {
 
 impl Drop for ScratchGuard<'_> {
     fn drop(&mut self) {
-        let s = std::mem::replace(&mut self.scratch, Scratch::empty());
+        let s = std::mem::take(&mut self.scratch);
         self.pool.lock().unwrap().push(s);
     }
 }
@@ -472,6 +403,20 @@ impl SparseFragment {
             col_idx: Vec::new(),
             values: Vec::new(),
             row_len: Vec::new(),
+        }
+    }
+
+    /// Probe global column `j` of element `e`'s row block with a unit
+    /// vector and append its nonzeros to `entries`.
+    fn probe_column(&mut self, op: &MaxwellOperator, e: usize, j: usize) {
+        self.probe[j] = 1.0;
+        self.out.iter_mut().for_each(|v| *v = 0.0);
+        op.apply_element(e, &self.probe, &mut self.out, &mut self.scratch);
+        self.probe[j] = 0.0;
+        for (il, &v) in self.out.iter().enumerate() {
+            if v != 0.0 {
+                self.entries.push((il, j, v));
+            }
         }
     }
 }
@@ -579,6 +524,47 @@ pub struct MaxwellOperator {
     /// Map mesh element index -> P-block slot, or `usize::MAX` if the element
     /// is non-dispersive. Length `n_elem`.
     disp_slot: Vec<usize>,
+}
+
+/// Physical coordinates of the face nodes of local face `f` of element `e`.
+fn face_node_coords(
+    re: &ReferenceElement,
+    geom: &[GeometricFactors],
+    e: usize,
+    f: usize,
+) -> Vec<[Field; 3]> {
+    re.face_nodes[f]
+        .iter()
+        .map(|&vi| geom[e].map(re.nodes[vi]))
+        .collect()
+}
+
+/// Nearest-node match of two coincident face-node sets: `perm[m]` is the
+/// index of the node of `there` closest to `here[m] + shift`. Fails with the
+/// best distance found if any node has no partner within squared distance
+/// `tol2`.
+fn match_face_nodes(
+    here: &[[Field; 3]],
+    there: &[[Field; 3]],
+    shift: [Field; 3],
+    tol2: Field,
+) -> Result<Vec<usize>, Field> {
+    here.iter()
+        .map(|p| {
+            let target = [p[0] + shift[0], p[1] + shift[1], p[2] + shift[2]];
+            let (mut best, mut bm) = (Field::MAX, 0);
+            for (m2, q) in there.iter().enumerate() {
+                let d = (target[0] - q[0]).powi(2)
+                    + (target[1] - q[1]).powi(2)
+                    + (target[2] - q[2]).powi(2);
+                if d < best {
+                    best = d;
+                    bm = m2;
+                }
+            }
+            if best < tol2 { Ok(bm) } else { Err(best.sqrt()) }
+        })
+        .collect()
 }
 
 /// For one periodic boundary triangle, locate its owning (element, local
@@ -731,18 +717,9 @@ fn link_periodic_faces(
         partner_b_to_a[bi] = i_a;
     }
 
-    // Face-node coordinates of a given (element, local face) under the
-    // operator's reference element, the same map used by the interior
-    // matcher.
-    let face_coords = |e: usize, f: usize| -> Vec<[Field; 3]> {
-        re.face_nodes[f]
-            .iter()
-            .map(|&vi| geom[e].map(re.nodes[vi]))
-            .collect()
-    };
-
     // Per-pair: wire each side's FaceInfo to the partner element / local
     // face and compute the face-node permutation in the translated frame.
+    let back = [-trans[0], -trans[1], -trans[2]];
     for (i_a, &i_b) in partner_a_to_b.iter().enumerate() {
         let tri_a = tris_a[i_a];
         let tri_b = tris_b[i_b];
@@ -752,58 +729,22 @@ fn link_periodic_faces(
         let (e_b, f_b) = boundary_tri_owner(mesh, tri_b).unwrap_or_else(
             || panic!("periodic triangle {tri_b} carries no owning tet"),
         );
-        let here_a = face_coords(e_a, f_a);
-        let here_b = face_coords(e_b, f_b);
+        let here_a = face_node_coords(re, geom, e_a, f_a);
+        let here_b = face_node_coords(re, geom, e_b, f_b);
 
-        // For each face-node of A, find the partner face-node on B by
-        // matching A's coordinates (after the period translation) to B's.
-        // This is the direct analogue of the interior-face matcher above,
-        // with the translation supplying the periodic glue.
-        let perm_a: Vec<usize> = here_a
-            .iter()
-            .map(|p| {
-                let target =
-                    [p[0] + trans[0], p[1] + trans[1], p[2] + trans[2]];
-                let (mut best, mut bm) = (Field::MAX, 0);
-                for (m2, q) in here_b.iter().enumerate() {
-                    let d = (target[0] - q[0]).powi(2)
-                        + (target[1] - q[1]).powi(2)
-                        + (target[2] - q[2]).powi(2);
-                    if d < best {
-                        best = d;
-                        bm = m2;
-                    }
-                }
-                assert!(
-                    best < tri_tol2,
-                    "periodic face-node A({tri_a},{}) found no B partner \
-                     within tolerance {tri_tol:e} (best {:e})",
-                    re.face_nodes[f_a][0],
-                    best.sqrt(),
-                );
-                bm
-            })
-            .collect();
-        // The mirror permutation, used to wire side B's FaceInfo.
-        let perm_b: Vec<usize> = here_b
-            .iter()
-            .map(|p| {
-                let target =
-                    [p[0] - trans[0], p[1] - trans[1], p[2] - trans[2]];
-                let (mut best, mut bm) = (Field::MAX, 0);
-                for (m2, q) in here_a.iter().enumerate() {
-                    let d = (target[0] - q[0]).powi(2)
-                        + (target[1] - q[1]).powi(2)
-                        + (target[2] - q[2]).powi(2);
-                    if d < best {
-                        best = d;
-                        bm = m2;
-                    }
-                }
-                assert!(best < tri_tol2, "periodic face-node B unmatched");
-                bm
-            })
-            .collect();
+        // The interior-face node match, with the period translation
+        // supplying the periodic glue: A's nodes shifted onto B's, and the
+        // mirror permutation B onto A for side B's FaceInfo.
+        let unmatched = |tri: usize, best: Field| -> Vec<usize> {
+            panic!(
+                "periodic face-node of triangle {tri} found no partner \
+                 within tolerance {tri_tol:e} (best {best:e})"
+            )
+        };
+        let perm_a = match_face_nodes(&here_a, &here_b, trans, tri_tol2)
+            .unwrap_or_else(|best| unmatched(tri_a, best));
+        let perm_b = match_face_nodes(&here_b, &here_a, back, tri_tol2)
+            .unwrap_or_else(|best| unmatched(tri_b, best));
 
         // Sanity: a face originally tagged for periodic linking must be a
         // domain boundary in the topology (neighbor = MAX); if not, the
@@ -828,114 +769,50 @@ fn link_periodic_faces(
     }
 }
 
-impl MaxwellOperator {
-    /// Build a vacuum operator (`ε = μ = 1`, `σ = 0`).
-    pub fn new(mesh: &Mesh, order: usize, flux_alpha: Field) -> Self {
-        let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-        Self::new_with_materials(mesh, order, flux_alpha, &vacuum)
-    }
-
-    /// Build the operator with per-element materials and the given upwind
-    /// blend (`flux_alpha` in `[0, 1]`).
-    pub fn new_with_materials(
-        mesh: &Mesh,
-        order: usize,
-        flux_alpha: Field,
-        materials: &[ElemMaterial],
-    ) -> Self {
-        Self::new_with_materials_ports(mesh, order, flux_alpha, materials, &[])
-    }
-
-    /// Build the operator with per-element materials and waveguide ports.
-    /// Faces on a port behave as a characteristic boundary; non-port
+/// Everything besides the mesh, the order and the flux blend that shapes a
+/// [`MaxwellOperator`]. The `Default` is a vacuum domain behind PEC walls:
+/// no materials, ports, dispersion, periodic pairs or internal plates.
+#[derive(Clone, Copy, Default)]
+pub struct OperatorOptions<'a> {
+    /// Per-element materials, one per tet; empty means vacuum everywhere.
+    pub materials: &'a [ElemMaterial],
+    /// Ports. Faces on a port behave as a characteristic boundary; non-port
     /// boundary faces are PEC walls.
-    pub fn new_with_materials_ports(
-        mesh: &Mesh,
-        order: usize,
-        flux_alpha: Field,
-        materials: &[ElemMaterial],
-        ports: &[PortSpec],
-    ) -> Self {
-        Self::new_with_materials_ports_dispersive(
-            mesh, order, flux_alpha, materials, ports, &[],
-        )
-    }
+    pub ports: &'a [PortSpec],
+    /// `(element_index, DebyeMaterial)` pairs; each listed element runs the
+    /// auxiliary-polarisation ADE, and its `materials[element]` entry must
+    /// already carry `ε = ε_∞` (the high-frequency permittivity) so the
+    /// static curl term and the dispersive polarisation current stay
+    /// consistent. Empty leaves `n_dof` and the state layout of the plain
+    /// `[E,H]` system.
+    pub dispersive: &'a [(usize, DebyeMaterial)],
+    /// Periodic boundary pairs: two opposite mesh faces whose triangles are
+    /// matched across the period translation, so DG faces on either side see
+    /// the partner element as their neighbour and the interior-face flux
+    /// applies unchanged.
+    pub periodic: &'a [PeriodicSpec],
+    /// Internal PEC plates. Both sides of each listed triangle are retagged
+    /// as boundary faces so the PEC ghost-state logic applies on both sides;
+    /// this models microstrip / RFIC traces, ground planes and other thin
+    /// internal conductors as zero-thickness perfect conductors.
+    pub pec_plates: &'a [PecSpec],
+}
 
-    /// Build the operator with per-element materials, waveguide ports and an
-    /// optional list of Debye dispersive elements.
-    ///
-    /// `dispersive` carries `(element_index, DebyeMaterial)` pairs, each
-    /// listed element runs the auxiliary-polarisation ADE, and its
-    /// `materials[element]` entry must already carry `ε = ε_∞` (the
-    /// high-frequency permittivity) so the static curl term and the dispersive
-    /// polarisation current stay consistent. With an empty `dispersive` list
-    /// the operator is byte-identical to [`new_with_materials_ports`](Self::new_with_materials_ports):
-    /// same `n_dof`, same state layout, same behaviour.
-    pub fn new_with_materials_ports_dispersive(
+impl MaxwellOperator {
+    /// Build the operator of order `order` on `mesh` with upwind blend
+    /// `flux_alpha` (0 central, 1 full upwind) and the materials, ports,
+    /// dispersion, periodic pairs and internal plates of `opts`.
+    pub fn new(
         mesh: &Mesh,
         order: usize,
         flux_alpha: Field,
-        materials: &[ElemMaterial],
-        ports: &[PortSpec],
-        dispersive: &[(usize, DebyeMaterial)],
+        opts: OperatorOptions<'_>,
     ) -> Self {
-        Self::new_with_materials_ports_dispersive_periodic(
-            mesh, order, flux_alpha, materials, ports, dispersive, &[],
-        )
-    }
-
-    /// Like [`new_with_materials_ports_dispersive`](Self::new_with_materials_ports_dispersive)
-    /// but additionally accepts periodic boundary pairs. Each entry in
-    /// `periodic` declares two opposite mesh faces whose triangles are
-    /// matched across the period translation, so DG faces on either side
-    /// see the partner element across the period as their neighbour.
-    ///
-    /// The numerical flux on a periodic face is then the existing
-    /// interior-face flux, no kernel change. With `periodic` empty the
-    /// operator is byte-identical to the non-periodic build.
-    pub fn new_with_materials_ports_dispersive_periodic(
-        mesh: &Mesh,
-        order: usize,
-        flux_alpha: Field,
-        materials: &[ElemMaterial],
-        ports: &[PortSpec],
-        dispersive: &[(usize, DebyeMaterial)],
-        periodic: &[PeriodicSpec],
-    ) -> Self {
-        Self::new_full(
-            mesh, order, flux_alpha, materials, ports, dispersive,
-            periodic, &[],
-        )
-    }
-
-    /// Most-general operator builder: like the
-    /// `_dispersive_periodic` form, plus internal-PEC plates. The
-    /// PEC plates retag both sides of each listed triangle as boundary
-    /// faces so the existing PEC ghost-state logic applies on both
-    /// sides; this lets microstrip / RFIC traces, ground planes, and
-    /// other thin internal conductors be modelled as zero-thickness
-    /// perfect conductors.
-    pub fn new_full(
-        mesh: &Mesh,
-        order: usize,
-        flux_alpha: Field,
-        materials: &[ElemMaterial],
-        ports: &[PortSpec],
-        dispersive: &[(usize, DebyeMaterial)],
-        periodic: &[PeriodicSpec],
-        pec_plates: &[PecSpec],
-    ) -> Self {
+        let OperatorOptions { materials, ports, dispersive, periodic, pec_plates } = opts;
         let re = ReferenceElement::new(order);
         let geom = all_geometric_factors(mesh);
         let topo = FaceTopology::build(mesh);
         let n_elem = mesh.n_tets();
-
-        let face_coords = |e: usize, f: usize| -> Vec<[Field; 3]> {
-            re.face_nodes[f]
-                .iter()
-                .map(|&vi| geom[e].map(re.nodes[vi]))
-                .collect()
-        };
 
         // Triangle → port index, so each face can be tagged as it is built.
         let mut tri_to_port = vec![usize::MAX; mesh.tris.len()];
@@ -953,25 +830,17 @@ impl MaxwellOperator {
                 let perm = if df.neighbor == usize::MAX {
                     Vec::new()
                 } else {
-                    let here = face_coords(e, f);
-                    let there =
-                        face_coords(df.neighbor, df.neighbor_local_face);
-                    here.iter()
-                        .map(|p| {
-                            let (mut best, mut bm) = (Field::MAX, 0);
-                            for (m2, q) in there.iter().enumerate() {
-                                let d = (p[0] - q[0]).powi(2)
-                                    + (p[1] - q[1]).powi(2)
-                                    + (p[2] - q[2]).powi(2);
-                                if d < best {
-                                    best = d;
-                                    bm = m2;
-                                }
-                            }
-                            assert!(best < 1e-18, "unmatched face node");
-                            bm
+                    let here = face_node_coords(&re, &geom, e, f);
+                    let there = face_node_coords(
+                        &re,
+                        &geom,
+                        df.neighbor,
+                        df.neighbor_local_face,
+                    );
+                    match_face_nodes(&here, &there, [0.0; 3], 1e-18)
+                        .unwrap_or_else(|best| {
+                            panic!("unmatched face node (best distance {best:e})")
                         })
-                        .collect()
                 };
                 faces.push(FaceInfo {
                     normal: df.normal.map(|x| x as Field),
@@ -1028,6 +897,13 @@ impl MaxwellOperator {
             );
         }
 
+        let vacuum;
+        let materials = if materials.is_empty() {
+            vacuum = vec![ElemMaterial::VACUUM; n_elem];
+            &vacuum[..]
+        } else {
+            materials
+        };
         assert_eq!(materials.len(), n_elem, "one material per element");
         let recip = |v: [Field; 3]| [1.0 / v[0], 1.0 / v[1], 1.0 / v[2]];
         let inv_eps: Vec<[Field; 3]> =
@@ -1223,10 +1099,6 @@ impl MaxwellOperator {
             .map_or(0.0, |m| m.cutoff())
     }
 
-    /// `true` if port `port_idx` carries a waveguide mode (rectangular,
-    /// coaxial or Floquet). A port with no mode is a pure characteristic
-    /// absorbing boundary (ABC), not an input / output channel, port
-    /// inspection and S-parameter extraction routines should skip those.
     /// Number of resolved `(element, local_face)` boundary-face pairs
     /// for port `port_idx`. For a port plate on a *domain boundary*
     /// (the validated case) this equals one face per triangle. For an
@@ -1253,6 +1125,10 @@ impl MaxwellOperator {
             .count()
     }
 
+    /// `true` if port `port_idx` carries a waveguide mode. A port with no
+    /// mode is a pure characteristic absorbing boundary (ABC), not an
+    /// input / output channel; port inspection and S-parameter extraction
+    /// routines should skip those.
     pub fn port_has_mode(&self, port_idx: usize) -> bool {
         self.ports[port_idx].mode.is_some()
     }
@@ -1481,10 +1357,10 @@ impl MaxwellOperator {
         }
 
         // Volume term:  dE = ∇×H,  dH = -∇×E.
-        element_curl_into(
+        element_curl(
             &self.re, &self.geom[e], &s.hh, &mut s.de, &mut s.rd, &mut s.pd,
         );
-        element_curl_into(
+        element_curl(
             &self.re, &self.geom[e], &s.ee, &mut s.dh, &mut s.rd, &mut s.pd,
         );
         for v in s.dh.iter_mut() {
@@ -1712,31 +1588,9 @@ impl CsrMatrix {
     pub fn nnz(&self) -> usize {
         self.values.len()
     }
-
-    /// Sparse matrix-vector product `A·x`.
-    pub fn matvec(&self, x: &[Field]) -> Vec<Field> {
-        let mut y = vec![0.0; self.n];
-        for i in 0..self.n {
-            let mut acc = 0.0;
-            for k in self.row_ptr[i]..self.row_ptr[i + 1] {
-                acc += self.values[k] * x[self.col_idx[k]];
-            }
-            y[i] = acc;
-        }
-        y
-    }
 }
 
 impl MaxwellOperator {
-    /// Assemble the operator as an explicit sparse CSR matrix, the
-    /// state-space `A`, **without ever densifying**.
-    ///
-    /// The DG operator couples each element only to itself and its (≤4) face
-    /// neighbours, so row block `e` is found by probing just that small
-    /// column stencil with unit vectors and reading element `e`'s output
-    /// block. Element blocks are independent and assemble in parallel.
-    /// Memory is `O(nnz)`, not `O(N²)`, so this scales to production meshes
-    /// where [`assemble_dense`](Self::assemble_dense) cannot.
     /// Sorted column-element stencil of row block `e`, itself plus every
     /// distinct face neighbour. Returns the fixed `[usize; 5]` array and the
     /// number of entries used; never allocates.
@@ -1755,6 +1609,15 @@ impl MaxwellOperator {
         (s, count)
     }
 
+    /// Assemble the operator as an explicit sparse CSR matrix, the
+    /// state-space `A`, **without ever densifying**.
+    ///
+    /// The DG operator couples each element only to itself and its (≤4) face
+    /// neighbours, so row block `e` is found by probing just that small
+    /// column stencil with unit vectors and reading element `e`'s output
+    /// block. Element blocks are independent and assemble in parallel.
+    /// Memory is `O(nnz)`, not `O(N²)`, so this scales to production meshes
+    /// where [`assemble_dense`](Self::assemble_dense) cannot.
     pub fn assemble_sparse(&self) -> CsrMatrix {
         let stride = self.re.n_nodes * 6;
         let np = self.re.n_nodes;
@@ -1773,8 +1636,8 @@ impl MaxwellOperator {
         // Each element block's column stencil is the element itself plus its
         // face neighbours. On a dispersive element the `[E,H]` rows also
         // couple to the appended polarisation block (the `−Ṗ/ε_∞` current),
-        // so the polarisation columns of every dispersive stencil element are
-        // probed too. The non-dispersive case has no such columns, so the
+        // so the element's own polarisation columns are probed too. The
+        // non-dispersive case has no such columns, so the
         // assembled `[E,H]` block stays byte-identical.
         let min_len =
             (self.n_elem / (4 * rayon::current_num_threads())).max(1);
@@ -1786,54 +1649,26 @@ impl MaxwellOperator {
                 |mut f, e| {
                     let (sten, ns) = self.element_stencil(e);
                     f.entries.clear();
+                    // The [E,H] columns of every stencil element.
                     for &c in &sten[..ns] {
-                        // The element's [E,H] columns.
                         for jl in 0..stride {
-                            let j = c * stride + jl;
-                            f.probe[j] = 1.0;
-                            f.out.iter_mut().for_each(|v| *v = 0.0);
-                            self.apply_element(
-                                e,
-                                &f.probe,
-                                &mut f.out,
-                                &mut f.scratch,
-                            );
-                            f.probe[j] = 0.0;
-                            for il in 0..stride {
-                                let v = f.out[il];
-                                if v != 0.0 {
-                                    f.entries.push((il, j, v));
-                                }
-                            }
+                            f.probe_column(self, e, c * stride + jl);
                         }
-                        // The element's own polarisation columns, if it is
-                        // dispersive. apply_element reads only element e's own
-                        // P-block, so a neighbour's P-columns always probe to
-                        // zero - only c == e can contribute.
-                        let slot = if c == e { self.disp_slot[e] } else { usize::MAX };
-                        if slot != usize::MAX {
-                            for jl in 0..p_stride {
-                                let j = eh_len + slot * p_stride + jl;
-                                f.probe[j] = 1.0;
-                                f.out.iter_mut().for_each(|v| *v = 0.0);
-                                self.apply_element(
-                                    e,
-                                    &f.probe,
-                                    &mut f.out,
-                                    &mut f.scratch,
-                                );
-                                f.probe[j] = 0.0;
-                                for il in 0..stride {
-                                    let v = f.out[il];
-                                    if v != 0.0 {
-                                        f.entries.push((il, j, v));
-                                    }
-                                }
-                            }
+                    }
+                    // The element's own polarisation columns, if it is
+                    // dispersive. apply_element reads only element e's own
+                    // P-block, so a neighbour's P-columns always probe to
+                    // zero.
+                    let slot = self.disp_slot[e];
+                    if slot != usize::MAX {
+                        for jl in 0..p_stride {
+                            f.probe_column(self, e, eh_len + slot * p_stride + jl);
                         }
                     }
                     // Group by local row, columns ascending within a row,
                     // sorting on the full key needs no stable-sort scratch.
+                    // Every (row, column) key occurs once, so the probe
+                    // order does not affect the result.
                     f.entries.sort_unstable_by_key(|&(il, j, _)| (il, j));
                     let mut cursor = 0;
                     for il in 0..stride {
@@ -1899,6 +1734,47 @@ impl MaxwellOperator {
 mod tests {
     use super::*;
 
+    /// [`element_curl`] into fresh buffers, returning `∇×field`.
+    fn curl_of(
+        re: &ReferenceElement,
+        gf: &GeometricFactors,
+        field: &[Field],
+    ) -> Vec<Field> {
+        let n = re.n_nodes;
+        let (mut out, mut rd, mut pd) =
+            (vec![0.0; 3 * n], vec![0.0; 3 * n], vec![0.0; 9 * n]);
+        element_curl(re, gf, field, &mut out, &mut rd, &mut pd);
+        out
+    }
+
+    /// Sparse matrix-vector product `A·x`.
+    fn csr_matvec(a: &CsrMatrix, x: &[Field]) -> Vec<Field> {
+        (0..a.n)
+            .map(|i| {
+                let mut acc = 0.0;
+                for k in a.row_ptr[i]..a.row_ptr[i + 1] {
+                    acc += a.values[k] * x[a.col_idx[k]];
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// Operator with per-element materials only.
+    fn with_materials(
+        mesh: &Mesh,
+        order: usize,
+        flux_alpha: Field,
+        materials: &[ElemMaterial],
+    ) -> MaxwellOperator {
+        MaxwellOperator::new(
+            mesh,
+            order,
+            flux_alpha,
+            OperatorOptions { materials, ..Default::default() },
+        )
+    }
+
     #[test]
     fn curl_of_polynomial_field_is_exact() {
         // On a sheared physical element, the discrete curl reproduces the
@@ -1922,7 +1798,7 @@ mod tests {
             field[i * 3 + 2] = 3.0 * p[0] * p[1];
         }
 
-        let curl = element_curl(&re, &gf, &field);
+        let curl = curl_of(&re, &gf, &field);
         for (i, p) in pn.iter().enumerate() {
             let want = [p[0], -2.0 * p[1], p[2]];
             for c in 0..3 {
@@ -1946,7 +1822,7 @@ mod tests {
         ]);
         let re = ReferenceElement::new(3);
         let field = vec![0.7; 3 * re.n_nodes];
-        let curl = element_curl(&re, &gf, &field);
+        let curl = curl_of(&re, &gf, &field);
         assert!(curl.iter().all(|c| c.abs() < 1e-10));
     }
 
@@ -1958,7 +1834,7 @@ mod tests {
         use crate::mesh_gen::structured_box;
         let mesh = structured_box(1, 1, 1, 1.0, 1.0, 1.0);
         // Central flux (alpha = 0) is the energy-conserving case.
-        let op = MaxwellOperator::new(&mesh, 2, 0.0);
+        let op = MaxwellOperator::new(&mesh, 2, 0.0, Default::default());
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mm = op.assemble_energy_mass();
@@ -2000,7 +1876,7 @@ mod tests {
         let eps_r = 4.0;
         let mats =
             vec![ElemMaterial::isotropic(eps_r, 1.0, 0.0); mesh.n_tets()];
-        let op = MaxwellOperator::new_with_materials(&mesh, 2, 1.0, &mats);
+        let op = with_materials(&mesh, 2, 1.0, &mats);
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mat = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2035,7 +1911,7 @@ mod tests {
                 )
             })
             .collect();
-        let op = MaxwellOperator::new_with_materials(&mesh, 2, 0.0, &mats);
+        let op = with_materials(&mesh, 2, 0.0, &mats);
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mm = op.assemble_energy_mass();
@@ -2081,7 +1957,7 @@ mod tests {
                 sigma_m: 0.0,
             })
             .collect();
-        let op = MaxwellOperator::new_with_materials(&mesh, 2, 1.0, &mats);
+        let op = with_materials(&mesh, 2, 1.0, &mats);
         let n = op.n_dof();
         let mm = op.assemble_energy_mass();
 
@@ -2130,7 +2006,7 @@ mod tests {
         let least_damped_re = |sigma: f64| -> f64 {
             let mats =
                 vec![ElemMaterial::isotropic(eps_r, 1.0, sigma); mesh.n_tets()];
-            let op = MaxwellOperator::new_with_materials(&mesh, 2, 1.0, &mats);
+            let op = with_materials(&mesh, 2, 1.0, &mats);
             let n = op.n_dof();
             let a = op.assemble_dense();
             let mat = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2165,7 +2041,7 @@ mod tests {
                 sigma_m: 0.0,
             })
             .collect();
-        let op = MaxwellOperator::new_with_materials(&mesh, 2, 0.0, &mats);
+        let op = with_materials(&mesh, 2, 0.0, &mats);
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mm = op.assemble_energy_mass();
@@ -2209,7 +2085,7 @@ mod tests {
 
         let least_damped_re = |mat: ElemMaterial| -> f64 {
             let mats = vec![mat; mesh.n_tets()];
-            let op = MaxwellOperator::new_with_materials(&mesh, 2, 1.0, &mats);
+            let op = with_materials(&mesh, 2, 1.0, &mats);
             let n = op.n_dof();
             let a = op.assemble_dense();
             let m = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2244,7 +2120,7 @@ mod tests {
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
         // Upwind flux (alpha = 1) damps the discontinuous spurious modes;
         // the physical cavity modes survive as the least-damped ones.
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mat = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2280,7 +2156,7 @@ mod tests {
         use faer::Mat;
 
         let mesh = structured_box_jittered(2, 2, 2, 1.0, 1.0, 1.0, 0.25, 7);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let a = op.assemble_dense();
         let mat = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2315,7 +2191,7 @@ mod tests {
 
         let fundamental_err = |cells: usize, order: usize| -> f64 {
             let mesh = structured_box(cells, cells, cells, 1.0, 1.0, 1.0);
-            let op = MaxwellOperator::new(&mesh, order, 1.0);
+            let op = MaxwellOperator::new(&mesh, order, 1.0, Default::default());
             let n = op.n_dof();
             let a = op.assemble_dense();
             let mat = Mat::from_fn(n, n, |i, j| a[i * n + j]);
@@ -2351,7 +2227,7 @@ mod tests {
         use crate::mesh_gen::structured_box;
         use crate::propagator::etd_step;
         let mesh = structured_box(1, 1, 1, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
 
         // Source: E_z at the cavity centre, which is a node, so exact.
@@ -2384,14 +2260,14 @@ mod tests {
     fn sparse_assembly_matches_matrix_free_apply() {
         use crate::mesh_gen::structured_box;
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let csr = op.assemble_sparse();
         assert_eq!(csr.n, n);
 
         let v: Vec<f64> =
             (0..n).map(|i| (1.0 + i as f64 * 0.07).cos()).collect();
-        let sp = csr.matvec(&v);
+        let sp = csr_matvec(&csr, &v);
         let mf = op.apply(&v);
         let err: f64 = sp
             .iter()
@@ -2418,7 +2294,7 @@ mod tests {
         // so nnz grows linearly with N, not quadratically.
         use crate::mesh_gen::structured_box;
         let mesh = structured_box(4, 4, 4, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let stride = 6 * 10; // 6 fields × Np(order 2) = 60
 
@@ -2443,7 +2319,7 @@ mod tests {
         // Correctness still holds at this scale.
         let v: Vec<f64> =
             (0..n).map(|i| (0.3 + i as f64 * 0.013).sin()).collect();
-        let sp = csr.matvec(&v);
+        let sp = csr_matvec(&csr, &v);
         let mf = op.apply(&v);
         let err: f64 = sp
             .iter()
@@ -2462,7 +2338,7 @@ mod tests {
         // vertices in the affine-map order.
         use crate::mesh_gen::structured_box;
         let mesh = structured_box(2, 1, 1, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 3, 1.0);
+        let op = MaxwellOperator::new(&mesh, 3, 1.0, Default::default());
         let corners = op.corner_local_nodes();
         for i in 0..4 {
             for j in (i + 1)..4 {
@@ -2526,8 +2402,11 @@ mod tests {
         let run = |ports: &[PortSpec]| -> f64 {
             // Central flux, the all-PEC channel is then exactly
             // energy-conserving, so any drain is the port's doing.
-            let op = MaxwellOperator::new_with_materials_ports(
-                &mesh, 2, 0.0, &vacuum, ports,
+            let op = MaxwellOperator::new(
+                &mesh,
+                2,
+                0.0,
+                OperatorOptions { materials: &vacuum, ports, ..Default::default() },
             );
             let n = op.n_dof();
             // A smooth, z-only Eₓ bump, depends on z alone, so ∇·E = 0:
@@ -2590,8 +2469,15 @@ mod tests {
         let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
         // Central flux, the interior is energy-conserving, only the port
         // dissipates.
-        let op = MaxwellOperator::new_with_materials_ports(
-            &mesh, 2, 0.0, &vacuum, &[PortSpec { tris: port_tris, mode: None }],
+        let op = MaxwellOperator::new(
+            &mesh,
+            2,
+            0.0,
+            OperatorOptions {
+                materials: &vacuum,
+                ports: &[PortSpec { tris: port_tris, mode: None }],
+                ..Default::default()
+            },
         );
         let n = op.n_dof();
         let a = op.assemble_dense();
@@ -2663,15 +2549,17 @@ mod tests {
             a,
             b,
             mode: (1, 0),
-            z0: 1.0,
         };
         let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-        let op = MaxwellOperator::new_with_materials_ports(
+        let op = MaxwellOperator::new(
             &mesh,
             2,
             0.0,
-            &vacuum,
-            &[PortSpec { tris: port_tris, mode: Some(PortMode::Rect(rect)) }],
+            OperatorOptions {
+                materials: &vacuum,
+                ports: &[PortSpec { tris: port_tris, mode: Some(PortMode::Rect(rect)) }],
+                ..Default::default()
+            },
         );
         let n = op.n_dof();
         let b_spatial = op.port_source(0);
@@ -2760,18 +2648,20 @@ mod tests {
             a,
             b,
             mode: (1, 0),
-            z0: 1.0,
         };
         let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-        let op = MaxwellOperator::new_with_materials_ports(
+        let op = MaxwellOperator::new(
             &mesh,
             2,
             0.0,
-            &vacuum,
-            &[PortSpec {
-                tris: port_tris,
-                mode: Some(PortMode::Rect(rect.clone())),
-            }],
+            OperatorOptions {
+                materials: &vacuum,
+                ports: &[PortSpec {
+                    tris: port_tris,
+                    mode: Some(PortMode::Rect(rect.clone())),
+                }],
+                ..Default::default()
+            },
         );
         let n = op.n_dof();
         let b_spatial = op.port_source(0);
@@ -2847,16 +2737,13 @@ mod tests {
         // c, and the per-frequency forward/backward split A,B = (P_e±Z·P_h)/2
         // recovers an almost purely forward wave (|B/A| ≪ 1) before any
         // far-end reflection can return. This mirrors `port_injects_a_mode_at
-        // _the_group_velocity` / `port_extracts_the_incident_amplitude` and,
-        // for the dispersionless speed, `lumped_port_carries_a_dispersionless
-        // _tem_wave`.
+        // _the_group_velocity` / `port_extracts_the_incident_amplitude`.
         //
         // The coax TEM field `E ∝ ρ̂/ρ` is divergence-free in the transverse
         // plane, so it propagates as a free travelling wave at exactly c.
         // The four side walls are transparent characteristic boundaries
-        // (`mode = None` ports), exactly as in the lumped-TEM test, so no
-        // hollow-guide dispersion is imposed and the dispersionless TEM
-        // velocity is the genuine signal.
+        // (`mode = None` ports), so no hollow-guide dispersion is imposed and
+        // the dispersionless TEM velocity is the genuine signal.
         use crate::mesh_gen::structured_box;
         use crate::propagator::etd_step;
         use crate::waveguide::CoaxPort;
@@ -2900,22 +2787,25 @@ mod tests {
         // transparent absorbing ports (no mode): the far-end carries no
         // reflection, and the side walls let the coax field exist as a
         // dispersionless free wave rather than a hollow-guide mode.
-        let op = MaxwellOperator::new_with_materials_ports(
+        let op = MaxwellOperator::new(
             &mesh,
             2,
             0.0,
-            &vacuum,
-            &[
-                PortSpec {
-                    tris: z0_tris,
-                    mode: Some(PortMode::Coax(coax.clone())),
-                },
-                PortSpec { tris: zl_tris, mode: None },
-                PortSpec { tris: x_lo, mode: None },
-                PortSpec { tris: x_hi, mode: None },
-                PortSpec { tris: y_lo, mode: None },
-                PortSpec { tris: y_hi, mode: None },
-            ],
+            OperatorOptions {
+                materials: &vacuum,
+                ports: &[
+                    PortSpec {
+                        tris: z0_tris,
+                        mode: Some(PortMode::Coax(coax.clone())),
+                    },
+                    PortSpec { tris: zl_tris, mode: None },
+                    PortSpec { tris: x_lo, mode: None },
+                    PortSpec { tris: x_hi, mode: None },
+                    PortSpec { tris: y_lo, mode: None },
+                    PortSpec { tris: y_hi, mode: None },
+                ],
+                ..Default::default()
+            },
         );
         let n = op.n_dof();
         // The coax port has no cutoff, the TEM mode reaches DC.
@@ -3066,24 +2956,26 @@ mod tests {
             a,
             b,
             mode: (1, 0),
-            z0: 1.0,
         };
         let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-        let op = MaxwellOperator::new_with_materials_ports(
+        let op = MaxwellOperator::new(
             &mesh,
             2,
             0.0,
-            &vacuum,
-            &[
-                PortSpec {
-                    tris: on_plane(0.0),
-                    mode: Some(PortMode::Rect(rect(0.0, 1.0))),
-                },
-                PortSpec {
-                    tris: on_plane(lz),
-                    mode: Some(PortMode::Rect(rect(lz, -1.0))),
-                },
-            ],
+            OperatorOptions {
+                materials: &vacuum,
+                ports: &[
+                    PortSpec {
+                        tris: on_plane(0.0),
+                        mode: Some(PortMode::Rect(rect(0.0, 1.0))),
+                    },
+                    PortSpec {
+                        tris: on_plane(lz),
+                        mode: Some(PortMode::Rect(rect(lz, -1.0))),
+                    },
+                ],
+                ..Default::default()
+            },
         );
         let n = op.n_dof();
         let src0 = op.port_source(0);
@@ -3188,7 +3080,7 @@ mod tests {
         // block is empty.
         use crate::mesh_gen::structured_box;
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let np = 10; // order 2
         assert_eq!(op.n_dispersive(), 0);
         assert_eq!(op.n_dof(), 6 * np * mesh.n_tets());
@@ -3207,8 +3099,11 @@ mod tests {
             vec![ElemMaterial::isotropic(mat.eps_inf, 1.0, 0.0); n_elem];
         let disp: Vec<(usize, DebyeMaterial)> =
             (0..n_elem).map(|e| (e, mat)).collect();
-        let op = MaxwellOperator::new_with_materials_ports_dispersive(
-            &mesh, 2, 1.0, &mats, &[], &disp,
+        let op = MaxwellOperator::new(
+            &mesh,
+            2,
+            1.0,
+            OperatorOptions { materials: &mats, dispersive: &disp, ..Default::default() },
         );
         assert_eq!(op.n_dispersive(), n_elem);
         assert_eq!(
@@ -3238,8 +3133,11 @@ mod tests {
         // Make half the elements dispersive, exercise the mixed path.
         let disp: Vec<(usize, DebyeMaterial)> =
             (0..n_elem).step_by(2).map(|e| (e, mat)).collect();
-        let op = MaxwellOperator::new_with_materials_ports_dispersive(
-            &mesh, 2, 1.0, &mats, &[], &disp,
+        let op = MaxwellOperator::new(
+            &mesh,
+            2,
+            1.0,
+            OperatorOptions { materials: &mats, dispersive: &disp, ..Default::default() },
         );
         let n = op.n_dof();
         let csr = op.assemble_sparse();
@@ -3247,7 +3145,7 @@ mod tests {
 
         let v: Vec<f64> =
             (0..n).map(|i| (1.0 + i as f64 * 0.07).cos()).collect();
-        let sp = csr.matvec(&v);
+        let sp = csr_matvec(&csr, &v);
         let mf = op.apply(&v);
         let err: f64 = sp
             .iter()
@@ -3294,8 +3192,11 @@ mod tests {
             vec![ElemMaterial::isotropic(debye.eps_inf, 1.0, 0.0); n_elem];
         let disp: Vec<(usize, DebyeMaterial)> =
             (0..n_elem).map(|e| (e, debye)).collect();
-        let op = MaxwellOperator::new_with_materials_ports_dispersive(
-            &mesh, 2, 0.0, &mats, &[], &disp,
+        let op = MaxwellOperator::new(
+            &mesh,
+            2,
+            0.0,
+            OperatorOptions { materials: &mats, dispersive: &disp, ..Default::default() },
         );
 
         let csr = op.assemble_sparse();
@@ -3442,13 +3343,19 @@ mod tests {
         };
 
         // (a) periodic run, z + x + y all periodic.
-        let op_per = MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-            &mesh, 2, 0.0, &vacuum, &[], &[],
-            &[
-                PeriodicSpec { tris_a: x_lo.clone(), tris_b: x_hi.clone() },
-                PeriodicSpec { tris_a: y_lo.clone(), tris_b: y_hi.clone() },
-                PeriodicSpec { tris_a: z0_tris.clone(), tris_b: zl_tris.clone() },
-            ],
+        let op_per = MaxwellOperator::new(
+            &mesh,
+            2,
+            0.0,
+            OperatorOptions {
+                materials: &vacuum,
+                periodic: &[
+                    PeriodicSpec { tris_a: x_lo.clone(), tris_b: x_hi.clone() },
+                    PeriodicSpec { tris_a: y_lo.clone(), tris_b: y_hi.clone() },
+                    PeriodicSpec { tris_a: z0_tris.clone(), tris_b: zl_tris.clone() },
+                ],
+                ..Default::default()
+            },
         );
         let n = op_per.n_dof();
         let mut y_per = make_state(&op_per);
@@ -3494,12 +3401,18 @@ mod tests {
         // not contaminate the comparison), only the z-faces switched to
         // PEC. The packet bounces off the z = lz wall, and the forward
         // coherence drifts down as a backward wave builds up.
-        let op_pec = MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-            &mesh, 2, 0.0, &vacuum, &[], &[],
-            &[
-                PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
-                PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
-            ],
+        let op_pec = MaxwellOperator::new(
+            &mesh,
+            2,
+            0.0,
+            OperatorOptions {
+                materials: &vacuum,
+                periodic: &[
+                    PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
+                    PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
+                ],
+                ..Default::default()
+            },
         );
         let mut y_pec = make_state(&op_pec);
         for _ in 0..steps {
@@ -3596,13 +3509,17 @@ mod tests {
         // To isolate the z-face effect, build TWO operators on the *same*
         // mesh with identical side walls but different z-face treatment:
         // (a) periodic on z, (b) PEC on z. Compare additional drift.
-        let op_per = MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-            &mesh, 2, 0.0, &vacuum, &[], &[],
-            &[PeriodicSpec { tris_a: z0_tris, tris_b: zl_tris }],
+        let op_per = MaxwellOperator::new(
+            &mesh,
+            2,
+            0.0,
+            OperatorOptions {
+                materials: &vacuum,
+                periodic: &[PeriodicSpec { tris_a: z0_tris, tris_b: zl_tris }],
+                ..Default::default()
+            },
         );
-        let op_pec = MaxwellOperator::new_with_materials(
-            &mesh, 2, 0.0, &vacuum,
-        );
+        let op_pec = with_materials(&mesh, 2, 0.0, &vacuum);
 
         // Critically: we use a problem whose *side* walls are also
         // periodic, so the *only* boundaries are the z-faces. Build a
@@ -3625,23 +3542,35 @@ mod tests {
         let z_lo = on(&|p| p[2].abs() < 1e-9);
         let z_hi = on(&|p| (p[2] - lz).abs() < 1e-9);
         let op_all_per =
-            MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-                &mesh, 2, 0.0, &vacuum, &[], &[],
-                &[
-                    PeriodicSpec { tris_a: x_lo.clone(), tris_b: x_hi.clone() },
-                    PeriodicSpec { tris_a: y_lo.clone(), tris_b: y_hi.clone() },
-                    PeriodicSpec { tris_a: z_lo.clone(), tris_b: z_hi.clone() },
-                ],
+            MaxwellOperator::new(
+                &mesh,
+                2,
+                0.0,
+                OperatorOptions {
+                    materials: &vacuum,
+                    periodic: &[
+                        PeriodicSpec { tris_a: x_lo.clone(), tris_b: x_hi.clone() },
+                        PeriodicSpec { tris_a: y_lo.clone(), tris_b: y_hi.clone() },
+                        PeriodicSpec { tris_a: z_lo.clone(), tris_b: z_hi.clone() },
+                    ],
+                    ..Default::default()
+                },
             );
         // Reference: keep x/y periodic but leave z as PEC, only the
         // z-face treatment differs.
         let op_z_pec =
-            MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-                &mesh, 2, 0.0, &vacuum, &[], &[],
-                &[
-                    PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
-                    PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
-                ],
+            MaxwellOperator::new(
+                &mesh,
+                2,
+                0.0,
+                OperatorOptions {
+                    materials: &vacuum,
+                    periodic: &[
+                        PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
+                        PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
+                    ],
+                    ..Default::default()
+                },
             );
 
         let n = op_all_per.n_dof();
@@ -3752,7 +3681,6 @@ mod tests {
                     polarisation: pol,
                     scan_theta: 0.0,
                     scan_phi: 0.0,
-                    e_override: None,
                 })),
             };
             let port_rx = PortSpec {
@@ -3767,17 +3695,22 @@ mod tests {
                     polarisation: pol,
                     scan_theta: 0.0,
                     scan_phi: 0.0,
-                    e_override: None,
                 })),
             };
             let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
-            let op = MaxwellOperator::new_with_materials_ports_dispersive_periodic(
-                &mesh, 2, 1.0, &vacuum,
-                &[port_tx, port_rx], &[],
-                &[
-                    PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
-                    PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
-                ],
+            let op = MaxwellOperator::new(
+                &mesh,
+                2,
+                1.0,
+                OperatorOptions {
+                    materials: &vacuum,
+                    ports: &[port_tx, port_rx],
+                    periodic: &[
+                        PeriodicSpec { tris_a: x_lo, tris_b: x_hi },
+                        PeriodicSpec { tris_a: y_lo, tris_b: y_hi },
+                    ],
+                    ..Default::default()
+                },
             );
             let n = op.n_dof();
             // Floquet ports are non-dispersive plane waves, zero cutoff.

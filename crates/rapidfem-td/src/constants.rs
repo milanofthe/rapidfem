@@ -84,7 +84,6 @@ pub const ARNOLDI_MIN_CHUNK: usize = 256;
 /// deriving the chunk from `n` and the thread count fixes that.
 pub const ARNOLDI_TASKS_PER_THREAD: usize = 4;
 
-
 // ── Dense matrix exponential (scaling-and-squaring) ───────────────────────
 
 /// Scaling-and-squaring threshold: the matrix is halved until its
@@ -100,8 +99,8 @@ pub const EXPM_TAYLOR_TERMS: usize = 18;
 
 /// `a` coefficients of the Carpenter-Kennedy 5-stage 4th-order low-storage
 /// Runge-Kutta scheme (LSERK4). The explicit alternative to the Krylov
-/// exponential propagator: five matvecs per step, two state registers, and
-///, unlike the unconditionally stable exponential integrator, a CFL step
+/// exponential propagator: five matvecs per step, two state registers and,
+/// unlike the unconditionally stable exponential integrator, a CFL step
 /// limit set by the spectral radius of the operator. Standard nodal-DG
 /// integrator (Hesthaven & Warburton, *Nodal DG Methods*).
 pub const LSERK4_A: [Field; 5] = [

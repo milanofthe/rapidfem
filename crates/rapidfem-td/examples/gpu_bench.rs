@@ -27,6 +27,7 @@ use rapidfem_td::gpu::{GpuContext, GpuOperator};
 use rapidfem_td::mesh_gen::structured_box;
 use rapidfem_td::propagator::expmv;
 use rapidfem_td::rhs::MaxwellOperator;
+use rapidfem_td::session::Drive;
 
 const STEPS: usize = 100;
 const KRYLOV_DIM: usize = 40;
@@ -111,7 +112,7 @@ fn main() {
 
     for &(label, nx, ny, nz) in cases {
         let mesh = structured_box(nx, ny, nz, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, ORDER, 1.0);
+        let op = MaxwellOperator::new(&mesh, ORDER, 1.0, Default::default());
         let n = op.n_dof();
         let tets = n / 60;
         let y0: Vec<Field> =
@@ -121,9 +122,9 @@ fn main() {
         let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
 
         // GPU explicit LSERK4 transient.
-        gop.transient(&gpu, &y0_32, dt as f32, 3).unwrap();
+        gop.transient(&gpu, &y0_32, dt as f32, 3, 1, Drive::Free, &[], false).unwrap();
         let gpu_lserk = time_median(5, || {
-            gop.transient(&gpu, &y0_32, dt as f32, STEPS).unwrap();
+            gop.transient(&gpu, &y0_32, dt as f32, STEPS, 1, Drive::Free, &[], false).unwrap();
         });
         let gdof = n as f64 * STEPS as f64 / gpu_lserk / 1e9;
 
@@ -140,7 +141,7 @@ fn main() {
                 let mut y = y0.clone();
                 let mut ws = LserkWorkspace::new();
                 for _ in 0..STEPS {
-                    ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt);
+                    ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt, None);
                 }
             });
             let cpu_expmv = time_median(3, || {

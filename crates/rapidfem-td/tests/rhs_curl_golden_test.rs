@@ -52,7 +52,9 @@ fn rhs_curl_matches_exact_polynomial_curl() {
     let re = ReferenceElement::new(2);
     assert_eq!(re.n_nodes, 10, "Np for p=2");
     let gf = GeometricFactors::for_tet(&TET);
-    let got = element_curl(&re, &gf, &FIELD);
+    let n = re.n_nodes;
+    let (mut got, mut rd, mut pd) = (vec![0.0; 3 * n], vec![0.0; 3 * n], vec![0.0; 9 * n]);
+    element_curl(&re, &gf, &FIELD, &mut got, &mut rd, &mut pd);
     let err = max_rel_err(&got, &CURL);
     eprintln!("rhs curl: max rel err {:.2e}", err);
     assert!(err < 1e-9, "curl mismatch: {:.2e}", err);

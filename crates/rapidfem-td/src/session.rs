@@ -32,7 +32,7 @@ use crate::constants::{
     KCL_RTOL, KCL_SAFETY, KCL_SHRINK_LIMIT, KRYLOV_TOL, RESONANCE_MERGE_REL,
     RESONANCE_STATIC_FRACTION, RUN_LOG_LINES, TRANSFER_BAND_FRACTION,
 };
-use crate::explicit::LserkWorkspace;
+use crate::explicit::{LserkWorkspace, Source};
 use crate::explicit_adaptive::KclWorkspace;
 use crate::propagator::KrylovWorkspace;
 use crate::rhs::MaxwellOperator;
@@ -264,6 +264,25 @@ fn fill_source(drive: Drive, g: f64, src: &mut [f64]) {
     }
 }
 
+/// The Runge-Kutta stepper source `b·g(t)` of `drive`, `None` for a free
+/// run (the waveform is then not sampled). A vector drive is scaled into
+/// `src`.
+fn rk_source<'s>(
+    drive: Drive,
+    t: f64,
+    wave: &mut dyn FnMut(f64) -> Result<f64, String>,
+    src: &'s mut [f64],
+) -> Result<Option<Source<'s>>, String> {
+    Ok(match drive {
+        Drive::Free => None,
+        Drive::Point(dof) => Some(Source::Point { dof, value: wave(t)? }),
+        Drive::Vector(_) => {
+            fill_source(drive, wave(t)?, src);
+            Some(Source::Vector(src))
+        }
+    })
+}
+
 /// Frame recorder.
 struct Recorder<'a> {
     record: Record<'a>,
@@ -386,10 +405,6 @@ impl TdSession {
         &self.op
     }
 
-    pub fn c(&self) -> f64 {
-        self.c
-    }
-
     pub fn n_dof(&self) -> usize {
         self.op.n_dof()
     }
@@ -419,7 +434,7 @@ impl TdSession {
         self.check_len("y", y.len())?;
         let mut out = y.to_vec();
         let op = &self.op;
-        self.lserk.step_into(|x, ax| op.apply_into(x, ax), &mut out, self.c * h);
+        self.lserk.step_into(|x, ax| op.apply_into(x, ax), &mut out, self.c * h, None);
         Ok(out)
     }
 
@@ -429,7 +444,7 @@ impl TdSession {
         let mut out = y.to_vec();
         let mut err = vec![0.0; y.len()];
         let op = &self.op;
-        self.kcl.step_into(|x, ax| op.apply_into(x, ax), &mut out, &mut err, self.c * h);
+        self.kcl.step_into(|x, ax| op.apply_into(x, ax), &mut out, &mut err, self.c * h, None);
         Ok((out, err))
     }
 
@@ -464,7 +479,7 @@ impl TdSession {
             let h = z / rho;
             let mut y = probe.clone();
             for _ in 0..CFL_PROBE_STEPS {
-                lserk.step_into(|x, ax| op.apply_into(x, ax), &mut y, h);
+                lserk.step_into(|x, ax| op.apply_into(x, ax), &mut y, h, None);
             }
             if !y.iter().all(|x| x.is_finite()) {
                 return false;
@@ -666,18 +681,8 @@ impl TdSession {
                 for k in warmup..steps {
                     let t = k as f64 * dt;
                     for j in 0..explicit_nsub {
-                        let ts = t + j as f64 * h_sub;
-                        match drive {
-                            Drive::Free => self.lserk.step_into(|x, ax| op.apply_into(x, ax), &mut y, h_op),
-                            Drive::Point(d) => {
-                                let g = wave(ts)?;
-                                self.lserk.step_driven_into(|x, ax| op.apply_into(x, ax), &mut y, h_op, d, g)
-                            }
-                            Drive::Vector(_) => {
-                                fill_source(drive, wave(ts)?, &mut src);
-                                self.lserk.step_with_source_into(|x, ax| op.apply_into(x, ax), &mut y, h_op, &src)
-                            }
-                        }
+                        let source = rk_source(drive, t + j as f64 * h_sub, &mut wave, &mut src)?;
+                        self.lserk.step_into(|x, ax| op.apply_into(x, ax), &mut y, h_op, source);
                     }
                     rec.push(&y);
                     hook()?;
@@ -736,17 +741,8 @@ impl TdSession {
             let h_try = s.h.min(dt - t_rel);
             let h_op = self.c * h_try;
             y_try.copy_from_slice(y);
-            match drive {
-                Drive::Free => self.kcl.step_into(|x, ax| op.apply_into(x, ax), y_try, err, h_op),
-                Drive::Point(d) => {
-                    let g = wave(t0 + t_rel)?;
-                    self.kcl.step_driven_into(|x, ax| op.apply_into(x, ax), y_try, err, h_op, d, g)
-                }
-                Drive::Vector(_) => {
-                    fill_source(drive, wave(t0 + t_rel)?, src);
-                    self.kcl.step_with_source_into(|x, ax| op.apply_into(x, ax), y_try, err, h_op, src)
-                }
-            }
+            let source = rk_source(drive, t0 + t_rel, wave, src)?;
+            self.kcl.step_into(|x, ax| op.apply_into(x, ax), y_try, err, h_op, source);
             let e = ctl.err_norm(y, y_try, err);
             if e.is_finite() && e <= 1.0 {
                 std::mem::swap(y, y_try);
@@ -846,10 +842,6 @@ impl TdSession {
         let h = (self.c * dt) as f32;
         let h_sub = dt / nsub as f64;
         let chunk = ((steps - k0) / RUN_LOG_LINES).max(1);
-        let b32: Vec<f32> = match drive {
-            Drive::Vector(b) => b.iter().map(|&v| v as f32).collect(),
-            _ => Vec::new(),
-        };
         let mut done = k0;
         while done < steps {
             let kk = chunk.min(steps - done);
@@ -862,11 +854,7 @@ impl TdSession {
             }
             let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
             let b = self.gpu_backend()?;
-            let traj = match drive {
-                Drive::Free => b.op.transient_traj(&b.ctx, &y32, h, kk, nsub)?,
-                Drive::Point(d) => b.op.transient_driven_traj(&b.ctx, &y32, h, kk, nsub, d, &g)?,
-                Drive::Vector(_) => b.op.transient_driven_vec_traj(&b.ctx, &y32, h, kk, nsub, &b32, &g)?,
-            };
+            let traj = b.op.transient(&b.ctx, &y32, h, kk, nsub, drive, &g, true)?;
             for r in 1..=kk {
                 let row: Vec<f64> = traj[r * n..(r + 1) * n].iter().map(|&v| v as f64).collect();
                 rec.push(&row);
@@ -913,14 +901,7 @@ impl TdSession {
         }
         let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
         let b = self.gpu_backend()?;
-        let (traj, acc, rej, h_min, h_max) = match drive {
-            Drive::Free => b.op.transient_kcl_traj(&b.ctx, &y32, h, steps, ctl)?,
-            Drive::Point(d) => b.op.transient_kcl_traj_driven(&b.ctx, &y32, h, steps, d, &g, ctl)?,
-            Drive::Vector(v) => {
-                let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-                b.op.transient_kcl_traj_driven_vec(&b.ctx, &y32, h, steps, &v32, &g, ctl)?
-            }
-        };
+        let (traj, acc, rej, h_min, h_max) = b.op.transient_kcl(&b.ctx, &y32, h, steps, drive, &g, ctl)?;
         for r in 1..=steps {
             let row: Vec<f64> = traj[r * n..(r + 1) * n].iter().map(|&v| v as f64).collect();
             rec.push(&row);
@@ -1140,7 +1121,7 @@ mod tests {
 
     fn session() -> TdSession {
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        TdSession::new(MaxwellOperator::new(&mesh, 2, 1.0), 1.0)
+        TdSession::new(MaxwellOperator::new(&mesh, 2, 1.0, Default::default()), 1.0)
     }
 
     fn opts(method: Method) -> RunOptions {

@@ -15,7 +15,7 @@ pub type Region = Vec<Vec<Vec<P2>>>;
 
 /// Gds2palace / gdstk offset convention: a miter longer than this many
 /// offset distances is bevelled.
-const MITER_LIMIT: f64 = 2.0;
+pub const MITER_LIMIT: f64 = 2.0;
 
 fn overlay(a: &Region, b: &Region, rule: OverlayRule) -> Region {
     a.overlay(b, rule, FillRule::NonZero)

@@ -20,6 +20,7 @@ pub mod tet_assembly;
 pub mod tri_assembly;
 pub mod waveguide;
 pub mod sparam;
+pub mod network;
 pub mod interp;
 pub mod port;
 pub mod sibc_edge;

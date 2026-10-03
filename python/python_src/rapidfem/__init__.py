@@ -29,7 +29,7 @@ from rapidfem.physics import (
 )
 from rapidfem.problem import ProblemFD, ProblemTD, ErrorIndicator
 from rapidfem.excitation import GaussianPulse
-from rapidfem import io  # registers .to_network/.to_touchstone/.to_hdf5 on SweepResult
+from rapidfem import io  # registers .to_network/.to_hdf5 on SweepResult
 from rapidfem import rfic  # RFIC: process stacks, the GDS model builder, rapidpassives bridge
 from rapidfem import structures  # general RF structure builders (coax, microstrip, ...)
 from rapidfem.ui import capture as _show_capture

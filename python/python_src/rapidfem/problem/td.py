@@ -26,12 +26,6 @@ import sys
 import numpy as np
 
 from .._native import TdSession
-from ._model import build_model
-from ..excitation import GaussianPulse
-
-_FLUX = {"upwind": 1.0, "central": 0.0}
-_FIELD = {"E": 0, "H": 1}
-_COMP = {"x": 0, "y": 1, "z": 2}
 
 # Speed of light (m/s). The DG operator runs in normalised units (c = 1, time
 # measured in metres); `c` maps operator results to physical SI units,
@@ -105,12 +99,6 @@ class TdStepper:
 
     def __repr__(self):
         return f"TdStepper(dt={self.dt:g}, method={self.method!r})"
-
-
-def _probe_method(device):
-    """The integrator of a probe run: exponential on the CPU, the explicit
-    LSERK4 on the GPU (its fast path)."""
-    return "explicit" if device == "gpu" else "exponential"
 
 
 def _point_label(spec):
@@ -291,30 +279,14 @@ class ProblemTD:
             Speed of light in the mesh's length units (default SI, metres);
             sets the operator↔physical time/frequency mapping.
         """
-        if flux not in _FLUX:
-            raise ValueError(f"flux must be one of {sorted(_FLUX)}")
-        if getattr(geometry, "_last_mesh", None) is None:
+        if getattr(geometry, "_fem_mesh", None) is None:
             raise RuntimeError(
                 "geometry not meshed yet, call g.mesh() before "
                 "constructing a ProblemTD"
             )
         self.c = float(c)
-        model = build_model(geometry)
-        # Near-field-to-far-field is a frequency-domain post-process; the TD
-        # operator has no NFFT path, so a FarFieldSurface here is meshed and
-        # tagged but never consumed. Warn rather than mislead.
-        from ..physics import FarFieldSurface
-        if any(isinstance(p, FarFieldSurface)
-               for p in getattr(geometry, "_physics", [])):
-            import warnings
-            warnings.warn(
-                "FarFieldSurface is ignored by the time-domain backend "
-                "(near-field-to-far-field is frequency-domain only); it has "
-                "no effect on a ProblemTD analysis.",
-                stacklevel=2,
-            )
         self._op = TdSession.from_model(
-            geometry._fem_mesh, model, order, _FLUX[flux], self.c)
+            geometry._fem_mesh, geometry._native.model(), order, flux, self.c)
         self._geometry = geometry
         self.order = order
         self.flux = flux
@@ -334,13 +306,11 @@ class ProblemTD:
         c : float
             Speed of light in the box's length units (default 1, normalised).
         """
-        if flux not in _FLUX:
-            raise ValueError(f"flux must be one of {sorted(_FLUX)}")
         lx, ly, lz = size
         nx, ny, nz = cells
         obj = cls.__new__(cls)
         obj._op = TdSession.box_cavity(nx, ny, nz, lx, ly, lz, order,
-                                       _FLUX[flux], float(c))
+                                       flux, float(c))
         obj._geometry = None
         obj.order = order
         obj.flux = flux
@@ -467,9 +437,7 @@ class ProblemTD:
         See also :meth:`step_explicit` (the cheaper CFL-bound LSERK4) and
         :meth:`step_adaptive` (embedded KCL 4(3)5 with self-tuned step),
         plus :meth:`transient` for the high-level loop."""
-        if tol is None:
-            return self._op.step(_arr(y), float(h), int(krylov_dim))
-        return self._op.step(_arr(y), float(h), int(krylov_dim), float(tol))
+        return self._op.step(_arr(y), float(h), int(krylov_dim), tol)
 
     def step_explicit(self, y, h):
         """Advance the state by ``h`` with the explicit LSERK4 integrator
@@ -560,8 +528,7 @@ class ProblemTD:
         """Global DOF index for a field component at the node nearest
         ``point``, used to place soft sources and field probes."""
         return self._op.nearest_node_dof(
-            tuple(float(x) for x in point), _FIELD[field], _COMP[component]
-        )
+            tuple(float(x) for x in point), field, component)
 
     def _spec_dof(self, spec):
         """The DOF of a ``(point, field, component)`` spec."""
@@ -598,8 +565,7 @@ class ProblemTD:
             None, dt=float(dt), steps=int(steps),
             source_dof=self._spec_dof(source), waveform=waveform,
             probes=[self._spec_dof(p) for p in probes],
-            method=_probe_method(device), device=device,
-            krylov_dim=int(krylov_dim), verbose=verbose)
+            device=device, krylov_dim=int(krylov_dim), verbose=verbose)
         return TdResponse(
             np.arange(steps + 1) * dt, frames.T,
             source_label=_point_label(source),
@@ -649,8 +615,8 @@ class ProblemTD:
         """
         freqs, h = self._op.transfer_function(
             self._spec_dof(source), self._spec_dof(probe), pulse,
-            dt=float(dt), steps=int(steps), method=_probe_method(device),
-            device=device, krylov_dim=int(krylov_dim), verbose=verbose)
+            dt=float(dt), steps=int(steps), device=device,
+            krylov_dim=int(krylov_dim), verbose=verbose)
         return TdTransfer(
             freqs, h,
             source_label=_point_label(source),
@@ -658,43 +624,16 @@ class ProblemTD:
         )
 
     # -- turnkey: a transient run ------------------------------------------
-    def _modal_ports(self):
-        """The geometry's modal port physics objects in the operator's
-        declaration order: rect, coax, floquet, wave. Matches
-        :func:`rapidfem_td::build::operator_from_model` port layout, so the
-        k-th entry here is the k-th port for which
-        ``port_has_mode`` is true."""
-        from ..physics import (
-            CoaxPort, FloquetPort, RectWaveguidePort, WavePort,
-        )
-        if self._geometry is None:
-            return []
-        geom = self._geometry
-        phys = [
-            p for p in getattr(geom, "_physics", [])
-            if geom._physics_tags.get(id(p)) is not None
-        ]
-        rect = [p for p in phys if isinstance(p, RectWaveguidePort)]
-        coax = [p for p in phys if isinstance(p, CoaxPort)]
-        floq = [p for p in phys if isinstance(p, FloquetPort)]
-        wave = [p for p in phys if isinstance(p, WavePort)]
-        return rect + coax + floq + wave
-
-    def _port_operator_index(self, port):
-        """Operator port index of a modal port physics object, the index
-        the native port source and port signals take. Resolves the port's
-        position among the modal ports (declaration order) and maps it onto
-        the operator's modal subset, so absorbing-only ABC faces in between
-        are skipped."""
-        modal = self._modal_ports()
-        k = next((i for i, p in enumerate(modal) if p is port), None)
-        if k is None:
+    def _port_tag(self, port):
+        """The face tag of a modal port physics object attached to this
+        problem's geometry; the native operator addresses its ports by tag."""
+        if self._geometry is None or getattr(port, "_geometry", None) is not self._geometry:
             raise ValueError(
-                "port= is not a modal port of this problem's geometry; pass "
-                "a RectWaveguidePort / CoaxPort / FloquetPort / WavePort "
+                "port= is not a port of this problem's geometry; pass a "
+                "RectWaveguidePort / CoaxPort / FloquetPort / WavePort "
                 "instance attached to the meshed geometry"
             )
-        return self._op.modal_port(k)
+        return port._tag
 
     def port_signals(self, traj, ports, *, dt=None, labels=None):
         """Modal wave amplitude ``P_e(t)`` at each port over a trajectory,
@@ -718,9 +657,8 @@ class ProblemTD:
         if dt is None:
             dt = getattr(traj, "_dt", None) or 1.0
         traj = np.ascontiguousarray(traj, dtype=np.float64)
-        idxs = [self._port_operator_index(p) for p in ports]
-        rows = self._op.port_signals(traj, idxs)
-        labs = list(labels) if labels else [f"port {k}" for k in range(len(idxs))]
+        rows = self._op.port_signals(traj, [self._port_tag(p) for p in ports])
+        labs = list(labels) if labels else [f"port {k}" for k in range(len(ports))]
         return TdResponse(np.arange(traj.shape[0]) * dt, rows, probe_labels=labs)
 
     def transient(self, y0=None, *, dt, steps, source=None, waveform=None,
@@ -753,7 +691,9 @@ class ProblemTD:
             Routed across ``method`` × ``device`` like the rest, so the
             exponential/explicit and CPU/GPU paths all inject the same mode.
         waveform : callable, optional
-            Excitation ``g(t)``, e.g. a :class:`~rapidfem.GaussianPulse`.
+            Excitation ``g(t)``, e.g. a :class:`~rapidfem.GaussianPulse`,
+            which the run samples natively; any other callable is called
+            once per sample.
         method : {"exponential", "explicit", "adaptive"}
             Time integrator. ``"exponential"`` is exact at any ``dt``;
             ``"explicit"`` is the cheaper LSERK4 stepper, substepped to
@@ -790,19 +730,11 @@ class ProblemTD:
             :func:`rapidfem.show` plays it back as a 3-D field animation
             in the UI.
         """
-        source_dof = vector = None
-        if port is not None:
-            if source is not None:
-                raise ValueError(
-                    "pass either source= (point) or port= (modal port), "
-                    "not both"
-                )
-            vector = self._op.port_source(self._port_operator_index(port))
-        elif source is not None:
-            source_dof = self._spec_dof(source)
         frames, _ = self._op.transient(
             None if y0 is None else _arr(y0), dt=float(dt), steps=int(steps),
-            source_dof=source_dof, source=vector, waveform=waveform,
+            source_dof=None if source is None else self._spec_dof(source),
+            port=None if port is None else self._port_tag(port),
+            waveform=waveform,
             method=method, device=device, krylov_dim=int(krylov_dim),
             warmup=int(warmup), verbose=verbose)
         return TdTrajectory(frames, problem=self, dt=dt)
@@ -837,12 +769,8 @@ class ProblemTD:
             Path of the ``.pvd`` collection file.
         """
         states = np.ascontiguousarray(states, dtype=np.float64)
-        if states.ndim == 1:
-            states = states[None, :]
-        n_snap = states.shape[0]
-        if times is None:
-            times = np.arange(n_snap, dtype=float)
-        times = [float(t) for t in np.asarray(times, dtype=float).ravel()]
-        pvd = self._op.export_vtk(states, times, os.fspath(path))
-        _log(f"export_vtk - {n_snap} snapshot(s) -> {pvd}")
+        if times is not None:
+            times = np.asarray(times, dtype=float).ravel()
+        pvd = self._op.export_vtk(states, os.fspath(path), times)
+        _log(f"export_vtk - {states.size // self.n_dofs} snapshot(s) -> {pvd}")
         return pvd

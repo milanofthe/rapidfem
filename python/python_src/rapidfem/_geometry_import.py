@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import _native
-
 # metres per unit of the ``unit`` codes
 _UNITS = {"M": 1.0, "CM": 1e-2, "MM": 1e-3, "UM": 1e-6, "MICRON": 1e-6,
           "NM": 1e-9, "IN": 0.0254, "INCH": 0.0254, "MIL": 2.54e-5, "FT": 0.3048}
@@ -147,7 +145,7 @@ class _ImportMixin:
         else:
             ids, file_unit = [self._native.add_import(str(path), float(heal_angle), maxh)], 1.0
         factor = (file_unit if unit is None else _UNITS[unit.upper()]) * float(scale)
-        objs = [self._wrap(i, sheet=False, material=material, maxh=maxh) for i in ids]
+        objs = [self._wrap(i, material) for i in ids]
         for obj in objs:
             if factor != 1.0:
                 self.stretch(obj, factor, factor, factor)
@@ -161,16 +159,9 @@ class _ImportMixin:
 
     def _load_mesh(self, path: str) -> MeshScene:
         from .geometry import EntityCollection, _Entity
-        if self._scene is not None or self._objects:
-            raise RuntimeError("load(.msh): a loaded mesh is the whole geometry; "
-                               "load it into a fresh Geometry()")
-        self._scene = _native.MeshScene(path)
         groups, dims = {}, {}
-        for name, dim in self._scene.groups():
-            if name in groups:
-                continue
-            ent = _Entity(self, dim, group=name)
-            self._entities.append(ent)
-            groups[name] = EntityCollection(self, [ent])
-            dims[name] = dim
+        for name, dim in self._native.load_msh(path):
+            if name not in groups:
+                groups[name] = EntityCollection(self, [_Entity(self, dim, name)])
+                dims[name] = dim
         return MeshScene(self, groups, dims)

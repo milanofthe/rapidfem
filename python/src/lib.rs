@@ -12,11 +12,13 @@ mod model;
 mod td;
 
 use num_complex::Complex64;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3};
-use pyo3::exceptions::PyRuntimeError;
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray2, PyReadonlyArray3};
+use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rapidfem_fd::eigenmode::Eigenmode;
+use rapidfem_fd::error_estimator::ErrorEstimate;
 use rapidfem_fd::farfield::RadiationPattern;
+use rapidfem_fd::network::{renormalize, TouchstoneFormat};
 use rapidfem_fd::order::OrderPolicy;
 use rapidfem_fd::simulation::{FdSettings, Simulation, SweepResult};
 use geometry::{PyFemMesh, PyGeometry};
@@ -49,32 +51,100 @@ struct PyRadiationPattern {
     inner: RadiationPattern,
 }
 
+/// Per-tetrahedron residual error indicator of one ``(frequency, port)``
+/// solution, from :meth:`ProblemFD.element_errors`.
+///
+/// Holds the Monk-style a-posteriori eta values plus the Doerfler-marked
+/// subset an AMR loop would refine. Diagnostic: it does not re-mesh or
+/// re-solve; refine where it points with the static size controls
+/// (``maxh``, :meth:`Geometry.refine_near_points`).
+///
+/// Attributes
+/// ----------
+/// eta : np.ndarray
+///     per-tet error indicator, shape ``(n_tets,)``, float64
+/// total : float
+///     global L2 error ``sqrt(sum_K eta_K^2)``
+/// marked : np.ndarray
+///     int64 tet indices selected by Doerfler marking at ``theta``
+/// volume_residuals : np.ndarray
+///     volume-residual contribution per tet, shape ``(n_tets,)``
+/// face_jumps : np.ndarray
+///     face-jump contribution per tet (accumulated over its 4 faces)
+/// h_k : np.ndarray
+///     per-tet element diameter (max edge length) in m, useful for choosing
+///     a refinement target relative to the current local size
+/// tet_centroids : np.ndarray
+///     per-tet centroid coordinates, shape ``(n_tets, 3)``, m
+/// freq_hz : float
+///     frequency at which the indicator was computed
+/// theta : float
+///     Doerfler fraction used for marking
+#[pyclass(name = "ErrorIndicator", module = "rapidfem", frozen)]
+struct PyErrorIndicator {
+    est: ErrorEstimate,
+    /// `est.h_k` in metres.
+    h_k: Vec<f64>,
+    centroids: Vec<[f64; 3]>,
+    freq_hz: f64,
+    theta: f64,
+}
+
+/// The element order of a sweep: 1, 2 or "adaptive".
+#[derive(FromPyObject)]
+enum OrderArg {
+    Uniform(i64),
+    Named(String),
+}
+
+/// A reference impedance: one per port, or one for every port.
+#[derive(FromPyObject)]
+enum ZRef {
+    Each(Vec<f64>),
+    One(f64),
+}
+
+impl ZRef {
+    fn values(self) -> Vec<f64> {
+        match self {
+            ZRef::Each(z) => z,
+            ZRef::One(z) => vec![z],
+        }
+    }
+}
+
 #[pymethods]
 impl PySimulation {
     /// Build a simulation on a solver mesh (`Geometry.fem_mesh`) and a
     /// `Model`.
     ///
-    /// `order` is the uniform element order (1 or 2); `adaptive` selects the
-    /// wavelength order policy instead. `eigenmode` is `(target_hz, n_modes)`.
+    /// `order` is the uniform element order (1 or 2, default 2) or
+    /// "adaptive", the wavelength order policy. `eigenmode` is
+    /// `(target_hz, n_modes)`.
     #[new]
-    #[pyo3(signature = (mesh, model, frequencies, *, order=2, adaptive=false, eigenmode=None))]
+    #[pyo3(signature = (mesh, model, frequencies, *, order=None, eigenmode=None))]
     fn new(
         mesh: &PyFemMesh,
         model: &PyModel,
         frequencies: Vec<f64>,
-        order: u8,
-        adaptive: bool,
+        order: Option<OrderArg>,
         eigenmode: Option<(f64, usize)>,
     ) -> PyResult<Self> {
-        if !(1..=2).contains(&order) {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "order must be 1 or 2, got {order}"
-            )));
+        if frequencies.is_empty() {
+            return Err(PyValueError::new_err("sweep needs at least one frequency"));
         }
-        let order = if adaptive {
-            OrderPolicy::Adaptive { theta: rapidfem_fd::order::DEFAULT_THETA }
-        } else {
-            OrderPolicy::Uniform(order)
+        let order = match order {
+            None | Some(OrderArg::Uniform(2)) => OrderPolicy::Uniform(2),
+            Some(OrderArg::Uniform(1)) => OrderPolicy::Uniform(1),
+            Some(OrderArg::Named(name)) if name == "adaptive" => {
+                OrderPolicy::Adaptive { theta: rapidfem_fd::order::DEFAULT_THETA }
+            }
+            Some(OrderArg::Uniform(p)) => {
+                return Err(PyValueError::new_err(format!("order must be 1, 2 or 'adaptive', got {p}")));
+            }
+            Some(OrderArg::Named(name)) => {
+                return Err(PyValueError::new_err(format!("order must be 1, 2 or 'adaptive', got {name:?}")));
+            }
         };
         let settings = FdSettings { frequencies, order, eigenmode };
         let inner = Simulation::new(mesh.inner.clone(), model.inner.clone(), settings)
@@ -152,29 +222,6 @@ impl PySimulation {
     /// Number of degrees of freedom in the FEM basis.
     #[getter]
     fn n_dofs(&self) -> usize { self.inner.basis.n_field }
-
-    /// Number of driven ports (i.e., ports with excitation: rect waveguide, lumped, coax, ...).
-    #[getter]
-    fn n_driven_ports(&self) -> usize {
-        self.inner.ports.iter().filter(|p| p.is_driven()).count()
-    }
-
-    /// Modal characteristic impedance (Ω) of the `driven_idx`-th DRIVEN port at
-    /// `freq_hz`. The index matches the S-matrix column order (driven ports
-    /// only). Modal ports (waveguide / wave) return their frequency-dependent
-    /// modal impedance; lumped ports return their fixed reference z0. Used by
-    /// Python to renormalize the modal-referenced S-parameters to a fixed
-    /// reference impedance. Returns 0.0 if the index is out of range.
-    fn port_z_mode(&self, driven_idx: usize, freq_hz: f64) -> f64 {
-        let exc = rapidfem_fd::excitation::Excitation::new(freq_hz, self.inner.mesh.l0);
-        self.inner
-            .ports
-            .iter()
-            .filter(|p| p.is_driven())
-            .nth(driven_idx)
-            .map(|p| p.z_mode(&exc))
-            .unwrap_or(0.0)
-    }
 
     /// Run an eigenmode analysis. Requires the simulation to be built with `eigenmode=`.
     /// Returns a list of `Eigenmode` (frequency, Q, field).
@@ -276,41 +323,36 @@ impl PySimulation {
         Some(per_node(self.inner.eigenmode_field_at_nodes(&mode.inner)?, py))
     }
 
-    /// Monk-style residual error indicator η per tetrahedron at
-    /// ``(freq_idx, port_idx)``. Returns a dict ``{eta, total, marked,
-    /// volume_residuals, face_jumps}`` with ``eta`` shape ``(n_tets,)``
-    /// float64, ``marked`` an int64 array of Dörfler-selected tet
-    /// indices at fraction ``theta``. Diagnostic only, does not
-    /// re-mesh.
+    /// Monk-style residual error indicator per tetrahedron at
+    /// ``(freq_idx, port_idx)``, Doerfler-marked at fraction ``theta``, as
+    /// an :class:`ErrorIndicator`. Raises ``IndexError`` without a solution
+    /// at those indices. Diagnostic only, does not re-mesh.
     #[pyo3(signature = (result, freq_idx=0, port_idx=0, theta=0.5))]
-    fn element_errors<'py>(
+    fn element_errors(
         &self,
-        py: Python<'py>,
         result: &PySweepResult,
         freq_idx: usize,
         port_idx: usize,
         theta: f64,
-    ) -> Option<Bound<'py, pyo3::types::PyDict>> {
-        let est = self.inner.element_errors_at(&result.inner, freq_idx, port_idx, theta)?;
-        let dict = pyo3::types::PyDict::new(py);
-        let eta = est.element_errors.clone().into_pyarray(py);
-        let volr = est.volume_residuals.clone().into_pyarray(py);
-        let fj = est.face_jumps.clone().into_pyarray(py);
+    ) -> PyResult<PyErrorIndicator> {
+        let est = self
+            .inner
+            .element_errors_at(&result.inner, freq_idx, port_idx, theta)
+            .ok_or_else(|| {
+                PyIndexError::new_err(format!("no solution for (freq_idx={freq_idx}, port_idx={port_idx})"))
+            })?;
         // h_k lives in mesh-internal units (l0-normalised); every other
         // length crossing this boundary (mesh_nodes, refine_near_points)
         // is in meters, so convert here.
         let l0 = self.inner.mesh.l0;
-        let h_k: Vec<f64> = est.h_k.iter().map(|&h| h * l0).collect();
-        let h_k = h_k.into_pyarray(py);
-        let marked: Vec<i64> = est.marked_elements.iter().map(|&i| i as i64).collect();
-        let marked_arr = marked.into_pyarray(py);
-        dict.set_item("eta", eta).ok()?;
-        dict.set_item("volume_residuals", volr).ok()?;
-        dict.set_item("face_jumps", fj).ok()?;
-        dict.set_item("h_k", h_k).ok()?;
-        dict.set_item("total", est.total_error).ok()?;
-        dict.set_item("marked", marked_arr).ok()?;
-        Some(dict)
+        let h_k = est.h_k.iter().map(|&h| h * l0).collect();
+        Ok(PyErrorIndicator {
+            est,
+            h_k,
+            centroids: self.inner.tet_centroids(),
+            freq_hz: result.inner.frequencies[freq_idx],
+            theta,
+        })
     }
 
     /// Compute the far-field radiation pattern at (freq_idx, port_idx) on a (theta, phi) grid.
@@ -342,12 +384,40 @@ impl PySweepResult {
     /// Indexing: `S[freq_idx, observation_port, excitation_port]`.
     #[getter]
     fn sparams<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<Complex64>> {
-        let n_freq = self.inner.frequencies.len();
-        let n = self.inner.n_driven;
-        let flat: Vec<Complex64> = self.inner.sparams.iter().flatten().flatten().copied().collect();
-        let arr = numpy::ndarray::Array3::from_shape_vec((n_freq, n, n), flat)
-            .expect("shape matches data");
-        arr.into_pyarray(py)
+        grid3(&self.inner.sparams, self.inner.n_driven, py)
+    }
+
+    /// Reference impedance (ohm) of each driven port per frequency, shape
+    /// `[n_freq, n_driven]`: the mode impedance of a modal port (waveguide /
+    /// wave), the fixed `z0` of a lumped one. `sparams` are referenced to
+    /// these; `renormalize` re-references them.
+    #[getter]
+    fn port_impedances<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        grid2(&self.inner.port_impedances, py)
+    }
+
+    /// The S-parameters renormalized from `port_impedances` to the fixed
+    /// reference `z_ref` (one impedance, or one per driven port), shape
+    /// `[n_freq, n_driven, n_driven]`. A matched modal line reads |S11| ~ 0
+    /// against its own mode impedance; against e.g. 50 ohm its mismatch
+    /// appears. Lumped ports already at `z_ref` are a no-op.
+    #[pyo3(signature = (z_ref=None))]
+    fn renormalize<'py>(&self, py: Python<'py>, z_ref: Option<ZRef>) -> PyResult<Bound<'py, PyArray3<Complex64>>> {
+        let z = z_ref.map_or_else(|| vec![50.0], ZRef::values);
+        let s = self.inner.renormalized(&z).map_err(PyValueError::new_err)?;
+        Ok(grid3(&s, self.inner.n_driven, py))
+    }
+
+    /// Writes the S-parameters to a Touchstone 1.0 file (.s1p, .s2p,
+    /// .snp) at `path`, the option line carrying reference `z0`, in format
+    /// `fmt`: "ri" (real / imaginary), "ma" (magnitude / degrees) or "db"
+    /// (dB / degrees). The values are written as solved, each port
+    /// referenced to its `port_impedances`.
+    #[pyo3(signature = (path, z0=50.0, fmt="ri"))]
+    fn to_touchstone(&self, path: std::path::PathBuf, z0: f64, fmt: &str) -> PyResult<()> {
+        let format: TouchstoneFormat = fmt.parse().map_err(PyValueError::new_err)?;
+        self.inner.write_touchstone(&path, z0, format)?;
+        Ok(())
     }
 
     /// Number of driven ports (S-matrix dimension).
@@ -357,6 +427,70 @@ impl PySweepResult {
     /// Total wall-clock for the sweep in seconds.
     #[getter]
     fn solve_time_s(&self) -> f64 { self.inner.solve_time_s }
+}
+
+#[pymethods]
+impl PyErrorIndicator {
+    /// Per-tet error indicator eta, shape `(n_tets,)`.
+    #[getter]
+    fn eta<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.est.element_errors.clone().into_pyarray(py)
+    }
+
+    /// Global L2 error `sqrt(sum eta^2)`.
+    #[getter]
+    fn total(&self) -> f64 { self.est.total_error }
+
+    /// Doerfler-marked tet indices (int64).
+    #[getter]
+    fn marked<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i64>> {
+        let marked: Vec<i64> = self.est.marked_elements.iter().map(|&i| i as i64).collect();
+        marked.into_pyarray(py)
+    }
+
+    /// Volume-residual contribution per tet.
+    #[getter]
+    fn volume_residuals<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.est.volume_residuals.clone().into_pyarray(py)
+    }
+
+    /// Face-jump contribution per tet.
+    #[getter]
+    fn face_jumps<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.est.face_jumps.clone().into_pyarray(py)
+    }
+
+    /// Per-tet element diameter (max edge length) in m.
+    #[getter]
+    fn h_k<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.h_k.clone().into_pyarray(py)
+    }
+
+    /// Per-tet centroid, shape `(n_tets, 3)`, in m.
+    #[getter]
+    fn tet_centroids<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let flat: Vec<f64> = self.centroids.iter().flatten().copied().collect();
+        numpy::ndarray::Array2::from_shape_vec((self.centroids.len(), 3), flat).expect("shape").into_pyarray(py)
+    }
+
+    /// Frequency of the indicated solution (Hz).
+    #[getter]
+    fn freq_hz(&self) -> f64 { self.freq_hz }
+
+    /// Doerfler fraction used for marking.
+    #[getter]
+    fn theta(&self) -> f64 { self.theta }
+
+    fn __repr__(&self) -> String {
+        let n = self.est.element_errors.len();
+        let m = self.est.marked_elements.len();
+        format!(
+            "ErrorIndicator(n_tets={n}, total={:.4e}, marked={m} ({:.1}%), freq={:.3} GHz)",
+            self.est.total_error,
+            100.0 * m as f64 / n.max(1) as f64,
+            self.freq_hz / 1e9
+        )
+    }
 }
 
 #[pymethods]
@@ -460,10 +594,38 @@ fn grid2<'py, T: numpy::Element + Copy>(grid: &[Vec<T>], py: Python<'py>) -> Bou
     numpy::ndarray::Array2::from_shape_vec((grid.len(), n_cols), flat).expect("shape").into_pyarray(py)
 }
 
+/// `[freq][n][n]` S-matrices as an `(n_freq, n, n)` array.
+fn grid3<'py>(s: &[Vec<Vec<Complex64>>], n: usize, py: Python<'py>) -> Bound<'py, PyArray3<Complex64>> {
+    let flat: Vec<Complex64> = s.iter().flatten().flatten().copied().collect();
+    numpy::ndarray::Array3::from_shape_vec((s.len(), n, n), flat).expect("square matrices").into_pyarray(py)
+}
+
 /// A flat `[x, y, z]`-per-node vector as an `(n_nodes, 3)` array.
 fn per_node<'py>(flat: Vec<Complex64>, py: Python<'py>) -> Bound<'py, PyArray2<Complex64>> {
     let n = flat.len() / 3;
     numpy::ndarray::Array2::from_shape_vec((n, 3), flat).expect("shape").into_pyarray(py)
+}
+
+/// Renormalize S-parameters `sparams` `(n_freq, n, n)`, referenced to the
+/// per-frequency, per-port impedances `z_old` `(n_freq, n)`, to `z_new`
+/// (one impedance, or one per port). See `SweepResult.renormalize`.
+#[pyfunction]
+fn renormalize_sparams<'py>(
+    py: Python<'py>,
+    sparams: PyReadonlyArray3<'py, Complex64>,
+    z_old: PyReadonlyArray2<'py, f64>,
+    z_new: ZRef,
+) -> PyResult<Bound<'py, PyArray3<Complex64>>> {
+    let s = sparams.as_array();
+    let (n_freq, n, m) = s.dim();
+    if n != m {
+        return Err(PyValueError::new_err(format!("sparams must be (n_freq, n, n), got ({n_freq}, {n}, {m})")));
+    }
+    let s: Vec<Vec<Vec<Complex64>>> =
+        (0..n_freq).map(|f| (0..n).map(|i| (0..n).map(|j| s[[f, i, j]]).collect()).collect()).collect();
+    let z_old: Vec<Vec<f64>> = z_old.as_array().outer_iter().map(|row| row.to_vec()).collect();
+    let out = renormalize(&s, &z_old, &z_new.values()).map_err(PyValueError::new_err)?;
+    Ok(grid3(&out, n, py))
 }
 
 /// rapidfem, frequency- and time-domain EM FEM solver.
@@ -473,11 +635,14 @@ fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyModel>()?;
     m.add_class::<PyGeometry>()?;
     m.add_class::<PyFemMesh>()?;
-    m.add_class::<geometry::PyMeshScene>()?;
+    m.add_class::<geometry::PyMeshStats>()?;
     m.add_class::<PySimulation>()?;
     m.add_class::<PySweepResult>()?;
     m.add_class::<PyEigenmode>()?;
     m.add_class::<PyRadiationPattern>()?;
+    m.add_class::<PyErrorIndicator>()?;
     m.add_class::<td::PyTdSession>()?;
+    m.add_class::<td::PyGaussianPulse>()?;
+    m.add_function(wrap_pyfunction!(renormalize_sparams, m)?)?;
     Ok(())
 }

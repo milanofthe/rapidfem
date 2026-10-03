@@ -123,7 +123,7 @@ def _entity_resolution(g, ent):
             key = "port" if cls in _PORT_CLASSES else cls.lower()
             key_count[key] = key_count.get(key, 0) + 1
             for pe in getattr(phys, "_entities", ()):
-                if id(pe) == id(ent):
+                if pe == ent:
                     return f"{key}_{key_count[key]}", _physics_color(phys)
         if ent.name:
             return ent.name, _color_from_name(ent.name)
@@ -134,7 +134,7 @@ def _entity_resolution(g, ent):
         if mat is not None:
             cls = type(mat).__name__.lower()
             order: list[int] = []
-            for e in getattr(g, "_entities", []):
+            for e in g.objects:
                 m = e.material
                 if m is not None and type(m).__name__.lower() == cls and id(m) not in order:
                     order.append(id(m))
@@ -201,7 +201,7 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
     entities: list[dict] = []
     empty = {"kind": "geometry", "bbox": dict(_DEFAULT_BBOX), "entities": entities,
              "stats": {"n_entities": 0, "n_triangles": 0, "maxh": 0.0}}
-    if getattr(g, "_scene", None) is not None:
+    if g._native.mesh_mode:
         return empty  # a loaded mesh shows once g.mesh() bakes it
     native = g._native
     try:
@@ -233,23 +233,23 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
                 "material": material,
             })
 
-    all_ents = [e for e in getattr(g, "_entities", []) if e.group is None]
-    for ent in all_ents:
+    objects = [o._entity for o in g.objects]
+    for ent in objects + [e for p in g._physics for e in p._entities]:
         if ent.dim != 2:
             continue
         label, color = _entity_resolution(g, ent)
         if label is None:
             continue  # untracked, a volume claims it next
-        emit(label, ent.origin[0], 2, color, native.face_ids([ent.origin]),
+        emit(label, ent.key[0], 2, color, native.face_ids([ent.key]),
              _material_label(ent.material))
     # later volumes first: an inner body added after its surrounding
     # volume takes the interface between them
-    for ent in reversed(all_ents):
+    for ent in reversed(objects):
         if ent.dim != 3:
             continue
         label, color = _entity_resolution(g, ent)
-        emit(label or ent.name or f"_volume_{ent.obj}", ent.obj, 3, color,
-             native.face_ids(native.faces_of(ent.obj)), _material_label(ent.material))
+        emit(label or ent.name or f"_volume_{ent.key}", ent.key, 3, color,
+             native.face_ids(native.faces_of(ent.key)), _material_label(ent.material))
     for fid in sorted(faces):
         emit(f"_face_{fid}", fid, 2, _COL_NEUTRAL, [fid], None)
 
@@ -282,11 +282,9 @@ def mesh_to_payload(g: Any, *, maxh: float) -> dict:
     t_mesh = time.perf_counter() - t0
     nodes, tris, tri_tags, tets, tet_tags = g._fem_mesh.viewer()
 
-    names = dict(getattr(g, "_group_names", {}))
-    face_groups, volume_groups = g._last_groups or ([], [])
-    phys_dim = {int(t): 2 for t, _ in face_groups}
-    phys_dim.update({int(t): 3 for t, _ in volume_groups})
-    phys_names = {t: names.get(t, f"group_{t}") for t in phys_dim}
+    groups = g._native.group_names()
+    phys_dim = {t: dim for t, _, dim in groups}
+    phys_names = {t: name for t, name, _ in groups}
     xyz = [nodes[k::3] for k in range(3)]
     bbox = ([min(c) for c in xyz] + [max(c) for c in xyz]) if nodes else []
     return {

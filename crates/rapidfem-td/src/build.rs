@@ -12,14 +12,17 @@
 //!   equivalent of the frequency-domain coordinate stretch, see
 //!   `absorber_rate`);
 //! - ports in the order rectangular, coax, Floquet, numerical wave, then the
-//!   absorbing (ABC) faces, so the modal-port indices stay contiguous;
+//!   absorbing (ABC) faces, so the modal-port indices stay contiguous; the
+//!   face tag of every port comes back with the operator, so a caller
+//!   addresses a port by its tag;
 //! - PEC faces (boundary PEC is the default anyway, internal plates are
 //!   retagged) and periodic pairs.
 //!
 //! Lumped ports have no time-domain counterpart (a uniform delta-gap only
 //! carries a clean mode on a genuine parallel-plate gap) and are rejected.
-//! Surface impedances, lumped elements, PMC and user-defined ports are
-//! frequency-domain only; they are skipped with a warning.
+//! Surface impedances, lumped elements, PMC, user-defined ports and the
+//! far-field surface are frequency-domain only; they are skipped with a
+//! warning.
 
 use crate::dispersive::DebyeMaterial;
 use crate::rhs::{
@@ -66,14 +69,15 @@ fn absorber_rate(
 
 /// Build the operator of `model` on `mesh`: DG order `order`, flux blend
 /// `flux_alpha` (1 upwind, 0 central), `c` the speed of light in the mesh's
-/// length unit (the operator runs with time in length units).
+/// length unit (the operator runs with time in length units). Returns the
+/// operator and the face tag of each of its ports, in operator port order.
 pub fn operator_from_model(
     mesh: &Mesh,
     model: &Model,
     order: usize,
     flux_alpha: f64,
     c: f64,
-) -> Result<MaxwellOperator, String> {
+) -> Result<(MaxwellOperator, Vec<i32>), String> {
     let tets_of = |tag: i32| mesh.vtag_to_tet.get(&tag).map(|v| v.as_slice()).unwrap_or(&[]);
 
     // Materials, then the dispersive tets at ε∞.
@@ -122,6 +126,7 @@ pub fn operator_from_model(
     // Ports, grouped by kind in the order the port indices assume.
     let missing = |what: &str, tag: i32| format!("{what} face tag {tag} has no triangles");
     let mut port_specs: Vec<PortSpec> = Vec::new();
+    let mut port_tags: Vec<i32> = Vec::new();
     for f in &model.faces {
         if let FaceSpec::Rectangular { tag, mode, .. } = f {
             if *mode == [0, 0] {
@@ -133,6 +138,7 @@ pub fn operator_from_model(
             let spec = PortSpec::from_mesh_tag(mesh, *tag, (mode[0], mode[1]))
                 .ok_or_else(|| missing("rectangular port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -140,6 +146,7 @@ pub fn operator_from_model(
             let spec = PortSpec::coax_from_mesh_tag(mesh, *tag, *origin)
                 .ok_or_else(|| missing("coax port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -158,6 +165,7 @@ pub fn operator_from_model(
             )
             .ok_or_else(|| missing("floquet port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     // Numerical wave ports read the per-tet ε and mark every node on a PEC
@@ -189,6 +197,7 @@ pub fn operator_from_model(
                 )
             })?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -197,6 +206,7 @@ pub fn operator_from_model(
                 let spec = PortSpec::absorbing_from_mesh_tag(mesh, *tag)
                     .ok_or_else(|| missing("ABC", *tag))?;
                 port_specs.push(spec);
+                port_tags.push(*tag);
             }
             FaceSpec::Lumped { .. } => {
                 return Err("LumpedPort is not supported by the time-domain backend. Use a \
@@ -215,6 +225,12 @@ pub fn operator_from_model(
             _ => {}
         }
     }
+    if let Some(tag) = model.far_field_tag {
+        eprintln!(
+            "  TD: far-field surface tag {tag} ignored, the near-to-far-field transform is \
+             frequency-domain only"
+        );
+    }
 
     let mut periodic_specs = Vec::new();
     for &(a, b) in &model.periodic {
@@ -227,7 +243,7 @@ pub fn operator_from_model(
         pec_specs.push(PecSpec::from_mesh_tag(mesh, tag).ok_or_else(|| missing("PEC", tag))?);
     }
 
-    Ok(MaxwellOperator::new(
+    let op = MaxwellOperator::new(
         mesh,
         order,
         flux_alpha,
@@ -238,7 +254,8 @@ pub fn operator_from_model(
             periodic: &periodic_specs,
             pec_plates: &pec_specs,
         },
-    ))
+    );
+    Ok((op, port_tags))
 }
 
 #[cfg(test)]

@@ -105,6 +105,12 @@ fn loops_of(sheet: &Sheet, transforms: &[Transform]) -> Result<Loops, String> {
     })
 }
 
+/// The outer vertex loop of `sheet` in 3D, `transforms` applied: the profile
+/// a loft or a revolution sweeps (a disc as a [`DISC_SEGMENTS`]-gon).
+pub(crate) fn outline(sheet: &Sheet, transforms: &[Transform]) -> Result<Vec<P3>, String> {
+    Ok(loops_of(sheet, transforms)?.outer)
+}
+
 /// The plane of an outline: a point on it and its unit normal (Newell).
 fn plane_of(outline: &[P3]) -> Result<(P3, P3), String> {
     let mut n = [0.0; 3];

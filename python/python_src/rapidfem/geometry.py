@@ -4,20 +4,22 @@
 """Geometry builder on the native rapidmesh scene.
 
 The scene lives in Rust (``rapidfem._native.Geometry``): a list of solids and
-sheets, realised into rapidmesh whenever a selection or a mesh needs it.
-Solids overlap by priority, a solid added later carves its region out of the
-earlier ones, and the mesh is always conformal, so there is no separate
-boolean fragment step. Faces are named by their origin ``(object, role)``,
-the role of the surface in its primitive (a box: -z, +z, -y, +y, -x, +x;
--1 for a sheet), which survives later changes of the scene.
+sheets, realised into rapidmesh whenever a selection or a mesh needs it, and
+the materials and physics placed on them. Solids overlap by priority, a
+solid added later carves its region out of the earlier ones, and the mesh is
+always conformal, so there is no separate boolean fragment step. Faces are
+named by their origin ``(object, role)``, the role of the surface in its
+primitive (a box: -z, +z, -y, +y, -x, +x; -1 for a sheet), which survives
+later changes of the scene.
 
 This module is the Python face of that scene: :class:`Geometry`,
-:class:`GeoObject` and the selectable :class:`EntityCollection`.
+:class:`GeoObject` and the selectable :class:`EntityCollection`, handles on
+the native state.
 """
 from __future__ import annotations
 
 import math
-from typing import Callable, Iterable
+from typing import Callable
 
 import numpy as np
 
@@ -27,83 +29,78 @@ from ._geometry_gds import _GdsMixin
 from ._geometry_import import _ImportMixin
 from ._geometry_primitives import _PrimitivesMixin
 
-# Two face centroids closer than this (relative to the model size) count as
-# the same position for min / max selection.
-_COG_TOL_REL = 1e-9
-# A face whose bounding box is thinner than this (relative) along an axis is
-# planar in that axis for the hull selectors.
-_HULL_TOL_REL = 1e-9
+MeshStats = _native.MeshStats
 
 
 class _Entity:
-    """A selectable piece of the scene: a solid object (``dim == 3``) or a
-    face, named by its selection ``(object, role, side, across)``
-    (``dim == 2``; role -1 is a sheet; ``side`` is the solid the face was
-    selected through, -1 for none, and ``across`` what lies on the other
-    side, an object, -2 for outside or -1 for anything: a face split by a
-    later solid keeps its origin on every piece, these two single the pieces
-    out).
+    """A selectable piece of the scene, a handle on its native state:
+
+    - a solid (``dim == 3``), ``key`` its object id;
+    - a face (``dim == 2``), ``key`` its selection ``(object, role, side,
+      across)``: role -1 is a sheet, ``side`` the solid the face was selected
+      through (-1 for none) and ``across`` what lies on the other side (an
+      object, -2 for outside, -1 for anything); a face split by a later solid
+      keeps its origin on every piece, these two single the pieces out;
+    - an edge of a solid (``dim == 1``), ``key`` ``(object, (role_a, role_b))``;
+    - a named group of a loaded mesh, ``key`` its name.
 
     ``material``, ``name`` and ``maxh`` are the attributes the physics and
-    mesh layers read; geometric properties (``cog``, ``bbox``) are looked up
-    on the realised scene when asked for.
+    mesh layers read; they and the geometric properties (``cog``, ``bbox``,
+    ``area``) live on the native side.
     """
 
-    def __init__(self, geometry: "Geometry", dim: int, *, obj: int | None = None,
-                 origin: tuple[int, int, int, int] | None = None,
-                 group: str | None = None):
+    __slots__ = ("_geometry", "dim", "key")
+
+    def __init__(self, geometry: "Geometry", dim: int, key):
         self._geometry = geometry
         self.dim = dim
-        self.obj = obj
-        self.origin = origin
-        # a named group of a loaded mesh (mesh mode)
-        self.group = group
-        self._material = None
-        self.name: str | None = None
-        self.maxh: float | None = None
+        self.key = key
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, _Entity) and other._geometry is self._geometry
+                and other.key == self.key)
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
+    def __repr__(self) -> str:
+        return f"_Entity({self.key!r})"
 
     @property
     def material(self):
-        return self._material
+        return self._geometry._native.material(self.key)
 
     @material.setter
     def material(self, value) -> None:
-        if value is not None and not isinstance(value, Material):
-            raise TypeError(f"material must be a rapidfem Material (rf.Air(), "
-                            f"rf.Dielectric(...), ...), got {type(value).__name__}")
-        self._material = value
-
-    def __repr__(self) -> str:
-        if self.group is not None:
-            what = f"group {self.group!r}"
-        else:
-            what = f"object {self.obj}" if self.dim == 3 else f"face {self.origin}"
-        return f"_Entity({what})"
+        self._geometry._set_material([self], value)
 
     @property
-    def _key(self):
-        """What the native groups take: the group name of a loaded mesh,
-        else the object (solid) or face selection."""
-        if self.group is not None:
-            return self.group
-        return self.obj if self.dim == 3 else self.origin
+    def name(self) -> str | None:
+        return self._geometry._native.name(self.key)
 
-    def _info(self):
-        if self.group is not None:
-            b = tuple(self._geometry._scene.bbox(self.group))
-            c = tuple((np.array(b[:3]) + np.array(b[3:])) / 2)
-            return (c, (0.0,) * 3, 0.0, [], b)
-        if self.dim == 3:
-            return self._geometry._object_info(self.obj)
-        return self._geometry._face_info([self.origin])[0]
+    @name.setter
+    def name(self, value: str | None) -> None:
+        self._geometry._native.set_name(self.key, value)
+
+    @property
+    def maxh(self) -> float | None:
+        return self._geometry._native.maxh(self.key)
+
+    @maxh.setter
+    def maxh(self, value: float | None) -> None:
+        self._geometry._native.set_maxh([self.key], value)
 
     @property
     def cog(self) -> tuple[float, float, float]:
-        return tuple(self._info()[0])
+        return tuple(self._geometry._native.extents([self.key])[0][0])
+
+    @property
+    def area(self) -> float:
+        return self._geometry._native.extents([self.key])[0][1]
 
     @property
     def bbox(self) -> tuple[float, ...]:
-        return tuple(self._info()[4])
+        return tuple(self._geometry._native.extents([self.key])[0][2])
 
 
 class EntityCollection:
@@ -138,18 +135,11 @@ class EntityCollection:
     def __repr__(self) -> str:
         return f"EntityCollection({len(self._entities)} entities)"
 
-    def _infos(self):
-        return [e._info() for e in self._entities]
+    def _keys(self) -> list:
+        return [e.key for e in self._entities]
 
-    def _extreme(self, axis: str, pick) -> "EntityCollection":
-        if not self._entities:
-            return EntityCollection(self._geometry, [])
-        ax = {"x": 0, "y": 1, "z": 2}[axis.lower()]
-        cogs = [info[0][ax] for info in self._infos()]
-        m = pick(cogs)
-        tol = _COG_TOL_REL * self._geometry._size()
-        kept = [e for e, c in zip(self._entities, cogs) if abs(c - m) <= tol]
-        return EntityCollection(self._geometry, kept)
+    def _pick(self, positions) -> "EntityCollection":
+        return EntityCollection(self._geometry, [self._entities[i] for i in positions])
 
     def min(self, axis: str = "z") -> "EntityCollection":
         """keep only entities whose centroid is at the minimum along ``axis``
@@ -177,7 +167,7 @@ class EntityCollection:
         EntityCollection
             subset of this collection at the min coordinate
         """
-        return self._extreme(axis, min)
+        return self._pick(self._geometry._native.select_extreme(self._keys(), axis, False))
 
     def max(self, axis: str = "z") -> "EntityCollection":
         """keep only entities whose centroid is at the maximum along ``axis``
@@ -195,7 +185,7 @@ class EntityCollection:
         EntityCollection
             subset of this collection at the max coordinate
         """
-        return self._extreme(axis, max)
+        return self._pick(self._geometry._native.select_extreme(self._keys(), axis, True))
 
     def where(self, predicate: Callable[[tuple, tuple], bool]) -> "EntityCollection":
         """filter entities by a user-supplied predicate on centroid + bbox
@@ -226,9 +216,9 @@ class EntityCollection:
         EntityCollection
             entities for which the predicate returned True
         """
-        kept = [e for e, info in zip(self._entities, self._infos())
-                if predicate(tuple(info[0]), tuple(info[4]))]
-        return EntityCollection(self._geometry, kept)
+        extents = self._geometry._native.extents(self._keys())
+        return self._pick([i for i, (c, _, b) in enumerate(extents)
+                           if predicate(tuple(c), tuple(b))])
 
     @property
     def name(self) -> str | None:
@@ -247,9 +237,7 @@ class EntityCollection:
 
     @maxh.setter
     def maxh(self, value: float) -> None:
-        for e in self._entities:
-            e.maxh = value
-        self._geometry._apply_maxh(self._entities, value)
+        self._geometry._native.set_maxh(self._keys(), value)
 
     @property
     def material(self):
@@ -265,9 +253,7 @@ class EntityCollection:
 
     @material.setter
     def material(self, value) -> None:
-        for e in self._entities:
-            e.material = value
-            self._geometry._sync_maxh(e)
+        self._geometry._set_material(self._entities, value)
 
     @property
     def unassigned(self) -> "EntityCollection":
@@ -293,13 +279,7 @@ class EntityCollection:
         EntityCollection
             entities not yet referenced by any physics object
         """
-        targeted = set()
-        for phys in self._geometry._physics:
-            for ent in getattr(phys, "_entities", ()):
-                targeted.add(ent.origin if ent.dim == 2 else ("obj", ent.obj))
-        kept = [e for e in self._entities
-                if (e.origin if e.dim == 2 else ("obj", e.obj)) not in targeted]
-        return EntityCollection(self._geometry, kept)
+        return self._pick(self._geometry._native.select_unassigned(self._keys()))
 
     @property
     def outer(self) -> "EntityCollection":
@@ -322,7 +302,7 @@ class EntityCollection:
         EntityCollection
             entities on the model bounding box
         """
-        return self._on_box(self._geometry._model_bbox())
+        return self._pick(self._geometry._native.select_on_box(self._keys(), False))
 
     @property
     def hull(self) -> "EntityCollection":
@@ -337,7 +317,7 @@ class EntityCollection:
         is itself wrapped by something else. ``air.faces.outer`` returns
         nothing once ``air`` is surrounded by PML on every side (none of
         air's faces touch the *model* bbox any more, they are all interior
-        air↔PML interfaces); ``air.faces.hull`` returns those six interface
+        air/PML interfaces); ``air.faces.hull`` returns those six interface
         faces, the natural near-field-to-far-field (Huygens) surface.
 
 
@@ -355,48 +335,11 @@ class EntityCollection:
         EntityCollection
             entities on this collection's bounding box
         """
-        infos = self._infos()
-        if not infos:
-            return EntityCollection(self._geometry, [])
-        b = np.array([info[4] for info in infos])
-        box = (*b[:, :3].min(axis=0), *b[:, 3:].max(axis=0))
-        return self._on_box(box)
-
-    def _on_box(self, box) -> "EntityCollection":
-        xmin, ymin, zmin, xmax, ymax, zmax = box
-        tol = _HULL_TOL_REL * self._geometry._size()
-        kept = []
-        for e, info in zip(self._entities, self._infos()):
-            ex0, ey0, ez0, ex1, ey1, ez1 = info[4]
-            on_box = (
-                (abs(ex1 - ex0) < tol and (abs(ex0 - xmin) < tol or abs(ex0 - xmax) < tol))
-                or (abs(ey1 - ey0) < tol and (abs(ey0 - ymin) < tol or abs(ey0 - ymax) < tol))
-                or (abs(ez1 - ez0) < tol and (abs(ez0 - zmin) < tol or abs(ez0 - zmax) < tol))
-            )
-            if on_box:
-                kept.append(e)
-        return EntityCollection(self._geometry, kept)
+        return self._pick(self._geometry._native.select_on_box(self._keys(), True))
 
 
-# Back-compat aliases (and clearer naming for users)
 FaceCollection = EntityCollection
 EdgeCollection = EntityCollection
-
-
-class _Edge:
-    """An edge of a solid object, named by the roles of its two faces."""
-
-    def __init__(self, geometry: "Geometry", obj: int, roles: tuple[int, int],
-                 midpoint):
-        self._geometry = geometry
-        self.dim = 1
-        self.obj = obj
-        self.roles = roles
-        self.midpoint = tuple(midpoint)
-
-    def _info(self):
-        m = self.midpoint
-        return (m, (0.0, 0.0, 0.0), 0.0, [], (*m, *m))
 
 
 class GeoObject:
@@ -408,33 +351,46 @@ class GeoObject:
     are read by the mesh and physics layers.
     """
 
-    def __init__(self, geometry: "Geometry", entity: _Entity):
+    def __init__(self, geometry: "Geometry", obj_id: int):
         self._geometry = geometry
-        self._entity = entity
+        self._id = obj_id
+
+    def __eq__(self, other) -> bool:
+        return (isinstance(other, GeoObject) and other._geometry is self._geometry
+                and other._id == self._id)
+
+    def __hash__(self) -> int:
+        return hash(self._id)
 
     def __repr__(self) -> str:
         kind = "sheet" if self.dim == 2 else "solid"
         return f"GeoObject({kind} {self._id})"
 
     @property
-    def _id(self) -> int:
-        e = self._entity
-        return e.obj if e.dim == 3 else e.origin[0]
+    def dim(self) -> int:
+        return 2 if self._geometry._native.is_sheet(self._id) else 3
+
+    @property
+    def _entity(self) -> _Entity:
+        """The object as a handle: a sheet is a face, a solid an object."""
+        if self.dim == 2:
+            return _Entity(self._geometry, 2, (self._id, -1, -1, -1))
+        return _Entity(self._geometry, 3, self._id)
 
     @property
     def faces(self) -> EntityCollection:
         g = self._geometry
         if self.dim == 2:
             return EntityCollection(g, [self._entity])
-        return EntityCollection(g, [g._face(o) for o in g._native.faces_of(self._id)])
+        return EntityCollection(g, [g._face(k) for k in g._native.faces_of(self._id)])
 
     @property
     def edges(self) -> EntityCollection:
         g = self._geometry
         if self.dim == 2:
             return EntityCollection(g, [])
-        return EntityCollection(
-            g, [_Edge(g, self._id, roles, mid) for roles, mid in g._native.edges_of(self._id)])
+        return EntityCollection(g, [_Entity(g, 1, (self._id, roles))
+                                    for roles, _ in g._native.edges_of(self._id)])
 
     @property
     def name(self) -> str | None:
@@ -451,7 +407,6 @@ class GeoObject:
     @material.setter
     def material(self, value) -> None:
         self._entity.material = value
-        self._geometry._sync_maxh(self._entity)
 
     @property
     def maxh(self) -> float | None:
@@ -460,40 +415,6 @@ class GeoObject:
     @maxh.setter
     def maxh(self, value: float) -> None:
         self._entity.maxh = value
-        self._geometry._apply_maxh([self._entity], value)
-
-    @property
-    def dim(self) -> int:
-        return self._entity.dim
-
-
-class MeshStats:
-    """Size and quality report of the last generated mesh.
-
-    Stored on ``geometry.mesh_stats`` by :meth:`Geometry.mesh`. The DOF
-    numbers bound the FD solver's Nédélec space: ``dofs_min`` is the
-    uniform order-1 count (one DOF per edge), ``dofs_max`` the uniform
-    order-2 count (two per edge plus two per triangular face), the
-    default of :meth:`ProblemFD.sweep`; ``order="adaptive"`` lands in
-    between. The bounds gate RAM and runtime before any assembly.
-    ``quality_min`` is the smallest dihedral angle in degrees (the sliver
-    indicator that governs the conditioning), ``n_slivers`` the number of
-    tets below the sliver threshold.
-    """
-    n_nodes: int
-    n_tets: int
-    n_tris: int           # unique tet faces, interior + boundary
-    n_edges: int          # unique tet edges
-    dofs_min: int         # uniform order 1: n_edges
-    dofs_max: int         # uniform order 2: 2*n_edges + 2*n_tris
-    quality_min: float    # smallest dihedral angle, degrees
-    n_slivers: int
-    groups: dict          # group name -> element count
-
-    def __repr__(self) -> str:
-        return (f"MeshStats({self.n_nodes} nodes, {self.n_tets} tets, "
-                f"{self.n_edges} edges, dofs {self.dofs_min}..{self.dofs_max}, "
-                f"min dihedral {self.quality_min:.1f} deg, {self.n_slivers} slivers)")
 
 
 class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
@@ -539,121 +460,35 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
     def __init__(self, *, maxh: float | None = None, grading: bool = True,
                  name: str = "rapidfem"):
-        self._native = _native.Geometry(maxh)
-        self._maxh = maxh
-        self._grading = bool(grading)
+        self._native = _native.Geometry(maxh, grading=bool(grading))
         self.name = name
-        self._objects: list[GeoObject] = []
-        self._entities: list[_Entity] = []
-        self._faces: dict[tuple[int, int], _Entity] = {}
+        # the physics objects, in the order (and by the index) the native
+        # setup holds them
         self._physics: list = []
-        self._material_tags: dict[int, int] = {}
-        self._physics_tags: dict = {}
         self._fem_mesh = None
-        self._last_mesh = None
-        self._last_groups = None
-        # The native MeshScene when a .msh file was loaded (mesh mode).
-        self._scene = None
-        # Mesh options a builder (rfic.build) sets for the geometries it makes.
-        self._mesh_defaults: dict = {}
         self.mesh_stats: MeshStats | None = None
 
-    # ── scene bookkeeping ───────────────────────────────────────────────────
+    @property
+    def objects(self) -> list[GeoObject]:
+        """every object of the scene, in the order they were added"""
+        return [GeoObject(self, i) for i in self._native.objects()]
 
-    def _wrap(self, obj_id: int, *, sheet: bool, material=None,
-              maxh: float | None = None) -> GeoObject:
-        self._require_geometry_mode()
-        ent = _Entity(self, 2 if sheet else 3, obj=None if sheet else obj_id,
-                      origin=(obj_id, -1, -1, -1) if sheet else None)
-        ent.material = material
-        ent.maxh = maxh
-        self._sync_maxh(ent)
-        if sheet:
-            self._faces[(obj_id, -1, -1, -1)] = ent
-        obj = GeoObject(self, ent)
-        self._objects.append(obj)
-        self._entities.append(ent)
+    def _wrap(self, obj_id: int, material=None) -> GeoObject:
+        obj = GeoObject(self, obj_id)
+        if material is not None:
+            obj.material = material
         return obj
 
-    def _require_geometry_mode(self) -> None:
-        if self._scene is not None:
-            raise RuntimeError(
-                "the geometry is in mesh mode (a .msh file was loaded): it takes "
-                "materials and physics on the file's groups, not new objects")
+    def _face(self, key) -> _Entity:
+        return _Entity(self, 2, tuple(key))
 
-    def _sync_maxh(self, ent: _Entity) -> None:
-        """A solid's mesh size: its own ``maxh``, else its material's."""
-        if ent.dim != 3 or ent.group is not None:
-            return
-        h = ent.maxh if ent.maxh is not None else getattr(ent.material, "maxh", None)
-        self._native.set_object_maxh(ent.obj, h)
+    def _set_material(self, entities, value) -> None:
+        if value is not None and not isinstance(value, Material):
+            raise TypeError(f"material must be a rapidfem Material (rf.Air(), "
+                            f"rf.Dielectric(...), ...), got {type(value).__name__}")
+        self._native.set_material([e.key for e in entities], value)
 
-    def _face(self, origin) -> _Entity:
-        """The face entity of an origin, one per origin (so attributes set
-        on it persist)."""
-        origin = tuple(int(v) for v in origin)
-        ent = self._faces.get(origin)
-        if ent is None:
-            ent = _Entity(self, 2, origin=origin)
-            self._faces[origin] = ent
-            self._entities.append(ent)
-        return ent
-
-    def _face_info(self, origins):
-        return self._native.face_info([tuple(o) for o in origins])
-
-    def _object_info(self, obj_id: int):
-        """(centroid, 0, 0, [], bbox) of a solid from its bounding faces."""
-        infos = self._face_info(self._native.faces_of(obj_id))
-        if not infos:
-            return ((0.0,) * 3, (0.0,) * 3, 0.0, [], (0.0,) * 6)
-        b = np.array([i[4] for i in infos])
-        box = (*b[:, :3].min(axis=0), *b[:, 3:].max(axis=0))
-        c = tuple((np.array(box[:3]) + np.array(box[3:])) / 2)
-        return (c, (0.0,) * 3, 0.0, [], box)
-
-    def _model_bbox(self):
-        infos = self._face_info(self._native.all_faces())
-        if not infos:
-            return (0.0,) * 6
-        b = np.array([i[4] for i in infos])
-        return (*b[:, :3].min(axis=0), *b[:, 3:].max(axis=0))
-
-    def _size(self) -> float:
-        b = self._model_bbox()
-        return max(b[3] - b[0], b[4] - b[1], b[5] - b[2], 1e-300)
-
-    def _apply_maxh(self, entities, h: float) -> None:
-        entities = [e for e in entities if e.group is None]  # a loaded mesh is not remeshed
-        faces = [e.origin for e in entities if e.dim == 2]
-        for e in entities:
-            if e.dim == 3:
-                self._native.set_object_maxh(e.obj, h)
-            elif e.origin[1] < 0:
-                self._native.set_object_maxh(e.origin[0], h)
-        if faces:
-            self._native.set_face_maxh([f for f in faces if f[1] >= 0], h)
-
-    def _sheet_boolean(self, op: str, target: GeoObject, tools) -> None:
-        """The sheet ``target`` combined with the sheets ``tools`` in their
-        common plane; the tools are used up."""
-        if any(t.dim != 2 for t in tools):
-            raise ValueError(f"{op}: a sheet combines with sheets only")
-        self._native.sheet_boolean(op, target._id, [t._id for t in tools])
-        # the outline kept for loft / revolve no longer describes the sheet
-        getattr(self, "_profiles", {}).pop(target._id, None)
-        for t in tools:
-            getattr(self, "_profiles", {}).pop(t._id, None)
-
-    def _solid_ids(self, objs) -> list[int]:
-        ids = []
-        for o in objs:
-            if o.dim != 3:
-                raise ValueError(f"{o!r} is not a solid")
-            ids.append(o._id)
-        return ids
-
-    # ── solids from faces ───────────────────────────────────────────────────
+    # -- solids from faces ----------------------------------------------------
 
     def extrude(self, face: GeoObject, height: float,
                 axis: tuple[float, float, float] = (0, 0, 1),
@@ -662,14 +497,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
                 maxh: float | None = None) -> GeoObject:
         """extrude a 2-D face along ``axis * height`` into a 3-D volume
 
-        The source ``face`` becomes the bottom cap of the new volume
-        and remains tracked in the entity registry (so names and per-
-        entity mesh sizes set on it survive).
+        The source ``face`` becomes the bottom cap of the new volume, which
+        keeps the object's identity (so names and mesh sizes set on it
+        survive).
 
 
         Example
         -------
-        A 35 µm copper trace from a polygon footprint:
+        A 35 um copper trace from a polygon footprint:
 
         .. code-block:: python
 
@@ -697,22 +532,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             new volume
         """
-        ax = np.asarray(axis, dtype=float)
-        n = np.linalg.norm(ax)
-        if n == 0:
-            raise ValueError("extrude: axis must be a nonzero vector")
-        oid = face._id
-        try:
-            self._native.extrude(oid, [float(c) for c in ax * (float(height) / n)])
-        except ValueError as e:
-            raise ValueError(f"extrude: {e}") from None
-        ent = face._entity
-        self._faces.pop((oid, -1, -1, -1), None)
-        ent.dim, ent.obj, ent.origin = 3, oid, None
-        ent.material = material
-        if maxh is not None:
-            ent.maxh = maxh
-        self._sync_maxh(ent)
+        self._native.extrude(face._id, height, axis, maxh)
+        if material is not None:
+            face.material = material
         return face
 
     def loft(self, face_a: GeoObject, face_b: GeoObject,
@@ -762,13 +584,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             new volume
         """
-        pa, pb = self._outline(face_a), self._outline(face_b)
-        if len(pa) != len(pb):
-            raise ValueError("loft: both profiles need the same vertex count")
-        oid = self._native.add_loft([list(p) for p in pa], [list(p) for p in pb], maxh)
-        for f in (face_a, face_b):
-            self._native.remove(f._id)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(self._native.loft(face_a._id, face_b._id, maxh), material)
 
     def revolve(self, face: GeoObject,
                 axis_point: tuple[float, float, float] = (0, 0, 0),
@@ -781,7 +597,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
         For a full :math:`2\\pi` sweep the profile typically touches
         the axis to close the body; partial sweeps produce a wedge-shaped
-        volume.
+        volume. The profile sheet is consumed.
 
 
         Example
@@ -814,28 +630,10 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             new volume
         """
-        p0 = np.asarray(axis_point, dtype=float)
-        a = np.asarray(axis_dir, dtype=float)
-        a = a / np.linalg.norm(a)
-        rz = []
-        for p in self._outline(face):
-            d = np.asarray(p, dtype=float) - p0
-            z = float(d @ a)
-            r = float(np.linalg.norm(d - z * a))
-            rz.append([r, z])
-        oid = self._native.add_revolve(rz, list(p0), list(a), math.degrees(angle), maxh)
-        self._native.remove(face._id)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        oid = self._native.revolve(face._id, axis_point, axis_dir, angle, maxh)
+        return self._wrap(oid, material)
 
-    def _outline(self, face: GeoObject) -> list[tuple[float, float, float]]:
-        """The 3-D vertex loop of a planar profile made by :meth:`polygon`,
-        :meth:`plate` or a ``*_plate``."""
-        pts = self._profiles.get(face._id) if hasattr(self, "_profiles") else None
-        if pts is None:
-            raise ValueError(f"{face!r} is not a polygon or plate profile")
-        return pts
-
-    # ── booleans ────────────────────────────────────────────────────────────
+    # -- booleans -------------------------------------------------------------
 
     def fragment(self, target: GeoObject, *tools: GeoObject) -> None:
         """make ``target`` and ``tools`` conformal, the tools on top
@@ -855,9 +653,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to put on top, in order
         """
-        ids = [t._id for t in tools if t.dim == 3]
-        if ids:
-            self._native.bring_to_front(ids)
+        self._native.bring_to_front([t._id for t in tools])
 
     def cut(self, target: GeoObject, *tools: GeoObject) -> None:
         """subtract ``tools``, leaving holes
@@ -879,13 +675,14 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to subtract
         """
+        ids = [t._id for t in tools]
         if target.dim == 2:
-            self._sheet_boolean("difference", target, tools)
-            return
-        self._native.make_void(self._solid_ids(tools))
+            self._native.sheet_boolean("difference", target._id, ids)
+        else:
+            self._native.make_void(ids)
 
     def fuse(self, target: GeoObject, *tools: GeoObject) -> None:
-        """boolean union ``target ∪ tools``
+        """boolean union ``target`` and ``tools``
 
         Merges the operands into a single connected body assigned back
         to ``target``. Sheets must lie in one plane; their union may fall
@@ -909,23 +706,19 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             operands to merge in
         """
+        ids = [t._id for t in tools]
         if target.dim == 2:
-            self._sheet_boolean("union", target, tools)
-            return
-        self._native.fuse(self._solid_ids((target, *tools)))
+            self._native.sheet_boolean("union", target._id, ids)
+        else:
+            self._native.fuse([target._id, *ids])
 
     def intersect(self, target: GeoObject, *tools: GeoObject) -> None:
-        """boolean intersect ``target ∩ tools``
+        """boolean intersect ``target`` with ``tools``
 
         Carves the intersection of ``target`` with every member of
         ``tools`` and assigns it back to ``target``. The tools are
-        consumed by the operation. Sheets intersect in their common plane.
-
-
-        Note
-        ----
-        Tools are **consumed** by ``intersect``, do not reference
-        them after the call.
+        consumed by the operation (and lose their material). Sheets
+        intersect in their common plane.
 
 
         Example
@@ -944,23 +737,13 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         *tools : GeoObject
             objects to intersect with (consumed)
         """
+        ids = [t._id for t in tools]
         if target.dim == 2:
-            self._sheet_boolean("intersection", target, tools)
-            return
-        ids = self._solid_ids((target, *tools))
-        self._native.intersect(ids[0], ids[1:])
-        for tool in tools:
-            tool._entity.material = None
+            self._native.sheet_boolean("intersection", target._id, ids)
+        else:
+            self._native.intersect(target._id, ids)
 
-    # ── transforms ──────────────────────────────────────────────────────────
-
-    def _move_profile(self, obj: GeoObject, f) -> None:
-        """Moves the vertex loop kept for a planar profile (see
-        :meth:`_outline`) with its sheet."""
-        pts = getattr(self, "_profiles", {}).get(obj._id)
-        if pts is not None:
-            self._profiles[obj._id] = [tuple(float(v) for v in f(np.asarray(p, dtype=float)))
-                                       for p in pts]
+    # -- transforms -----------------------------------------------------------
 
     def translate(self, obj: GeoObject,
                   dx: float = 0.0, dy: float = 0.0, dz: float = 0.0) -> None:
@@ -988,9 +771,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         dx, dy, dz : float
             translation along each axis in metres (default 0 = no move)
         """
-        d = np.array([dx, dy, dz], dtype=float)
-        self._native.translate(obj._id, list(d))
-        self._move_profile(obj, lambda p: p + d)
+        self._native.translate(obj._id, [dx, dy, dz])
 
     def rotate(self, obj: GeoObject, angle: float,
                axis: tuple[float, float, float] = (0, 0, 1),
@@ -1004,7 +785,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
         Example
         -------
-        Rotate a horn 30° around y:
+        Rotate a horn 30 degrees around y:
 
         .. code-block:: python
 
@@ -1022,16 +803,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             a point on the rotation axis (defaults to origin)
         """
-        a = np.asarray(axis, dtype=float)
-        a = a / np.linalg.norm(a)
-        c = np.asarray(center, dtype=float)
-        self._native.rotate(obj._id, float(angle), list(a), list(c))
-        cos, sin = math.cos(angle), math.sin(angle)
-
-        def turn(p):
-            v = p - c
-            return c + v * cos + np.cross(a, v) * sin + a * (a @ v) * (1 - cos)
-        self._move_profile(obj, turn)
+        self._native.rotate(obj._id, angle, axis, center)
 
     def stretch(self, obj: GeoObject,
                 fx: float = 1.0, fy: float = 1.0, fz: float = 1.0,
@@ -1060,10 +832,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         center : tuple[float, float, float]
             scaling centre (defaults to origin)
         """
-        f = np.array([fx, fy, fz], dtype=float)
-        c = np.asarray(center, dtype=float)
-        self._native.stretch(obj._id, list(f), list(c))
-        self._move_profile(obj, lambda p: c + f * (p - c))
+        self._native.stretch(obj._id, [fx, fy, fz], center)
 
     def mirror(self, obj: GeoObject,
                normal: tuple[float, float, float] = (1, 0, 0),
@@ -1103,11 +872,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         point : tuple[float, float, float]
             a point the plane passes through (defaults to origin)
         """
-        n = np.asarray(normal, dtype=float)
-        n = n / np.linalg.norm(n)
-        q = np.asarray(point, dtype=float)
-        self._native.mirror(obj._id, list(n), list(q))
-        self._move_profile(obj, lambda p: p - 2.0 * ((p - q) @ n) * n)
+        self._native.mirror(obj._id, normal, point)
 
     def copy(self, obj: GeoObject, *, material=None,
              maxh: float | None = None) -> GeoObject:
@@ -1150,13 +915,10 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         GeoObject
             the new, independent duplicate
         """
-        src = obj._entity
-        oid = self._native.copy(obj._id)
-        if getattr(self, "_profiles", {}).get(obj._id) is not None:
-            self._profiles[oid] = list(self._profiles[obj._id])
-        return self._wrap(oid, sheet=obj.dim == 2,
-                          material=src.material if material is None else material,
-                          maxh=src.maxh if maxh is None else maxh)
+        new = self._wrap(self._native.copy(obj._id), material)
+        if maxh is not None:
+            new.maxh = maxh
+        return new
 
     def array(self, obj: GeoObject, count: int, *,
               spacing: tuple[float, float, float] | None = None,
@@ -1225,7 +987,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
             out.append(c)
         return out
 
-    # ── edge features ───────────────────────────────────────────────────────
+    # -- edge features --------------------------------------------------------
 
     def fillet(self, obj: GeoObject, radius: float,
                edges: "EntityCollection | None" = None) -> GeoObject:
@@ -1324,9 +1086,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         if edges is not None:
             picks = []
             for e in edges:
-                if not isinstance(e, _Edge) or e.obj != obj._id:
+                if getattr(e, "dim", None) != 1 or e.key[0] != obj._id:
                     raise ValueError(f"{e!r} is not an edge of {obj!r}")
-                picks.append(tuple(e.roles))
+                picks.append(e.key[1])
         self._native.cut_edges(obj._id, float(size), fillet, picks)
 
     def _hollow(self, name: str) -> list[tuple["EntityCollection", float]]:
@@ -1337,22 +1099,13 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         ``w t / (w + t)``: the thickness at which a two-sided surface
         impedance on every wall reproduces the DC resistance ``1/(sigma w t)``).
         """
-        ids = [o._id for o in self._objects if o.dim == 3 and o.name == name]
-        if not ids:
+        walls = self._native.hollow(name)
+        if walls is None:
             return []
-        self._native.make_void(ids)
-        walls = sorted({tuple(f) for i in ids for f in self._native.faces_of(i)})
-        infos = self._face_info(walls)
-        area = sum(info[2] for info in infos)
-        # Volume from the shapes themselves: walls shared with another void
-        # (a contact) are not in the model, so the walls do not close.
-        volume = sum(self._native.volume(i) for i in ids)
-        if volume <= 0.0 or area <= 0.0:
-            raise ValueError(f"_hollow: {name!r} encloses no volume")
-        faces = EntityCollection(self, [self._face(f) for f in walls])
-        return [(faces, 2.0 * volume / area)]
+        keys, thickness = walls
+        return [(EntityCollection(self, [self._face(k) for k in keys]), thickness)]
 
-    # ── sizing ──────────────────────────────────────────────────────────────
+    # -- sizing ---------------------------------------------------------------
 
     def auto_refine_features(
         self,
@@ -1413,32 +1166,10 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         -------
         dict[str, float]
             map ``{descriptor: assigned_maxh}`` for the objects touched
-            (the object's ``name`` if set, else ``"vol@(cx,cy,cz)"`` or
-            ``"sheet@(cx,cy,cz)"``)
+            (the object's ``name`` if set, else ``"vol@(cx,cy,cz)mm"`` or
+            ``"sheet@(cx,cy,cz)mm"``)
         """
-        assigned: dict[str, float] = {}
-        for obj in self._objects:
-            if obj.maxh is not None:
-                continue
-            if getattr(obj.material, "maxh", None) is not None:
-                continue  # sized by its material
-            box = self._object_info(obj._id)[4]
-            dims = (box[3] - box[0], box[4] - box[1], box[5] - box[2])
-            positive = [d for d in dims if d > 0]
-            if not positive:
-                continue
-            min_dim = min(positive)
-            if min_dim >= base_maxh:
-                continue
-            h = min_dim / resolution
-            if min_maxh is not None:
-                h = max(h, min_maxh)
-            obj.maxh = h
-            c = self._object_info(obj._id)[0]
-            kind = "vol" if obj.dim == 3 else "sheet"
-            desc = obj.name or f"{kind}@({c[0]*1e3:.1f},{c[1]*1e3:.1f},{c[2]*1e3:.1f})mm"
-            assigned[desc] = h
-        return assigned
+        return dict(self._native.auto_refine(base_maxh, resolution, min_maxh))
 
     def refine_near_points(self, points, h: float) -> None:
         """register a local mesh-size refinement around a point cloud
@@ -1455,72 +1186,9 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         h : float
             element size at the points
         """
-        for p in np.asarray(points, dtype=float).reshape(-1, 3):
-            self._native.add_size_point([float(v) for v in p], float(h))
+        self._native.add_size_points(np.asarray(points, dtype=float).reshape(-1, 3).tolist(), h)
 
-    # ── meshing ─────────────────────────────────────────────────────────────
-
-    def _assign_groups(self):
-        """Tag every material and physics object and build the face and
-        volume groups the solver mesh carries: one tag per Material
-        instance over its solids, one per
-        physics object over its faces or volumes, two for a periodic pair.
-        """
-        next_tag = 1
-        face_groups: list = []
-        volume_groups: list = []
-        self._material_tags = {}
-        self._physics_tags = {}
-        # Group names for the stats and viewers: one counter per class, and
-        # every driven port in one shared "port_<n>" namespace.
-        self._group_names: dict[int, str] = {}
-        counts: dict[str, int] = {}
-        port_classes = {"RectWaveguidePort", "LumpedPort", "CoaxPort", "WavePort",
-                        "UserDefinedPort", "FloquetPort"}
-
-        def name(obj) -> str:
-            cls = type(obj).__name__
-            key = "port" if cls in port_classes else cls.lower()
-            counts[key] = counts.get(key, 0) + 1
-            return f"{key}_{counts[key]}"
-        by_mat: dict[int, tuple] = {}
-        for ent in self._entities:
-            mat = ent.material
-            if mat is None or isinstance(mat, str) or ent.dim != 3:
-                continue
-            by_mat.setdefault(id(mat), (mat, []))[1].append(ent._key)
-        for mat_id, (mat, objs) in by_mat.items():
-            self._material_tags[mat_id] = next_tag
-            self._group_names[next_tag] = name(mat)
-            volume_groups.append((next_tag, objs))
-            next_tag += 1
-
-        def group(ents):
-            faces = [e._key for e in ents if e.dim == 2]
-            vols = [e._key for e in ents if e.dim == 3]
-            return faces, vols
-
-        for phys in self._physics:
-            if type(phys).__name__ == "PeriodicBoundary":
-                fa, _ = group(phys._entities_a)
-                fb, _ = group(phys._entities_b)
-                face_groups.append((next_tag, fa))
-                face_groups.append((next_tag + 1, fb))
-                self._physics_tags[id(phys)] = (next_tag, next_tag + 1)
-                base = name(phys)
-                self._group_names[next_tag] = f"{base}_a"
-                self._group_names[next_tag + 1] = f"{base}_b"
-                next_tag += 2
-                continue
-            faces, vols = group(phys._entities)
-            if vols:
-                volume_groups.append((next_tag, vols))
-            if faces:
-                face_groups.append((next_tag, faces))
-            self._physics_tags[id(phys)] = next_tag
-            self._group_names[next_tag] = name(phys)
-            next_tag += 1
-        return face_groups, volume_groups
+    # -- meshing --------------------------------------------------------------
 
     def save_mesh(self, path: str) -> str:
         """Write the last generated mesh to ``path`` as gmsh ``.msh`` v4.
@@ -1534,13 +1202,7 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         carries one volume group: a volume group over regions an earlier
         group (a material) already holds is left out, with a warning.
         """
-        if self._scene is not None:
-            raise RuntimeError("save_mesh: the geometry is a loaded mesh; save its file instead")
-        if self._last_groups is None:
-            raise RuntimeError("save_mesh: call mesh() first")
-        face_groups, volume_groups = self._last_groups
-        dropped = self._native.save_msh(str(path), face_groups, volume_groups,
-                                        dict(self._group_names))
+        dropped = self._native.save_msh(str(path))
         if dropped:
             import warnings
             warnings.warn(f"save_mesh: volume groups without regions of their own "
@@ -1558,10 +1220,11 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
 
         Meshes the scene with rapidmesh (bottom-up: edges, then every face
         on its true surface, then every region by its constrained Delaunay
-        tetrahedralization, with exact predicates), honouring the global ``maxh``, per-object and
-        per-face sizes and the size points of :meth:`refine_near_points`,
-        then tags every material and physics object and hands the mesh to
-        the solvers in memory. Fills :attr:`mesh_stats`.
+        tetrahedralization, with exact predicates), honouring the global
+        ``maxh``, per-object and per-face sizes and the size points of
+        :meth:`refine_near_points`, then tags every material and physics
+        object and hands the mesh to the solvers in memory. A loaded mesh
+        is taken as it is. Fills :attr:`mesh_stats`.
 
 
         Parameters
@@ -1581,44 +1244,8 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         MeshStats
             size and quality of the mesh
         """
-        if self._scene is not None:
-            # mesh mode: the file's mesh as it is, the bindings baked in
-            n_points, n_tets, min_dihedral, n_slivers = self._scene.stats()
-            face_groups, volume_groups = self._assign_groups()
-            if not face_groups and not volume_groups:
-                raise RuntimeError(
-                    "mesh(): no materials or physics are bound to the loaded mesh's groups")
-            self._fem_mesh = self._scene.fem_mesh(face_groups, volume_groups)
-        else:
-            h = maxh if maxh is not None else self._maxh
-            if cells_across is None:
-                cells_across = self._mesh_defaults.get("cells_across")
-            n_points, n_tets, min_dihedral, n_slivers = self._native.mesh(
-                maxh=h, grading=None if self._grading else 1e9,
-                cells_across=None if cells_across is None else float(cells_across),
-                target_elements=target_elements)
-            face_groups, volume_groups = self._assign_groups()
-            self._fem_mesh = self._native.fem_mesh(face_groups, volume_groups)
-        self._last_groups = (face_groups, volume_groups)
-        fm = self._fem_mesh
-        stats = MeshStats()
-        stats.n_nodes = fm.n_nodes
-        stats.n_tets = fm.n_tets
-        stats.n_tris = fm.n_tris
-        stats.n_edges = fm.n_edges
-        stats.dofs_min = fm.n_edges
-        stats.dofs_max = 2 * fm.n_edges + 2 * fm.n_tris
-        stats.quality_min = float(min_dihedral)
-        stats.n_slivers = int(n_slivers)
-        vols, faces = fm.group_sizes()
-        stats.groups = {}
-        for t, n in [*vols, *faces]:
-            key = self._group_names.get(t, f"group_{t}")
-            stats.groups[key] = stats.groups.get(key, 0) + n
-        self.mesh_stats = stats
-        self._last_mesh = (self._fem_mesh, {})
-        return stats
-
+        self._fem_mesh, self.mesh_stats = self._native.mesh(maxh, cells_across, target_elements)
+        return self.mesh_stats
 
 
 __all__ = [

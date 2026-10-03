@@ -16,10 +16,6 @@ from __future__ import annotations
 from typing import Sequence
 
 
-
-# HELPERS ===============================================================================
-
-
 # DISPERSIVE MODELS =====================================================================
 
 class Debye:
@@ -232,30 +228,6 @@ class Material:
         self.debye = debye
         self.drude = drude
         self.maxh = float(maxh) if maxh is not None else None
-
-    def _add_to(self, model, volume_tag: int) -> None:
-        """place this material on the native model under a volume tag
-
-        Parameters
-        ----------
-        model : rapidfem._native.Model
-            the model being built
-        volume_tag : int
-            mesh tag of the volume this material is attached to
-        """
-        debye = drude = None
-        if self.debye is not None:
-            d = self.debye
-            debye = (d.er_inf, d.er_static, d.tau_s)
-        if self.drude is not None:
-            d = self.drude
-            drude = (d.er_inf, d.plasma_freq_hz, d.damping_freq_hz)
-        vec = lambda v: None if v is None else [float(x) for x in v]
-        model.add_material(
-            volume_tag, er=self.er, ur=self.ur, tand=self.tand,
-            conductivity=self.conductivity, cond_diag=vec(self.cond_diag),
-            er_diag=vec(self.er_diag), ur_diag=vec(self.ur_diag),
-            debye=debye, drude=drude)
 
 
 

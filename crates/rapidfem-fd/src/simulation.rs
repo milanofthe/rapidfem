@@ -37,6 +37,10 @@ pub struct SweepResult {
     pub sparams: Vec<Vec<Vec<C64>>>,
     /// FEM E-field solutions: `[freq_idx][port_exc][dof]`.
     pub solutions: Vec<Vec<Vec<C64>>>,
+    /// Reference impedance of each driven port, `[freq_idx][port]` (ohm):
+    /// the mode impedance of a modal port, the `z0` of a lumped one. The
+    /// S-parameters are referenced to these, see [`crate::network`].
+    pub port_impedances: Vec<Vec<f64>>,
     /// Number of driven ports (matches the inner dimension of `sparams`).
     pub n_driven: usize,
     /// Total wall-clock for the sweep (s).
@@ -243,11 +247,13 @@ impl Simulation {
             .into_iter()
             .map(|r| r.solutions.into_iter().collect())
             .collect();
+        let port_impedances = frequencies.iter().map(|&f| self.port_impedances(f)).collect();
 
         Ok(SweepResult {
             frequencies,
             sparams: all_sparams,
             solutions,
+            port_impedances,
             n_driven,
             solve_time_s,
         })
@@ -348,6 +354,32 @@ impl Simulation {
             return None;
         }
         Some((1.0 - column.iter().sum::<f64>()).clamp(0.0, 1.0))
+    }
+
+    /// The reference impedance (ohm) of each driven port at `freq` Hz, in
+    /// S-matrix order: the mode impedance of a modal port, the `z0` of a
+    /// lumped one.
+    pub fn port_impedances(&self, freq: f64) -> Vec<f64> {
+        let exc = crate::excitation::Excitation::new(freq, self.mesh.l0);
+        self.ports.iter().filter(|p| p.is_driven()).map(|p| p.z_mode(&exc)).collect()
+    }
+
+    /// The centroid of every tet in physical coordinates (m).
+    pub fn tet_centroids(&self) -> Vec<[f64; 3]> {
+        let l0 = self.mesh.l0;
+        self.mesh
+            .tets
+            .iter()
+            .map(|tet| {
+                let mut c = [0.0; 3];
+                for &n in tet {
+                    for k in 0..3 {
+                        c[k] += self.mesh.nodes[n][k] * l0;
+                    }
+                }
+                c.map(|x| x / 4.0)
+            })
+            .collect()
     }
 
     /// Monk-style residual a-posteriori error indicator per tet for a given

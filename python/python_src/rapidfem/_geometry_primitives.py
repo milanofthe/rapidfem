@@ -8,19 +8,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Iterable
 
-import numpy as np
-
 if TYPE_CHECKING:
     from .geometry import GeoObject
 
 
 class _PrimitivesMixin:
     """Primitive factory methods of :class:`rapidfem.Geometry`."""
-
-    def _profile(self, obj_id: int, pts) -> None:
-        if not hasattr(self, "_profiles"):
-            self._profiles = {}
-        self._profiles[obj_id] = [tuple(float(v) for v in p) for p in pts]
 
     def box(self, width: float, depth: float, height: float,
             position: tuple[float, float, float] = (0, 0, 0),
@@ -62,7 +55,7 @@ class _PrimitivesMixin:
             volume with 6 ``.faces`` and 12 ``.edges``
         """
         oid = self._native.add_box([width, depth, height], list(position), maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     def cylinder(self, radius: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
@@ -108,7 +101,7 @@ class _PrimitivesMixin:
             volume
         """
         oid = self._native.add_cylinder(radius, height, list(position), list(axis), maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     def sphere(self, radius: float,
                position: tuple[float, float, float] = (0, 0, 0),
@@ -134,7 +127,7 @@ class _PrimitivesMixin:
             volume
         """
         oid = self._native.add_sphere(radius, list(position), maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     def cone(self, r1: float, r2: float, height: float,
              position: tuple[float, float, float] = (0, 0, 0),
@@ -165,7 +158,7 @@ class _PrimitivesMixin:
             volume
         """
         oid = self._native.add_cone(r1, r2, height, list(position), list(axis), maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     def wedge(self, dx: float, dy: float, dz: float,
               top_x: float = 0.0,
@@ -200,7 +193,7 @@ class _PrimitivesMixin:
             volume
         """
         oid = self._native.add_wedge([dx, dy, dz], top_x, list(position), maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     def torus(self, major_radius: float, minor_radius: float,
               position: tuple[float, float, float] = (0, 0, 0),
@@ -228,15 +221,12 @@ class _PrimitivesMixin:
             volume
         """
         oid = self._native.add_torus(major_radius, minor_radius, list(position), [0.0, 0.0, 1.0], maxh)
-        return self._wrap(oid, sheet=False, material=material, maxh=maxh)
+        return self._wrap(oid, material)
 
     # ── sheets ──────────────────────────────────────────────────────────────
 
     def _sheet(self, corner, u, v, maxh):
-        oid = self._native.add_plate(list(corner), list(u), list(v), maxh)
-        c, u, v = (np.asarray(x, dtype=float) for x in (corner, u, v))
-        self._profile(oid, [c, c + u, c + u + v, c + v])
-        return self._wrap(oid, sheet=True, maxh=maxh)
+        return self._wrap(self._native.add_plate(corner, u, v, maxh))
 
     def xy_plate(self, width: float, height: float,
                  position: tuple[float, float, float] = (0, 0, 0),
@@ -432,6 +422,8 @@ class _PrimitivesMixin:
             vertices in CCW order; polygon closes automatically
         position : tuple[float, float, float]
             offset added to every vertex (defaults to origin)
+        holes : list of vertex lists, optional
+            holes cut out of the polygon, vertices as in ``points``
         maxh : float, optional
             per-face mesh size override
 
@@ -440,27 +432,9 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        pts = [tuple(float(v) for v in p) for p in points]
-        if len(pts) < 3:
-            raise ValueError("polygon needs at least 3 vertices")
-        x0, y0, z0 = (float(v) for v in position)
-        p3 = np.array([(p[0] + x0, p[1] + y0, (p[2] if len(p) == 3 else 0.0) + z0)
-                       for p in pts])
-        hole3 = [np.array([(h[0] + x0, h[1] + y0, (h[2] if len(h) == 3 else 0.0) + z0)
-                           for h in hole]) for hole in (holes or [])]
-        z = p3[:, 2]
-        if np.ptp(z) <= 1e-12 * max(1.0, np.abs(p3).max()):
-            oid = self._native.add_polygon(
-                [list(p[:2]) for p in p3], float(z[0]),
-                [[list(p[:2]) for p in h] for h in hole3], maxh)
-            self._profile(oid, p3)
-            return self._wrap(oid, sheet=True, maxh=maxh)
-        # Off the xy plane: a parallelogram is a plate.
-        if len(p3) == 4 and not hole3 and np.allclose(p3[0] + p3[2], p3[1] + p3[3]):
-            return self._sheet(p3[0], p3[1] - p3[0], p3[3] - p3[0], maxh)
-        raise NotImplementedError(
-            "polygon: a general polygon off the xy plane is not available yet "
-            "(milanofthe/rapidmesh-dev#140); parallelograms work in any plane")
+        pts = [[float(v) for v in p] for p in points]
+        holes = [[[float(v) for v in p] for p in h] for h in (holes or [])]
+        return self._wrap(self._native.add_polygon(pts, position, holes, maxh))
 
     def disc(self, radius: float,
              position: tuple[float, float, float] = (0, 0, 0),
@@ -493,5 +467,4 @@ class _PrimitivesMixin:
         GeoObject
             2-D face
         """
-        oid = self._native.add_disc(radius, list(position), list(axis), maxh)
-        return self._wrap(oid, sheet=True, maxh=maxh)
+        return self._wrap(self._native.add_disc(radius, position, axis, maxh))

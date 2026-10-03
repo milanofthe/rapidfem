@@ -78,7 +78,7 @@ def test_intersect_keeps_the_overlap():
     g.intersect(a, t)
     assert t.material is None
     np.testing.assert_allclose(_box_of(a), np.array([1, 1, 1, 2, 2, 2]) * MM, atol=1e-12)
-    area = sum(f._info()[2] for f in a.faces)
+    area = sum(f.area for f in a.faces)
     assert area == pytest.approx(6 * MM**2, rel=1e-9)
 
 
@@ -128,7 +128,7 @@ def _sheet_area(g, phys) -> float:
     """Meshed area of the face group a physics object tags."""
     nodes, tris, tags, _, _ = g._fem_mesh.viewer()
     p = np.asarray(nodes).reshape(-1, 3)
-    t = np.asarray(tris).reshape(-1, 3)[np.asarray(tags) == g._physics_tags[id(phys)]]
+    t = np.asarray(tris).reshape(-1, 3)[np.asarray(tags) == phys._tag]
     return 0.5 * np.linalg.norm(np.cross(p[t[:, 1]] - p[t[:, 0]], p[t[:, 2]] - p[t[:, 0]]), axis=1).sum()
 
 

@@ -127,6 +127,58 @@ pub fn viewer_mesh(m: &Mesh) -> ViewerMesh {
     ViewerMesh { tris, tri_tags, tet_tags: first(&m.vtag_to_tet, m.tets.len()) }
 }
 
+/// Size and quality of a solver mesh. The DOF numbers bound the FD solver's
+/// Nedelec space: `dofs_min` is the uniform order-1 count (one per edge),
+/// `dofs_max` the uniform order-2 count (two per edge plus two per
+/// triangle); the adaptive order lands in between.
+#[derive(Clone, Debug)]
+pub struct MeshStats {
+    pub n_nodes: usize,
+    pub n_tets: usize,
+    /// Unique tet faces, interior and boundary.
+    pub n_tris: usize,
+    /// Unique tet edges.
+    pub n_edges: usize,
+    pub dofs_min: usize,
+    pub dofs_max: usize,
+    /// Smallest dihedral angle in degrees, the sliver indicator.
+    pub quality_min: f64,
+    /// Tets below the sliver threshold.
+    pub n_slivers: usize,
+    /// Elements per group name, the volume groups' tets first, then the
+    /// face groups' triangles (a tag without a name is `group_<tag>`).
+    pub groups: Vec<(String, usize)>,
+}
+
+impl MeshStats {
+    pub fn new(m: &Mesh, quality_min: f64, n_slivers: usize, names: &std::collections::BTreeMap<i32, String>) -> MeshStats {
+        let sizes = |groups: &hashbrown::HashMap<i32, Vec<usize>>| {
+            let mut v: Vec<(i32, usize)> = groups.iter().map(|(&t, s)| (t, s.len())).collect();
+            v.sort_unstable();
+            v
+        };
+        let mut groups: Vec<(String, usize)> = Vec::new();
+        for (t, n) in sizes(&m.vtag_to_tet).into_iter().chain(sizes(&m.ftag_to_tri)) {
+            let name = names.get(&t).cloned().unwrap_or_else(|| format!("group_{t}"));
+            match groups.iter_mut().find(|(k, _)| *k == name) {
+                Some(g) => g.1 += n,
+                None => groups.push((name, n)),
+            }
+        }
+        MeshStats {
+            n_nodes: m.n_nodes(),
+            n_tets: m.n_tets(),
+            n_tris: m.n_tris(),
+            n_edges: m.n_edges(),
+            dofs_min: m.n_edges(),
+            dofs_max: 2 * m.n_edges() + 2 * m.n_tris(),
+            quality_min,
+            n_slivers,
+            groups,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,13 +10,16 @@ use std::path::Path;
 
 use numpy::ndarray::Array2;
 use numpy::{
-    Complex64, IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadwriteArray1,
+    AllowTypeChange, Complex64, IntoPyArray, PyArray1, PyArray2, PyArrayLikeDyn, PyReadonlyArray1,
+    PyReadonlyArray2, PyReadonlyArrayDyn, PyReadwriteArray1,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyFloat;
 use rapidfem_td::constants::KRYLOV_TOL;
-use rapidfem_td::session::{Drive, Hook, Record, RunOptions, TdSession, Waveform};
+use rapidfem_td::session::{
+    flux_alpha, Device, Drive, GaussianPulse, Hook, Method, Record, RunOptions, TdSession, Waveform,
+};
 
 use crate::geometry::PyFemMesh;
 use crate::model::PyModel;
@@ -29,8 +32,93 @@ fn slice<'a>(a: &'a PyReadonlyArray1<'_, f64>) -> PyResult<&'a [f64]> {
     a.as_slice().map_err(rt)
 }
 
-/// Runs `f` with the Python waveform as a Rust one and a hook that checks
-/// for signals once per frame; an exception raised by either comes back as
+/// A Gaussian pulse, optionally modulated by a sinusoidal carrier.
+///
+/// ``g(t) = exp(-((t-t0)/tau)^2) * cos(2*pi*f0*(t-t0))``
+///
+/// With ``f0 = None`` the bare Gaussian is a smooth broadband pulse; with a
+/// carrier it is a band-limited pulse centred on ``f0``. The pulse is
+/// native: a time-domain run samples it in Rust, without a call into Python
+/// per step. Calling it evaluates ``g`` at a time or an array of times.
+///
+/// Parameters
+/// ----------
+/// t0 : float
+///     Pulse-centre time, in the simulation's time units (seconds in SI).
+/// tau : float
+///     Gaussian width (the `1/e` half-width), in the same time units.
+/// f0 : float, optional
+///     Carrier frequency in the reciprocal units (Hz in SI); omit for a
+///     bare Gaussian.
+#[pyclass(name = "GaussianPulse", module = "rapidfem", frozen)]
+pub struct PyGaussianPulse {
+    inner: GaussianPulse,
+}
+
+#[pymethods]
+impl PyGaussianPulse {
+    #[new]
+    #[pyo3(signature = (*, t0, tau, f0 = None))]
+    fn new(t0: f64, tau: f64, f0: Option<f64>) -> Self {
+        PyGaussianPulse { inner: GaussianPulse { t0, tau, f0 } }
+    }
+
+    /// Pulse-centre time.
+    #[getter]
+    fn t0(&self) -> f64 {
+        self.inner.t0
+    }
+
+    /// Gaussian `1/e` half-width.
+    #[getter]
+    fn tau(&self) -> f64 {
+        self.inner.tau
+    }
+
+    /// Carrier frequency, ``None`` for the bare Gaussian.
+    #[getter]
+    fn f0(&self) -> Option<f64> {
+        self.inner.f0
+    }
+
+    /// ``g(t)``: a float for a scalar ``t``, an array of ``t``'s shape
+    /// otherwise.
+    fn __call__<'py>(&self, py: Python<'py>, t: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> {
+        let g = t.as_array().mapv(|x| self.inner.eval(x));
+        if g.ndim() == 0 {
+            PyFloat::new(py, g.first().copied().unwrap_or(f64::NAN)).into_any()
+        } else {
+            g.into_pyarray(py).into_any()
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let GaussianPulse { t0, tau, f0 } = self.inner;
+        match f0 {
+            Some(f0) => format!("GaussianPulse(t0={t0:e}, tau={tau:e}, f0={f0:e})"),
+            None => format!("GaussianPulse(t0={t0:e}, tau={tau:e})"),
+        }
+    }
+}
+
+/// The excitation of a run: a native pulse, sampled in Rust, or any Python
+/// callable `g(t)`, called once per sample.
+enum Excitation<'a, 'py> {
+    Native(GaussianPulse),
+    Python(&'a Bound<'py, PyAny>),
+}
+
+impl<'a, 'py> Excitation<'a, 'py> {
+    fn of(waveform: &'a Bound<'py, PyAny>) -> Self {
+        match waveform.cast::<PyGaussianPulse>() {
+            Ok(pulse) => Excitation::Native(pulse.get().inner),
+            Err(_) => Excitation::Python(waveform),
+        }
+    }
+}
+
+/// Runs `f` with the waveform as a Rust one and a hook that checks for
+/// signals once per frame; an exception raised by either comes back as
 /// itself.
 fn with_python<T>(
     py: Python<'_>,
@@ -43,9 +131,12 @@ fn with_python<T>(
         *raised.borrow_mut() = Some(e);
         msg
     };
+    let excitation = waveform.map(Excitation::of);
     let mut wave = |t: f64| -> Result<f64, String> {
-        let w = waveform.expect("called only with a waveform");
-        w.call1((t,)).and_then(|v| v.extract::<f64>()).map_err(keep)
+        match excitation.as_ref().expect("called only with a waveform") {
+            Excitation::Native(pulse) => Ok(pulse.eval(t)),
+            Excitation::Python(w) => w.call1((t,)).and_then(|v| v.extract::<f64>()).map_err(keep),
+        }
     };
     let mut hook = || py.check_signals().map_err(keep);
     let w: Option<&mut Waveform> = if waveform.is_some() { Some(&mut wave) } else { None };
@@ -53,15 +144,14 @@ fn with_python<T>(
     out.map_err(|msg| raised.take().unwrap_or_else(|| PyRuntimeError::new_err(msg)))
 }
 
-fn options(method: &str, device: &str, krylov_dim: usize, warmup: usize, verbose: bool) -> PyResult<RunOptions> {
-    Ok(RunOptions {
-        method: method.parse().map_err(PyValueError::new_err)?,
-        device: device.parse().map_err(PyValueError::new_err)?,
-        krylov_dim,
-        warmup,
-        verbose,
-        ..Default::default()
-    })
+/// The run options; without a `method` the device's default integrator.
+fn options(method: Option<&str>, device: &str, krylov_dim: usize, warmup: usize, verbose: bool) -> PyResult<RunOptions> {
+    let device: Device = device.parse().map_err(PyValueError::new_err)?;
+    let method: Method = match method {
+        Some(m) => m.parse().map_err(PyValueError::new_err)?,
+        None => device.default_method(),
+    };
+    Ok(RunOptions { method, device, krylov_dim, warmup, verbose, ..Default::default() })
 }
 
 fn matrix<'py>(py: Python<'py>, rows: usize, cols: usize, data: Vec<f64>) -> Bound<'py, PyArray2<f64>> {
@@ -85,28 +175,36 @@ impl PyTdSession {
         }
         Ok(rows)
     }
+
+    /// The operator indices of the modal ports on face tags `tags`.
+    fn ports(&self, tags: &[i32]) -> PyResult<Vec<usize>> {
+        tags.iter().map(|&t| self.s.port_of_tag(t).map_err(PyValueError::new_err)).collect()
+    }
 }
 
 #[pymethods]
 impl PyTdSession {
     /// A structured box cavity `[0,lx]×[0,ly]×[0,lz]` of `nx·ny·nz` cells
-    /// with PEC walls, DG order `order`, flux blend `flux_alpha` (1 upwind,
-    /// 0 central), `c` the speed of light in the box's unit.
+    /// with PEC walls, DG order `order`, numerical flux `flux` ("upwind" or
+    /// "central"), `c` the speed of light in the box's unit.
     #[staticmethod]
-    #[pyo3(signature = (nx, ny, nz, lx, ly, lz, order, flux_alpha = 1.0, c = 1.0))]
-    fn box_cavity(nx: usize, ny: usize, nz: usize, lx: f64, ly: f64, lz: f64, order: usize, flux_alpha: f64, c: f64) -> Self {
+    #[pyo3(signature = (nx, ny, nz, lx, ly, lz, order, flux = "upwind", c = 1.0))]
+    fn box_cavity(nx: usize, ny: usize, nz: usize, lx: f64, ly: f64, lz: f64, order: usize, flux: &str, c: f64) -> PyResult<Self> {
+        let alpha = flux_alpha(flux).map_err(PyValueError::new_err)?;
         let mesh = rapidfem_td::mesh_gen::structured_box(nx, ny, nz, lx, ly, lz);
-        let op = rapidfem_td::rhs::MaxwellOperator::new(&mesh, order, flux_alpha, Default::default());
-        PyTdSession { s: TdSession::new(op, c) }
+        let op = rapidfem_td::rhs::MaxwellOperator::new(&mesh, order, alpha, Default::default());
+        Ok(PyTdSession { s: TdSession::new(op, c) })
     }
 
-    /// The operator of a `Model` on a solver mesh.
+    /// The operator of a `Model` on a solver mesh, its ports addressed by
+    /// their face tags.
     #[staticmethod]
-    #[pyo3(signature = (mesh, model, order, flux_alpha = 1.0, c = 299_792_458.0))]
-    fn from_model(mesh: &PyFemMesh, model: &PyModel, order: usize, flux_alpha: f64, c: f64) -> PyResult<Self> {
-        let op = rapidfem_td::build::operator_from_model(&mesh.inner, &model.inner, order, flux_alpha, c)
+    #[pyo3(signature = (mesh, model, order, flux = "upwind", c = 299_792_458.0))]
+    fn from_model(mesh: &PyFemMesh, model: &PyModel, order: usize, flux: &str, c: f64) -> PyResult<Self> {
+        let alpha = flux_alpha(flux).map_err(PyValueError::new_err)?;
+        let (op, port_tags) = rapidfem_td::build::operator_from_model(&mesh.inner, &model.inner, order, alpha, c)
             .map_err(PyRuntimeError::new_err)?;
-        Ok(PyTdSession { s: TdSession::new(op, c) })
+        Ok(PyTdSession { s: TdSession::new(op, c).with_port_tags(port_tags) })
     }
 
     /// State length: `6·Np·n_elem`, plus `3·Np` per dispersive element.
@@ -149,9 +247,11 @@ impl PyTdSession {
         Ok(self.s.op().field_energy(slice(&y)?))
     }
 
-    /// `exp(h·A)·y` by the Krylov propagator.
-    #[pyo3(signature = (y, h, krylov_dim = 40, tol = KRYLOV_TOL))]
-    fn step<'py>(&mut self, py: Python<'py>, y: PyReadonlyArray1<'py, f64>, h: f64, krylov_dim: usize, tol: f64) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    /// `exp(h·A)·y` by the Krylov propagator, `tol` its a-posteriori
+    /// tolerance (`None` the default).
+    #[pyo3(signature = (y, h, krylov_dim = 40, tol = None))]
+    fn step<'py>(&mut self, py: Python<'py>, y: PyReadonlyArray1<'py, f64>, h: f64, krylov_dim: usize, tol: Option<f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let tol = tol.unwrap_or(KRYLOV_TOL);
         Ok(self.s.step(slice(&y)?, h, krylov_dim, tol).map_err(PyValueError::new_err)?.into_pyarray(py))
     }
 
@@ -172,18 +272,30 @@ impl PyTdSession {
         self.s.cfl_dt(recompute)
     }
 
-    /// Global DOF of a field component (`field` 0 = E, 1 = H; `comp` 0..3)
-    /// at the DG node nearest `point`.
-    fn nearest_node_dof(&self, point: (f64, f64, f64), field: usize, comp: usize) -> usize {
-        self.s.op().nearest_node_dof([point.0, point.1, point.2], field, comp)
+    /// Global DOF of field `field` ("E" or "H"), component `component`
+    /// ("x", "y" or "z") at the DG node nearest `point`.
+    fn nearest_node_dof(&self, point: (f64, f64, f64), field: &str, component: &str) -> PyResult<usize> {
+        let field = match field {
+            "E" => 0,
+            "H" => 1,
+            _ => return Err(PyValueError::new_err(format!("field must be 'E' or 'H', got {field:?}"))),
+        };
+        let comp = match component {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            _ => return Err(PyValueError::new_err(format!("component must be 'x', 'y' or 'z', got {component:?}"))),
+        };
+        Ok(self.s.op().nearest_node_dof([point.0, point.1, point.2], field, comp))
     }
 
     /// A run of `steps` frames of `dt`, driven at `source_dof` or by the
-    /// pattern `source` with `waveform(t)`. Returns the recorded frames
-    /// `[steps + 1, n_dof]` (or `[steps + 1, len(probes)]`) and, for the
-    /// adaptive integrator, `(accepted, rejected, h_min, h_max)`.
-    #[pyo3(signature = (y0 = None, *, dt, steps, source_dof = None, source = None, waveform = None,
-                        probes = None, method = "exponential", device = "cpu", krylov_dim = 40,
+    /// mode of the port on face tag `port` with `waveform(t)`. Returns the
+    /// recorded frames `[steps + 1, n_dof]` (or `[steps + 1, len(probes)]`)
+    /// and, for the adaptive integrator, `(accepted, rejected, h_min,
+    /// h_max)`. Without a `method` the device's default integrator runs.
+    #[pyo3(signature = (y0 = None, *, dt, steps, source_dof = None, port = None, waveform = None,
+                        probes = None, method = None, device = "cpu", krylov_dim = 40,
                         warmup = 0, verbose = true))]
     fn transient<'py>(
         &mut self,
@@ -192,10 +304,10 @@ impl PyTdSession {
         dt: f64,
         steps: usize,
         source_dof: Option<usize>,
-        source: Option<PyReadonlyArray1<'py, f64>>,
+        port: Option<i32>,
         waveform: Option<Bound<'py, PyAny>>,
         probes: Option<Vec<usize>>,
-        method: &str,
+        method: Option<&str>,
         device: &str,
         krylov_dim: usize,
         warmup: usize,
@@ -203,10 +315,15 @@ impl PyTdSession {
     ) -> PyResult<(Bound<'py, PyArray2<f64>>, Option<(usize, usize, f64, f64)>)> {
         let opts = options(method, device, krylov_dim, warmup, verbose)?;
         let y0 = y0.as_ref().map(slice).transpose()?;
-        let source = source.as_ref().map(slice).transpose()?;
-        let drive = match (source_dof, source) {
-            (Some(_), Some(_)) => return Err(PyValueError::new_err("pass source_dof or source, not both")),
-            (Some(d), None) => Drive::Point(d),
+        if source_dof.is_some() && port.is_some() {
+            return Err(PyValueError::new_err("pass either source= (point) or port= (modal port), not both"));
+        }
+        let pattern = match port {
+            Some(tag) => Some(self.s.op().port_source(self.ports(&[tag])?[0])),
+            None => None,
+        };
+        let drive = match (source_dof, pattern.as_deref()) {
+            (Some(d), _) => Drive::Point(d),
             (None, Some(b)) => Drive::Vector(b),
             (None, None) => Drive::Free,
         };
@@ -223,8 +340,9 @@ impl PyTdSession {
     }
 
     /// `(frequencies, H)` of the field-to-field transfer function from
-    /// `source_dof` to `probe_dof` under `pulse`.
-    #[pyo3(signature = (source_dof, probe_dof, pulse, *, dt, steps, method = "exponential",
+    /// `source_dof` to `probe_dof` under `pulse`. Without a `method` the
+    /// device's default integrator runs.
+    #[pyo3(signature = (source_dof, probe_dof, pulse, *, dt, steps, method = None,
                         device = "cpu", krylov_dim = 40, verbose = true))]
     fn transfer_function<'py>(
         &mut self,
@@ -234,7 +352,7 @@ impl PyTdSession {
         pulse: Bound<'py, PyAny>,
         dt: f64,
         steps: usize,
-        method: &str,
+        method: Option<&str>,
         device: &str,
         krylov_dim: usize,
         verbose: bool,
@@ -253,31 +371,27 @@ impl PyTdSession {
         Ok(self.s.resonances(n).map_err(rt)?.into_pyarray(py))
     }
 
-    /// Operator index of the `k`-th modal port.
-    fn modal_port(&self, k: usize) -> PyResult<usize> {
-        self.s.modal_port(k).map_err(rt)
-    }
-
-    /// The modal amplitude `P_e` of each port over a trajectory,
-    /// `[len(ports), n_frames]`.
-    fn port_signals<'py>(&self, py: Python<'py>, states: PyReadonlyArray2<'py, f64>, ports: Vec<usize>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    /// The modal amplitude `P_e` of the ports on face tags `tags` over a
+    /// trajectory, `[len(tags), n_frames]`.
+    fn port_signals<'py>(&self, py: Python<'py>, states: PyReadonlyArray2<'py, f64>, tags: Vec<i32>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let rows = self.frames(&states)?;
+        let ports = self.ports(&tags)?;
         let data = self.s.port_signals(states.as_slice().map_err(rt)?, &ports).map_err(PyValueError::new_err)?;
         Ok(matrix(py, ports.len(), rows, data))
     }
 
-    /// Writes the trajectory as a VTK series, returns the `.pvd` path.
-    fn export_vtk(&self, states: PyReadonlyArray2<'_, f64>, times: Vec<f64>, path: &str) -> PyResult<String> {
-        self.frames(&states)?;
-        let pvd = self.s.export_vtk(states.as_slice().map_err(rt)?, &times, Path::new(path)).map_err(|e| {
+    /// Writes a state `[n_dof]` or a trajectory `[frames, n_dof]` as a VTK
+    /// series over `times` (default the frame index), returns the `.pvd`
+    /// path.
+    #[pyo3(signature = (states, path, times = None))]
+    fn export_vtk(&self, states: PyReadonlyArrayDyn<'_, f64>, path: &str, times: Option<Vec<f64>>) -> PyResult<String> {
+        let states = states.as_slice().map_err(rt)?;
+        let frames = states.len() / self.s.n_dof().max(1);
+        let times = times.unwrap_or_else(|| (0..frames).map(|k| k as f64).collect());
+        let pvd = self.s.export_vtk(states, &times, Path::new(path)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::InvalidInput { PyValueError::new_err(e.to_string()) } else { e.into() }
         })?;
         Ok(pvd.to_string_lossy().into_owned())
-    }
-
-    /// The source pattern `b` that drives port `idx`.
-    fn port_source<'py>(&self, py: Python<'py>, idx: usize) -> Bound<'py, PyArray1<f64>> {
-        self.s.op().port_source(idx).into_pyarray(py)
     }
 
     /// `A` as CSR `(n, row_ptr, col_idx, values)`.

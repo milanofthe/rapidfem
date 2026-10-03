@@ -413,7 +413,7 @@ def build(
     g = Geometry.from_gds(str(gds), stack=stack, top_cell=top_cell)
     layer_names = {l.name for l in stack.layers}
     conductors: dict[str, list] = {}
-    for o in g._objects:
+    for o in g.objects:
         if o.name in layer_names:
             conductors.setdefault(o.name, []).append(o)
     if not conductors:
@@ -424,7 +424,7 @@ def build(
         mesh = MeshSpec.derive(stack, conductors.keys(), preset=mesh_preset)
 
     # Layout bbox from the extruded conductors.
-    bbs = np.array([o._entity.bbox for o in g._objects if o.name in layer_names])
+    bbs = np.array([o._entity.bbox for o in g.objects if o.name in layer_names])
     x_min, y_min = bbs[:, 0].min(), bbs[:, 1].min()
     x_max, y_max = bbs[:, 3].max(), bbs[:, 4].max()
     x0, y0 = x_min - margin, y_min - margin
@@ -660,11 +660,11 @@ def build(
             outer.append(bot.faces.min(axis="z"))
         ABC(*outer)
 
-    if g._maxh is None:
-        g._maxh = mesh.h(mesh.global_h)
+    if g._native.mesh_maxh is None:
+        g._native.mesh_maxh = mesh.h(mesh.global_h)
     # A process stack is a pile of layers far thinner than the element size:
     # flat tets through each layer, not elements across every one of them.
-    g._mesh_defaults["cells_across"] = 0.0
+    g._native.cells_across = 0.0
 
     return BuiltModel(
         geometry=g, stack=stack, conductors=conductors, slabs=slabs,

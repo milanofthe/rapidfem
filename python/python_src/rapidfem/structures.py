@@ -23,7 +23,6 @@ solvable; otherwise use the returned port faces to wire your own physics.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -45,23 +44,101 @@ __all__ = [
 ]
 
 
-# Map the axis label a builder is laid out along to its unit direction. Used
-# both for the cylinder sweep direction and for selecting the end-cap faces.
+# Unit direction of each axis label a straight section can be built along.
 _AXIS_VEC = {
     "x": (1.0, 0.0, 0.0),
     "y": (0.0, 1.0, 0.0),
     "z": (0.0, 0.0, 1.0),
 }
 
-# Microstrip substrate ports: a single-element-thick substrate slab is too
+# Planar-line substrates: a single-element-thick substrate slab is too
 # coarse for the vector wave-port eigensolve to resolve the inhomogeneous
 # quasi-TEM mode, so the substrate is meshed at this fraction of its
 # thickness by default. Matches the fd_microstrip_line.py example.
 _SUBSTRATE_MESH_DIVISIONS = 3
 
 
-@dataclass
-class CoaxLine:
+# SHARED HELPERS ========================================================================
+
+def _axis(builder: str, axis: str) -> tuple[float, float, float]:
+    """unit vector of the build axis label, or a ValueError naming the builder"""
+    if axis not in _AXIS_VEC:
+        raise ValueError(f"{builder}: axis must be 'x', 'y' or 'z', got {axis!r}")
+    return _AXIS_VEC[axis]
+
+
+def _check_f0(builder: str, add_ports: bool, f0: float | None) -> None:
+    """wave ports solve their mode at the band centre, so they need ``f0``;
+    checked before anything is built"""
+    if add_ports and f0 is None:
+        raise ValueError(f"{builder}: add_ports=True needs f0 (band-centre Hz) "
+                         "for the wave-port mode solve")
+
+
+def _fill(er: float, material):
+    """the fill material and its relative permittivity: ``material`` when
+    given (its ``er`` then also feeds the analytic ports), else air or a
+    lossless dielectric of permittivity ``er``"""
+    if material is None:
+        material = Air() if er == 1.0 else Dielectric(er=er)
+    return material, material.er
+
+
+def _ends(axis: str, *bodies):
+    """the end-cap faces (near, far) of straight sections along ``axis``;
+    one collection per body, unwrapped for a single body"""
+    near = tuple(b.faces.min(axis=axis) for b in bodies)
+    far = tuple(b.faces.max(axis=axis) for b in bodies)
+    return (near, far) if len(bodies) > 1 else (near[0], far[0])
+
+
+def _slab(g, origin, width, length, z, height, material):
+    """box of a planar line: centred on the origin's x, running along +y from
+    the origin, spanning ``[z, z + height]`` above it"""
+    ox, oy, oz = origin
+    return g.box(width, length, height, position=(ox - width / 2, oy, oz + z),
+                 material=material)
+
+
+def _substrate(g, origin, width, length, height, er, tand, maxh):
+    """dielectric slab of a planar line, meshed at ``height / 3`` unless
+    ``maxh`` is given"""
+    if maxh is None:
+        maxh = height / _SUBSTRATE_MESH_DIVISIONS
+    return _slab(g, origin, width, length, 0.0, height,
+                 Dielectric(er=er, tand=tand, maxh=maxh))
+
+
+def _strip(g, origin, x, width, length, z):
+    """sheet conductor of a planar line along +y, its left edge ``x`` and
+    its height ``z`` relative to the origin"""
+    ox, oy, oz = origin
+    return g.xy_plate(width, length, position=(ox + x, oy, oz + z))
+
+
+def _wave_ports(line, f0: float, power: float) -> None:
+    """attach a full-vector wave port at each end of ``line``; ``line.pec``,
+    when already set, marks the conductors inside the cross-section"""
+    pec = None if line.pec is None else [line.pec]
+    line.ports = [WavePort(*(end if isinstance(end, tuple) else (end,)),
+                           f0=f0, pec=pec, power=power)
+                  for end in (line.port_a, line.port_b)]
+
+
+@dataclass(kw_only=True)
+class _Section:
+    """Fields every builder result carries (documented on each subclass)."""
+
+    port_a: "EntityCollection | tuple[EntityCollection, ...]"
+    port_b: "EntityCollection | tuple[EntityCollection, ...]"
+    pec: object = None
+    ports: list = field(default_factory=list)
+
+
+# COAX ==================================================================================
+
+@dataclass(kw_only=True)
+class CoaxLine(_Section):
     """Result of :func:`coax`.
 
     Attributes
@@ -73,15 +150,15 @@ class CoaxLine:
         the end cap at the base of the line (minimum along the build axis)
     port_b : EntityCollection
         the end cap at the far end (maximum along the build axis)
+    pec : object or None
+        the :class:`rapidfem.PEC` on the inner-conductor surface and the
+        shield when ``add_ports`` was set (else None)
     ports : list
         the two :class:`rapidfem.CoaxPort` objects, populated only when
         :func:`coax` was called with ``add_ports=True`` (else empty)
     """
 
     dielectric: "GeoObject"
-    port_a: "EntityCollection"
-    port_b: "EntityCollection"
-    ports: list = field(default_factory=list)
 
 
 def coax(g: "Geometry", *,
@@ -93,11 +170,13 @@ def coax(g: "Geometry", *,
          add_ports: bool = False,
          power: float = 1.0) -> CoaxLine:
     """build a straight coaxial line: a fill cylinder of outer radius ``ro``
-    with the inner conductor (radius ``ri``) removed as a PEC core.
+    with the inner conductor (radius ``ri``) cut out of it.
 
     The annular region between ``ri`` and ``ro`` carries the fill material
-    (air by default, or a dielectric when ``er`` is set). The two end caps
-    are the coaxial ports.
+    (air by default, or a dielectric when ``er`` is set) and is the only
+    meshed volume: the inner conductor is a hole, so its surface is a
+    boundary face of the fill (PEC unless other physics is placed on it).
+    The two annular end caps are the coaxial ports.
 
 
     Example
@@ -133,7 +212,8 @@ def coax(g: "Geometry", *,
         relative permittivity of the fill (defaults to 1, i.e. air); ignored
         when ``material`` is given
     material : rapidfem.Material, optional
-        explicit fill material; overrides ``er``
+        explicit fill material; overrides ``er`` (the ports then use its
+        ``er``)
     add_ports : bool
         when True, attach a :class:`rapidfem.CoaxPort` at each end and PEC on
         every remaining (inner-conductor + shield) face
@@ -152,38 +232,32 @@ def coax(g: "Geometry", *,
     """
     if ri >= ro:
         raise ValueError(f"coax: ri ({ri}) must be < ro ({ro})")
-    if axis not in _AXIS_VEC:
-        raise ValueError(f"coax: axis must be 'x', 'y' or 'z', got {axis!r}")
-    av = _AXIS_VEC[axis]
-    fill = material if material is not None else (
-        Air() if er == 1.0 else Dielectric(er=er))
+    av = _axis("coax", axis)
+    fill, er = _fill(er, material)
 
-    # Outer fill cylinder with the inner-conductor cylinder fragmented out, so
-    # the inner-conductor surface exists as a face we can mark PEC. The core's
-    # material is irrelevant (it is walled off by PEC), so it shares the fill.
-    outer = g.cylinder(ro, length, position=origin, axis=av, material=fill)
-    inner = g.cylinder(ri, length, position=origin, axis=av, material=fill)
-    g.fragment(outer, inner)
+    # The inner conductor is a hole in the fill: the mesh ends on its surface,
+    # which stays a face of the dielectric for the PEC.
+    dielectric = g.cylinder(ro, length, position=origin, axis=av, material=fill)
+    g.cut(dielectric, g.cylinder(ri, length, position=origin, axis=av))
 
-    port_a = outer.faces.min(axis=axis)
-    port_b = outer.faces.max(axis=axis)
-    line = CoaxLine(dielectric=outer, port_a=port_a, port_b=port_b)
+    port_a, port_b = _ends(axis, dielectric)
+    line = CoaxLine(dielectric=dielectric, port_a=port_a, port_b=port_b)
 
     if add_ports:
-        far = tuple(origin[i] + av[i] * length for i in range(3))
-        p0 = CoaxPort(port_a, ri=ri, ro=ro, origin=origin, z_axis=av,
-                      er=er, power=power)
-        p1 = CoaxPort(port_b, ri=ri, ro=ro, origin=far, z_axis=av,
-                      er=er, power=power)
+        far = tuple(o + v * length for o, v in zip(origin, av))
+        line.ports = [CoaxPort(end, ri=ri, ro=ro, origin=at, z_axis=av,
+                               er=er, power=power)
+                      for end, at in ((port_a, origin), (port_b, far))]
         # Everything left (inner-conductor surface + outer shield) is PEC.
-        PEC(*outer.faces.unassigned)
-        line.ports = [p0, p1]
+        line.pec = PEC(*dielectric.faces.unassigned)
 
     return line
 
 
-@dataclass
-class MicrostripLine:
+# PLANAR LINES ==========================================================================
+
+@dataclass(kw_only=True)
+class MicrostripLine(_Section):
     """Result of :func:`microstrip`.
 
     Attributes
@@ -213,10 +287,6 @@ class MicrostripLine:
     air: "GeoObject"
     trace: "GeoObject"
     ground: "EntityCollection"
-    port_a: "tuple[EntityCollection, EntityCollection]"
-    port_b: "tuple[EntityCollection, EntityCollection]"
-    pec: object = None
-    ports: list = field(default_factory=list)
 
 
 def microstrip(g: "Geometry", *,
@@ -298,50 +368,32 @@ def microstrip(g: "Geometry", *,
     ValueError
         if ``add_ports`` is True but ``f0`` was not given
     """
-    if add_ports and f0 is None:
-        raise ValueError(
-            "microstrip: add_ports=True needs f0 (band-centre Hz) for the "
-            "wave-port phase reference")
+    _check_f0("microstrip", add_ports, f0)
 
-    ox, oy, oz = origin
-    eff_sub_maxh = sub_maxh if sub_maxh is not None else sub_h / _SUBSTRATE_MESH_DIVISIONS
-    fr4 = Dielectric(er=er, tand=tand, maxh=eff_sub_maxh)
+    sub = _substrate(g, origin, sub_w, line_l, sub_h, er, tand, sub_maxh)
+    air = _slab(g, origin, sub_w, line_l, sub_h, air_h, Air())
+    trace = _strip(g, origin, -line_w / 2, line_w, line_l, sub_h)
 
-    sub = g.box(sub_w, line_l, sub_h, position=(ox - sub_w / 2, oy, oz),
-                material=fr4)
-    air = g.box(sub_w, line_l, air_h, position=(ox - sub_w / 2, oy, oz + sub_h),
-                material=Air())
-    trace = g.xy_plate(line_w, line_l, position=(ox - line_w / 2, oy, oz + sub_h))
-
-    g.fragment(sub, air, trace)
-
-    ground = sub.faces.min(axis="z")
-    port_a = (sub.faces.min(axis="y"), air.faces.min(axis="y"))
-    port_b = (sub.faces.max(axis="y"), air.faces.max(axis="y"))
-    line = MicrostripLine(substrate=sub, air=air, trace=trace, ground=ground,
+    port_a, port_b = _ends("y", sub, air)
+    line = MicrostripLine(substrate=sub, air=air, trace=trace,
+                          ground=sub.faces.min(axis="z"),
                           port_a=port_a, port_b=port_b)
 
     if add_ports:
         # Trace + ground plane on one PEC so the wave-port eigensolve can mark
-        # the conductor nodes via pec=[strip].
-        strip = PEC(trace, ground)
-        p0 = WavePort(port_a[0], port_a[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
-        p1 = WavePort(port_b[0], port_b[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
+        # the conductor nodes.
+        line.pec = PEC(trace, line.ground)
+        _wave_ports(line, f0, power)
         # Open the enclosure: ABC on the lateral x-walls (substrate + air) and
         # the air top. The y-extreme faces are the ports, so they are excluded.
-        ABC(sub.faces.min(axis="x"), sub.faces.max(axis="x"),
-            air.faces.min(axis="x"), air.faces.max(axis="x"),
-            air.faces.max(axis="z"))
-        line.pec = strip
-        line.ports = [p0, p1]
+        walls_lo, walls_hi = _ends("x", sub, air)
+        ABC(*walls_lo, *walls_hi, air.faces.max(axis="z"))
 
     return line
 
 
-@dataclass
-class CpwLine:
+@dataclass(kw_only=True)
+class CpwLine(_Section):
     """Result of :func:`cpw`.
 
     Attributes
@@ -365,10 +417,6 @@ class CpwLine:
     signal: "GeoObject"
     ground_left: "GeoObject"
     ground_right: "GeoObject"
-    port_a: "tuple[EntityCollection, EntityCollection]"
-    port_b: "tuple[EntityCollection, EntityCollection]"
-    pec: object = None
-    ports: list = field(default_factory=list)
 
 
 def cpw(g: "Geometry", *,
@@ -454,31 +502,16 @@ def cpw(g: "Geometry", *,
         raise ValueError(
             f"cpw: signal_w/2 + gap ({signal_w / 2 + gap}) must be < sub_w/2 "
             f"({sub_w / 2}); ground strips have width {ground_w}")
-    if add_ports and f0 is None:
-        raise ValueError("cpw: add_ports=True needs f0 (band-centre Hz)")
+    _check_f0("cpw", add_ports, f0)
 
-    ox, oy, oz = origin
-    eff_sub_maxh = sub_maxh if sub_maxh is not None else sub_h / _SUBSTRATE_MESH_DIVISIONS
-    diel = Dielectric(er=er, tand=tand, maxh=eff_sub_maxh)
+    sub = _substrate(g, origin, sub_w, line_l, sub_h, er, tand, sub_maxh)
+    air = _slab(g, origin, sub_w, line_l, sub_h, air_h, Air())
+    signal = _strip(g, origin, -signal_w / 2, signal_w, line_l, sub_h)
+    # Each ground strip runs from its gap edge out to the substrate edge.
+    ground_left = _strip(g, origin, -sub_w / 2, ground_w, line_l, sub_h)
+    ground_right = _strip(g, origin, signal_w / 2 + gap, ground_w, line_l, sub_h)
 
-    sub = g.box(sub_w, line_l, sub_h, position=(ox - sub_w / 2, oy, oz),
-                material=diel)
-    air = g.box(sub_w, line_l, air_h, position=(ox - sub_w / 2, oy, oz + sub_h),
-                material=Air())
-
-    top_z = oz + sub_h
-    signal = g.xy_plate(signal_w, line_l, position=(ox - signal_w / 2, oy, top_z))
-    # Left ground: from the substrate's left edge to the left gap edge.
-    gl_x0 = ox - sub_w / 2
-    ground_left = g.xy_plate(ground_w, line_l, position=(gl_x0, oy, top_z))
-    # Right ground: from the right gap edge to the substrate's right edge.
-    gr_x0 = ox + signal_w / 2 + gap
-    ground_right = g.xy_plate(ground_w, line_l, position=(gr_x0, oy, top_z))
-
-    g.fragment(sub, air, signal, ground_left, ground_right)
-
-    port_a = (sub.faces.min(axis="y"), air.faces.min(axis="y"))
-    port_b = (sub.faces.max(axis="y"), air.faces.max(axis="y"))
+    port_a, port_b = _ends("y", sub, air)
     line = CpwLine(substrate=sub, air=air, signal=signal,
                    ground_left=ground_left, ground_right=ground_right,
                    port_a=port_a, port_b=port_b)
@@ -487,21 +520,16 @@ def cpw(g: "Geometry", *,
         conductors = [signal, ground_left, ground_right]
         if backside_ground:
             conductors.append(sub.faces.min(axis="z"))
-        strip = PEC(*conductors)
-        p0 = WavePort(port_a[0], port_a[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
-        p1 = WavePort(port_b[0], port_b[1], f0=f0, mode_kind="auto",
-                      pec=[strip], power=power)
+        line.pec = PEC(*conductors)
+        _wave_ports(line, f0, power)
         # Lateral x-walls touch the ground strips; only the air top stays open.
         ABC(air.faces.max(axis="z"))
-        line.pec = strip
-        line.ports = [p0, p1]
 
     return line
 
 
-@dataclass
-class Stripline:
+@dataclass(kw_only=True)
+class Stripline(_Section):
     """Result of :func:`stripline`.
 
     Attributes
@@ -520,10 +548,6 @@ class Stripline:
 
     fill: "GeoObject"
     trace: "GeoObject"
-    port_a: "EntityCollection"
-    port_b: "EntityCollection"
-    pec: object = None
-    ports: list = field(default_factory=list)
 
 
 def stripline(g: "Geometry", *,
@@ -596,49 +620,27 @@ def stripline(g: "Geometry", *,
     ValueError
         if ``add_ports`` is set without ``f0``
     """
-    if add_ports and f0 is None:
-        raise ValueError("stripline: add_ports=True needs f0 (band-centre Hz)")
+    _check_f0("stripline", add_ports, f0)
 
-    ox, oy, oz = origin
-    eff_sub_maxh = sub_maxh if sub_maxh is not None else sub_h / _SUBSTRATE_MESH_DIVISIONS
+    fill = _substrate(g, origin, sub_w, line_l, sub_h, er, tand, sub_maxh)
+    trace = _strip(g, origin, -line_w / 2, line_w, line_l, sub_h / 2)
 
-    fill = g.box(sub_w, line_l, sub_h, position=(ox - sub_w / 2, oy, oz),
-                 material=Dielectric(er=er, tand=tand, maxh=eff_sub_maxh))
-    trace = g.xy_plate(line_w, line_l, position=(ox - line_w / 2, oy, oz + sub_h / 2))
-    g.fragment(fill, trace)
-
-    line = Stripline(fill=fill, trace=trace,
-                     port_a=fill.faces.min(axis="y"), port_b=fill.faces.max(axis="y"))
+    port_a, port_b = _ends("y", fill)
+    line = Stripline(fill=fill, trace=trace, port_a=port_a, port_b=port_b)
 
     if add_ports:
         # Trace + the four enclosing walls: both ground planes and both side
         # walls.
-        strip = PEC(trace,
-                    fill.faces.min(axis="z"), fill.faces.max(axis="z"),
-                    fill.faces.min(axis="x"), fill.faces.max(axis="x"))
-        p0 = WavePort(line.port_a, f0=f0, mode_kind="auto", pec=[strip], power=power)
-        p1 = WavePort(line.port_b, f0=f0, mode_kind="auto", pec=[strip], power=power)
-        line.pec = strip
-        line.ports = [p0, p1]
+        line.pec = PEC(trace, *_ends("z", fill), *_ends("x", fill))
+        _wave_ports(line, f0, power)
 
     return line
 
 
-# Box dimension order per propagation axis: which (width, depth, height) slot
-# the two transverse sizes (a, b) and the length fill. Keeps the cross-section
-# (a, b) transverse to the chosen propagation axis.
-def _box_dims_for_axis(a: float, b: float, length: float, axis: str):
-    if axis == "z":
-        return (a, b, length)          # transverse x, y
-    if axis == "y":
-        return (a, length, b)          # transverse x, z
-    if axis == "x":
-        return (length, a, b)          # transverse y, z
-    raise ValueError(f"axis must be 'x', 'y' or 'z', got {axis!r}")
+# WAVEGUIDES ============================================================================
 
-
-@dataclass
-class RectWaveguide:
+@dataclass(kw_only=True)
+class RectWaveguide(_Section):
     """Result of :func:`rect_waveguide`.
 
     Attributes
@@ -647,15 +649,14 @@ class RectWaveguide:
         the waveguide fill volume
     port_a, port_b : EntityCollection
         the end-cap faces (the two waveguide ports)
+    pec : object or None
+        the PEC on the four side walls when ``add_ports`` (else None)
     ports : list
         the two :class:`rapidfem.RectWaveguidePort` objects when
         ``add_ports`` (else empty)
     """
 
     body: "GeoObject"
-    port_a: "EntityCollection"
-    port_b: "EntityCollection"
-    ports: list = field(default_factory=list)
 
 
 def rect_waveguide(g: "Geometry", *,
@@ -696,12 +697,14 @@ def rect_waveguide(g: "Geometry", *,
     origin : tuple[float, float, float]
         lower corner of the body box (defaults to the origin)
     axis : str
-        propagation direction, one of ``"x"`` / ``"y"`` / ``"z"`` (z default)
+        propagation direction, one of ``"x"`` / ``"y"`` / ``"z"`` (z default);
+        ``a`` runs along the first and ``b`` along the second remaining axis
     er : float
         relative permittivity of the fill (defaults to 1, air); ignored
         when ``material`` is given
     material : rapidfem.Material, optional
-        explicit fill material; overrides ``er``
+        explicit fill material; overrides ``er`` (the ports then use its
+        ``er``)
     mode : tuple[int, int]
         waveguide mode (m, n) for the ports (defaults to TE10)
     add_ports : bool
@@ -713,27 +716,30 @@ def rect_waveguide(g: "Geometry", *,
     -------
     RectWaveguide
         the built section and its port faces
-    """
-    fill = material if material is not None else (
-        Air() if er == 1.0 else Dielectric(er=er))
-    w, d, h = _box_dims_for_axis(a, b, length, axis)
-    body = g.box(w, d, h, position=origin, material=fill)
 
-    port_a = body.faces.min(axis=axis)
-    port_b = body.faces.max(axis=axis)
+    Raises
+    ------
+    ValueError
+        if ``axis`` is not one of x / y / z
+    """
+    _axis("rect_waveguide", axis)
+    fill, er = _fill(er, material)
+    size = {"x": (length, a, b), "y": (a, length, b), "z": (a, b, length)}[axis]
+    body = g.box(*size, position=origin, material=fill)
+
+    port_a, port_b = _ends(axis, body)
     wg = RectWaveguide(body=body, port_a=port_a, port_b=port_b)
 
     if add_ports:
-        p0 = RectWaveguidePort(port_a, mode=mode, er=er, power=power)
-        p1 = RectWaveguidePort(port_b, mode=mode, er=er, power=power)
-        PEC(*body.faces.unassigned)
-        wg.ports = [p0, p1]
+        wg.ports = [RectWaveguidePort(end, mode=mode, er=er, power=power)
+                    for end in (port_a, port_b)]
+        wg.pec = PEC(*body.faces.unassigned)
 
     return wg
 
 
-@dataclass
-class CircWaveguide:
+@dataclass(kw_only=True)
+class CircWaveguide(_Section):
     """Result of :func:`circ_waveguide`.
 
     Attributes
@@ -742,14 +748,13 @@ class CircWaveguide:
         the cylindrical fill volume
     port_a, port_b : EntityCollection
         the end-cap faces (the two waveguide ports)
+    pec : object or None
+        the PEC on the curved wall when ``add_ports`` (else None)
     ports : list
         the two :class:`rapidfem.WavePort` objects when ``add_ports``
     """
 
     body: "GeoObject"
-    port_a: "EntityCollection"
-    port_b: "EntityCollection"
-    ports: list = field(default_factory=list)
 
 
 def circ_waveguide(g: "Geometry", *,
@@ -812,27 +817,22 @@ def circ_waveguide(g: "Geometry", *,
     ValueError
         if ``axis`` is invalid, or ``add_ports`` is set without ``f0``
     """
-    if axis not in _AXIS_VEC:
-        raise ValueError(f"circ_waveguide: axis must be 'x', 'y' or 'z', got {axis!r}")
-    if add_ports and f0 is None:
-        raise ValueError("circ_waveguide: add_ports=True needs f0 (band-centre Hz)")
-    av = _AXIS_VEC[axis]
-    fill = material if material is not None else (
-        Air() if er == 1.0 else Dielectric(er=er))
+    av = _axis("circ_waveguide", axis)
+    _check_f0("circ_waveguide", add_ports, f0)
+    fill, _ = _fill(er, material)
     body = g.cylinder(radius, length, position=origin, axis=av, material=fill)
 
-    port_a = body.faces.min(axis=axis)
-    port_b = body.faces.max(axis=axis)
+    port_a, port_b = _ends(axis, body)
     wg = CircWaveguide(body=body, port_a=port_a, port_b=port_b)
 
     if add_ports:
-        p0 = WavePort(port_a, f0=f0, mode_kind="auto", power=power)
-        p1 = WavePort(port_b, f0=f0, mode_kind="auto", power=power)
-        PEC(*body.faces.unassigned)
-        wg.ports = [p0, p1]
+        _wave_ports(wg, f0, power)
+        wg.pec = PEC(*body.faces.unassigned)
 
     return wg
 
+
+# SWEPT CONDUCTORS ======================================================================
 
 def sweep_along_path(g: "Geometry", profile: "GeoObject",
                      points: "list[tuple[float, float, float]]",
@@ -887,18 +887,8 @@ def sweep_along_path(g: "Geometry", profile: "GeoObject",
         if ``profile`` is not an unmoved disc or fewer than two points are
         given
     """
-    if profile.dim != 2:
-        raise ValueError(f"sweep_along_path expects a 2D profile, got dim={profile.dim}")
-    if len(points) < 2:
-        raise ValueError("sweep_along_path needs at least two path points")
-    disc = g._native.disc_of(profile._id)
-    if disc is None:
-        raise ValueError("sweep_along_path: the profile must be a disc from "
-                         "Geometry.disc, not moved after (rapidmesh sweeps round tubes)")
-    oid = g._native.add_sweep([tuple(float(c) for c in p) for p in points],
-                              disc[0], maxh=maxh)
-    g._native.remove(profile._id)
-    return g._wrap(oid, sheet=False, material=material, maxh=maxh)
+    oid = g._native.sweep(profile._id, [tuple(float(c) for c in p) for p in points], maxh)
+    return g._wrap(oid, material)
 
 
 def helix(g: "Geometry", *,
@@ -966,4 +956,4 @@ def helix(g: "Geometry", *,
         raise ValueError(f"helix: points_per_turn must be >= 2, got {points_per_turn}")
     oid = g._native.add_helix(radius, pitch, turns, wire_radius, position=tuple(position),
                               points_per_turn=int(points_per_turn), maxh=maxh)
-    return g._wrap(oid, sheet=False, material=material, maxh=maxh)
+    return g._wrap(oid, material)

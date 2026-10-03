@@ -94,6 +94,21 @@ pub enum WaveKind {
     Tm,
 }
 
+impl WaveKind {
+    /// The solve a wave port's `mode_kind` asks for: "te" and "tm" as named,
+    /// "auto" the vector solve at `f0`, or without `f0` (the time domain,
+    /// which has no operating frequency) the scalar TE solve.
+    pub fn pick(mode_kind: &str, f0: Option<f64>) -> Result<WaveKind, String> {
+        match mode_kind {
+            "te" => Ok(WaveKind::Te),
+            "tm" => Ok(WaveKind::Tm),
+            "auto" if f0.is_none() => Ok(WaveKind::Te),
+            "auto" => Ok(WaveKind::Vector),
+            other => Err(format!("WavePort mode_kind must be one of ('auto', 'te', 'tm'), got '{other}'")),
+        }
+    }
+}
+
 /// A port or a boundary condition on the faces of `tag`.
 #[derive(Clone, Debug)]
 pub enum FaceSpec {
@@ -184,6 +199,36 @@ impl FaceSpec {
             | FaceSpec::WaveNumerical { tag, .. }
             | FaceSpec::SurfaceImpedance { tag, .. } => *tag,
         }
+    }
+
+    /// Puts the entry on the faces of `new` (an entry is described before
+    /// the mesh tags are handed out).
+    pub fn set_tag(&mut self, new: i32) {
+        match self {
+            FaceSpec::Rectangular { tag, .. }
+            | FaceSpec::Floquet { tag, .. }
+            | FaceSpec::UserDefined { tag, .. }
+            | FaceSpec::Coax { tag, .. }
+            | FaceSpec::Lumped { tag, .. }
+            | FaceSpec::Abc { tag }
+            | FaceSpec::Pmc { tag }
+            | FaceSpec::LumpedElement { tag, .. }
+            | FaceSpec::WaveNumerical { tag, .. }
+            | FaceSpec::SurfaceImpedance { tag, .. } => *tag = new,
+        }
+    }
+
+    /// Whether the entry is a driven port.
+    pub fn is_port(&self) -> bool {
+        matches!(
+            self,
+            FaceSpec::Rectangular { .. }
+                | FaceSpec::Floquet { .. }
+                | FaceSpec::UserDefined { .. }
+                | FaceSpec::Coax { .. }
+                | FaceSpec::Lumped { .. }
+                | FaceSpec::WaveNumerical { .. }
+        )
     }
 }
 

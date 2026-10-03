@@ -197,8 +197,7 @@ def test_msh_bake_and_solve(wg_msh):
     rf.PEC(scene.group("pec_1"))
     stats = g.mesh()
     assert stats.n_tets == n_tets
-    assert len(g._material_tags) == 1
-    assert len(g._physics_tags) == 3  # two ports + the PEC walls
+    assert sorted(stats.groups) == ["air_1", "pec_1", "port_1", "port_2"]
     res = rf.ProblemFD(g).sweep(f)
     assert res.sparams.shape == (3, 2, 2)
 

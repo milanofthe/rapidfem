@@ -81,6 +81,27 @@ impl FromStr for Device {
     }
 }
 
+impl Device {
+    /// The integrator of a run that names none: the exponential one on the
+    /// CPU, the explicit LSERK4 on the GPU (its fast path).
+    pub fn default_method(self) -> Method {
+        match self {
+            Device::Cpu => Method::Exponential,
+            Device::Gpu => Method::Explicit,
+        }
+    }
+}
+
+/// The flux blend of a named numerical flux: `upwind` 1, `central` 0
+/// (exactly energy-conserving).
+pub fn flux_alpha(flux: &str) -> Result<f64, String> {
+    match flux {
+        "upwind" => Ok(1.0),
+        "central" => Ok(0.0),
+        _ => Err(format!("flux must be one of ['central', 'upwind'], got {flux:?}")),
+    }
+}
+
 /// The source of `dy/dt = A·y + b·g(t)`.
 #[derive(Clone, Copy)]
 pub enum Drive<'a> {
@@ -214,6 +235,31 @@ pub struct Run {
 /// The excitation `g(t)`, sampled in physical time.
 pub type Waveform<'a> = dyn FnMut(f64) -> Result<f64, String> + 'a;
 
+/// A Gaussian pulse, optionally modulated by a sinusoidal carrier,
+/// `g(t) = exp(-((t-t0)/tau)^2) * cos(2 pi f0 (t-t0))`: a native waveform,
+/// sampled without a call back into the host language.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GaussianPulse {
+    /// Pulse centre (s).
+    pub t0: f64,
+    /// Gaussian `1/e` half-width (s).
+    pub tau: f64,
+    /// Carrier frequency (Hz); `None` for the bare Gaussian.
+    pub f0: Option<f64>,
+}
+
+impl GaussianPulse {
+    /// `g(t)`.
+    pub fn eval(&self, t: f64) -> f64 {
+        let x = (t - self.t0) / self.tau;
+        let envelope = (-(x * x)).exp();
+        match self.f0 {
+            None => envelope,
+            Some(f0) => envelope * (2.0 * std::f64::consts::PI * f0 * (t - self.t0)).cos(),
+        }
+    }
+}
+
 /// Called once per output frame; an `Err` aborts the run (an interrupt).
 pub type Hook<'a> = dyn FnMut() -> Result<(), String> + 'a;
 
@@ -240,6 +286,9 @@ pub struct TdSession {
     kcl: KclWorkspace,
     /// The stable explicit step in operator time, once computed.
     cfl_h: Option<f64>,
+    /// The face tag of each operator port, in operator port order (empty
+    /// for an operator not built from a model).
+    port_tags: Vec<i32>,
     #[cfg(feature = "gpu")]
     gpu: GpuSlot,
 }
@@ -396,9 +445,17 @@ impl TdSession {
             lserk: LserkWorkspace::new(),
             kcl: KclWorkspace::new(),
             cfl_h: None,
+            port_tags: Vec::new(),
             #[cfg(feature = "gpu")]
             gpu: GpuSlot::Untried,
         }
+    }
+
+    /// The session with the face tag of each operator port, see
+    /// [`crate::build::operator_from_model`].
+    pub fn with_port_tags(mut self, port_tags: Vec<i32>) -> Self {
+        self.port_tags = port_tags;
+        self
     }
 
     pub fn op(&self) -> &MaxwellOperator {
@@ -970,13 +1027,13 @@ impl TdSession {
         Ok(out)
     }
 
-    /// The operator index of the `k`-th modal port (the ports carrying a
-    /// mode, in declaration order; absorbing-only faces skipped).
-    pub fn modal_port(&self, k: usize) -> Result<usize, String> {
-        (0..self.op.n_ports())
-            .filter(|&p| self.op.port_has_mode(p))
-            .nth(k)
-            .ok_or_else(|| format!("modal port {k} does not exist on the operator"))
+    /// The operator index of the modal port on face tag `tag`.
+    pub fn port_of_tag(&self, tag: i32) -> Result<usize, String> {
+        match self.port_tags.iter().position(|&t| t == tag) {
+            Some(p) if self.op.port_has_mode(p) => Ok(p),
+            Some(_) => Err(format!("the port on face tag {tag} is an absorbing boundary, not a modal port")),
+            None => Err(format!("face tag {tag} carries no port of the operator")),
+        }
     }
 
     /// The modal amplitude `P_e` of each port over a row-major trajectory,
@@ -1214,6 +1271,14 @@ mod tests {
             y = s.step_explicit(&y, h).unwrap();
         }
         assert!(norm(&y) <= 1.01 * n0, "growth at the CFL step");
+    }
+
+    #[test]
+    fn gaussian_pulse_peaks_at_its_centre() {
+        let g = GaussianPulse { t0: 1.0, tau: 0.5, f0: Some(2.0) };
+        assert_eq!(g.eval(1.0), 1.0);
+        let bare = GaussianPulse { f0: None, ..g };
+        assert!((bare.eval(1.5) - (-1.0_f64).exp()).abs() < 1e-12);
     }
 
     #[test]

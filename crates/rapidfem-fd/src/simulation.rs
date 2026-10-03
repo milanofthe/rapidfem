@@ -861,6 +861,24 @@ fn build_pml_regions(mesh: &Mesh, model: &Model) -> Vec<PmlRegion> {
     }).collect()
 }
 
+/// A nodal field (`[x, y, z]` per node) in the viewer's phasor form: per
+/// node `A = |Re E|²`, `B = |Im E|²`, `C = Re E · Im E`, so that
+/// `|E(t)|² = A cos²(ωt) + B sin²(ωt) - 2 C sin(ωt) cos(ωt)`, as f32.
+pub fn abc_phasor(field: &[C64]) -> Vec<f32> {
+    field
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|v| {
+            let (re, im) = (v.iter().map(|c| c.re), v.iter().map(|c| c.im));
+            let a: f64 = re.clone().map(|x| x * x).sum();
+            let b: f64 = im.clone().map(|y| y * y).sum();
+            let c: f64 = re.zip(im).map(|(x, y)| x * y).sum();
+            [a as f32, b as f32, c as f32]
+        })
+        .collect()
+}
+
 /// One scalar per tet from its material, `default` where none applies.
 fn per_tet(materials: &[Material], n_tets: usize, default: f64, f: impl Fn(&Material) -> f64) -> Vec<f64> {
     let mut out = vec![default; n_tets];

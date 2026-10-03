@@ -46,7 +46,6 @@ export interface GeometryEntity {
 	normals?: number[];
 	// Wireframe mode (before g.mesh()): flat xyz pairs, 2 verts per segment.
 	lines?: number[];
-	material: string | null;
 }
 
 export interface GeometryPayload {
@@ -67,8 +66,7 @@ export interface MeshPayload {
 	tet_phys: number[];
 	phys_names: Record<string, string>;
 	phys_dim: Record<string, number>;
-	name_to_tag: Record<string, number>;
-	stats: { n_nodes: number; n_tets: number; n_tris: number; mesh_time_s: number; msh_bytes: number };
+	stats: { n_nodes: number; n_tets: number; n_tris: number; mesh_time_s: number };
 }
 
 export interface FileEntry {

@@ -11,7 +11,8 @@ is a *model-export* tool: it compiles the meshed structure into a linear ODE
 
 * :meth:`transient`           : turnkey, propagate an initial state,
 * :meth:`step`                : advance the state one exponential step,
-* :meth:`rhs` / :meth:`jacobian`, the ODE right-hand side / constant Jacobian,
+* :meth:`rhs` / :meth:`ode`   : the ODE right-hand side / the handoff to
+  external integrators,
 * :meth:`state_space`         : the verbatim sparse operator ``A``.
 
 The operator is built from the same meshed geometry and typed model as
@@ -92,10 +93,6 @@ class TdStepper:
             _arr(y), dt=self.dt, steps=1, method=self.method,
             krylov_dim=self.krylov_dim, verbose=False)
         return frames[-1]
-
-    def advance(self, y):
-        """Advance ``y`` by one ``dt`` step, same as calling the stepper."""
-        return self(y)
 
     def __repr__(self):
         return f"TdStepper(dt={self.dt:g}, method={self.method!r})"
@@ -339,24 +336,6 @@ class ProblemTD:
         """The ODE right-hand side ``dy/dt = A·y``."""
         return self._op.apply(_arr(y))
 
-    def rhs_into(self, y, out):
-        """Allocation-free :meth:`rhs`: write ``dy/dt = A·y`` into ``out``.
-
-        ``out`` must be a contiguous float64 array of length :attr:`n_dofs`.
-        Reuse one buffer across a hand-rolled integration loop to avoid a
-        fresh allocation per evaluation. The built-in steppers already do
-        this internally, so prefer :meth:`step` / :meth:`transient` unless
-        you are driving the operator yourself.
-
-        Parameters
-        ----------
-        y : array_like
-            state vector of length :attr:`n_dofs`
-        out : numpy.ndarray
-            float64 output buffer of length :attr:`n_dofs`, overwritten in place
-        """
-        self._op.apply_into(_arr(y), out)
-
     def field_energy(self, state):
         """Instantaneous electromagnetic field energy of a state.
 
@@ -384,11 +363,6 @@ class ProblemTD:
             The field energy, finite and non-negative for any real state.
         """
         return self._op.field_energy(_arr(state))
-
-    def jacobian(self):
-        """The (constant) Jacobian of the linear system, i.e. ``A`` itself,
-        as a sparse matrix. See :meth:`state_space`."""
-        return self.state_space()
 
     def state_space(self):
         """The verbatim operator ``A`` as a :class:`scipy.sparse.csr_matrix`.

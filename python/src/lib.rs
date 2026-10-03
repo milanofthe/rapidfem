@@ -21,7 +21,7 @@ use rapidfem_fd::error_estimator::ErrorEstimate;
 use rapidfem_fd::farfield::RadiationPattern;
 use rapidfem_fd::network::{renormalize, TouchstoneFormat};
 use rapidfem_fd::order::OrderPolicy;
-use rapidfem_fd::simulation::{FdSettings, Simulation, SweepResult};
+use rapidfem_fd::simulation::{abc_phasor, FdSettings, Simulation, SweepResult};
 use geometry::{PyFemMesh, PyGeometry};
 use model::PyModel;
 
@@ -322,6 +322,34 @@ impl PySimulation {
         mode: &PyEigenmode,
     ) -> Option<Bound<'py, PyArray2<Complex64>>> {
         Some(per_node(self.inner.eigenmode_field_at_nodes(&mode.inner)?, py))
+    }
+
+    /// The field of `channel` ("E", "J" or "H") at every node at
+    /// ``(freq_idx, port_idx)`` in the viewer's phasor form, flat float32
+    /// ``[A, B, C]`` per node (see `abc_phasor`); None where the solver
+    /// derives no such field.
+    #[pyo3(signature = (result, freq_idx, port_idx, channel="E"))]
+    fn field_abc<'py>(
+        &self,
+        py: Python<'py>,
+        result: &PySweepResult,
+        freq_idx: usize,
+        port_idx: usize,
+        channel: &str,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f32>>>> {
+        let (r, s) = (&result.inner, &self.inner);
+        let field = match channel {
+            "E" | "e" => s.field_at_nodes(r, freq_idx, port_idx),
+            "J" | "j" => s.current_density_at_nodes(r, freq_idx, port_idx),
+            "H" | "h" => s.h_field_at_nodes(r, freq_idx, port_idx),
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(format!("channel must be E, J or H, got {channel:?}"))),
+        };
+        Ok(field.map(|f| abc_phasor(&f).into_pyarray(py)))
+    }
+
+    /// An eigenmode's E field in the viewer's phasor form (see `field_abc`).
+    fn mode_field_abc<'py>(&self, py: Python<'py>, mode: &PyEigenmode) -> Option<Bound<'py, PyArray1<f32>>> {
+        Some(abc_phasor(&self.inner.eigenmode_field_at_nodes(&mode.inner)?).into_pyarray(py))
     }
 
     /// Monk-style residual error indicator per tetrahedron at

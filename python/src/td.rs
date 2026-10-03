@@ -11,11 +11,11 @@ use std::path::Path;
 use numpy::ndarray::Array2;
 use numpy::{
     AllowTypeChange, Complex64, IntoPyArray, PyArray1, PyArray2, PyArrayLikeDyn, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArrayDyn, PyReadwriteArray1,
+    PyReadonlyArray2, PyReadonlyArrayDyn,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyFloat;
+use pyo3::types::{PyDict, PyFloat};
 use rapidfem_td::constants::KRYLOV_TOL;
 use rapidfem_td::session::{
     flux_alpha, Device, Drive, GaussianPulse, Hook, Method, Record, RunOptions, TdSession, Waveform,
@@ -226,22 +226,6 @@ impl PyTdSession {
         Ok(self.s.op().apply(y).into_pyarray(py))
     }
 
-    /// `A·y` into `out`.
-    fn apply_into(&self, y: PyReadonlyArray1<'_, f64>, mut out: PyReadwriteArray1<'_, f64>) -> PyResult<()> {
-        let n = self.s.n_dof();
-        let y = slice(&y)?;
-        let out = out.as_slice_mut().map_err(rt)?;
-        if y.len() != n || out.len() != n {
-            return Err(PyValueError::new_err(format!(
-                "apply_into: expected y and out of length n_dof = {n}, got y={} out={}",
-                y.len(),
-                out.len()
-            )));
-        }
-        self.s.op().apply_into(y, out);
-        Ok(())
-    }
-
     /// `½·∫(ε|E|² + μ|H|²) dV` of a state.
     fn field_energy(&self, y: PyReadonlyArray1<'_, f64>) -> PyResult<f64> {
         Ok(self.s.op().field_energy(slice(&y)?))
@@ -402,17 +386,37 @@ impl PyTdSession {
         (csr.n, row_ptr.into_pyarray(py), col_idx.into_pyarray(py), csr.values.into_pyarray(py))
     }
 
-    /// DG node coordinates `[n_elem·Np, 3]` in state order.
-    fn node_coords<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let pts = self.s.op().node_coords();
-        let n = pts.len();
-        matrix(py, n, 3, pts.into_iter().flatten().collect())
-    }
-
-    /// Local node indices of the four tet corners.
-    fn corner_local_nodes(&self) -> (usize, usize, usize, usize) {
-        let c = self.s.op().corner_local_nodes();
-        (c[0], c[1], c[2], c[3])
+    /// The trajectory `states` (`[n_frames, n_dof]`) for the field viewer:
+    /// the merged corner nodes, tets, kept frame indices and the |E|, |H|
+    /// per node and frame quantised to 0..1000 of `field_max` (see
+    /// `TdSession::viewer_trajectory`).
+    #[pyo3(signature = (states, max_frames = 180))]
+    fn viewer_trajectory<'py>(&self, py: Python<'py>, states: PyReadonlyArray2<'py, f64>, max_frames: usize) -> PyResult<Bound<'py, PyDict>> {
+        let v = self.s.viewer_trajectory(states.as_slice().map_err(rt)?, max_frames).map_err(PyValueError::new_err)?;
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in &v.nodes {
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let d = PyDict::new(py);
+        d.set_item("nodes", v.nodes.iter().flatten().map(|&x| x as f32).collect::<Vec<f32>>())?;
+        d.set_item("tets", v.tets.iter().flatten().copied().collect::<Vec<usize>>())?;
+        d.set_item("n_node", v.nodes.len())?;
+        d.set_item("n_elem", v.tets.len())?;
+        let bbox = PyDict::new(py);
+        bbox.set_item("min", lo)?;
+        bbox.set_item("max", hi)?;
+        d.set_item("bbox", bbox)?;
+        d.set_item("frames", v.frames)?;
+        let field_max = PyDict::new(py);
+        field_max.set_item("E", v.field_max[0])?;
+        field_max.set_item("H", v.field_max[1])?;
+        d.set_item("field_max", field_max)?;
+        d.set_item("frames_e", v.frames_e)?;
+        d.set_item("frames_h", v.frames_h)?;
+        Ok(d)
     }
 
     /// Whether a GPU backend can be built.

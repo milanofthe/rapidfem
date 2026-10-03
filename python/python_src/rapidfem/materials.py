@@ -238,10 +238,8 @@ class Air(Material):
     :math:`\\tan\\delta = \\sigma = 0`.
 
     The simplest material; sets every permittivity, permeability, and
-    loss term to its free-space default. Convenient as a placeholder
-    for air boxes, padding regions, and inside :class:`PML` slabs
-    (the PML's coordinate stretch overrides the bulk permittivity, so
-    the material here only fills the volume role).
+    loss term to its free-space default, for air boxes and padding
+    regions.
 
 
     Example

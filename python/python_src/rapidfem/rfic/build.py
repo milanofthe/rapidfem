@@ -117,8 +117,8 @@ def build(
         ``"auto" | "sibc" | "pec" | "volume" | "volume_iso"``. Defaults:
         metals -> auto, vias -> volume (anisotropic), LOWLOSS -> pec.
         ``"sibc"`` and ``"pec"`` conductors are holes in the mesh whose walls
-        carry the boundary condition; the SIBC thickness per conductor piece is
-        ``2V/S`` (volume over wall area), which reproduces the DC resistance.
+        carry the boundary condition; the SIBC thickness of a layer is ``2V/S``
+        (its volume over its wall area), which reproduces the DC resistance.
         ``"auto"`` picks per layer from the thickness-to-skin-depth ratio over
         ``band``: SIBC where ``t/delta < 1.5`` or ``> 4`` across the whole band
         (the surface model, with its edge correction, is within a few percent

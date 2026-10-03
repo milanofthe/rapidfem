@@ -1053,6 +1053,83 @@ impl TdSession {
         Ok(out)
     }
 
+    /// A trajectory as the field viewer takes it: the DG element corners
+    /// merged into one continuous node set (corners within 1e-7 of the
+    /// coordinate span are one node, nodes sorted by position) with the tet
+    /// connectivity, and per frame the |E| and |H| of every node averaged
+    /// over its corners, quantised to 0..1000 of the channel maximum over
+    /// all frames. At most `max_frames` frames, evenly picked.
+    pub fn viewer_trajectory(&self, states: &[f64], max_frames: usize) -> Result<ViewerTrajectory, String> {
+        let n = self.n_dof();
+        if states.is_empty() || !states.len().is_multiple_of(n) {
+            return Err(format!("states carry {} values, not a positive multiple of n_dof = {n}", states.len()));
+        }
+        let n_snap = states.len() / n;
+        let frames: Vec<usize> = if n_snap > max_frames && max_frames > 1 {
+            let step = (n_snap - 1) as f64 / (max_frames - 1) as f64;
+            let mut f: Vec<usize> = (0..max_frames)
+                .map(|k| if k + 1 == max_frames { n_snap - 1 } else { (k as f64 * step).round_ties_even() as usize })
+                .collect();
+            f.dedup();
+            f
+        } else if n_snap > max_frames {
+            vec![0]
+        } else {
+            (0..n_snap).collect()
+        };
+        let (coords, corners, n_elem) = (self.op.node_coords(), self.op.corner_local_nodes(), self.op.n_elem());
+        let np = coords.len() / n_elem;
+        // every (element, corner), its DG node
+        let dg: Vec<usize> = (0..n_elem).flat_map(|e| corners.map(|c| e * np + c)).collect();
+        let span = {
+            let all = dg.iter().flat_map(|&i| coords[i]);
+            let (lo, hi) = all.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), x| (lo.min(x), hi.max(x)));
+            if hi > lo { hi - lo } else { 1.0 }
+        };
+        let quantum = span * 1e-7;
+        let key = |i: usize| coords[i].map(|x| (x / quantum).round_ties_even() as i64);
+        let mut first: std::collections::BTreeMap<[i64; 3], usize> = std::collections::BTreeMap::new();
+        for (j, &i) in dg.iter().enumerate() {
+            first.entry(key(i)).or_insert(j);
+        }
+        let index: std::collections::HashMap<[i64; 3], usize> = first.keys().enumerate().map(|(k, q)| (*q, k)).collect();
+        let node_of: Vec<usize> = dg.iter().map(|&i| index[&key(i)]).collect();
+        let nodes: Vec<[f64; 3]> = first.values().map(|&j| coords[dg[j]]).collect();
+        let n_node = nodes.len();
+        let mut count = vec![0.0f64; n_node];
+        for &k in &node_of {
+            count[k] += 1.0;
+        }
+        let magnitude = |v: &[f64]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let mut node_e = vec![vec![0.0f64; n_node]; frames.len()];
+        let mut node_h = node_e.clone();
+        for (fi, &f) in frames.iter().enumerate() {
+            let state = &states[f * n..(f + 1) * n];
+            for (j, &i) in dg.iter().enumerate() {
+                let v = &state[i * 6..i * 6 + 6];
+                node_e[fi][node_of[j]] += magnitude(&v[0..3]);
+                node_h[fi][node_of[j]] += magnitude(&v[3..6]);
+            }
+            for k in 0..n_node {
+                node_e[fi][k] /= count[k];
+                node_h[fi][k] /= count[k];
+            }
+        }
+        let max_of = |v: &Vec<Vec<f64>>| v.iter().flatten().fold(0.0f64, |m, &x| m.max(x)).max(1e-30);
+        let (e_max, h_max) = (max_of(&node_e), max_of(&node_h));
+        let quantise = |v: Vec<Vec<f64>>, top: f64| -> Vec<Vec<i16>> {
+            v.into_iter().map(|row| row.into_iter().map(|x| (x / top * 1000.0).round_ties_even().clamp(0.0, 1000.0) as i16).collect()).collect()
+        };
+        Ok(ViewerTrajectory {
+            nodes,
+            tets: node_of.as_chunks::<4>().0.to_vec(),
+            frames,
+            field_max: [e_max, h_max],
+            frames_e: quantise(node_e, e_max),
+            frames_h: quantise(node_h, h_max),
+        })
+    }
+
     /// Writes a trajectory as `<base>_NNNN.vtu` per frame (discontinuous
     /// linear tets, `E` and `H` at the element corners) and the
     /// `<base>.pvd` collection over `times`; returns the `.pvd` path.
@@ -1141,6 +1218,18 @@ impl TdSession {
         w.flush()?;
         Ok(pvd)
     }
+}
+
+/// A trajectory for the field viewer, see [`TdSession::viewer_trajectory`].
+pub struct ViewerTrajectory {
+    pub nodes: Vec<[f64; 3]>,
+    pub tets: Vec<[usize; 4]>,
+    /// The kept frame indices.
+    pub frames: Vec<usize>,
+    /// Max |E| and |H| over the kept frames.
+    pub field_max: [f64; 2],
+    pub frames_e: Vec<Vec<i16>>,
+    pub frames_h: Vec<Vec<i16>>,
 }
 
 /// `R(f)/G(f)` of two equally sampled signals at spacing `dt`, by real FFT

@@ -279,30 +279,13 @@ def handle_field_query(msg: dict) -> None:
         return
     try:
         import base64
-        import numpy as np
-        fi = int(msg.get("freq", 0))
-        pi = int(msg.get("port", 0))
         channel = str(msg.get("channel", "E"))
-        if channel in ("J", "j"):
-            arr = sim.current_density_at_nodes(result, fi, pi)
-        elif channel in ("H", "h"):
-            arr = sim.h_field_at_nodes(result, fi, pi)
-        else:
-            arr = sim.field_at_nodes(result, fi, pi)
-        if arr is None:
-            send({"type": "field-result", "qid": qid, "ok": True, "data": ""})
-            return
-        # ABC phasor (A=Σre², B=Σim², C=Σre·im per node), packed f32 → base64.
-        # The backend serves the decoded buffer raw; the viewer reads its
-        # byteLength, so no element count needs to ride along.
-        re = np.asarray(arr.real)
-        im = np.asarray(arr.imag)
-        a = np.sum(re * re, axis=1)
-        b = np.sum(im * im, axis=1)
-        c = np.sum(re * im, axis=1)
-        buf = np.stack([a, b, c], axis=1).astype(np.float32).tobytes()
-        send({"type": "field-result", "qid": qid, "ok": True,
-              "data": base64.b64encode(buf).decode("ascii")})
+        abc = sim.field_abc(result, int(msg.get("freq", 0)), int(msg.get("port", 0)),
+                            "E" if channel not in ("J", "j", "H", "h") else channel)
+        # The ABC phasor as packed f32; the backend serves the decoded buffer
+        # raw and the viewer reads its byteLength.
+        data = "" if abc is None else base64.b64encode(abc.tobytes()).decode("ascii")
+        send({"type": "field-result", "qid": qid, "ok": True, "data": data})
     except Exception as e:  # noqa: BLE001
         send({"type": "field-result", "qid": qid, "ok": False, "error": str(e)})
 

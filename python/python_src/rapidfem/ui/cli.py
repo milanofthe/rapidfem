@@ -30,38 +30,6 @@ def _default_workdir() -> Path:
     return Path.cwd()
 
 
-def _populate_examples(workdir: Path) -> int:
-    """Copy bundled examples into ``workdir`` if no ``.py`` is there yet.
-
-    Idempotent: never overwrites an existing file. Returns the count of
-    files actually copied (0 if the workdir already had Python in it).
-    """
-    if any(p.is_file() for p in workdir.glob("*.py")):
-        return 0
-    try:
-        from importlib import resources
-        root = resources.files("rapidfem.examples")
-    except (ModuleNotFoundError, FileNotFoundError):
-        return 0
-    n = 0
-    for entry in root.iterdir():  # type: ignore[attr-defined]
-        if not entry.is_file():
-            continue
-        name = entry.name
-        if not name.endswith(".py") or name.startswith("_"):
-            continue
-        target = workdir / name
-        if target.exists():
-            continue
-        try:
-            content = entry.read_text(encoding="utf-8")
-            target.write_text(content, encoding="utf-8", newline="\n")
-            n += 1
-        except OSError as e:
-            print(f"rapidfem serve, could not copy {name}: {e}", file=sys.stderr)
-    return n
-
-
 def _cmd_serve(args: argparse.Namespace) -> int:
     try:
         from rapidfem.ui.server import create_app, run
@@ -76,13 +44,6 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     if args.workdir is None:
         workdir = _default_workdir()
-        if not workdir.exists():
-            try:
-                workdir.mkdir(parents=True, exist_ok=True)
-                print(f"rapidfem serve, created workdir {workdir}")
-            except OSError as e:
-                print(f"error: could not create default workdir {workdir}: {e}", file=sys.stderr)
-                return 2
     else:
         workdir = Path(args.workdir).resolve()
         if not workdir.exists():
@@ -95,7 +56,6 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     # Examples are NOT copied into the workdir: they stay browsable read-only
     # in the UI's "Examples" section and open as unsaved buffers, so the
     # workdir is only ever populated by what the user explicitly saves.
-    # (`_populate_examples` is kept for opt-in / scripted use.)
 
     app = create_app(workdir=workdir, debug=args.debug)
     run(app, host=args.host, port=args.port, open_browser=not args.no_browser)

@@ -19,25 +19,6 @@ from typing import Any
 # ── Geometry → triangle payload ───────────────────────────────────────────────
 
 
-def _material_label(material) -> str | None:
-    """Render a tracked entity's ``.material`` into a JSON-safe display string.
-
-    A short label like ``"Dielectric (εr=4.4)"`` so the UI legend shows
-    something meaningful without dragging the whole object into the JSON
-    payload; ``None`` without a material.
-    """
-    if material is None:
-        return None
-    cls = type(material).__name__
-    er = getattr(material, "er", None)
-    er_diag = getattr(material, "er_diag", None)
-    if er_diag is not None:
-        return f"{cls} (εr=[{er_diag[0]:.2g},{er_diag[1]:.2g},{er_diag[2]:.2g}])"
-    if er is not None and abs(er - 1.0) > 1e-9:
-        return f"{cls} (εr={er:.3g})"
-    return cls
-
-
 # Signature palette mirrored from `lib/theme.ts`. Kept here as floats so the
 # serializer can emit RGB triples directly without pulling theme.ts into the
 # Python side. Updates to either side must be matched.
@@ -217,7 +198,7 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
     # body instead of a litter of gray faces; the rest is neutral.
     claimed: set[int] = set()
 
-    def emit(name, tag, dim, color, ids, material):
+    def emit(name, tag, dim, color, ids):
         pos: list[float] = []
         nor: list[float] = []
         for i in ids:
@@ -230,7 +211,6 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
             entities.append({
                 "name": name, "tag": int(tag), "dim": int(dim),
                 "color": color, "positions": pos, "normals": nor,
-                "material": material,
             })
 
     objects = [o._entity for o in g.objects]
@@ -240,8 +220,7 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
         label, color = _entity_resolution(g, ent)
         if label is None:
             continue  # untracked, a volume claims it next
-        emit(label, ent.key[0], 2, color, native.face_ids([ent.key]),
-             _material_label(ent.material))
+        emit(label, ent.key[0], 2, color, native.face_ids([ent.key]))
     # later volumes first: an inner body added after its surrounding
     # volume takes the interface between them
     for ent in reversed(objects):
@@ -249,9 +228,9 @@ def _surface_preview(g: Any, target_tris: int) -> dict:
             continue
         label, color = _entity_resolution(g, ent)
         emit(label or ent.name or f"_volume_{ent.key}", ent.key, 3, color,
-             native.face_ids(native.faces_of(ent.key)), _material_label(ent.material))
+             native.face_ids(native.faces_of(ent.key)))
     for fid in sorted(faces):
-        emit(f"_face_{fid}", fid, 2, _COL_NEUTRAL, [fid], None)
+        emit(f"_face_{fid}", fid, 2, _COL_NEUTRAL, [fid])
 
     return {
         "kind": "geometry",
@@ -297,12 +276,10 @@ def mesh_to_payload(g: Any, *, maxh: float) -> dict:
         "tet_phys": tet_tags,
         "phys_names": phys_names,
         "phys_dim": phys_dim,
-        "name_to_tag": {n: t for t, n in phys_names.items()},
         "stats": {
             "n_nodes": len(nodes) // 3,
             "n_tets": len(tet_tags),
             "n_tris": len(tri_tags),
             "mesh_time_s": t_mesh,
-            "msh_bytes": 0,
         },
     }

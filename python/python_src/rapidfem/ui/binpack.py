@@ -99,7 +99,7 @@ def _pack_geometry(geo: _Buffer, payload: dict) -> None:
     for ent in payload.get("entities", []):
         if not isinstance(ent, dict):
             continue
-        for key in ("positions", "normals", "lines"):
+        for key in ("positions", "normals"):
             v = ent.get(key)
             if isinstance(v, list) and v:
                 ent[key] = _pack_array(geo, "geo", v, "f32")

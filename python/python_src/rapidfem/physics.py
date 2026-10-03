@@ -768,7 +768,7 @@ class SurfaceImpedance(_Physics):
     ----
     A surface impedance on the walls of a finite-thickness strip is accurate
     where the metal is thinner than about 1.5 or thicker than about 4 skin
-    depths: on one-sided walls (a conductor hollowed out of the mesh) the
+    depths: on the walls of a conductor hollowed out of the mesh the
     impedance of the current along a convex edge rises within a few skin
     depths of it, the current crowding a per-face impedance misses, and the
     solver adds that from a universal profile (within 3 % of a 2D
@@ -937,10 +937,9 @@ class PML(_Physics):
     Note
     ----
     PML lives on a *volume* (dim=3), not a surface. Build it as an
-    extra cuboid attached to the air region; assign a placeholder
-    material (e.g. :class:`Air`) so the volume gets meshed, then
-    declare the PML BC on the volume, the BC's stretch overrides the
-    bulk permittivity for the absorption profile.
+    extra cuboid attached to the air region and declare the PML on it;
+    ``er_base`` / ``ur_base`` and the stretch set the slab's permittivity
+    and permeability, whatever material fills the box.
 
     For a closed enclosure around an antenna use one PML slab per
     outer face; the slabs must not overlap (each volume can only carry

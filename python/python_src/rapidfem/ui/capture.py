@@ -6,7 +6,7 @@
 
 When the UI server runs user code, it calls `start_capture()` first, exec's
 the user script, and then collects whatever was passed to `rapidfem.show()`
-via `get_captured()`.
+from `stop_capture()`.
 
 Outside UI mode the capture slot is inactive and `show()` is a print-only
 no-op, so scripts behave the same on the command line and in the UI.
@@ -66,10 +66,6 @@ def active_sweep_callback():
     if not is_capturing():
         return None
     return getattr(_state, "sweep_cb", None)
-
-
-def get_captured() -> list[CapturedItem]:
-    return list(getattr(_state, "items", []))
 
 
 def is_capturing() -> bool:

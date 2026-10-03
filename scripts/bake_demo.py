@@ -193,7 +193,7 @@ def _bake_cell(cell: Cell, kernel) -> dict:
     err: BaseException | None = None
     _show_capture.start_capture()
     try:
-        with _capture_streams(on_line=on_line, stage="cell"):
+        with _capture_streams(on_line=on_line):
             try:
                 exec(compile(cell.text, kernel.file_path or "<cell>", "exec"),
                      kernel.namespace)

@@ -690,16 +690,16 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
 
         The scene is always assembled conformally (every interface is shared
         by the mesh on both sides); where solids overlap, the one on top owns
-        the overlap. ``fragment`` puts the ``tools`` above ``target`` and
-        everything else, in the given order (the last tool wins), which is
-        the usual intent of fragmenting inner objects with their surrounding
-        volume.
+        the overlap. ``fragment`` puts the ``tools`` on top of every object,
+        in the given order (the last tool wins), which is the usual intent of
+        fragmenting inner objects with their surrounding volume; ``target``
+        itself is not changed.
 
 
         Parameters
         ----------
         target : GeoObject
-            object to fragment
+            the surrounding object, for readability only
         *tools : GeoObject
             objects to put on top, in order
         """

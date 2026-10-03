@@ -43,8 +43,30 @@ def test_mesh_payload_after_meshing():
     assert len(p["tets"]) == 4 * len(p["tet_phys"]) == 4 * g.mesh_stats.n_tets
     assert len(p["tris"]) == 3 * len(p["tri_phys"])
     assert max(p["tets"]) < n and max(p["tris"]) < n
-    by_name = p["name_to_tag"]
+    by_name = {n: t for t, n in p["phys_names"].items()}
     assert p["phys_dim"][by_name["port_1"]] == 2
     assert p["phys_dim"][by_name["dielectric_1"]] == 3
     assert set(p["tet_phys"]) == {by_name["air_1"], by_name["dielectric_1"]}
     assert set(p["tri_phys"]) == {by_name["port_1"], by_name["pec_1"]}
+
+
+def test_td_trajectory_payload():
+    """The native viewer export: merged corner nodes, tets and quantised
+    per-node |E|, |H| frames, decimated to max_frames."""
+    import numpy as np
+    import rapidfem as rf
+    from rapidfem.ui.api import _td_trajectory_payload
+
+    p = rf.ProblemTD.box(size=(1, 1, 1), cells=(2, 2, 2), order=2)
+    y0 = np.random.default_rng(0).standard_normal(p.n_dofs)
+    traj = p.transient(y0, dt=0.05, steps=9, method="explicit", verbose=False)
+    out = _td_trajectory_payload(traj, max_frames=4)
+    n = out["n_node"]
+    # a 2x2x2 box: 3 x 3 x 3 corner nodes shared by all tets
+    assert n == 27 and len(out["nodes"]) == 3 * n
+    assert len(out["tets"]) == 4 * out["n_elem"] == 4 * p.n_tets
+    assert max(out["tets"]) == n - 1
+    assert out["n_snapshots"] == len(out["times"]) == len(out["frames_e"]) == 4
+    assert all(len(f) == n and 0 <= min(f) and max(f) <= 1000 for f in out["frames_e"])
+    assert max(max(f) for f in out["frames_e"]) == 1000
+    assert out["field_max"]["E"] > 0

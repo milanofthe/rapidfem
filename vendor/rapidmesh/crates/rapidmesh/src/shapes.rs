@@ -12,36 +12,83 @@
 //!
 //! A shape is only a description; [`crate::Geometry::add_solid`] facets it,
 //! with the geometry's target size where the faceting depends on it.
+//!
+//! [`Shape::of_kind`] and [`Sheet::of_kind`] make a shape from its kind's
+//! name and its fields by name (the Python binding's path): the fields the
+//! shape cannot do without must be there, the others take the defaults of
+//! `new`, and an unknown field is an error.
 
 use crate::{Error, Result};
+use rapidmesh_geom::vec3::{cross, len};
 pub use rapidmesh_geom::ProfileEdge;
 use rapidmesh_geom::{
     cylinder, cylinder_iso, extrude_polygon, extrude_spline_profile, facet_subdivisions, frustum,
-    frustum_iso, helix, icosphere, import_obj_creased, import_stl_creased, loft, mesh_solid,
-    naca0012_profile, pipe, revolve, sheet_disk, sheet_nurbs, sheet_polygon, sheet_rect, solid_box,
-    torus, validate_closed, wedge, Faceted, NurbsSurface,
+    frustum_iso, helix, icosphere, import_obj, import_stl, loft, mesh_solid, naca0012_profile,
+    pipe, revolve, sheet_disk, sheet_nurbs, sheet_polygon, sheet_rect, solid_box, torus,
+    validate_closed, wedge, Faceted, NurbsSurface,
 };
+use serde::Deserialize;
 use std::f64::consts::TAU;
 use std::path::PathBuf;
 
 type P3 = [f64; 3];
 type P2 = [f64; 2];
 
+/// The defaults of the shapes' fields, shared by `new` and [`Shape::of_kind`].
+mod default {
+    use super::{Up, P3};
+
+    pub fn origin() -> P3 {
+        [0.0; 3]
+    }
+    pub fn z() -> P3 {
+        [0.0, 0.0, 1.0]
+    }
+    pub fn segments() -> usize {
+        24
+    }
+    pub fn subdivisions() -> usize {
+        3
+    }
+    pub fn n_per_side() -> usize {
+        40
+    }
+    pub fn n_seg() -> usize {
+        120
+    }
+    pub fn torus_segments() -> usize {
+        32
+    }
+    pub fn tube_segments() -> usize {
+        16
+    }
+    pub fn sweep_segments() -> usize {
+        16
+    }
+    pub fn points_per_turn() -> usize {
+        24
+    }
+    pub fn helix_segments() -> usize {
+        12
+    }
+    pub fn full_turn() -> f64 {
+        360.0
+    }
+    pub fn crease_deg() -> f64 {
+        40.0
+    }
+    pub fn up() -> Up {
+        Up::Z
+    }
+}
+
 /// `v` scaled to unit length; an error for the zero vector.
 pub(crate) fn unit(v: P3) -> Result<P3> {
-    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let n = len(v);
     if n == 0.0 {
         return Err(Error::Invalid("axis must be nonzero".into()));
     }
     Ok(v.map(|c| c / n))
-}
-
-fn cross(a: P3, b: P3) -> P3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
 }
 
 /// Rows of a structured barrel with roughly square cells: the height over
@@ -56,9 +103,11 @@ fn square_rows(height: f64, radius: f64, segments: usize) -> usize {
 }
 
 /// Axis-aligned box: `size` along x, y, z from the lower corner `position`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cuboid {
     pub size: P3,
+    #[serde(default = "default::origin")]
     pub position: P3,
 }
 
@@ -66,7 +115,7 @@ impl Cuboid {
     pub fn new(size: P3) -> Cuboid {
         Cuboid {
             size,
-            position: [0.0; 3],
+            position: default::origin(),
         }
     }
 
@@ -79,14 +128,20 @@ impl Cuboid {
 /// faceted with `segments` chords and carries the analytic surface. With
 /// `uniform` the barrel is a structured grid of `rows` (roughly square cells
 /// when `None`) instead of full-height strips.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cylinder {
     pub radius: f64,
     pub height: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::z")]
     pub axis: P3,
+    #[serde(default = "default::segments")]
     pub segments: usize,
+    #[serde(default)]
     pub uniform: bool,
+    #[serde(default)]
     pub rows: Option<usize>,
 }
 
@@ -95,9 +150,9 @@ impl Cylinder {
         Cylinder {
             radius,
             height,
-            position: [0.0; 3],
-            axis: [0.0, 0.0, 1.0],
-            segments: 24,
+            position: default::origin(),
+            axis: default::z(),
+            segments: default::segments(),
             uniform: false,
             rows: None,
         }
@@ -114,10 +169,13 @@ impl Cylinder {
 
 /// Sphere centred at `position` (faceted geodesically, analytic surface).
 /// The facet density follows the target size; `segments` is a floor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sphere {
     pub radius: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::segments")]
     pub segments: usize,
 }
 
@@ -125,8 +183,8 @@ impl Sphere {
     pub fn new(radius: f64) -> Sphere {
         Sphere {
             radius,
-            position: [0.0; 3],
-            segments: 24,
+            position: default::origin(),
+            segments: default::segments(),
         }
     }
 
@@ -136,10 +194,13 @@ impl Sphere {
 }
 
 /// Geodesic sphere with a fixed facet level: `20 * 4^subdivisions` faces.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Icosphere {
     pub radius: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::subdivisions")]
     pub subdivisions: usize,
 }
 
@@ -147,8 +208,8 @@ impl Icosphere {
     pub fn new(radius: f64) -> Icosphere {
         Icosphere {
             radius,
-            position: [0.0; 3],
-            subdivisions: 3,
+            position: default::origin(),
+            subdivisions: default::subdivisions(),
         }
     }
 
@@ -160,13 +221,18 @@ impl Icosphere {
 /// A NACA 0012 airfoil (chord along +x, leading edge at `position`)
 /// extruded along `span_axis` by `span`: one analytic spline skin, a flat
 /// blunt trailing edge and two caps.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Naca0012 {
     pub chord: f64,
     pub span: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::z")]
     pub span_axis: P3,
+    #[serde(default = "default::n_per_side")]
     pub n_per_side: usize,
+    #[serde(default = "default::n_seg")]
     pub n_seg: usize,
 }
 
@@ -175,10 +241,10 @@ impl Naca0012 {
         Naca0012 {
             chord,
             span,
-            position: [0.0; 3],
-            span_axis: [0.0, 0.0, 1.0],
-            n_per_side: 40,
-            n_seg: 120,
+            position: default::origin(),
+            span_axis: default::z(),
+            n_per_side: default::n_per_side(),
+            n_seg: default::n_seg(),
         }
     }
 
@@ -189,15 +255,21 @@ impl Naca0012 {
 
 /// Conical frustum: radius `r1` at `position`, `r2` (0 for a full cone) at
 /// `position + height * axis`. `uniform` and `rows` as for [`Cylinder`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cone {
     pub r1: f64,
     pub r2: f64,
     pub height: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::z")]
     pub axis: P3,
+    #[serde(default = "default::segments")]
     pub segments: usize,
+    #[serde(default)]
     pub uniform: bool,
+    #[serde(default)]
     pub rows: Option<usize>,
 }
 
@@ -207,9 +279,9 @@ impl Cone {
             r1,
             r2,
             height,
-            position: [0.0; 3],
-            axis: [0.0, 0.0, 1.0],
-            segments: 24,
+            position: default::origin(),
+            axis: default::z(),
+            segments: default::segments(),
             uniform: false,
             rows: None,
         }
@@ -226,11 +298,14 @@ impl Cone {
 
 /// Right prism: the polygon `points` (xy plane, offset by `position`) with
 /// `holes`, extruded by `height` along z.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Prism {
     pub points: Vec<P2>,
+    #[serde(default)]
     pub holes: Vec<Vec<P2>>,
     pub height: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
 }
 
@@ -240,7 +315,7 @@ impl Prism {
             points,
             holes: Vec::new(),
             height,
-            position: [0.0; 3],
+            position: default::origin(),
         }
     }
 
@@ -250,13 +325,18 @@ impl Prism {
 }
 
 /// Torus centred at `position`, its plane normal to `axis`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Torus {
     pub major_radius: f64,
     pub minor_radius: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::z")]
     pub axis: P3,
+    #[serde(default = "default::torus_segments")]
     pub segments: usize,
+    #[serde(default = "default::tube_segments")]
     pub tube_segments: usize,
 }
 
@@ -265,10 +345,10 @@ impl Torus {
         Torus {
             major_radius,
             minor_radius,
-            position: [0.0; 3],
+            position: default::origin(),
             axis: [0.0, 0.0, 1.0],
-            segments: 32,
-            tube_segments: 16,
+            segments: default::torus_segments(),
+            tube_segments: default::tube_segments(),
         }
     }
 
@@ -279,10 +359,13 @@ impl Torus {
 
 /// A `dx x dy x dz` box whose top edge is shortened to `top_x` along x (0 a
 /// triangular prism); the taper runs in the xz plane.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Wedge {
     pub size: P3,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default)]
     pub top_x: f64,
 }
 
@@ -290,7 +373,7 @@ impl Wedge {
     pub fn new(size: P3) -> Wedge {
         Wedge {
             size,
-            position: [0.0; 3],
+            position: default::origin(),
             top_x: 0.0,
         }
     }
@@ -301,10 +384,12 @@ impl Wedge {
 }
 
 /// A round tube of `radius` swept along the open polyline `path`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Sweep {
     pub path: Vec<P3>,
     pub radius: f64,
+    #[serde(default = "default::sweep_segments")]
     pub segments: usize,
 }
 
@@ -313,21 +398,25 @@ impl Sweep {
         Sweep {
             path,
             radius,
-            segments: 16,
+            segments: default::sweep_segments(),
         }
     }
 }
 
 /// Helical coil around +z through `position`: helix `radius`, `pitch` per
 /// turn, round wire of `wire_radius`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Helix {
     pub radius: f64,
     pub pitch: f64,
     pub turns: f64,
     pub wire_radius: f64,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::points_per_turn")]
     pub points_per_turn: usize,
+    #[serde(default = "default::helix_segments")]
     pub segments: usize,
 }
 
@@ -338,9 +427,9 @@ impl Helix {
             pitch,
             turns,
             wire_radius,
-            position: [0.0; 3],
-            points_per_turn: 24,
-            segments: 12,
+            position: default::origin(),
+            points_per_turn: default::points_per_turn(),
+            segments: default::helix_segments(),
         }
     }
 
@@ -351,7 +440,8 @@ impl Helix {
 
 /// Ruled loft between two planar profiles with the same vertex count,
 /// corresponded by index; both star-shaped about their centroid.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Loft {
     pub profile_a: Vec<P3>,
     pub profile_b: Vec<P3>,
@@ -363,13 +453,21 @@ pub struct Loft {
 /// carrier (plane, cylinder, cone, sphere, torus or a revolved spline); a
 /// part turn adds a start and an end cap. The facet count follows the
 /// target size; `segments` is a floor around a full turn.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Revolve {
     pub points: Vec<P2>,
+    /// The edges of the profile (straight where none are given): `"line"`,
+    /// `{"arc": bulge}` or `{"spline": interior points}` by name.
+    #[serde(default, deserialize_with = "profile_edges")]
     pub edges: Vec<ProfileEdge>,
+    #[serde(default = "default::origin")]
     pub position: P3,
+    #[serde(default = "default::z")]
     pub axis: P3,
+    #[serde(default = "default::full_turn")]
     pub angle: f64,
+    #[serde(default = "default::segments")]
     pub segments: usize,
 }
 
@@ -379,27 +477,36 @@ impl Revolve {
         Revolve {
             edges: vec![ProfileEdge::Line; points.len()],
             points,
-            position: [0.0; 3],
+            position: default::origin(),
             axis: [0.0, 0.0, 1.0],
-            angle: 360.0,
-            segments: 24,
+            angle: default::full_turn(),
+            segments: default::segments(),
         }
     }
 }
 
 /// A closed, non-self-intersecting triangle soup taken as it is (no
 /// analytic surface); the winding is made outward.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Triangles {
     pub verts: Vec<P3>,
     pub tris: Vec<[u32; 3]>,
 }
 
-/// Which axis of a file points up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which axis of a file points up (`"y"` or `"z"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
 pub enum Up {
     Y,
     Z,
+}
+
+impl TryFrom<String> for Up {
+    type Error = Error;
+    fn try_from(s: String) -> Result<Up> {
+        s.parse()
+    }
 }
 
 impl std::str::FromStr for Up {
@@ -418,10 +525,13 @@ impl std::str::FromStr for Up {
 /// A solid from an STL or OBJ file, split into smooth surfaces at creases
 /// sharper than `crease_deg` and remeshed. The file must be a closed,
 /// consistently oriented 2-manifold; a y-up file is turned z-up.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Import {
     pub path: PathBuf,
+    #[serde(default = "default::crease_deg")]
     pub crease_deg: f64,
+    #[serde(default = "default::up")]
     pub up: Up,
 }
 
@@ -429,8 +539,8 @@ impl Import {
     pub fn new(path: impl Into<PathBuf>) -> Import {
         Import {
             path: path.into(),
-            crease_deg: 40.0,
-            up: Up::Z,
+            crease_deg: default::crease_deg(),
+            up: default::up(),
         }
     }
 }
@@ -469,6 +579,60 @@ into_shape!(
     Cuboid, Cylinder, Sphere, Icosphere, Naca0012, Cone, Prism, Torus, Wedge, Sweep, Helix, Loft,
     Revolve, Triangles, Import
 );
+
+impl Shape {
+    /// The shape of kind `kind` ("box", "cylinder", "sphere", "icosphere",
+    /// "naca0012", "cone", "prism", "torus", "wedge", "sweep", "helix",
+    /// "loft", "revolve", "triangles", "import") from its fields by name.
+    pub fn of_kind<'de, D: serde::Deserializer<'de>>(kind: &str, fields: D) -> Result<Shape> {
+        fn de<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+            kind: &str,
+            d: D,
+        ) -> Result<T> {
+            T::deserialize(d).map_err(|e| Error::Invalid(format!("{kind}: {e}")))
+        }
+        Ok(match kind {
+            "box" => Shape::Cuboid(de(kind, fields)?),
+            "cylinder" => Shape::Cylinder(de(kind, fields)?),
+            "sphere" => Shape::Sphere(de(kind, fields)?),
+            "icosphere" => Shape::Icosphere(de(kind, fields)?),
+            "naca0012" => Shape::Naca0012(de(kind, fields)?),
+            "cone" => Shape::Cone(de(kind, fields)?),
+            "prism" => Shape::Prism(de(kind, fields)?),
+            "torus" => Shape::Torus(de(kind, fields)?),
+            "wedge" => Shape::Wedge(de(kind, fields)?),
+            "sweep" => Shape::Sweep(de(kind, fields)?),
+            "helix" => Shape::Helix(de(kind, fields)?),
+            "loft" => Shape::Loft(de(kind, fields)?),
+            "revolve" => Shape::Revolve(de(kind, fields)?),
+            "triangles" => Shape::Triangles(de(kind, fields)?),
+            "import" => Shape::Import(de(kind, fields)?),
+            other => return Err(Error::Invalid(format!("unknown shape {other:?}"))),
+        })
+    }
+}
+
+/// The edges of a revolve's profile by name: `"line"`, `{"arc": bulge}` or
+/// `{"spline": points}`.
+fn profile_edges<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<ProfileEdge>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum Edge {
+        Line,
+        Arc(f64),
+        Spline(Vec<P2>),
+    }
+    Ok(Vec::<Edge>::deserialize(d)?
+        .into_iter()
+        .map(|e| match e {
+            Edge::Line => ProfileEdge::Line,
+            Edge::Arc(b) => ProfileEdge::Arc(b),
+            Edge::Spline(p) => ProfileEdge::Spline(p),
+        })
+        .collect())
+}
 
 /// The faces of a box, in their order.
 pub const BOX_ROLES: [&str; 6] = ["-z", "+z", "-y", "+y", "-x", "+x"];
@@ -580,7 +744,11 @@ impl Shape {
             Shape::Loft(l) => loft(&l.profile_a, &l.profile_b),
             Shape::Revolve(r) => revolve(
                 &r.points,
-                &r.edges,
+                &if r.edges.is_empty() {
+                    vec![ProfileEdge::Line; r.points.len()]
+                } else {
+                    r.edges.clone()
+                },
                 r.position,
                 r.axis,
                 r.angle.to_radians(),
@@ -598,9 +766,9 @@ impl Shape {
                     .and_then(|s| s.to_str())
                     .is_some_and(|s| s.eq_ignore_ascii_case("stl"));
                 let f = if stl {
-                    import_stl_creased(p, i.crease_deg)
+                    import_stl(p, i.crease_deg)
                 } else {
-                    import_obj_creased(p, i.crease_deg)
+                    import_obj(p, i.crease_deg)
                 }
                 .map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
                 let f = match i.up {
@@ -645,6 +813,82 @@ pub enum Sheet {
 }
 
 impl Sheet {
+    /// The sheet of kind `kind` ("rect": `corner`, `u`, `v`; "disc":
+    /// `radius`, `center` (origin), `axis` (z), `segments`; "polygon": `points`,
+    /// `position`, `holes`; "nurbs": `ctrl`, `degree`, `weights`, `knots`)
+    /// from its fields by name.
+    pub fn of_kind<'de, D: serde::Deserializer<'de>>(kind: &str, fields: D) -> Result<Sheet> {
+        fn de<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(
+            kind: &str,
+            d: D,
+        ) -> Result<T> {
+            T::deserialize(d).map_err(|e| Error::Invalid(format!("{kind}: {e}")))
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Rect {
+            corner: P3,
+            u: P3,
+            v: P3,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Disc {
+            radius: f64,
+            #[serde(default = "default::origin")]
+            center: P3,
+            #[serde(default = "default::z")]
+            axis: P3,
+            #[serde(default = "default::segments")]
+            segments: usize,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Polygon {
+            points: Vec<P2>,
+            #[serde(default = "default::origin")]
+            position: P3,
+            #[serde(default)]
+            holes: Vec<Vec<P2>>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Nurbs {
+            ctrl: Vec<Vec<P3>>,
+            degree: [usize; 2],
+            weights: Option<Vec<Vec<f64>>>,
+            knots: Option<[Vec<f64>; 2]>,
+        }
+        Ok(match kind {
+            "rect" => {
+                let r: Rect = de(kind, fields)?;
+                Sheet::plate(r.corner, r.u, r.v)
+            }
+            "disc" => {
+                let d: Disc = de(kind, fields)?;
+                Sheet::Disc {
+                    radius: d.radius,
+                    center: d.center,
+                    axis: d.axis,
+                    segments: d.segments,
+                }
+            }
+            "polygon" => {
+                let p: Polygon = de(kind, fields)?;
+                Sheet::Polygon {
+                    points: p.points,
+                    holes: p.holes,
+                    position: p.position,
+                }
+            }
+            "nurbs" => {
+                let n: Nurbs = de(kind, fields)?;
+                Sheet::nurbs(n.ctrl, n.degree, n.weights, n.knots)?
+            }
+            other => return Err(Error::Invalid(format!("unknown sheet {other:?}"))),
+        })
+    }
+
     /// A rectangle in an xy plane: `width` along x, `height` along y.
     pub fn xy(width: f64, height: f64, position: P3) -> Sheet {
         Sheet::plate(position, [width, 0.0, 0.0], [0.0, height, 0.0])
@@ -671,7 +915,7 @@ impl Sheet {
             radius,
             center,
             axis,
-            segments: 24,
+            segments: default::segments(),
         }
     }
 

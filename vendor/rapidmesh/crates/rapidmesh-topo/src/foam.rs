@@ -10,6 +10,7 @@
 //! (by owner, then neighbour, owner the smaller cell), then the boundary
 //! faces patch after patch.
 
+use crate::math::{add, cross, dot, norm, scale, sub};
 use crate::{TetTopology, NONE};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -59,34 +60,6 @@ pub struct FvmQuality {
     /// out of it) over the sum of their magnitudes, 0 for a closed cell
     /// (`checkMesh` fails above 1e-6).
     pub max_openness: f64,
-}
-
-fn sub(a: P, b: P) -> P {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn add(a: P, b: P) -> P {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scale(a: P, s: f64) -> P {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-fn dot(a: P, b: P) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: P, b: P) -> P {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn norm(a: P) -> f64 {
-    dot(a, a).sqrt()
 }
 
 fn mean(points: &[P], ids: &[u32]) -> P {

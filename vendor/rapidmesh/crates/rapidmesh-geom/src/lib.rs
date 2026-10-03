@@ -2,14 +2,17 @@
 //!
 //! The tagged PLC (piecewise-linear complex: watertight triangle surface with
 //! face/region tags and back-references to the originating analytic surface) is
-//! the central intermediate representation of rapidmesh. Both the CSG path
-//! (primitives + booleans) and the later STEP path converge on it; the tet
-//! mesher consumes it. Surface back-references exist so the order-2 snapping
-//! stage can project midside nodes onto the true surface.
+//! the central intermediate representation of rapidmesh. The CSG path
+//! (primitives + booleans), the imports and the STEP path converge on it; the
+//! B-rep is built from it. The surface back-references give each face its
+//! carrier, which the mesher samples and the second-order nodes are projected
+//! onto.
 
+pub mod bvh;
 pub mod cdt2;
 pub mod discrete;
 mod faceted;
+pub mod grid;
 pub mod import;
 pub mod nurbs;
 pub mod nurbs_surface;
@@ -21,11 +24,8 @@ pub mod tube;
 pub mod vec3;
 
 pub use discrete::DiscreteSurface;
-pub use faceted::{Faceted, FlatFacet, Frame, SurfaceKind};
-pub use import::{
-    import_obj, import_obj_creased, import_stl, import_stl_creased, min_height_ratio,
-    validate_closed, ImportError, CREASE_DEG,
-};
+pub use faceted::{CurveKind, EdgeCurve, Faceted, FlatFacet, Frame, SurfaceKind};
+pub use import::{import_obj, import_stl, validate_closed, ImportError, CREASE_DEG};
 pub use nurbs::NurbsCurve;
 pub use nurbs_surface::NurbsSurface;
 pub use plc::{FaceTag, RegionTag, SurfaceRef, TaggedPlc};

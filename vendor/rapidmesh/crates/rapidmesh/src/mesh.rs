@@ -5,8 +5,8 @@
 use rapidmesh_brep::Model;
 use rapidmesh_exact::clock::Instant;
 use rapidmesh_exact::log::{Event, Level};
-use rapidmesh_tet::diagnostics::{Defect, MeshDiagnostics};
-use rapidmesh_tet::fidelity::Fidelity;
+use rapidmesh_tet::Fidelity;
+use rapidmesh_tet::{Defect, MeshDiagnostics};
 use rapidmesh_tet::{QualityStats, TetMesh};
 use rapidmesh_topo::export::Names;
 use rapidmesh_topo::{
@@ -286,6 +286,11 @@ struct Viewer<'a> {
     stats: ViewerStats,
     #[serde(skip_serializing_if = "Option::is_none")]
     defects: Option<Vec<ViewerDefect>>,
+    /// The mid-edge node of every edge of the second-order mesh that lies
+    /// off its chord, `[a, b, [x, y, z]]` (`a < b`); every other edge is
+    /// straight. Absent for the linear mesh.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    curved_edges: Option<Vec<(usize, usize, [f64; 3])>>,
 }
 
 impl<'a> Viewer<'a> {
@@ -325,6 +330,7 @@ impl<'a> Viewer<'a> {
             edges: Vec::new(),
             stats,
             defects: None,
+            curved_edges: None,
         }
     }
 }
@@ -361,8 +367,9 @@ pub struct Mesh {
     pub quality: QualityStats,
     pub labels: Labels,
     pub run: Run,
-    /// The model the mesh was made from, for the fidelity check.
-    model: Option<Arc<Model>>,
+    /// The model the mesh was made from, for the fidelity check and the
+    /// curves of the second-order mesh.
+    pub(crate) model: Option<Arc<Model>>,
     view: OnceLock<TetView>,
 }
 
@@ -389,16 +396,6 @@ impl Mesh {
             model,
             view: OnceLock::new(),
         }
-    }
-
-    /// A mesh made elsewhere, without labels or input model.
-    pub fn from_tets(inner: TetMesh) -> Mesh {
-        let quality = rapidmesh_tet::quality_stats(&inner);
-        Mesh::new(inner, quality, Labels::default(), Run::default(), None)
-    }
-
-    pub fn into_tet_mesh(self) -> TetMesh {
-        self.inner
     }
 
     /// The solver view, built on first use.
@@ -586,9 +583,9 @@ impl Mesh {
             .model
             .as_ref()
             .filter(|_| !self.inner.tets.is_empty())
-            .map(|m| rapidmesh_tet::fidelity::measure(&self.inner, m));
+            .map(|m| rapidmesh_tet::measure(&self.inner, m));
         Diagnostics {
-            mesh: rapidmesh_tet::diagnostics::diagnose(&self.inner),
+            mesh: rapidmesh_tet::diagnose(&self.inner),
             fidelity,
         }
     }
@@ -613,9 +610,10 @@ impl Mesh {
             fmt_g4(loc[2])
         ));
         lines.push(format!("  max radius/edge {:.2}", q.max_radius_edge));
-        for &(region, min_dih, n) in &q.per_region {
+        for r in &q.per_region {
             lines.push(format!(
-                "  region {region:<3} min dihedral {min_dih:6.2} deg ({n} tets)"
+                "  region {:<3} min dihedral {:6.2} deg ({} tets)",
+                r.region, r.min_dihedral_deg, r.n_tets
             ));
         }
         let warn: Vec<&Event> = self.run.warnings().collect();
@@ -669,6 +667,30 @@ impl Mesh {
     pub fn viewer_json(&self, name: &str) -> String {
         serde_json::to_string(&self.viewer(name)).expect("serialize")
     }
+
+    /// [`Mesh::viewer_json`] of the second-order mesh: with the mid-edge
+    /// nodes off their chords, so the viewer draws the curved faces and
+    /// edges of the curved tets (see [`Mesh::second_order`]).
+    pub fn viewer_json_second_order(&self, name: &str) -> String {
+        let so = self.second_order();
+        let mut curved = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (t, _) in so.tets.iter().zip(&so.curved_tets).filter(|x| *x.1) {
+            for (e, &[i, j]) in crate::TET10_EDGES.iter().enumerate() {
+                let (a, b) = (t[i] as usize, t[j] as usize);
+                let (pa, pb, p) = (so.points[a], so.points[b], so.points[t[4 + e] as usize]);
+                let chord: [f64; 3] = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
+                if p != chord && seen.insert((a.min(b), a.max(b))) {
+                    curved.push((a.min(b), a.max(b), p));
+                }
+            }
+        }
+        let viewer = Viewer {
+            curved_edges: Some(curved),
+            ..self.viewer(name)
+        };
+        serde_json::to_string(&viewer).expect("serialize")
+    }
 }
 
 impl fmt::Display for Mesh {
@@ -708,10 +730,6 @@ impl SurfaceMesh {
             run,
             view: OnceLock::new(),
         }
-    }
-
-    pub fn into_surface_mesh(self) -> rapidmesh_tet::SurfaceMesh {
-        self.inner
     }
 
     /// The solver view, built on first use.

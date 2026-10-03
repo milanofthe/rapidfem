@@ -1,15 +1,16 @@
 //! Tagged piecewise-linear complex: the central intermediate representation.
 
 use crate::faceted::SurfaceKind;
+use crate::vec3::len;
 
-/// Identifies the analytic surface a PLC facet originated from, so that
-/// downstream stages (order-2 midside snapping) can project points back onto
-/// the exact geometry instead of the linear facet.
+/// Identifies the analytic surface a PLC facet originated from, so the
+/// mesher and the second-order nodes follow the exact geometry instead of the
+/// linear facet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SurfaceRef(pub u32);
 
 /// Region (material) tag carried through CSG into the volume mesh. Every output
-/// tet lies in exactly one region — conformal material interfaces are a hard
+/// tet lies in exactly one region -- conformal material interfaces are a hard
 /// requirement for Maxwell FEM. `RegionTag(0)` is the background (outside all
 /// scene solids).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -60,10 +61,9 @@ pub struct TaggedPlc {
     /// Vertices the input shapes declare as corners (see
     /// `Faceted::corners`), sorted.
     pub corners: Vec<u32>,
-    /// Pairs of triangles that meet other than in the vertices and edges
-    /// they share (`[t, t]` for a triangle of zero area), by the exact check
-    /// of the rounded PLC; empty for a valid one.
-    pub crossings: Vec<[u32; 2]>,
+    /// The exact edge curves the input shapes declare (see
+    /// `Faceted::curves`); a B-rep edge whose chain lies on one takes it.
+    pub curves: Vec<crate::EdgeCurve>,
 }
 
 /// Owner value in [TaggedPlc::surface_owners] for surfaces that belong to an
@@ -106,7 +106,7 @@ impl TaggedPlc {
                 (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
                     - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]),
             ];
-            let area = 0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            let area = 0.5 * len(n);
             // The normal points out of the back region, into the front one.
             let vol = (p[0][0] * n[0] + p[0][1] * n[1] + p[0][2] * n[2]) / 6.0;
             for (reg, sign) in [(back, 1.0), (front, -1.0)] {

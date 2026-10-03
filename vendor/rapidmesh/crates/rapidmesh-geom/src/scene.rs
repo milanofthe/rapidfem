@@ -18,6 +18,8 @@ use rapidmesh_exact::{Point3, Prepared3};
 // Deterministic (seedless) hashers: the weld/merge stages ITERATE these maps,
 // and that order decides which coincident vertex wins -- std's RandomState would
 // make the assembled PLC (and the whole mesh) vary run to run.
+use crate::grid::HashGrid;
+use crate::vec3::{cross, dot};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Relative (to the scene bounding-box diagonal) tolerance for welding f64
@@ -222,13 +224,15 @@ impl Scene {
     /// arrangement could not triangulate (a solid or a sheet, and what
     /// failed).
     pub fn try_assemble(&self) -> Result<TaggedPlc, AssembleError> {
-        let mut plc = self.snapped().assemble_exact()?;
+        let plc = self.snapped().assemble_exact()?;
         // The rounded PLC, checked exactly: rounding and welding must not
-        // have made triangles cross, fold or touch.
+        // have made triangles cross, fold or touch: pairs that meet other
+        // than in the vertices and edges they share (`[t, t]` for a triangle
+        // of zero area).
         let t = rapidmesh_exact::clock::Instant::now();
-        plc.crossings = rapidmesh_csg::improper_pairs(&plc.vertices, &plc.triangles);
+        let crossings = rapidmesh_csg::improper_pairs(&plc.vertices, &plc.triangles);
         rapidmesh_exact::log::stage("assemble.check", t.elapsed().as_secs_f64());
-        if !plc.crossings.is_empty() {
+        if !crossings.is_empty() {
             let name = |t: u32| {
                 let s = plc.surface_refs[t as usize].0 as usize;
                 let r = plc.region_tags[t as usize].map(|r| r.0);
@@ -238,12 +242,12 @@ impl Scene {
                     plc.surface_roles.get(s).copied().unwrap_or(u32::MAX),
                 )
             };
-            let [a, b] = plc.crossings[0];
+            let [a, b] = crossings[0];
             rapidmesh_exact::log::warn(
                 "assemble",
                 format!(
                     "{} pairs of PLC triangles meet improperly, first {} and {}",
-                    plc.crossings.len(),
+                    crossings.len(),
                     name(a),
                     name(b)
                 ),
@@ -651,14 +655,11 @@ impl Scene {
             raw.iter().map(|q| q[k]).fold(f64::MIN, f64::max)
         }
         let tol = WELD_REL_TOL * diag.max(f64::MIN_POSITIVE);
-        let cell = 2.0 * tol;
-        let cell_of =
-            |q: &[f64; 3]| -> [i64; 3] { std::array::from_fn(|k| (q[k] / cell).floor() as i64) };
-        let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::default();
+        let mut grid: HashGrid<u32> = HashGrid::new(2.0 * tol);
         let mut vertices: Vec<[f64; 3]> = Vec::with_capacity(raw.len());
         let mut remap: Vec<u32> = vec![u32::MAX; raw.len()];
         let weld_pass = |explicit_only: bool,
-                         grid: &mut HashMap<[i64; 3], Vec<u32>>,
+                         grid: &mut HashGrid<u32>,
                          vertices: &mut Vec<[f64; 3]>,
                          remap: &mut Vec<u32>| {
             for (i, q) in raw.iter().enumerate() {
@@ -668,29 +669,16 @@ impl Scene {
                 if explicit_only && !matches!(pool.verts[i], Point3::Explicit(_)) {
                     continue;
                 }
-                let base = cell_of(q);
-                let mut hit = None;
-                'search: for dx in -1..=1i64 {
-                    for dy in -1..=1i64 {
-                        for dz in -1..=1i64 {
-                            let key = [base[0] + dx, base[1] + dy, base[2] + dz];
-                            if let Some(ids) = grid.get(&key) {
-                                for &v in ids {
-                                    let p = vertices[v as usize];
-                                    let d2: f64 = (0..3).map(|k| (p[k] - q[k]).powi(2)).sum();
-                                    if d2 <= tol * tol {
-                                        hit = Some(v);
-                                        break 'search;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                let base = grid.key(*q);
+                let hit = grid.around(base, 1).copied().find(|&v| {
+                    let p = vertices[v as usize];
+                    let d2: f64 = (0..3).map(|k| (p[k] - q[k]).powi(2)).sum();
+                    d2 <= tol * tol
+                });
                 remap[i] = hit.unwrap_or_else(|| {
                     let v = vertices.len() as u32;
                     vertices.push(*q);
-                    grid.entry(base).or_default().push(v);
+                    grid.at_mut(base).push(v);
                     v
                 });
             }
@@ -714,11 +702,7 @@ impl Scene {
             );
             let u: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
             let v: [f64; 3] = std::array::from_fn(|k| c[k] - a[k]);
-            let n = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
+            let n = cross(u, v);
             if n.iter().all(|&x| x == 0.0) {
                 continue; // exactly degenerate in f64
             }
@@ -771,6 +755,12 @@ impl Scene {
             .flat_map(|f| f.corners.iter().copied())
             .collect();
         let corners = corner_vertices(&vertices, &out_triangles, &declared, tol);
+        let curves = self
+            .solids
+            .iter()
+            .chain(self.sheets.iter().map(|(f, _)| f))
+            .flat_map(|f| f.curves.iter().cloned())
+            .collect();
         rapidmesh_exact::log::stat("plc.vertices", vertices.len() as f64);
         rapidmesh_exact::log::stat("plc.triangles", out_triangles.len() as f64);
         rapidmesh_exact::log::stat("plc.features", features.len() as f64);
@@ -787,7 +777,7 @@ impl Scene {
             owner_frames,
             features,
             corners,
-            crossings: Vec::new(),
+            curves,
         })
     }
 }
@@ -804,9 +794,7 @@ fn corner_vertices(
     if points.is_empty() {
         return Vec::new();
     }
-    let cell = tol.max(1e-300) * 4.0;
-    let key = |p: [f64; 3]| p.map(|x| (x / cell).floor() as i64);
-    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::default();
+    let mut grid: HashGrid<u32> = HashGrid::new(tol.max(1e-300) * 4.0);
     let mut used = vec![false; vertices.len()];
     for t in triangles {
         for &v in t {
@@ -815,30 +803,17 @@ fn corner_vertices(
     }
     for (v, &p) in vertices.iter().enumerate() {
         if used[v] {
-            grid.entry(key(p)).or_default().push(v as u32);
+            grid.insert(p, v as u32);
         }
     }
     let mut out = Vec::new();
     for &p in points {
-        let k = key(p);
         let mut best: Option<(f64, u32)> = None;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    for &v in grid
-                        .get(&[k[0] + dx, k[1] + dy, k[2] + dz])
-                        .into_iter()
-                        .flatten()
-                    {
-                        let q = vertices[v as usize];
-                        let d =
-                            ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2))
-                                .sqrt();
-                        if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
-                            best = Some((d, v));
-                        }
-                    }
-                }
+        for &v in grid.around(grid.key(p), 1) {
+            let q = vertices[v as usize];
+            let d = ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt();
+            if d <= tol && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, v));
             }
         }
         if let Some((_, v)) = best {
@@ -876,18 +851,12 @@ fn feature_edges(
         n.dedup();
     }
     // Vertices by a grid of the weld tolerance, for the segment ends.
-    let cell = tol.max(f64::MIN_POSITIVE);
-    let key = |p: [f64; 3]| p.map(|x| (x / cell).floor() as i64);
-    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::default();
+    let mut grid: HashGrid<u32> = HashGrid::new(tol.max(f64::MIN_POSITIVE));
     for &v in next.keys() {
-        grid.entry(key(vertices[v as usize])).or_default().push(v);
+        grid.insert(vertices[v as usize], v);
     }
     let at = |p: [f64; 3]| -> Option<u32> {
-        let k = key(p);
-        (0..27)
-            .map(|n| [k[0] + n % 3 - 1, k[1] + n / 3 % 3 - 1, k[2] + n / 9 - 1])
-            .filter_map(|c| grid.get(&c))
-            .flatten()
+        grid.around(grid.key(p), 1)
             .copied()
             .find(|&v| (0..3).all(|i| (vertices[v as usize][i] - p[i]).abs() <= tol))
     };
@@ -897,7 +866,7 @@ fn feature_edges(
             continue;
         };
         let d: [f64; 3] = std::array::from_fn(|i| q[i] - p[i]);
-        let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let len2 = dot(d, d);
         if a == b || len2 == 0.0 {
             continue;
         }
@@ -906,7 +875,7 @@ fn feature_edges(
         let place = |v: u32| {
             let x = vertices[v as usize];
             let r: [f64; 3] = std::array::from_fn(|i| x[i] - p[i]);
-            let t = (r[0] * d[0] + r[1] * d[1] + r[2] * d[2]) / len2;
+            let t = (dot(r, d)) / len2;
             let off: f64 = (0..3)
                 .map(|i| (r[i] - t * d[i]).powi(2))
                 .sum::<f64>()
@@ -941,16 +910,11 @@ fn feature_edges(
 /// tolerance of the OPEN segment) becomes a shared corner of both incident
 /// triangles by splitting that edge across every triangle that carries it.
 ///
-/// Why this exists: the CDT boundary recovery downstream assumes a
-/// combinatorially valid PLC (no vertex in a segment or facet interior).
-/// Welding distinct exact crossings onto one f64 vertex can violate that: a
-/// vertex ends up exactly coplanar with a facet yet a hair off its boundary
-/// edge's carrier line. Recovery cannot fuzzily adopt such a vertex without
-/// kinking the boundary chain in-plane while the facet region stays the exact
-/// straight triangle (which breaks face recovery's straddle-impossibility
-/// argument). Splitting the facet here turns the micro-kink into two exact
-/// straight segments meeting at the now shared vertex, so recovery only ever
-/// sees exactly-collinear chain vertices.
+/// Why this exists: the B-rep and the mesher downstream take the PLC as
+/// combinatorially valid (no vertex inside an edge or a facet). Welding
+/// distinct exact crossings onto one f64 vertex can break that: a vertex ends
+/// up on a facet's plane, a hair off its edge. Splitting the facet there turns
+/// the micro-kink into two straight edges meeting at the shared vertex.
 ///
 /// Per-triangle attributes are duplicated onto the split children. The pass
 /// iterates to a fixpoint (a split makes a new edge other vertices may sit
@@ -1016,7 +980,7 @@ fn repair_t_junctions(
         for (&(a, b), vs) in edge_verts.iter_mut() {
             let (pa, pb) = (vertices[a as usize], vertices[b as usize]);
             let d: [f64; 3] = std::array::from_fn(|k| pb[k] - pa[k]);
-            let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            let len2 = dot(d, d);
             let param = |w: u32| -> f64 {
                 let p = vertices[w as usize];
                 (0..3).map(|k| (p[k] - pa[k]) * d[k]).sum::<f64>() / len2
@@ -1121,7 +1085,7 @@ fn repair_t_junctions(
             }
             // An edge may cap ONLY slivers: a degenerate flap on a tangent
             // seam (two barrels touching along a line) whose base edge no
-            // real triangle holds — its side edges already belong to the
+            // real triangle holds -- its side edges already belong to the
             // real surface triangles on both sides (the flap made them
             // non-manifold). Dropping every cap is then correct: the flap
             // has no area, and the base chain conforms through the side
@@ -1202,22 +1166,18 @@ fn split_tri_chain(tri: [u32; 3], a: u32, b: u32, vs: &[u32]) -> Vec<[u32; 3]> {
 /// perpendicular distance to the carrier line is at most `tol`.
 fn on_open_segment(a: [f64; 3], b: [f64; 3], p: [f64; 3], tol: f64) -> bool {
     let d: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
-    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let len2 = dot(d, d);
     if len2 <= 0.0 {
         return false;
     }
     let pa: [f64; 3] = std::array::from_fn(|k| p[k] - a[k]);
-    let t = (pa[0] * d[0] + pa[1] * d[1] + pa[2] * d[2]) / len2;
+    let t = (dot(pa, d)) / len2;
     let margin = tol / len2.sqrt();
     if !(t > margin && t < 1.0 - margin) {
         return false;
     }
-    let cr = [
-        pa[1] * d[2] - pa[2] * d[1],
-        pa[2] * d[0] - pa[0] * d[2],
-        pa[0] * d[1] - pa[1] * d[0],
-    ];
-    let perp2 = (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]) / len2;
+    let cr = cross(pa, d);
+    let perp2 = (dot(cr, cr)) / len2;
     perp2 <= tol * tol
 }
 
@@ -1229,17 +1189,11 @@ fn on_open_segment(a: [f64; 3], b: [f64; 3], p: [f64; 3], tol: f64) -> bool {
 /// quarter cell plus the tolerance of a sample, so the 27 cells around the
 /// point hold the edge. Cell size is the median edge length.
 struct EdgeGrid {
-    cell: f64,
-    origin: [f64; 3],
-    map: HashMap<[i64; 3], Vec<u32>>,
+    grid: HashGrid<u32>,
     edges: Vec<(u32, u32)>,
 }
 
 impl EdgeGrid {
-    fn cell_of(&self, p: [f64; 3]) -> [i64; 3] {
-        std::array::from_fn(|k| ((p[k] - self.origin[k]) / self.cell).floor() as i64)
-    }
-
     fn build(verts: &[[f64; 3]], edges: Vec<(u32, u32)>) -> EdgeGrid {
         let len = |&(a, b): &(u32, u32)| -> f64 {
             let (pa, pb) = (verts[a as usize], verts[b as usize]);
@@ -1251,22 +1205,22 @@ impl EdgeGrid {
         let cell = if median > 0.0 { median } else { 1.0 };
         let origin = verts.first().copied().unwrap_or([0.0; 3]);
         let mut g = EdgeGrid {
-            cell,
-            origin,
-            map: HashMap::default(),
+            grid: HashGrid::with_origin(origin, cell),
             edges,
         };
         let mut last: Option<[i64; 3]>;
         for ei in 0..g.edges.len() {
             let (a, b) = g.edges[ei];
             let (pa, pb) = (verts[a as usize], verts[b as usize]);
-            let steps = (2.0 * len(&(a, b)) / g.cell).ceil().max(1.0) as usize;
+            let steps = (2.0 * len(&(a, b)) / g.grid.cell()).ceil().max(1.0) as usize;
             last = None;
             for i in 0..=steps {
                 let t = i as f64 / steps as f64;
-                let c = g.cell_of(std::array::from_fn(|k| pa[k] + t * (pb[k] - pa[k])));
+                let c = g
+                    .grid
+                    .key(std::array::from_fn(|k| pa[k] + t * (pb[k] - pa[k])));
                 if last != Some(c) {
-                    let v = g.map.entry(c).or_default();
+                    let v = g.grid.at_mut(c);
                     if v.last() != Some(&(ei as u32)) {
                         v.push(ei as u32);
                     }
@@ -1282,19 +1236,10 @@ impl EdgeGrid {
     /// with `stamp`, a value distinct per query.
     fn edges_near(&self, p: [f64; 3], stamp: u32, seen: &mut [u32], out: &mut Vec<u32>) {
         out.clear();
-        let base = self.cell_of(p);
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if let Some(v) = self.map.get(&[base[0] + dx, base[1] + dy, base[2] + dz]) {
-                        for &e in v {
-                            if seen[e as usize] != stamp {
-                                seen[e as usize] = stamp;
-                                out.push(e);
-                            }
-                        }
-                    }
-                }
+        for &e in self.grid.around(self.grid.key(p), 1) {
+            if seen[e as usize] != stamp {
+                seen[e as usize] = stamp;
+                out.push(e);
             }
         }
     }

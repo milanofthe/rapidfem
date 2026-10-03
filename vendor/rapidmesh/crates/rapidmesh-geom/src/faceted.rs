@@ -2,6 +2,7 @@
 //! back-references.
 
 use crate::nurbs::NurbsCurve;
+use crate::vec3::{len, normalize, ortho_unit, unit};
 use rapidmesh_csg::{PlanarFacet, Solid, Tri};
 use std::sync::Arc;
 
@@ -22,9 +23,8 @@ pub struct FlatFacet {
     pub tris: std::ops::Range<usize>,
 }
 
-/// The analytic surface a facet was tessellated from. Flat facets need no
-/// snapping; curved kinds carry the data the order-2 midside snapping stage
-/// projects onto. Metadata only — exactness of the mesh never depends on it.
+/// The analytic surface a facet was tessellated from: the carrier of the
+/// B-rep face the facet ends up in. The exact CSG never reads it.
 #[derive(Debug, Clone)]
 pub enum SurfaceKind {
     /// A plane through `point` with the normal `normal` (not necessarily
@@ -40,8 +40,8 @@ pub enum SurfaceKind {
     Facets,
     /// A DISCRETE smooth patch of an imported triangle soup (an STL region
     /// between crease edges): the carrier is the patch itself, queried by
-    /// closest-point projection, so the import is REMESHED against its own
-    /// envelope instead of frozen facet by facet.
+    /// closest-point projection, so the import is remeshed against its own
+    /// envelope.
     Discrete(std::sync::Arc<crate::discrete::DiscreteSurface>),
     /// An infinite cylinder barrel.
     Cylinder {
@@ -49,6 +49,8 @@ pub enum SurfaceKind {
         center: [f64; 3],
         /// Axis direction (not necessarily unit).
         axis: [f64; 3],
+        /// Unit direction of angle 0, square to the axis.
+        x: [f64; 3],
         /// Barrel radius.
         radius: f64,
     },
@@ -56,6 +58,10 @@ pub enum SurfaceKind {
     Sphere {
         /// Center.
         center: [f64; 3],
+        /// The polar axis of its angles (unit).
+        axis: [f64; 3],
+        /// Unit direction of longitude 0, square to the axis.
+        x: [f64; 3],
         /// Radius.
         radius: f64,
     },
@@ -65,6 +71,8 @@ pub enum SurfaceKind {
         apex: [f64; 3],
         /// Axis direction from apex into the cone (not necessarily unit).
         axis: [f64; 3],
+        /// Unit direction of angle 0, square to the axis.
+        x: [f64; 3],
         /// Tangent of the half-opening angle.
         tan_half_angle: f64,
     },
@@ -75,6 +83,8 @@ pub enum SurfaceKind {
         /// Axis direction normal to the major circle's plane (not
         /// necessarily unit).
         axis: [f64; 3],
+        /// Unit direction of angle 0, square to the axis.
+        x: [f64; 3],
         /// Major radius (center to tube center).
         major_radius: f64,
         /// Minor radius (tube radius).
@@ -100,8 +110,8 @@ pub enum SurfaceKind {
     },
     /// A constant-radius tube around a polyline path (swept pipes, helical
     /// coils): the surface is `dist(p, path) = radius`. The path is the
-    /// SMOOTH sweep centerline; the offset/projection oracle is analytic per
-    /// segment, so the carrier is smooth in the ways that matter (no facet
+    /// SMOOTH sweep centerline; the projection is analytic per segment, so
+    /// the carrier is smooth in the ways that matter (no facet
     /// coplanarity, exact curvature `radius` for sizing).
     Tube {
         /// Sweep centerline with its closest-point accelerator.
@@ -129,6 +139,53 @@ pub enum SurfaceKind {
 }
 
 impl SurfaceKind {
+    /// A cylinder whose angle 0 is [`ortho_unit`] of its axis.
+    pub fn cylinder(center: [f64; 3], axis: [f64; 3], radius: f64) -> SurfaceKind {
+        SurfaceKind::Cylinder {
+            center,
+            axis,
+            x: ortho_unit(normalize(axis)),
+            radius,
+        }
+    }
+
+    /// A sphere about the z axis.
+    pub fn sphere(center: [f64; 3], radius: f64) -> SurfaceKind {
+        let axis = [0.0, 0.0, 1.0];
+        SurfaceKind::Sphere {
+            center,
+            axis,
+            x: ortho_unit(axis),
+            radius,
+        }
+    }
+
+    /// A cone whose angle 0 is [`ortho_unit`] of its axis.
+    pub fn cone(apex: [f64; 3], axis: [f64; 3], tan_half_angle: f64) -> SurfaceKind {
+        SurfaceKind::Cone {
+            apex,
+            axis,
+            x: ortho_unit(normalize(axis)),
+            tan_half_angle,
+        }
+    }
+
+    /// A torus whose angle 0 is [`ortho_unit`] of its axis.
+    pub fn torus(
+        center: [f64; 3],
+        axis: [f64; 3],
+        major_radius: f64,
+        minor_radius: f64,
+    ) -> SurfaceKind {
+        SurfaceKind::Torus {
+            center,
+            axis,
+            x: ortho_unit(normalize(axis)),
+            major_radius,
+            minor_radius,
+        }
+    }
+
     /// The plane of the flat polygon `pts` (at least three points, not all
     /// on a line): through their centroid, with their Newell normal, which
     /// is its area vector. Where the geometry knows its normal exactly (an
@@ -154,7 +211,7 @@ impl SurfaceKind {
         let SurfaceKind::Plane { point, normal } = plane else {
             return SurfaceKind::Facets;
         };
-        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+        let len = len(normal);
         let extent = pts
             .iter()
             .map(|p| (0..3).map(|k| (p[k] - point[k]).abs()).fold(0.0, f64::max))
@@ -182,8 +239,7 @@ impl SurfaceKind {
         let SurfaceKind::Plane { point, normal } = self else {
             return None;
         };
-        let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
-        (len > 0.0).then(|| (*point, normal.map(|x| x / len)))
+        Some((*point, unit(*normal)?))
     }
 }
 
@@ -212,6 +268,16 @@ impl Frame {
                 (0..3).map(|k| linear[i][k] * self.offset[k]).sum::<f64>() + offset[i]
             }),
         }
+    }
+
+    /// The image of `p`: `linear p + offset`.
+    pub fn apply(&self, p: [f64; 3]) -> [f64; 3] {
+        std::array::from_fn(|i| {
+            self.linear[i][0] * p[0]
+                + self.linear[i][1] * p[1]
+                + self.linear[i][2] * p[2]
+                + self.offset[i]
+        })
     }
 
     /// The point of the scene `p` in the frame (the inverse map).
@@ -266,6 +332,88 @@ pub struct Faceted {
     /// creases inside one smooth region of an import (an open crease a region
     /// wraps around). They become B-rep edges inside their face.
     pub features: Vec<[[f64; 3]; 2]>,
+    /// Exact edge curves the shape declares (the B-spline edges of a CAD
+    /// file): the B-rep edges along them take them as their carriers.
+    pub curves: Vec<EdgeCurve>,
+}
+
+/// An exact edge curve of a shape: its carrier and the points of it, in
+/// order, that the shape's triangles have along the edge.
+#[derive(Debug, Clone)]
+pub struct EdgeCurve {
+    pub kind: CurveKind,
+    pub points: Vec<[f64; 3]>,
+}
+
+/// The carrier of an exact edge curve. The conics carry unit directions.
+#[derive(Debug, Clone)]
+pub enum CurveKind {
+    Line {
+        p0: [f64; 3],
+        dir: [f64; 3],
+    },
+    /// `center + radius (cos t x + sin t (axis x x))`.
+    Circle {
+        center: [f64; 3],
+        axis: [f64; 3],
+        x: [f64; 3],
+        radius: f64,
+    },
+    /// `center + a cos t major + b sin t minor`.
+    Ellipse {
+        center: [f64; 3],
+        major: [f64; 3],
+        minor: [f64; 3],
+        a: f64,
+        b: f64,
+    },
+    Nurbs(Arc<NurbsCurve<3>>),
+}
+
+impl CurveKind {
+    /// The carrier moved by the affine map `map` with linear part
+    /// `map_dir`, a rigid one for the conics (their radii stay).
+    fn mapped(
+        &self,
+        map: impl Fn([f64; 3]) -> [f64; 3],
+        map_dir: impl Fn([f64; 3]) -> [f64; 3],
+    ) -> CurveKind {
+        match self {
+            CurveKind::Line { p0, dir } => CurveKind::Line {
+                p0: map(*p0),
+                dir: map_dir(*dir),
+            },
+            CurveKind::Circle {
+                center,
+                axis,
+                x,
+                radius,
+            } => CurveKind::Circle {
+                center: map(*center),
+                axis: map_dir(*axis),
+                x: map_dir(*x),
+                radius: *radius,
+            },
+            CurveKind::Ellipse {
+                center,
+                major,
+                minor,
+                a,
+                b,
+            } => CurveKind::Ellipse {
+                center: map(*center),
+                major: map_dir(*major),
+                minor: map_dir(*minor),
+                a: *a,
+                b: *b,
+            },
+            // A B-spline is affine invariant: its control points move.
+            CurveKind::Nurbs(c) => CurveKind::Nurbs(Arc::new(NurbsCurve {
+                ctrl: c.ctrl.iter().map(|&q| map(q)).collect(),
+                ..(**c).clone()
+            })),
+        }
+    }
 }
 
 impl Faceted {
@@ -279,6 +427,7 @@ impl Faceted {
             surfaces: Vec::new(),
             flats: Vec::new(),
             features: Vec::new(),
+            curves: Vec::new(),
         }
     }
 
@@ -321,24 +470,6 @@ impl Faceted {
         });
     }
 
-    /// Appends another shape (surface and triangle indices are re-based).
-    pub fn append(&mut self, other: &Faceted) {
-        let surf_base = self.surfaces.len() as u32;
-        let tri_base = self.tris.len();
-        self.surfaces.extend(other.surfaces.iter().cloned());
-        self.tris.extend(other.tris.iter().copied());
-        self.face_surface
-            .extend(other.face_surface.iter().map(|&s| s + surf_base));
-        self.flats.extend(other.flats.iter().map(|fl| FlatFacet {
-            facet: fl.facet.clone(),
-            surface: fl.surface + surf_base,
-            tris: (fl.tris.start + tri_base)..(fl.tris.end + tri_base),
-        }));
-        self.features.extend(other.features.iter().copied());
-    }
-
-    /// The bare triangle soup as a CSG solid operand. Only meaningful for
-    /// shapes built as closed, outward-oriented solids.
     /// This shape with `cutter` taken away, by the exact boolean.
     pub fn minus(&self, cutter: &Faceted) -> Result<Faceted, rapidmesh_csg::ArrangeError> {
         self.boolean(cutter, rapidmesh_csg::BoolOp::Difference)
@@ -381,6 +512,7 @@ impl Faceted {
                 .collect(),
             flats: Vec::new(),
             features: self.features.clone(),
+            curves: self.curves.clone(),
         };
         for (t, &src) in out.triangles.iter().zip(&out.source_facet) {
             let v = t.map(|i| pts[i]);
@@ -398,6 +530,8 @@ impl Faceted {
         Ok(f)
     }
 
+    /// The bare triangle soup as a CSG solid operand. Only meaningful for
+    /// shapes built as closed, outward-oriented solids.
     pub fn to_solid(&self) -> Solid {
         Solid {
             tris: self.tris.clone(),
@@ -431,6 +565,14 @@ impl Faceted {
             surfaces: self.surfaces.clone(),
             flats: Vec::with_capacity(self.flats.len()),
             features: self.features.iter().map(|s| s.map(&map)).collect(),
+            curves: self
+                .curves
+                .iter()
+                .map(|c| EdgeCurve {
+                    kind: c.kind.clone(),
+                    points: c.points.iter().map(|&p| map(p)).collect(),
+                })
+                .collect(),
         };
         // Old triangle index -> new, to carry the helper ranges of the flats.
         let mut new_index = vec![usize::MAX; self.tris.len()];
@@ -523,6 +665,14 @@ impl Faceted {
                 .collect(),
             face_surface: self.face_surface.clone(),
             features: self.features.iter().map(|f| f.map(map)).collect(),
+            curves: self
+                .curves
+                .iter()
+                .map(|c| EdgeCurve {
+                    kind: c.kind.mapped(map, map_dir),
+                    points: c.points.iter().map(|&p| map(p)).collect(),
+                })
+                .collect(),
             flats: self
                 .flats
                 .iter()
@@ -544,33 +694,46 @@ impl Faceted {
                     SurfaceKind::Cylinder {
                         center,
                         axis,
+                        x,
                         radius,
                     } => SurfaceKind::Cylinder {
                         center: map(*center),
                         axis: map_dir(*axis),
+                        x: normalize(map_dir(*x)),
                         radius: *radius,
                     },
-                    SurfaceKind::Sphere { center, radius } => SurfaceKind::Sphere {
+                    SurfaceKind::Sphere {
+                        center,
+                        axis,
+                        x,
+                        radius,
+                    } => SurfaceKind::Sphere {
                         center: map(*center),
+                        axis: normalize(map_dir(*axis)),
+                        x: normalize(map_dir(*x)),
                         radius: *radius,
                     },
                     SurfaceKind::Cone {
                         apex,
                         axis,
+                        x,
                         tan_half_angle,
                     } => SurfaceKind::Cone {
                         apex: map(*apex),
                         axis: map_dir(*axis),
+                        x: normalize(map_dir(*x)),
                         tan_half_angle: *tan_half_angle,
                     },
                     SurfaceKind::Torus {
                         center,
                         axis,
+                        x,
                         major_radius,
                         minor_radius,
                     } => SurfaceKind::Torus {
                         center: map(*center),
                         axis: map_dir(*axis),
+                        x: normalize(map_dir(*x)),
                         major_radius: *major_radius,
                         minor_radius: *minor_radius,
                     },
@@ -752,7 +915,7 @@ impl Faceted {
     /// Copy rotated by `angle` radians around the axis `(origin, dir)`
     /// (Rodrigues formula, right-handed).
     pub fn rotated(&self, origin: [f64; 3], dir: [f64; 3], angle: f64) -> Faceted {
-        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        let len = len(dir);
         assert!(len > 0.0, "rotation axis must be nonzero");
         let u = [dir[0] / len, dir[1] / len, dir[2] / len];
         let (s, c) = angle.sin_cos();

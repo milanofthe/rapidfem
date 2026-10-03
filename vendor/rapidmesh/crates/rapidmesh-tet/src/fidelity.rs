@@ -14,14 +14,15 @@
 //! nearest mesh interface face. Two surfaces match where they are closer than
 //! [`FIDELITY_REL`] of it.
 
-use crate::conform::TetMesh;
 use crate::constants::{
-    FIDELITY_MESH_SHARP_DEG, FIDELITY_REL, FIDELITY_SAMPLES_PER_FACE, FIDELITY_SHARP_DEG, TET_FACES,
+    FIDELITY_MESH_SHARP_DEG, FIDELITY_REL, FIDELITY_SAMPLES_PER_FACE, FIDELITY_SHARP_DEG,
 };
 use crate::diagnostics::{Defect, DefectKind};
+use crate::mesh::TetMesh;
+use crate::simplex::TET_FACES;
 use rapidmesh_brep::index::FacetBvh;
 use rapidmesh_csg::Tri;
-use rapidmesh_geom::vec3::{cross, dist, dot, len, V3};
+use rapidmesh_geom::vec3::{centroid, cross, dist, dot, len, sub, V3};
 use rapidmesh_geom::{SurfaceKind, CREASE_DEG};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -119,28 +120,13 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
             .collect::<Vec<_>>(),
     );
     let mesh_long: Vec<f64> = mtris.iter().map(|t| longest(corners(&mpt, t))).collect();
-    // The faces closing a filled contact wedge are off the geometry by
-    // design: not measured against it.
-    let sorted = |t: [usize; 3]| {
-        let mut k = t;
-        k.sort_unstable();
-        k
-    };
-    let contact: FxHashSet<[usize; 3]> = mesh
-        .contact_faces
-        .iter()
-        .filter_map(|&i| mesh.faces.get(i).map(|f| sorted(f.tri)))
-        .collect();
     // Per face: its area, its deviation (relative to its size) and where.
     let faces: Vec<Option<(f64, f64, V3)>> = mtris
         .par_iter()
         .zip(&mesh_long)
         .map(|(t, &l)| {
-            if contact.contains(&sorted(*t)) {
-                return None;
-            }
             let v = corners(&mpt, t);
-            let c = centroid(v);
+            let c = centroid(&v);
             let d = plc_bvh
                 .nearest(c)
                 .map_or(f64::INFINITY, |(t, d)| true_dist(c, t, d, l));
@@ -184,12 +170,9 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         .faces
         .par_iter()
         .map(|sf| {
-            if contact.contains(&sorted(sf.tri)) {
-                return None;
-            }
             let v = corners(&mpt, &sf.tri);
             let (a, l) = (area(v), longest(v));
-            let c = centroid(v);
+            let c = centroid(&v);
             let rel = by_label
                 .get(&sf.surface)
                 .and_then(|(bvh, ids)| bvh.nearest(c).map(|(i, d)| (ids[i as usize], d)))
@@ -217,33 +200,10 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
             .map(|t| tri(corners(&mpt, t)))
             .collect::<Vec<_>>(),
     );
-    // A point of the geometry within a face's size of a face closing a
-    // filled contact wedge lies in or at the fill (the wedge is material
-    // now): not measured.
-    let fill_faces: Vec<[usize; 3]> = mesh
-        .contact_faces
-        .iter()
-        .filter_map(|&i| mesh.faces.get(i).map(|f| f.tri))
-        .collect();
-    let fill_long: Vec<f64> = fill_faces
-        .iter()
-        .map(|t| longest(corners(&mpt, t)))
-        .collect();
-    let fill_bvh = FacetBvh::build(
-        &fill_faces
-            .iter()
-            .map(|t| tri(corners(&mpt, t)))
-            .collect::<Vec<_>>(),
-    );
-    let in_fill = |p: V3| {
-        fill_bvh
-            .nearest(p)
-            .is_some_and(|(fi, d)| d <= fill_long[fi as usize])
-    };
     let local = |p: V3| -> Option<f64> {
         let (fi, d) = mesh_bvh.nearest(p)?;
         let l = mesh_long[fi as usize];
-        (l > 0.0 && !in_fill(p)).then(|| d / l)
+        (l > 0.0).then(|| d / l)
     };
     let step = sample_step(
         &mesh_long,
@@ -335,7 +295,7 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         if e.coedges.iter().all(|c| Some(surface_of(c)) == first) {
             continue;
         }
-        let pts: Vec<V3> = match crate::brep_mesh::edge_curve(&model.brep, e) {
+        let pts: Vec<V3> = match crate::curve::kinds::edge_curve(&model.brep, e) {
             Some(c) => {
                 let n = 2 * e.chain.len().max(2);
                 (0..=n)
@@ -371,7 +331,7 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
                     continue;
                 };
                 let size = mesh_long[fi as usize];
-                if size <= 0.0 || in_fill(p) {
+                if size <= 0.0 {
                     continue;
                 }
                 let rel = seg_bvh.nearest_dist(p) / size;
@@ -465,7 +425,7 @@ fn sharp_edges(
     edges.sort_unstable_by_key(|e| e.0);
     let normal = |ti: u32| {
         let v = corners(pt, &tris[ti as usize]);
-        cross(sub3(v[1], v[0]), sub3(v[2], v[0]))
+        cross(sub(v[1], v[0]), sub(v[2], v[0]))
     };
     let mut out = Vec::new();
     for group in edges.chunk_by(|a, b| a.0 == b.0) {
@@ -547,7 +507,7 @@ fn splits(l: f64, step: f64) -> usize {
 /// Centroids of the `k * k` triangles of the regular split of `v` with `k`
 /// segments per edge (all of equal area).
 fn tri_samples(v: [V3; 3], k: usize, out: &mut Vec<V3>) {
-    let (e1, e2) = (sub3(v[1], v[0]), sub3(v[2], v[0]));
+    let (e1, e2) = (sub(v[1], v[0]), sub(v[2], v[0]));
     let at = |u: f64, w: f64| -> V3 { std::array::from_fn(|j| v[0][j] + u * e1[j] + w * e2[j]) };
     let kf = k as f64;
     for i in 0..k {
@@ -569,20 +529,12 @@ fn tri(v: [V3; 3]) -> Tri {
     Tri::new(v[0], v[1], v[2])
 }
 
-fn sub3(a: V3, b: V3) -> V3 {
-    std::array::from_fn(|k| a[k] - b[k])
-}
-
 fn area(v: [V3; 3]) -> f64 {
-    0.5 * len(cross(sub3(v[1], v[0]), sub3(v[2], v[0])))
+    0.5 * len(cross(sub(v[1], v[0]), sub(v[2], v[0])))
 }
 
 fn longest(v: [V3; 3]) -> f64 {
     dist(v[0], v[1]).max(dist(v[1], v[2])).max(dist(v[2], v[0]))
-}
-
-fn centroid(v: [V3; 3]) -> V3 {
-    std::array::from_fn(|k| (v[0][k] + v[1][k] + v[2][k]) / 3.0)
 }
 
 fn ratio(part: f64, whole: f64) -> f64 {

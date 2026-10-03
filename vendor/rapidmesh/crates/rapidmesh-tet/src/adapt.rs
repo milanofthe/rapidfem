@@ -4,7 +4,7 @@
 //! size sources, which the mesher's grading + Ruppert refinement realise
 //! sliver-free. SOLVE and ESTIMATE belong to the solver.
 
-use crate::conform::SurfaceMesh;
+use crate::mesh::SurfaceMesh;
 use rapidmesh_geom::vec3::{len, sub};
 
 /// The knobs of Dörfler marking and the refinement it asks for.

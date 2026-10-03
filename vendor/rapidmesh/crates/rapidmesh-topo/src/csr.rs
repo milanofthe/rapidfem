@@ -1,5 +1,5 @@
 //! A compact compressed-row adjacency for the variable-degree stars
-//! (vertex→tris, vertex→tets, vertex→edges). Offsets + flat data, no per-row
+//! (vertex->tris, vertex->tets, vertex->edges). Offsets + flat data, no per-row
 //! allocation, cache-friendly iteration.
 
 /// Compressed adjacency: `row(k)` is the slice of values associated with key `k`.

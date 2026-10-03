@@ -13,7 +13,7 @@ use crate::{Axis, Sign};
 /// every predicate evaluates their homogeneous coordinates symbolically (as
 /// polynomials in the defining inputs) at the precision the staged evaluation
 /// requires. This is what makes cascaded constructions (intersection points of
-/// intersection segments, Steiner points on recovered boundaries) exact.
+/// intersection segments) exact.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Point3 {
     /// An ordinary coordinate point.
@@ -47,31 +47,11 @@ pub enum Point3 {
         /// The three points being averaged.
         pts: Box<[Point3; 3]>,
     },
-    /// Linear combination on a segment: `a + t * (b - a)`.
-    ///
-    /// The CDT Steiner-point type (Diazzi et al. 2023, Sec. 4.2): a point
-    /// constrained to lie EXACTLY on the segment through `a`, `b` for any
-    /// f64 parameter `t` — rounding `t` only slides the point along the
-    /// carrier line, never off it. Degree 1 in the inputs (w = 1), so every
-    /// staged predicate stays cheap. Splits of sub-segments fold back onto
-    /// the original carrier with a recomputed `t`, keeping the
-    /// representation closed under recovery.
-    Lnc {
-        /// Segment start.
-        a: [f64; 3],
-        /// Segment end.
-        b: [f64; 3],
-        /// Position parameter, meaningful in (0, 1).
-        t: f64,
-    },
     /// Planar affine combination on a triangle: `a + u (b - a) + v (c - a)`.
     ///
-    /// The 2D analog of [`Point3::Lnc`]: a point constrained to lie EXACTLY
-    /// on the plane through `a`, `b`, `c` for any f64 parameters — rounding
-    /// `u`, `v` only slides the point within the plane, never off it. The
-    /// CDT facet-interior Steiner type (surface refinement points must stay
-    /// exactly on their constraint facet or face recovery would see the
-    /// facet pierced next round). Degree 1 in the inputs, w = 1.
+    /// A point constrained to lie EXACTLY on the plane through `a`, `b`, `c`
+    /// for any f64 parameters: rounding `u`, `v` only slides the point within
+    /// the plane, never off it. Degree 1 in the inputs, w = 1.
     Pac {
         /// Triangle corner the parameters are anchored at.
         a: [f64; 3],
@@ -110,7 +90,7 @@ impl Point3 {
     /// coplanar, or if the lines are parallel or identical.
     ///
     /// Construction: the point is the LPI of line (p, q) with a plane that
-    /// contains line (a, b) but not the common plane — its third defining
+    /// contains line (a, b) but not the common plane -- its third defining
     /// point `x` is synthesized off-plane. Any `x` works as long as the
     /// resulting LPI is valid: if `x` accidentally lands in the common plane
     /// or collinear with (a, b), the LPI's w is exactly zero and the next
@@ -165,13 +145,6 @@ impl Point3 {
         }
     }
 
-    /// A point on the segment from `a` to `b` at parameter `t` (exact on the
-    /// carrier line for ANY f64 `t`; meaningful as a Steiner point for
-    /// `t` in (0, 1)).
-    pub fn lnc(a: [f64; 3], b: [f64; 3], t: f64) -> Point3 {
-        Point3::Lnc { a, b, t }
-    }
-
     /// A point in the plane of the triangle (a, b, c) at barycentric-style
     /// parameters (u, v) (exact on the carrier plane for ANY f64 values;
     /// inside the triangle for u, v > 0, u + v < 1).
@@ -183,27 +156,6 @@ impl Point3 {
     pub fn as_explicit(&self) -> Option<[f64; 3]> {
         match self {
             Point3::Explicit(c) => Some(*c),
-            _ => None,
-        }
-    }
-
-    /// Affine (degree-1, w = 1) decomposition into explicit parent points and
-    /// barycentric weights, for the Steiner types [`Point3::Lnc`] and
-    /// [`Point3::Pac`]: the point equals `sum_i weight_i * parent_i` exactly
-    /// (the weights are the real numbers `1 - t`, `t`, etc.; the returned f64
-    /// values are their roundings, used only for a strictly-positive guard).
-    /// Returns the parents, weights, and the count `n` (2 for Lnc, 3 for Pac).
-    /// `None` for explicit points and the projective types (Lpi/Tpi/Bary).
-    ///
-    /// Multilinear predicates (orient3d) can substitute the parents for the
-    /// point: the predicate's value is the same weighted combination of the
-    /// per-parent values, so when every parent shares an orientation sign the
-    /// point shares it too -- resolved by fast explicit predicates instead of
-    /// the implicit interval/expansion path.
-    pub fn affine_combo(&self) -> Option<([[f64; 3]; 3], [f64; 3], usize)> {
-        match self {
-            Point3::Lnc { a, b, t } => Some(([*a, *b, [0.0; 3]], [1.0 - t, *t, 0.0], 2)),
-            Point3::Pac { a, b, c, u, v } => Some(([*a, *b, *c], [1.0 - u - v, *u, *v], 3)),
             _ => None,
         }
     }
@@ -236,16 +188,6 @@ impl Point3 {
                 let w = T::from_f64(3.0).mul(&w01).mul(&h[2][3]);
                 [coord(0), coord(1), coord(2), w]
             }
-            Point3::Lnc { a, b, t } => {
-                // a + t (b - a), w = 1: degree 1 in the f64 inputs.
-                let tt = T::from_f64(*t);
-                let coord = |i: usize| {
-                    let ai = T::from_f64(a[i]);
-                    let bi = T::from_f64(b[i]);
-                    ai.add(&tt.mul(&Ring::sub(&bi, &ai)))
-                };
-                [coord(0), coord(1), coord(2), T::from_f64(1.0)]
-            }
             Point3::Pac { a, b, c, u, v } => {
                 // a + u (b - a) + v (c - a), w = 1: degree 1 in the inputs.
                 let uu = T::from_f64(*u);
@@ -263,8 +205,8 @@ impl Point3 {
     }
 
     /// Homogeneous 2D coordinates in the projection that drops the given
-    /// axis. The pairing is cyclic — drop X gives (y, z), drop Y gives (z, x),
-    /// drop Z gives (x, y) — so the projected orientation of a triangle equals
+    /// axis. The pairing is cyclic -- drop X gives (y, z), drop Y gives (z, x),
+    /// drop Z gives (x, y) -- so the projected orientation of a triangle equals
     /// the sign of the dropped component of its normal.
     pub fn hom2<T: Ring>(&self, drop: Axis) -> [T; 3] {
         let [x, y, z, w] = self.hom::<T>();
@@ -311,7 +253,7 @@ impl Point3 {
     /// invalid and must not be used in predicates).
     pub fn w_sign(&self) -> Sign {
         match self {
-            Point3::Explicit(_) | Point3::Lnc { .. } | Point3::Pac { .. } => Sign::Positive,
+            Point3::Explicit(_) | Point3::Pac { .. } => Sign::Positive,
             _ => {
                 // Interval filter first, exact fallback.
                 if let Some(s) = self.hom::<Interval>()[3].sign() {

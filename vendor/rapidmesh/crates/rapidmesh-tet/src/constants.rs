@@ -18,12 +18,8 @@ pub(crate) const DEFAULT_SUBDIV: f64 = 8.0;
 pub const SLIVER_DEG: f64 = 10.0;
 
 // ---- spatial structures ----------------------------------------------------
-/// Domain octree max refinement depth (`domain.rs`).
+/// Sizing tree max refinement depth (`sizing/tree.rs`).
 pub(crate) const DOMAIN_MAX_DEPTH: u32 = 18;
-
-// ---- topology --------------------------------------------------------------
-/// The four faces of a tet as local vertex-index triples (opposite vertex 0..3).
-pub(crate) const TET_FACES: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
 
 // ---- boundary fidelity (fidelity.rs) ---------------------------------------
 /// A mesh interface and the PLC count as matching where they are closer than
@@ -38,13 +34,3 @@ pub const FIDELITY_SHARP_DEG: f64 = 30.0;
 pub const FIDELITY_MESH_SHARP_DEG: f64 = 15.0;
 /// PLC samples per mesh interface face at most (the sampling budget).
 pub const FIDELITY_SAMPLES_PER_FACE: usize = 8;
-
-// ---- layered path (mesh3/layered.rs) ----------------------------------------
-/// Model tolerance of the layered path, relative to the finest target size:
-/// levels, walls and plan points closer than this are one.
-pub(crate) const LAYERED_SNAP: f64 = 1e-3;
-/// The layered path takes a stack with a layer thinner than this fraction
-/// of the (median) size over it. Refinement meshes thicker layers with better
-/// tets at up to this factor more density across them; thinner ones blow it
-/// up (the passive stacks, at 0.05, by five to ten times).
-pub(crate) const LAYERED_THIN: f64 = 0.1;

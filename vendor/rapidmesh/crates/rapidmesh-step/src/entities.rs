@@ -3,9 +3,11 @@
 //! structure; whatever reads the model after that sees Rust types, and an
 //! entity that does not decode is named with the reason.
 
-use crate::geometry::{scale, unit, Curve, Curve2, Frame, Spline, Surface, P3};
+use crate::geometry::{extruded, revolved, Axes, Curve, Curve2, Surface, P3};
 use crate::part21::{Exchange, Record, Value};
+use rapidmesh_geom::vec3::{bbox, normalize, scale};
 use rapidmesh_geom::NurbsSurface;
+use rapidmesh_geom::{Frame, NurbsCurve};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -63,57 +65,21 @@ pub struct Face {
     pub bounds: Vec<Bound>,
 }
 
-/// An affine map `x -> linear x + offset`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Affine {
-    pub linear: [[f64; 3]; 3],
-    pub offset: P3,
-}
-
-impl Affine {
-    pub const IDENTITY: Affine = Affine {
-        linear: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+/// The map from the axes `from` onto the axes `to`: a point with
+/// coordinates `a, b, c` in `from` goes to the point with the same in `to`.
+fn between(from: &Axes, to: &Axes) -> Frame {
+    let f = [from.x, from.y, from.z];
+    let t = [to.x, to.y, to.z];
+    let linear: [[f64; 3]; 3] =
+        std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| t[k][i] * f[k][j]).sum()));
+    let m = Frame {
+        linear,
         offset: [0.0; 3],
     };
-
-    pub fn apply(&self, p: P3) -> P3 {
-        std::array::from_fn(|i| {
-            self.linear[i][0] * p[0]
-                + self.linear[i][1] * p[1]
-                + self.linear[i][2] * p[2]
-                + self.offset[i]
-        })
-    }
-
-    /// `self` after `first`.
-    fn then(&self, first: &Affine) -> Affine {
-        let linear = std::array::from_fn(|i| {
-            std::array::from_fn(|j| (0..3).map(|k| self.linear[i][k] * first.linear[k][j]).sum())
-        });
-        Affine {
-            linear,
-            offset: self.apply(first.offset),
-        }
-    }
-
-    /// The map from the frame `from` onto the frame `to`.
-    fn between(from: &Frame, to: &Frame) -> Affine {
-        // x = from.o + a from.x + b from.y + c from.z goes to the same a, b,
-        // c in `to`.
-        let f = [from.x, from.y, from.z];
-        let t = [to.x, to.y, to.z];
-        let linear: [[f64; 3]; 3] = std::array::from_fn(|i| {
-            std::array::from_fn(|j| (0..3).map(|k| t[k][i] * f[k][j]).sum())
-        });
-        let m = Affine {
-            linear,
-            offset: [0.0; 3],
-        };
-        let o = m.apply(from.o);
-        Affine {
-            linear,
-            offset: std::array::from_fn(|i| to.o[i] - o[i]),
-        }
+    let o = m.apply(from.o);
+    Frame {
+        linear,
+        offset: std::array::from_fn(|i| to.o[i] - o[i]),
     }
 }
 
@@ -123,7 +89,7 @@ pub struct Solid {
     pub name: String,
     pub faces: Vec<usize>,
     /// Where the assembly places it.
-    pub placement: Affine,
+    pub placement: Frame,
 }
 
 /// The typed model of a file.
@@ -234,6 +200,9 @@ struct Decoder<'a> {
     surface_of: FxHashMap<u32, usize>,
     edge_of: FxHashMap<u32, usize>,
     face_of: FxHashMap<u32, usize>,
+    /// The surfaces whose normal runs against the file's (swept ones read
+    /// as a torus, say): the faces on them turn.
+    flipped: rustc_hash::FxHashSet<usize>,
 }
 
 impl<'a> Decoder<'a> {
@@ -251,6 +220,7 @@ impl<'a> Decoder<'a> {
             surface_of: FxHashMap::default(),
             edge_of: FxHashMap::default(),
             face_of: FxHashMap::default(),
+            flipped: Default::default(),
         }
     }
 
@@ -295,7 +265,7 @@ impl<'a> Decoder<'a> {
         self.coords(id, "DIRECTION")
     }
 
-    fn placement(&self, id: u32) -> R<Frame> {
+    fn placement(&self, id: u32) -> R<Axes> {
         let r = self.rec(id, "AXIS2_PLACEMENT_3D")?;
         let o = self.point(r.refr(1)?)?;
         let z = match r.get(2)?.as_ref() {
@@ -306,7 +276,7 @@ impl<'a> Decoder<'a> {
             Some(d) => Some(self.direction(d)?),
             None => None,
         };
-        Ok(Frame::new(o, z, x))
+        Ok(Axes::new(o, z, x))
     }
 
     /// B-spline data of a curve: degree, control point ids, knots, weights.
@@ -329,6 +299,15 @@ impl<'a> Decoder<'a> {
             None => None,
         };
         let degree = degree.max(1) as usize;
+        if degree > rapidmesh_geom::nurbs::MAX_DEGREE {
+            return fail(id, format!("degree {degree} above the largest supported"));
+        }
+        if weights
+            .as_ref()
+            .is_some_and(|w| w.len() != ctrl.len() || w.iter().any(|&w| !(w > 0.0)))
+        {
+            return fail(id, "weights that do not fit the points".to_string());
+        }
         if knots.len() != ctrl.len() + degree + 1 {
             return fail(
                 id,
@@ -351,7 +330,7 @@ impl<'a> Decoder<'a> {
             let (degree, ids, knots, weights) = self.spline_parts(id)?;
             let ctrl: Vec<P3> = ids.iter().map(|&p| self.point(p)).collect::<R<_>>()?;
             let weights = weights.unwrap_or_else(|| vec![1.0; ctrl.len()]);
-            return Ok(Curve::Spline(Spline {
+            return Ok(Curve::Spline(NurbsCurve {
                 degree,
                 knots,
                 ctrl,
@@ -369,7 +348,7 @@ impl<'a> Decoder<'a> {
                 let d = self.direction(v.refr(1)?)?;
                 Ok(Curve::Line {
                     p,
-                    d: scale(unit(d), v.num(2)?),
+                    d: scale(normalize(d), v.num(2)?),
                 })
             }
             "CIRCLE" => Ok(Curve::Circle {
@@ -405,7 +384,7 @@ impl<'a> Decoder<'a> {
                 .map(|&p| self.coords(p, "CARTESIAN_POINT"))
                 .collect::<R<_>>()?;
             let weights = weights.unwrap_or_else(|| vec![1.0; ctrl.len()]);
-            return Ok(Curve2::Spline(Spline {
+            return Ok(Curve2::Spline(NurbsCurve {
                 degree,
                 knots,
                 ctrl,
@@ -461,6 +440,33 @@ impl<'a> Decoder<'a> {
             || self.x.kind(id) == Some("B_SPLINE_SURFACE_WITH_KNOTS")
         {
             self.spline_surface(id)?
+        } else if let Some(name @ ("SURFACE_OF_REVOLUTION" | "SURFACE_OF_LINEAR_EXTRUSION")) =
+            self.x.kind(id)
+        {
+            let r = self.any(id)?;
+            let profile = self.curve3(r.refr(1)?)?;
+            let swept = if name == "SURFACE_OF_REVOLUTION" {
+                let a = self.rec(r.refr(2)?, "AXIS1_PLACEMENT")?;
+                let o = self.point(a.refr(1)?)?;
+                let axis = match a.get(2)?.as_ref() {
+                    Some(d) => self.direction(d)?,
+                    None => [0.0, 0.0, 1.0],
+                };
+                revolved(&profile, o, axis)
+            } else {
+                let v = self.rec(r.refr(2)?, "VECTOR")?;
+                extruded(
+                    &profile,
+                    scale(normalize(self.direction(v.refr(1)?)?), v.num(2)?),
+                )
+            };
+            let Some(swept) = swept else {
+                return fail(id, format!("{name} of this profile is not read"));
+            };
+            if swept.flipped {
+                self.flipped.insert(self.m.surfaces.len());
+            }
+            swept.surface
         } else {
             let r = self.any(id)?;
             let frame = self.placement(r.refr(1)?)?;
@@ -609,7 +615,7 @@ impl<'a> Decoder<'a> {
             .rec(id, "ADVANCED_FACE")
             .or_else(|_| self.rec(id, "FACE_SURFACE"))?;
         let surface = self.surface(r.refr(2)?)?;
-        let same_sense = r.flag(3);
+        let same_sense = r.flag(3) != self.flipped.contains(&surface);
         let mut bounds = Vec::new();
         for b in r.refs(1)? {
             let fb = self
@@ -642,6 +648,21 @@ impl<'a> Decoder<'a> {
         Ok(i)
     }
 
+    /// A copy of face `i` facing the other way: its normal against its
+    /// surface's where it was with it, its loops run backwards.
+    fn reversed(&mut self, i: usize) -> usize {
+        let mut f = self.m.faces[i].clone();
+        f.same_sense = !f.same_sense;
+        for b in &mut f.bounds {
+            if let Bound::Edges(edges) = b {
+                edges.reverse();
+                edges.iter_mut().for_each(|e| e.1 = !e.1);
+            }
+        }
+        self.m.faces.push(f);
+        self.m.faces.len() - 1
+    }
+
     /// Every solid: its faces, its name, where the assembly puts it.
     fn solids(&mut self) -> R<()> {
         let names = self.product_names();
@@ -660,11 +681,15 @@ impl<'a> Decoder<'a> {
             }
             let mut faces = Vec::new();
             for s in shells {
-                let shell = self
-                    .rec(s, "CLOSED_SHELL")
-                    .or_else(|_| self.rec(s, "ORIENTED_CLOSED_SHELL"))?;
-                for f in shell.refs(1)? {
-                    faces.push(self.face(f)?);
+                // An oriented shell (the void of a BREP_WITH_VOIDS) names a
+                // closed shell and whether it keeps its orientation.
+                let (s, keep) = match self.rec(s, "ORIENTED_CLOSED_SHELL") {
+                    Ok(o) => (o.refr(2)?, o.flag(3)),
+                    Err(_) => (s, true),
+                };
+                for f in self.rec(s, "CLOSED_SHELL")?.refs(1)? {
+                    let f = self.face(f)?;
+                    faces.push(if keep { f } else { self.reversed(f) });
                 }
             }
             let rep = self.representation_of(id);
@@ -674,7 +699,7 @@ impl<'a> Decoder<'a> {
                 .unwrap_or_else(|| r.name());
             let placement = rep
                 .and_then(|r| places.get(&r).copied())
-                .unwrap_or(Affine::IDENTITY);
+                .unwrap_or(Frame::IDENTITY);
             self.m.solids.push(Solid {
                 name,
                 faces,
@@ -781,9 +806,9 @@ impl<'a> Decoder<'a> {
 
     /// Where the assembly places each shape representation: the maps of
     /// its transforming relationships up to the root, composed.
-    fn placements(&self) -> FxHashMap<u32, Affine> {
+    fn placements(&self) -> FxHashMap<u32, Frame> {
         // child -> (parent, map into the parent)
-        let mut up: FxHashMap<u32, (u32, Affine)> = FxHashMap::default();
+        let mut up: FxHashMap<u32, (u32, Frame)> = FxHashMap::default();
         let mut same: Vec<(u32, u32)> = Vec::new();
         for rel in self.x.all("REPRESENTATION_RELATIONSHIP") {
             let Some(r) = self.x.record(rel, "REPRESENTATION_RELATIONSHIP") else {
@@ -803,7 +828,7 @@ impl<'a> Decoder<'a> {
                 .and_then(|t| {
                     let from = self.placement(t.args.get(2)?.as_ref()?).ok()?;
                     let to = self.placement(t.args.get(3)?.as_ref()?).ok()?;
-                    Some(Affine::between(&from, &to))
+                    Some(between(&from, &to))
                 });
             match map {
                 Some(m) => {
@@ -827,12 +852,12 @@ impl<'a> Decoder<'a> {
         }
         let mut out = FxHashMap::default();
         for &rep in up.keys().chain(same.iter().flat_map(|(a, b)| [a, b])) {
-            let mut m = Affine::IDENTITY;
+            let mut m = Frame::IDENTITY;
             let mut at = rep;
             for _ in 0..64 {
                 match up.get(&at) {
                     Some(&(parent, step)) => {
-                        m = step.then(&m);
+                        m = m.then(step.linear, step.offset);
                         at = parent;
                     }
                     None => break,
@@ -862,15 +887,7 @@ fn low_degree(s: NurbsSurface) -> NurbsSurface {
     if s.degree.iter().all(|&p| p <= CARRIER_DEGREE) {
         return s;
     }
-    let (lo, hi) = s
-        .ctrl
-        .iter()
-        .fold(([f64::MAX; 3], [f64::MIN; 3]), |(lo, hi), c| {
-            (
-                std::array::from_fn(|k| lo[k].min(c[k])),
-                std::array::from_fn(|k| hi[k].max(c[k])),
-            )
-        });
+    let (lo, hi) = bbox(&s.ctrl);
     let size = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
     let (du, dv) = s.domain();
     let degree = s.degree.map(|p| p.min(CARRIER_DEGREE));
@@ -1010,13 +1027,13 @@ pub fn decode(x: &Exchange) -> Result<Model, StepError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::dist;
+    use rapidmesh_geom::vec3::dist;
 
     #[test]
     fn a_map_between_frames_takes_one_onto_the_other() {
-        let a = Frame::new([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], Some([1.0, 0.0, 0.0]));
-        let b = Frame::new([-4.0, 0.5, 2.0], [1.0, 0.0, 0.0], Some([0.0, 1.0, 0.0]));
-        let m = Affine::between(&a, &b);
+        let a = Axes::new([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], Some([1.0, 0.0, 0.0]));
+        let b = Axes::new([-4.0, 0.5, 2.0], [1.0, 0.0, 0.0], Some([0.0, 1.0, 0.0]));
+        let m = between(&a, &b);
         let p = m.apply([1.0, 2.0, 3.0]);
         assert!((0..3).all(|k| (p[k] - b.o[k]).abs() < 1e-12));
         // a.x maps onto b.x.

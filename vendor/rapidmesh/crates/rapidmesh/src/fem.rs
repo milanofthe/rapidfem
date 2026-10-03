@@ -8,6 +8,7 @@
 
 use crate::mesh::Mesh;
 use rapidmesh_brep::Surface;
+use rapidmesh_geom::vec3::{cross, dot, sub};
 use rapidmesh_geom::SurfaceKind;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -15,8 +16,7 @@ use std::path::Path;
 
 type P = [f64; 3];
 
-/// The corner pairs of a tet's mid-edge nodes, in node order.
-pub const TET10_EDGES: [[usize; 2]; 6] = [[0, 1], [1, 2], [2, 0], [0, 3], [1, 3], [2, 3]];
+pub use rapidmesh_topo::TET10_EDGES;
 
 /// A second-order tet mesh.
 #[derive(Debug, Clone)]
@@ -28,26 +28,19 @@ pub struct SecondOrder {
     pub tets: Vec<[u32; 10]>,
     /// Six nodes per surface triangle (parallel to the linear mesh's faces).
     pub faces: Vec<[u32; 6]>,
+    /// Per tet (parallel to `tets`): whether a mid-edge node of it lies off
+    /// its chord, so its map from the reference tet is quadratic. Every
+    /// other tet has its mid-edge nodes in the middle of its edges, an
+    /// affine map as a linear tet: a solver with the geometry order apart
+    /// from the order of its basis (curved boundary, straight medium) maps
+    /// only these isoparametrically. A face of a curved tet that holds a
+    /// curved edge belongs to curved tets only, so straight and curved tets
+    /// meet on straight faces.
+    pub curved_tets: Vec<bool>,
     /// Mid-edge nodes moved onto a curved surface or curve.
     pub curved: usize,
     /// Of those, the ones put back on their chord to keep a tet valid.
     pub straightened: usize,
-}
-
-fn sub(a: P, b: P) -> P {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn dot(a: P, b: P) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: P, b: P) -> P {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
 }
 
 fn mid(a: P, b: P) -> P {
@@ -142,7 +135,8 @@ const MIN_JACOBIAN: f64 = 0.2;
 impl Mesh {
     /// The second-order mesh: a node in the middle of every edge, on the
     /// true geometry where the edge lies on a curved surface (its closest
-    /// point) or on a curve between surfaces (projected onto them in turn).
+    /// point) or on a curve (onto the curve: a rim between flat faces too,
+    /// else onto the surfaces in turn).
     /// Where that leaves a tet's Jacobian below a fifth of the straight
     /// tet's anywhere it is sampled, its curved nodes go back on their
     /// chords.
@@ -175,6 +169,56 @@ impl Mesh {
         let mut node: HashMap<(usize, usize), u32> = HashMap::new();
         // per mid-edge node: its chord's middle, and whether it moved
         let mut chord: Vec<(u32, P)> = Vec::new();
+        // The B-rep curve each mesh edge on one lies on, and the projection
+        // onto the smooth ones.
+        let on_curve: HashMap<(usize, usize), u32> = m
+            .curve_edges
+            .iter()
+            .map(|ce| (key(ce.v[0], ce.v[1]), ce.edge))
+            .collect();
+        let project = self
+            .model
+            .as_deref()
+            .map(|model| rapidmesh_tet::edge_projection(&model.brep));
+        // The mid-edge node of the edge `k`: the middle of its chord, moved
+        // onto the curve the edge lies on (a rim between flat faces too), or
+        // onto every curved surface it lies on, in turn.
+        let new_node = |k: (usize, usize), points: &mut Vec<P>, chord: &mut Vec<(u32, P)>| {
+            let c = mid(m.points[k.0], m.points[k.1]);
+            let curve = on_curve
+                .get(&k)
+                .and_then(|&e| project.as_ref().and_then(|pr| pr(e, c)));
+            if let Some(p) = curve {
+                let id = points.len() as u32;
+                points.push(p);
+                if p != c {
+                    chord.push((id, c));
+                }
+                return id;
+            }
+            let mut p = c;
+            let mut kinds: Vec<OnSurface> = Vec::new();
+            let mut curved = false;
+            for &fi in on.get(&k).into_iter().flatten() {
+                if let Some(s) = carrier(fi) {
+                    curved |= matches!(s, OnSurface::Curved(_));
+                    kinds.push(s);
+                }
+            }
+            if curved {
+                for _ in 0..8 {
+                    for s in &kinds {
+                        p = s.project(p);
+                    }
+                }
+            }
+            let id = points.len() as u32;
+            points.push(p);
+            if p != c {
+                chord.push((id, c));
+            }
+            id
+        };
         let mut tets: Vec<[u32; 10]> = Vec::with_capacity(m.tets.len());
         for t in &m.tets {
             let t = positive(&m.points, t);
@@ -184,36 +228,34 @@ impl Mesh {
             }
             for (e, &[i, j]) in TET10_EDGES.iter().enumerate() {
                 let k = key(t[i], t[j]);
-                let id = *node.entry(k).or_insert_with(|| {
-                    let c = mid(m.points[k.0], m.points[k.1]);
-                    let mut p = c;
-                    let mut kinds: Vec<OnSurface> = Vec::new();
-                    let mut curved = false;
-                    for &fi in on.get(&k).into_iter().flatten() {
-                        if let Some(s) = carrier(fi) {
-                            curved |= matches!(s, OnSurface::Curved(_));
-                            kinds.push(s);
-                        }
-                    }
-                    if curved {
-                        // onto every surface it lies on, in turn
-                        for _ in 0..8 {
-                            for s in &kinds {
-                                p = s.project(p);
-                            }
-                        }
-                    }
-                    let id = points.len() as u32;
-                    points.push(p);
-                    if p != c {
-                        chord.push((id, c));
-                    }
-                    id
-                });
-                n10[4 + e] = id;
+                n10[4 + e] = *node
+                    .entry(k)
+                    .or_insert_with(|| new_node(k, &mut points, &mut chord));
             }
             tets.push(n10);
         }
+        // A face edge no tet has (a sheet outside every region) takes its
+        // node here, with no tet to keep valid.
+        let faces: Vec<[u32; 6]> = m
+            .faces
+            .iter()
+            .map(|f| {
+                let [a, b, c] = f.tri;
+                let mut at = |k: (usize, usize)| {
+                    *node
+                        .entry(k)
+                        .or_insert_with(|| new_node(k, &mut points, &mut chord))
+                };
+                [
+                    a as u32,
+                    b as u32,
+                    c as u32,
+                    at(key(a, b)),
+                    at(key(b, c)),
+                    at(key(c, a)),
+                ]
+            })
+            .collect();
         let curved = chord.len();
         let on_chord: HashMap<u32, P> = chord.into_iter().collect();
         let mut straightened = 0;
@@ -240,25 +282,13 @@ impl Mesh {
                 points[v as usize] = on_chord[&v];
             }
         }
-        let faces = m
-            .faces
-            .iter()
-            .map(|f| {
-                let [a, b, c] = f.tri;
-                [
-                    a as u32,
-                    b as u32,
-                    c as u32,
-                    node[&key(a, b)],
-                    node[&key(b, c)],
-                    node[&key(c, a)],
-                ]
-            })
-            .collect();
+        let off_chord = |v: &u32| on_chord.get(v).is_some_and(|&c| points[*v as usize] != c);
+        let curved_tets = tets.iter().map(|t| t[4..].iter().any(off_chord)).collect();
         SecondOrder {
             points,
             tets,
             faces,
+            curved_tets,
             curved,
             straightened,
         }
@@ -445,59 +475,14 @@ impl SecondOrder {
     /// Writes a VTK XML unstructured grid of the quadratic tets (cell type
     /// 24) with cell data `region`.
     pub fn write_vtu(&self, regions: &[u32], path: impl AsRef<Path>) -> io::Result<()> {
+        use rapidmesh_topo::export::{write_vtu_grid, VTK_QUADRATIC_TET};
         let mut w = io::BufWriter::new(std::fs::File::create(path)?);
-        writeln!(w, r#"<?xml version="1.0"?>"#)?;
-        writeln!(
-            w,
-            r#"<VTKFile type="UnstructuredGrid" version="1.0" byte_order="LittleEndian">"#
-        )?;
-        writeln!(w, "<UnstructuredGrid>")?;
-        writeln!(
-            w,
-            r#"<Piece NumberOfPoints="{}" NumberOfCells="{}">"#,
-            self.points.len(),
-            self.tets.len()
-        )?;
-        writeln!(
-            w,
-            r#"<Points><DataArray type="Float64" NumberOfComponents="3" format="ascii">"#
-        )?;
-        for p in &self.points {
-            writeln!(w, "{:?} {:?} {:?}", p[0], p[1], p[2])?;
-        }
-        writeln!(w, "</DataArray></Points>")?;
-        writeln!(w, "<Cells>")?;
-        writeln!(
-            w,
-            r#"<DataArray type="Int64" Name="connectivity" format="ascii">"#
-        )?;
-        for t in &self.tets {
-            let ids: Vec<String> = t.iter().map(|v| v.to_string()).collect();
-            writeln!(w, "{}", ids.join(" "))?;
-        }
-        writeln!(w, "</DataArray>")?;
-        writeln!(
-            w,
-            r#"<DataArray type="Int64" Name="offsets" format="ascii">"#
-        )?;
-        for i in 0..self.tets.len() {
-            writeln!(w, "{}", 10 * (i + 1))?;
-        }
-        writeln!(w, "</DataArray>")?;
-        writeln!(w, r#"<DataArray type="UInt8" Name="types" format="ascii">"#)?;
-        for _ in &self.tets {
-            writeln!(w, "24")?;
-        }
-        writeln!(w, "</DataArray></Cells>")?;
-        writeln!(
-            w,
-            r#"<CellData><DataArray type="Int32" Name="region" format="ascii">"#
-        )?;
-        for r in regions {
-            writeln!(w, "{r}")?;
-        }
-        writeln!(w, "</DataArray></CellData>")?;
-        writeln!(w, "</Piece></UnstructuredGrid></VTKFile>")?;
+        let cells = self
+            .tets
+            .iter()
+            .map(|t| (t.iter().map(|&v| v as usize).collect(), VTK_QUADRATIC_TET));
+        let regions: Vec<i64> = regions.iter().map(|&r| r as i64).collect();
+        write_vtu_grid(&mut w, &self.points, cells, &[("region", &regions)])?;
         w.flush()
     }
 }

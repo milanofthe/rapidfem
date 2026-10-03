@@ -1,10 +1,9 @@
 //! Exact arithmetic foundation: expansions, interval filters, indirect predicates.
 //!
-//! Both hard stages of rapidmesh stand on this crate: the exact mesh CSG
-//! (arrangements with implicitly represented intersection points) and the CDT
-//! boundary recovery (implicitly represented Steiner points). The shared
-//! mechanism is staged sign evaluation of polynomial expressions over f64
-//! inputs:
+//! The exact mesh CSG (arrangements with implicitly represented intersection
+//! points), the planar triangulations and the inside/outside classification
+//! stand on this crate. The shared mechanism is staged sign evaluation of
+//! polynomial expressions over f64 inputs:
 //!
 //! 1. **Interval filter** ([`Interval`]): conservative interval arithmetic with
 //!    one-ulp outward widening per operation. Fast; resolves the sign in the
@@ -16,13 +15,13 @@
 //!
 //! Geometric expressions (determinants, implicit-point coordinates) are written
 //! once, generically over the [`Ring`] trait, and evaluated with either number
-//! type — or with a rational type in tests, which serves as the correctness
+//! type -- or with a rational type in tests, which serves as the correctness
 //! oracle.
 //!
 //! Implicit points ([`Point3::Lpi`], [`Point3::Tpi`]) are represented by their
 //! defining primitives (line/plane, three planes) and evaluated lazily as
 //! homogeneous coordinates whose entries are polynomials in the input
-//! coordinates — no constructed (rounded) coordinates ever enter a predicate.
+//! coordinates -- no constructed (rounded) coordinates ever enter a predicate.
 //!
 //! # Input domain
 //!
@@ -57,9 +56,7 @@ pub mod ring;
 pub use expansion::Expansion;
 pub use interval::Interval;
 pub use order::{cmp_along, collinear, lex_cmp, strictly_between, within_closed};
-pub use orient::{
-    incircle2d, insphere3d, orient2d, orient3d, orient3d_explicit, power_test3d, Prepared3,
-};
+pub use orient::{incircle2d, orient2d, orient3d, orient3d_explicit, Prepared3};
 pub use point::Point3;
 pub use ring::Ring;
 

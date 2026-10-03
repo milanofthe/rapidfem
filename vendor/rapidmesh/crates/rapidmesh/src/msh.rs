@@ -11,6 +11,7 @@
 use crate::mesh::{Labels, Mesh, Run, SolidInfo};
 use crate::{Error, Result};
 use rapidmesh_geom::plc::SHEET_OWNER;
+use rapidmesh_geom::vec3::cross;
 use rapidmesh_geom::{FaceTag, RegionTag, SurfaceKind};
 use rapidmesh_tet::{quality_stats, CurveEdge, PointClass, SurfaceFace, TetMesh};
 use std::collections::{BTreeMap, HashMap};
@@ -278,12 +279,7 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
     let points: Vec<[f64; 3]> = nodes.iter().map(|n| n.1).collect();
     let point_class: Vec<PointClass> = nodes
         .iter()
-        .map(|n| match n.2 {
-            (0, t) if t > 0 => PointClass::Vertex(t - 1),
-            (1, t) if t > 0 => PointClass::Edge(t - 1),
-            (2, t) if t > 0 => PointClass::Face(t - 1),
-            _ => PointClass::Interior,
-        })
+        .map(|n| rapidmesh_topo::export::msh_class(n.2 .0, n.2 .1))
         .collect();
     let groups = |e: (u8, u32)| raw.entity_groups.get(&e).cloned().unwrap_or_default();
 
@@ -342,11 +338,7 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
             let (a, b, c, d) = (points[f[0]], points[f[1]], points[f[2]], points[t[skip]]);
             let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
             let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                u[1] * v[2] - u[2] * v[1],
-                u[2] * v[0] - u[0] * v[2],
-                u[0] * v[1] - u[1] * v[0],
-            ];
+            let n = cross(u, v);
             let toward = (0..3).map(|k| n[k] * (d[k] - a[k])).sum::<f64>();
             let out = if toward > 0.0 {
                 [f[0], f[2], f[1]]
@@ -447,7 +439,6 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
         list.push((n, ids));
     }
 
-    let n = points.len();
     let inner = TetMesh {
         points,
         tets,
@@ -456,11 +447,9 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
         surfaces: vec![SurfaceKind::Facets],
         surface_owners: vec![SHEET_OWNER],
         plc_points: 0,
-        point_size: vec![0.0; n],
         point_class,
         curve_edges: lines,
         periodic_points: Vec::new(),
-        contact_faces: Vec::new(),
     };
     let quality = quality_stats(&inner);
     Ok(Mesh::new(inner, quality, labels, Run::default(), None))

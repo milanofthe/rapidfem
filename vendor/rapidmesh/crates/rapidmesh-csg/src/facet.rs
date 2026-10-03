@@ -90,7 +90,7 @@ impl PlanarFacet {
 
     /// A projection axis in which the outer loop has exactly nonzero area,
     /// with the LOOP's 2D orientation there (exact shoelace sign). The sign
-    /// of a single vertex triple is NOT the loop orientation — on a
+    /// of a single vertex triple is NOT the loop orientation -- on a
     /// non-convex loop a triple at a reflex corner has the opposite sign,
     /// and a caller trusting it walks every downstream containment test with
     /// inverted in/out. Tries the axis of the largest normal component first
@@ -193,7 +193,7 @@ impl PlanarFacet {
 
     /// Triangulates the outer loop into a triangle fan (for the arrangement
     /// broadphase and for shapes that still need a triangle soup, e.g. a
-    /// solid operand). Holes are NOT represented here — this is the convex/
+    /// solid operand). Holes are NOT represented here -- this is the convex/
     /// star-shaped hull fan, used only where holes are handled separately.
     /// The conformal path never fans; it triangulates from boundary +
     /// constraints in triangulate_facet.
@@ -269,8 +269,8 @@ mod tests {
     #[test]
     fn projection_orientation_is_loop_winding_not_first_triple() {
         // CCW L-shape whose loop STARTS at its reflex corner: the first
-        // vertex triple turns clockwise (Negative), but the loop winding —
-        // what every containment test needs — is Positive. Regression for
+        // vertex triple turns clockwise (Negative), but the loop winding --
+        // what every containment test needs -- is Positive. Regression for
         // the non-convex prism caps (spiral arms) whose facets classified
         // every interior point as outside.
         let l = |x: f64, y: f64| [x, y, 4.0];

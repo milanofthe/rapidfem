@@ -1,8 +1,8 @@
 //! Exact triangle-triangle intersection with implicit intersection points.
 //!
 //! The workhorse of the arrangement stage. Intersection points are produced
-//! as implicit [`Point3`]s (line-plane intersections, or original vertices) —
-//! never as rounded coordinates — so cascaded predicates downstream stay
+//! as implicit [`Point3`]s (line-plane intersections, or original vertices) --
+//! never as rounded coordinates -- so cascaded predicates downstream stay
 //! exact.
 
 use crate::tri::Tri;

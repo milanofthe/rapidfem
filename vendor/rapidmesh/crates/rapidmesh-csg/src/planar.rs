@@ -1,6 +1,6 @@
 //! Conformal arrangement of planar facets.
 //!
-//! The triangle-soup arrangement ([`crate::arrange`]) tessellates every flat
+//! The triangle-soup arrangement ([`crate::arrange()`]) tessellates every flat
 //! face up front, so a curve piercing a flat face lands on intersection points
 //! that sit a hair off the face's interior tessellation vertices -- the seam
 //! micro-features. This module fixes
@@ -146,12 +146,10 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Result<Arrangement, ArrangeError
     // interior) against the other facet's helper triangles, merging the clipped
     // sub-segments along each edge. This is the polygon analog of the
     // triangle-soup coplanar clip and keeps the constraint set boundary-only.
-    // Coplanar boundary-edge clipping in PARALLEL: each (target, source) direction
-    // clips one facet's boundary against the other's helpers and is independent, so
-    // run them across cores and scatter the results serially. A sorted pair order
-    // makes the scatter deterministic (the HashSet iteration the old serial loop
-    // used was not). This was the dominant remaining cost on coplanar-heavy scenes
-    // (perforated plates, plate stacks).
+    // Each (target, source) direction clips one facet's boundary against the
+    // other's helpers independently: in parallel (the cost of coplanar-heavy
+    // scenes such as perforated plates), the results scattered serially in
+    // sorted pair order, so deterministically.
     // A facet with a coplanar partner triangulates canonically (Delaunay), so
     // coincident facets of different inputs match triangle by triangle.
     let mut canonical = vec![false; n];
@@ -188,6 +186,50 @@ pub fn arrange_facets(input: &[PlanarInput]) -> Result<Arrangement, ArrangeError
     for (target, cs, ps) in contribs {
         cop[target].extend(cs);
         points[target].extend(ps);
+    }
+    // Coplanar partners triangulate their overlap alike only from the same
+    // points: every point a facet takes from its touches, its merged cuts and
+    // its partners that lies on its partner goes to the partner too (a touch
+    // at an inner vertex of one facet's input triangles reaches that facet
+    // alone). Cut pieces end where the input triangles meet; merged along
+    // their lines, those ends go.
+    let cut_ends: Vec<Vec<Point3>> = cut
+        .par_iter()
+        .map(|segs| {
+            segs.values()
+                .flat_map(|g| collinear_groups(g))
+                .flat_map(|group| {
+                    let raw: Vec<(Point3, Point3)> =
+                        group.iter().map(|s| (s.a.clone(), s.b.clone())).collect();
+                    merge_on_line(&group[0].a, &group[0].b, &raw)
+                })
+                .flat_map(|(a, b)| [a, b])
+                .collect()
+        })
+        .collect();
+    let shared: Vec<(usize, Vec<Point3>)> = cop_pairs
+        .par_iter()
+        .flat_map_iter(|&(fi, fj)| {
+            [(fi, fj), (fj, fi)].into_iter().map(|(from, to)| {
+                let own = points[from]
+                    .iter()
+                    .chain(&cut_ends[from])
+                    .chain(cop[from].iter().flat_map(|c| [&c.a, &c.b]));
+                let on: Vec<Point3> = own
+                    .filter(|p| {
+                        input[to].helpers.iter().any(|h| {
+                            let (axis, orientation) = h.projection_axis();
+                            h.contains_coplanar(p, axis, orientation)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                (to, on)
+            })
+        })
+        .collect();
+    for (to, ps) in shared {
+        points[to].extend(ps);
     }
 
     // Per facet: merge cut sub-segments into constraints, then triangulate the

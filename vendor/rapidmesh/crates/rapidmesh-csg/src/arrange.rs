@@ -5,7 +5,7 @@
 //! intersecting pair contributes constraints to both facets (with line
 //! provenance, see [`crate::constraint`]); coplanar pairs contribute the
 //! other facet's edges clipped to this facet. Each facet is then
-//! independently retriangulated — exact constructions and exact coincidence
+//! independently retriangulated -- exact constructions and exact coincidence
 //! guarantee that shared intersection vertices match across facets, which is
 //! what downstream inside/outside classification relies on.
 
@@ -167,7 +167,7 @@ fn cross_pairs(a: &Bvh, b: &Bvh, boxes: &[Aabb], out: &mut Vec<(usize, usize)>) 
 
 /// Clips the explicit edge (u, v) of a triangle coplanar with `facet` to the
 /// (closed, convex) facet. Returns the clipped sub-segment endpoints ordered
-/// along u→v; they coincide for a single-point touch. `None` if the edge
+/// along u->v; they coincide for a single-point touch. `None` if the edge
 /// misses the facet.
 pub(crate) fn clip_coplanar_edge(
     facet: &Tri,
@@ -201,7 +201,7 @@ pub(crate) fn clip_coplanar_edge(
             cands.push(pa);
         }
     }
-    // The facet is convex, so the clip is the extreme candidates along u→v.
+    // The facet is convex, so the clip is the extreme candidates along u->v.
     let mut iter = cands.into_iter();
     let first = iter.next()?;
     let (mut lo, mut hi) = (first.clone(), first);

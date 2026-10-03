@@ -1,5 +1,6 @@
-//! Rational B-spline (NURBS) curves in 2D, the profile primitive for swept and
-//! extruded spline surfaces (e.g. an airfoil section). A curve is a degree, a
+//! Rational B-spline (NURBS) curves in any dimension: in 2D the profile
+//! primitive for swept and extruded spline surfaces (e.g. an airfoil
+//! section), in 3D the B-spline edges of CAD files. A curve is a degree, a
 //! clamped knot vector, control points and rational weights; evaluation and the
 //! first two derivatives use the standard basis-function-derivative algorithms
 //! (Piegl & Tiller, "The NURBS Book", A2.1/A2.3), so curvature is exact and
@@ -9,7 +10,16 @@
 //! (the exact circle/ellipse) need the rational form, so the type carries
 //! weights throughout and de-homogenizes with the quotient rule.
 
+#[cfg(test)]
 type P2 = [f64; 2];
+
+fn dot<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
+    (0..N).map(|k| a[k] * b[k]).sum()
+}
+
+fn dist<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
+    (0..N).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
+}
 
 /// Highest supported degree. Basis evaluation runs on fixed-size stack
 /// arrays, so evaluating a curve or surface never allocates.
@@ -139,7 +149,7 @@ fn ders_basis_in<const M: usize>(knots: &[f64], p: usize, span: usize, u: f64) -
 
 /// Solves `A x = b` (two RHS columns) by Gaussian elimination with partial
 /// pivoting. `A` is small and dense (the interpolation collocation matrix).
-fn solve_banded(a: &mut [Vec<f64>], b: &mut [[f64; 2]]) -> Vec<[f64; 2]> {
+fn solve_banded<const N: usize>(a: &mut [Vec<f64>], b: &mut [[f64; N]]) -> Vec<[f64; N]> {
     let n = a.len();
     for col in 0..n {
         let mut piv = col;
@@ -159,39 +169,40 @@ fn solve_banded(a: &mut [Vec<f64>], b: &mut [[f64; 2]]) -> Vec<[f64; 2]> {
             for c in col..n {
                 a[r][c] -= f * a[col][c];
             }
-            b[r][0] -= f * b[col][0];
-            b[r][1] -= f * b[col][1];
+            for k in 0..N {
+                b[r][k] -= f * b[col][k];
+            }
         }
     }
-    let mut x = vec![[0.0; 2]; n];
+    let mut x = vec![[0.0; N]; n];
     for col in (0..n).rev() {
         let mut s = b[col];
         for c in (col + 1)..n {
-            s[0] -= a[col][c] * x[c][0];
-            s[1] -= a[col][c] * x[c][1];
+            for k in 0..N {
+                s[k] -= a[col][c] * x[c][k];
+            }
         }
-        x[col][0] = s[0] / a[col][col];
-        x[col][1] = s[1] / a[col][col];
+        x[col] = s.map(|v| v / a[col][col]);
     }
     x
 }
 
-/// A 2D rational B-spline curve.
+/// A rational B-spline curve in `N` dimensions (2 by default: a profile).
 #[derive(Debug, Clone, PartialEq)]
-pub struct NurbsCurve {
+pub struct NurbsCurve<const N: usize = 2> {
     /// Polynomial degree `p` (order `p + 1`).
     pub degree: usize,
     /// Clamped, non-decreasing knot vector, length `ctrl.len() + degree + 1`.
     pub knots: Vec<f64>,
     /// Control points.
-    pub ctrl: Vec<P2>,
+    pub ctrl: Vec<[f64; N]>,
     /// Rational weights, parallel to `ctrl` (all 1.0 = a plain B-spline).
     pub weights: Vec<f64>,
 }
 
-impl NurbsCurve {
+impl<const N: usize> NurbsCurve<N> {
     /// The same curve traversed the other way, over the same domain.
-    pub fn reversed(&self) -> NurbsCurve {
+    pub fn reversed(&self) -> NurbsCurve<N> {
         let (lo, hi) = (self.knots[0], self.knots[self.knots.len() - 1]);
         NurbsCurve {
             degree: self.degree,
@@ -203,15 +214,20 @@ impl NurbsCurve {
 
     /// The curve scaled by `s` about the origin (exact: NURBS are affine
     /// invariant).
-    pub fn scaled(&self, s: f64) -> NurbsCurve {
+    pub fn scaled(&self, s: f64) -> NurbsCurve<N> {
         NurbsCurve {
-            ctrl: self.ctrl.iter().map(|c| [c[0] * s, c[1] * s]).collect(),
+            ctrl: self.ctrl.iter().map(|c| c.map(|x| x * s)).collect(),
             ..self.clone()
         }
     }
 
     /// Builds a curve, validating the knot/control/weight sizes.
-    pub fn new(degree: usize, knots: Vec<f64>, ctrl: Vec<P2>, weights: Vec<f64>) -> NurbsCurve {
+    pub fn new(
+        degree: usize,
+        knots: Vec<f64>,
+        ctrl: Vec<[f64; N]>,
+        weights: Vec<f64>,
+    ) -> NurbsCurve<N> {
         assert!(
             (1..=MAX_DEGREE).contains(&degree),
             "degree must be in 1..={MAX_DEGREE}"
@@ -238,11 +254,11 @@ impl NurbsCurve {
     /// artifacts -- so a curvature sizing field refines only the genuinely
     /// curved regions (Piegl & Tiller, global interpolation A9.1: chord-length
     /// parameters, averaged knots, solve `N P = Q`). Needs >= 4 points.
-    pub fn interpolate(points: &[P2]) -> NurbsCurve {
+    pub fn interpolate(points: &[[f64; N]]) -> NurbsCurve<N> {
         let n = points.len() - 1;
         assert!(n >= 3, "cubic interpolation needs >= 4 points");
         let p = 3;
-        let dd = |a: P2, b: P2| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+        let dd = |a: [f64; N], b: [f64; N]| dist(a, b);
         // Chord-length parameters.
         let total: f64 = (1..=n).map(|k| dd(points[k], points[k - 1])).sum();
         let mut u = vec![0.0; n + 1];
@@ -268,7 +284,7 @@ impl NurbsCurve {
                 a[k][span - p + j] = basis[j];
             }
         }
-        let mut rhs: Vec<[f64; 2]> = points.to_vec();
+        let mut rhs: Vec<[f64; N]> = points.to_vec();
         let ctrl = solve_banded(&mut a, &mut rhs);
         NurbsCurve::new(p, knots, ctrl, vec![1.0; n + 1])
     }
@@ -285,50 +301,49 @@ impl NurbsCurve {
 
     /// Point and first two derivatives `(C, C', C'')` at parameter `u`, via the
     /// rational quotient rule on the homogeneous numerator.
-    pub fn ders2(&self, u: f64) -> (P2, P2, P2) {
+    pub fn ders2(&self, u: f64) -> ([f64; N], [f64; N], [f64; N]) {
         let p = self.degree;
         let (lo, hi) = self.domain();
         let u = u.clamp(lo, hi);
         let span = self.find_span(u);
         let nd = ders_basis(&self.knots, self.degree, span, u);
-        // homogeneous A^(k) = (x, y, w) for k = 0,1,2
-        let mut a = [[0.0f64; 3]; 3];
+        // The homogeneous numerator A^(k) and weight w^(k), k = 0, 1, 2.
+        let mut a = [[0.0f64; N]; 3];
+        let mut w = [0.0f64; 3];
         for j in 0..=p {
             let i = span - p + j;
-            let w = self.weights[i];
-            let pw = [self.ctrl[i][0] * w, self.ctrl[i][1] * w, w];
-            for (ak, ndk) in a.iter_mut().zip(&nd) {
-                for c in 0..3 {
-                    ak[c] += ndk[j] * pw[c];
+            let wi = self.weights[i];
+            for k in 0..3 {
+                for c in 0..N {
+                    a[k][c] += nd[k][j] * self.ctrl[i][c] * wi;
                 }
+                w[k] += nd[k][j] * wi;
             }
         }
-        let (w0, w1, w2) = (a[0][2], a[1][2], a[2][2]);
-        let c0 = [a[0][0] / w0, a[0][1] / w0];
-        let c1 = [(a[1][0] - w1 * c0[0]) / w0, (a[1][1] - w1 * c0[1]) / w0];
-        let c2 = [
-            (a[2][0] - 2.0 * w1 * c1[0] - w2 * c0[0]) / w0,
-            (a[2][1] - 2.0 * w1 * c1[1] - w2 * c0[1]) / w0,
-        ];
+        let c0: [f64; N] = std::array::from_fn(|c| a[0][c] / w[0]);
+        let c1: [f64; N] = std::array::from_fn(|c| (a[1][c] - w[1] * c0[c]) / w[0]);
+        let c2: [f64; N] =
+            std::array::from_fn(|c| (a[2][c] - 2.0 * w[1] * c1[c] - w[2] * c0[c]) / w[0]);
         (c0, c1, c2)
     }
 
     /// Curve point at `u`.
-    pub fn eval(&self, u: f64) -> P2 {
+    pub fn eval(&self, u: f64) -> [f64; N] {
         let p = self.degree;
         let (lo, hi) = self.domain();
         let u = u.clamp(lo, hi);
         let span = self.find_span(u);
         let b = basis_funs(span, u, p, &self.knots);
-        let (mut x, mut y, mut w) = (0.0, 0.0, 0.0);
+        let (mut x, mut w) = ([0.0; N], 0.0);
         for (j, bj) in b.iter().enumerate().take(p + 1) {
             let i = span - p + j;
             let bw = bj * self.weights[i];
-            x += bw * self.ctrl[i][0];
-            y += bw * self.ctrl[i][1];
+            for c in 0..N {
+                x[c] += bw * self.ctrl[i][c];
+            }
             w += bw;
         }
-        [x / w, y / w]
+        x.map(|v| v / w)
     }
 
     /// Parameter of the curve point nearest to `q`. A knot span lies in the
@@ -336,19 +351,20 @@ impl NurbsCurve {
     /// their bounding box bounds the span from below: the nearest span is
     /// searched first, then only spans that could still beat it. Inside a
     /// span a few samples seed Newton on `(C(t) - q) . C'(t) = 0`.
-    pub fn closest_param(&self, q: P2) -> f64 {
+    pub fn closest_param(&self, q: [f64; N]) -> f64 {
         let p = self.degree;
         let spans = (p..self.ctrl.len()).filter(|&s| self.knots[s] < self.knots[s + 1]);
         let bound = |s: usize| {
-            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            let (mut lo, mut hi) = ([f64::INFINITY; N], [f64::NEG_INFINITY; N]);
             for c in &self.ctrl[s - p..=s] {
-                for k in 0..2 {
+                for k in 0..N {
                     lo[k] = lo[k].min(c[k]);
                     hi[k] = hi[k].max(c[k]);
                 }
             }
-            let d: [f64; 2] = std::array::from_fn(|k| (lo[k] - q[k]).max(q[k] - hi[k]).max(0.0));
-            d[0] * d[0] + d[1] * d[1]
+            (0..N)
+                .map(|k| (lo[k] - q[k]).max(q[k] - hi[k]).max(0.0).powi(2))
+                .sum::<f64>()
         };
         // Nearest bound first; once a bound reaches the best distance, no
         // span after it can beat it.
@@ -370,12 +386,41 @@ impl NurbsCurve {
         best.0
     }
 
+    /// The parameter of a curve point near `q` by Newton from `t0`, the
+    /// parameter of a point near it (a search where the answer lies close,
+    /// not over the whole curve). Falls back to [`NurbsCurve::closest_param`]
+    /// where Newton does not come nearer than `t0` was.
+    pub fn closest_param_near(&self, q: [f64; N], t0: f64) -> f64 {
+        let (lo, hi) = self.domain();
+        let d2 = |t: f64| dist(self.eval(t), q).powi(2);
+        let mut t = t0.clamp(lo, hi);
+        let start = d2(t);
+        for _ in 0..16 {
+            let (c, d1, dd) = self.ders2(t);
+            let r: [f64; N] = std::array::from_fn(|k| c[k] - q[k]);
+            let gp = dot(d1, d1) + dot(r, dd);
+            if !(gp > 1e-15) {
+                break;
+            }
+            let step = dot(r, d1) / gp;
+            t = (t - step).clamp(lo, hi);
+            if step.abs() < 1e-13 * (hi - lo).max(1.0) {
+                break;
+            }
+        }
+        if d2(t) <= start {
+            t
+        } else {
+            self.closest_param(q)
+        }
+    }
+
     /// Nearest parameter to `q` within knot span `s`, with its squared
     /// distance.
-    fn closest_in_span(&self, s: usize, q: P2) -> (f64, f64) {
+    fn closest_in_span(&self, s: usize, q: [f64; N]) -> (f64, f64) {
         const SAMPLES: usize = 4;
         let (a, b) = (self.knots[s], self.knots[s + 1]);
-        let d2 = |c: P2| (c[0] - q[0]).powi(2) + (c[1] - q[1]).powi(2);
+        let d2 = |c: [f64; N]| dist(c, q).powi(2);
         let mut best = (a, f64::INFINITY);
         for i in 0..=SAMPLES {
             let t = a + (b - a) * i as f64 / SAMPLES as f64;
@@ -387,9 +432,9 @@ impl NurbsCurve {
         let mut t = best.0;
         for _ in 0..16 {
             let (c, d1, dd) = self.ders2(t);
-            let r = [c[0] - q[0], c[1] - q[1]];
-            let g = r[0] * d1[0] + r[1] * d1[1];
-            let gp = d1[0] * d1[0] + d1[1] * d1[1] + r[0] * dd[0] + r[1] * dd[1];
+            let r: [f64; N] = std::array::from_fn(|k| c[k] - q[k]);
+            let g = dot(r, d1);
+            let gp = dot(d1, d1) + dot(r, dd);
             if !(gp > 1e-15) {
                 break;
             }
@@ -406,16 +451,23 @@ impl NurbsCurve {
         best
     }
 
-    /// Signed-magnitude curvature `kappa = |x' x y''| / |x'|^3` at `u`.
+    /// Curvature `kappa = |C' x C''| / |C'|^3` at `u`, the cross product's
+    /// length summed over the coordinate planes (in any dimension, and
+    /// without the cancellation of `|C'|^2 |C''|^2 - (C' . C'')^2` where
+    /// the curve is nearly straight).
     pub fn curvature(&self, u: f64) -> f64 {
         let (_, c1, c2) = self.ders2(u);
-        let cross = c1[0] * c2[1] - c1[1] * c2[0];
-        let speed = (c1[0] * c1[0] + c1[1] * c1[1]).sqrt();
+        let speed = dot(c1, c1).sqrt();
         if speed < 1e-15 {
-            0.0
-        } else {
-            cross.abs() / speed.powi(3)
+            return 0.0;
         }
+        let mut cross2 = 0.0;
+        for i in 0..N {
+            for j in i + 1..N {
+                cross2 += (c1[i] * c2[j] - c1[j] * c2[i]).powi(2);
+            }
+        }
+        cross2.sqrt() / speed.powi(3)
     }
 
     /// Arc length over `[u0, u1]` by composite Gauss-Legendre (3-point per
@@ -437,7 +489,7 @@ impl NurbsCurve {
             for k in 0..3 {
                 let u = mid + 0.5 * h * X[k];
                 let (_, d, _) = self.ders2(u);
-                total += W[k] * (d[0] * d[0] + d[1] * d[1]).sqrt();
+                total += W[k] * dot(d, d).sqrt();
             }
         }
         0.5 * h * total
@@ -450,6 +502,37 @@ mod tests {
 
     fn norm(p: P2) -> f64 {
         (p[0] * p[0] + p[1] * p[1]).sqrt()
+    }
+
+    /// The quarter circle of radius 2 in the plane x = y, as a 3D curve:
+    /// on the circle, curvature 1/2, and the nearest point of a point
+    /// beside it on the ray through that point.
+    #[test]
+    fn a_tilted_quarter_circle_in_3d_is_exact() {
+        let w = (0.5_f64).sqrt();
+        let (e1, e2) = ([w, w, 0.0], [0.0, 0.0, 1.0]);
+        let at =
+            |a: f64, b: f64| -> [f64; 3] { std::array::from_fn(|k| 2.0 * (a * e1[k] + b * e2[k])) };
+        let c: NurbsCurve<3> = NurbsCurve::new(
+            2,
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![at(1.0, 0.0), at(1.0, 1.0), at(0.0, 1.0)],
+            vec![1.0, w, 1.0],
+        );
+        for &t in &[0.0, 0.3, 0.5, 0.9, 1.0] {
+            let p = c.eval(t);
+            assert!((dist(p, [0.0; 3]) - 2.0).abs() < 1e-12, "{t}: {p:?}");
+            assert!((p[0] - p[1]).abs() < 1e-12);
+            assert!(
+                (c.curvature(t) - 0.5).abs() < 1e-9,
+                "{t}: {}",
+                c.curvature(t)
+            );
+        }
+        let q = at(3.0 * 0.6, 3.0 * 0.8);
+        let foot = c.eval(c.closest_param(q));
+        let want = at(0.6, 0.8);
+        assert!(dist(foot, want) < 1e-9, "{foot:?} {want:?}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ pub(crate) fn normalize(a: V3) -> V3 {
     }
 }
 
-/// Determinant of a 3×3 given as rows.
+/// Determinant of a 3x3 given as rows.
 #[inline]
 pub(crate) fn det3(m: [[f64; 3]; 3]) -> f64 {
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
@@ -48,7 +48,7 @@ pub(crate) fn det3(m: [[f64; 3]; 3]) -> f64 {
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
-/// Inverse of a 3×3 (rows in, rows out). `None` if (near-)singular.
+/// Inverse of a 3x3 (rows in, rows out). `None` if (near-)singular.
 pub(crate) fn inv3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     let det = det3(m);
     if det.abs() < 1e-300 {

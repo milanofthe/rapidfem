@@ -9,19 +9,52 @@
 //! incidence (region -> faces -> edges) so a scope can walk down the hierarchy.
 
 use crate::{Brep, Curve};
-use rapidmesh_geom::vec3::{cross, len as norm, sub, V3};
+use rapidmesh_geom::vec3::{cross, dot, len as norm, sub, V3};
 use rapidmesh_geom::TaggedPlc;
 
-/// Analytic curve kind of an edge, as a small code (for the Python selector to
-/// distinguish straight from curved edges without the full enum).
+/// The kind of an edge's curve, named for the selectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeKind {
-    Line = 0,
-    Circle = 1,
-    Profile = 2,
-    Intersection = 3,
-    Polyline = 4,
-    Ellipse = 5,
+    Line,
+    Circle,
+    Profile,
+    Intersection,
+    Polyline,
+    Ellipse,
+    Spline,
+}
+
+impl EdgeKind {
+    /// Every kind, in the order of their names.
+    pub const ALL: [EdgeKind; 7] = [
+        EdgeKind::Line,
+        EdgeKind::Circle,
+        EdgeKind::Ellipse,
+        EdgeKind::Spline,
+        EdgeKind::Profile,
+        EdgeKind::Intersection,
+        EdgeKind::Polyline,
+    ];
+
+    /// The name of the kind: "line", "circle", "ellipse", "spline",
+    /// "profile" (a swept profile's edge), "intersection" (of two curved
+    /// surfaces) or "polyline" (no analytic curve).
+    pub fn name(self) -> &'static str {
+        match self {
+            EdgeKind::Line => "line",
+            EdgeKind::Circle => "circle",
+            EdgeKind::Ellipse => "ellipse",
+            EdgeKind::Spline => "spline",
+            EdgeKind::Profile => "profile",
+            EdgeKind::Intersection => "intersection",
+            EdgeKind::Polyline => "polyline",
+        }
+    }
+
+    /// The kind of a [`EdgeKind::name`].
+    pub fn parse(name: &str) -> Option<EdgeKind> {
+        EdgeKind::ALL.into_iter().find(|k| k.name() == name)
+    }
 }
 
 /// One face of the boundary, with its sizing-relevant geometry and incidence.
@@ -108,8 +141,7 @@ pub struct FaceFilter {
 #[derive(Debug, Clone, Default)]
 pub struct EdgeFilter {
     pub id: Option<u32>,
-    /// Match [`EdgeKind`] by its small code.
-    pub kind: Option<u8>,
+    pub kind: Option<EdgeKind>,
     /// Keep edges whose incident faces span BOTH of these region tags.
     pub between: Option<(u32, u32)>,
     /// If set, keep only the single edge whose midpoint is closest to this point.
@@ -187,7 +219,7 @@ impl EdgeFilter {
     /// The edges of this kind.
     pub fn kind(kind: EdgeKind) -> EdgeFilter {
         EdgeFilter {
-            kind: Some(kind as u8),
+            kind: Some(kind),
             ..Default::default()
         }
     }
@@ -211,7 +243,7 @@ impl EdgeFilter {
 
 fn d2(a: V3, b: V3) -> f64 {
     let d = sub(a, b);
-    d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    dot(d, d)
 }
 
 /// Reduce `ids` to the single entry whose `pos` is nearest `p` (the first on a
@@ -270,7 +302,7 @@ impl Topology {
         if matches!(ef.id, Some(i) if i != id) {
             return false;
         }
-        if matches!(ef.kind, Some(k) if k != e.kind as u8) {
+        if matches!(ef.kind, Some(k) if k != e.kind) {
             return false;
         }
         if let Some((a, b)) = ef.between {
@@ -440,6 +472,7 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
             Curve::Profile { .. } => EdgeKind::Profile,
             Curve::Ellipse { .. } => EdgeKind::Ellipse,
             Curve::Intersection { .. } => EdgeKind::Intersection,
+            Curve::Nurbs { .. } => EdgeKind::Spline,
             Curve::Polyline => EdgeKind::Polyline,
         };
         let mut faces_of: Vec<u32> = e.coedges.iter().map(|&c| brep.coedge(c).face.0).collect();

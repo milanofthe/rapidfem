@@ -8,11 +8,11 @@ use crate::csr::Csr;
 use crate::source::TetSource;
 use std::collections::HashMap;
 
-/// Derived connectivity of a tet mesh. Pure topology — no coordinates.
+/// Derived connectivity of a tet mesh. Pure topology -- no coordinates.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TetTopology {
     pub n_verts: usize,
-    /// The tet → vertex connectivity (the source elements, as `u32`), so the
+    /// The tet -> vertex connectivity (the source elements, as `u32`), so the
     /// complex is self-contained and the geometry builders need only coordinates.
     pub tets: Vec<[u32; 4]>,
     /// Unique edges, canonical `(min, max)`.
@@ -21,7 +21,7 @@ pub struct TetTopology {
     pub faces: Vec<[u32; 3]>,
     /// Global edge id per local edge (`TET_EDGE_LOCAL` order).
     pub tet_edges: Vec<[u32; 6]>,
-    /// `+1` if the local edge runs min→max (matches canonical), else `-1`.
+    /// `+1` if the local edge runs min->max (matches canonical), else `-1`.
     pub tet_edge_sign: Vec<[i8; 6]>,
     /// Global face id per local face (`TET_FACE_LOCAL` order).
     pub tet_faces: Vec<[u32; 4]>,
@@ -33,11 +33,11 @@ pub struct TetTopology {
     pub tet_face_perm: Vec<[u8; 4]>,
     /// The 3 edges of each face (`TRI_EDGE_LOCAL` order on the canonical face).
     pub face_edges: Vec<[u32; 3]>,
-    /// The (≤2) tets incident to each face; `NONE` marks a boundary face.
+    /// The (<=2) tets incident to each face; `NONE` marks a boundary face.
     pub face_tets: Vec<[u32; 2]>,
-    /// Vertex → incident edges.
+    /// Vertex -> incident edges.
     pub vert_edges: Csr,
-    /// Vertex → incident tets.
+    /// Vertex -> incident tets.
     pub vert_tets: Csr,
 }
 
@@ -84,7 +84,7 @@ impl TetTopology {
             }
         }
 
-        // Face → its 3 edges (every edge already exists as a tet edge).
+        // Face -> its 3 edges (every edge already exists as a tet edge).
         let nf = faces.len();
         let mut face_edges = vec![[0u32; 3]; nf];
         for (fi, &f) in faces.iter().enumerate() {
@@ -94,7 +94,7 @@ impl TetTopology {
             }
         }
 
-        // Face → incident tets (a volume face has ≤2).
+        // Face -> incident tets (a volume face has <=2).
         let mut face_tets = vec![[NONE; 2]; nf];
         let mut fcnt = vec![0u8; nf];
         for t in 0..nt {
@@ -135,21 +135,21 @@ impl TetTopology {
 }
 
 /// Per-element geometry of a tet mesh. All basis-free facts about the embedding.
-/// `grad` holds ∇λ_i (the barycentric-coordinate gradients = the inverse-
-/// transpose Jacobian) — pure simplex calculus, the only per-element datum a
+/// `grad` holds grad lambda_i (the barycentric-coordinate gradients = the inverse-
+/// transpose Jacobian) -- pure simplex calculus, the only per-element datum a
 /// P1/Nédélec assembly needs.
 #[derive(Debug, Clone, Default)]
 pub struct TetGeometry {
     /// Unsigned tet volume.
     pub volume: Vec<f64>,
-    /// ∇λ_i for the 4 local vertices (constant per tet). `Σ_i ∇λ_i = 0`.
+    /// grad lambda_i for the 4 local vertices (constant per tet). `sum_i grad lambda_i = 0`.
     pub grad: Vec<[[f64; 3]; 4]>,
     /// Per-edge length (parallel to `TetTopology::edges`).
     pub edge_len: Vec<f64>,
     /// Per-face area (parallel to `TetTopology::faces`).
     pub face_area: Vec<f64>,
-    /// Per-face unit normal: boundary outward, interior `t0 → t1` (oriented away
-    /// from `face_tets[f][0]`'s opposite vertex — outward for a boundary face).
+    /// Per-face unit normal: boundary outward, interior `t0 -> t1` (oriented away
+    /// from `face_tets[f][0]`'s opposite vertex -- outward for a boundary face).
     pub face_normal: Vec<[f64; 3]>,
     pub face_centroid: Vec<[f64; 3]>,
 }
@@ -178,7 +178,7 @@ impl TetGeometry {
             ];
             volume[t] = det3(m).abs() / 6.0;
             if let Some(inv) = inv3(m) {
-                // λ_{1,2,3} = (T^{-1}(x - p0))_{0,1,2} -> ∇λ_i = rows of T^{-1}.
+                // lambda_{1,2,3} = (T^{-1}(x - p0))_{0,1,2} -> grad lambda_i = rows of T^{-1}.
                 let (g1, g2, g3) = (inv[0], inv[1], inv[2]);
                 grad[t][1] = g1;
                 grad[t][2] = g2;
@@ -252,7 +252,7 @@ mod tests {
         });
         assert_eq!(topo.edges.len(), 6);
         assert_eq!(topo.faces.len(), 4);
-        // ascending vertex labels -> every local edge already runs min→max.
+        // ascending vertex labels -> every local edge already runs min->max.
         assert_eq!(topo.tet_edge_sign[0], [1; 6]);
         // all four faces are on the boundary.
         for f in &topo.face_tets {
@@ -306,11 +306,11 @@ mod tests {
         ];
         let g = TetGeometry::build(&topo, &coords);
         assert!((g.volume[0] - 1.0 / 6.0).abs() < 1e-12);
-        // ∇λ_0 = (-1,-1,-1).
+        // grad lambda_0 = (-1,-1,-1).
         for k in 0..3 {
             assert!((g.grad[0][0][k] + 1.0).abs() < 1e-12);
         }
-        // Σ_i ∇λ_i = 0.
+        // sum_i grad lambda_i = 0.
         let mut s = [0.0; 3];
         for i in 0..4 {
             for k in 0..3 {

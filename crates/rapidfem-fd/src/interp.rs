@@ -20,17 +20,13 @@ use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::tet_assembly::{barycentric_grads, build_basis, BasisFn};
+use rapidfem_core::geom::cross;
 
 type V3 = [f64; 3];
 
 /// Global sign matching the reconstruction to the `sparam`/excitation
 /// convention (see module docs). Physically immaterial; pinned here.
 const RECON_SIGN: f64 = -1.0;
-
-#[inline]
-fn cross3(a: &V3, b: &V3) -> V3 {
-    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-}
 
 /// Barycentric L_i of local node i at point `p`: L_i = δ_{i0} + ∇L_i·(p − v0).
 #[inline]
@@ -236,7 +232,7 @@ pub fn eval_curl_in_tet(
                 }
                 let mut e_less = t.exps;
                 e_less[m] -= 1;
-                let c = cross3(&grads[m], &grads[t.grad as usize]);
+                let c = cross(grads[m], grads[t.grad as usize]);
                 let s = w * em as f64 * monomial(&lam, &e_less);
                 for k in 0..3 {
                     curl[k] += dof * C64::from(s * c[k]);

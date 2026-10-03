@@ -12,9 +12,7 @@ mod model;
 mod td;
 
 use num_complex::Complex64;
-use numpy::{
-    Complex64 as NpC64, IntoPyArray, PyArray1, PyArray2, PyArray3,
-};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArray3};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rapidfem_fd::eigenmode::Eigenmode;
@@ -119,16 +117,7 @@ impl PySimulation {
         let cb_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
         let hook = |fi: usize, freq: f64, s: &[Vec<Complex64>]| -> bool {
             Python::attach(|py| {
-                let n = s.len();
-                let mut flat: Vec<NpC64> = Vec::with_capacity(n * n);
-                for row in s {
-                    for v in row {
-                        flat.push(NpC64::new(v.re, v.im));
-                    }
-                }
-                let arr = numpy::ndarray::Array2::from_shape_vec((n, n), flat)
-                    .expect("square s-matrix")
-                    .into_pyarray(py);
+                let arr = grid2(s, py);
                 match cb.call1(py, (fi, freq, arr)) {
                     Ok(_) => {}
                     Err(e) => {
@@ -242,12 +231,8 @@ impl PySimulation {
         result: &PySweepResult,
         freq_idx: usize,
         port_idx: usize,
-    ) -> Option<Bound<'py, PyArray2<NpC64>>> {
-        let flat = self.inner.field_at_nodes(&result.inner, freq_idx, port_idx)?;
-        let n = self.inner.mesh.n_nodes();
-        let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray(py))
+    ) -> Option<Bound<'py, PyArray2<Complex64>>> {
+        Some(per_node(self.inner.field_at_nodes(&result.inner, freq_idx, port_idx)?, py))
     }
 
     /// Loss-equivalent current density J = σ_eff · E at every mesh node for
@@ -261,12 +246,8 @@ impl PySimulation {
         result: &PySweepResult,
         freq_idx: usize,
         port_idx: usize,
-    ) -> Option<Bound<'py, PyArray2<NpC64>>> {
-        let flat = self.inner.current_density_at_nodes(&result.inner, freq_idx, port_idx)?;
-        let n = self.inner.mesh.n_nodes();
-        let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray(py))
+    ) -> Option<Bound<'py, PyArray2<Complex64>>> {
+        Some(per_node(self.inner.current_density_at_nodes(&result.inner, freq_idx, port_idx)?, py))
     }
 
     /// Magnetic field H = ∇×E / (jωμ₀μ_r) at every mesh node for a given
@@ -279,12 +260,8 @@ impl PySimulation {
         result: &PySweepResult,
         freq_idx: usize,
         port_idx: usize,
-    ) -> Option<Bound<'py, PyArray2<NpC64>>> {
-        let flat = self.inner.h_field_at_nodes(&result.inner, freq_idx, port_idx)?;
-        let n = self.inner.mesh.n_nodes();
-        let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray(py))
+    ) -> Option<Bound<'py, PyArray2<Complex64>>> {
+        Some(per_node(self.inner.h_field_at_nodes(&result.inner, freq_idx, port_idx)?, py))
     }
 
     /// Same as ``field_at_nodes`` but for an :class:`Eigenmode`. Returns a
@@ -295,12 +272,8 @@ impl PySimulation {
         &self,
         py: Python<'py>,
         mode: &PyEigenmode,
-    ) -> Option<Bound<'py, PyArray2<NpC64>>> {
-        let flat = self.inner.eigenmode_field_at_nodes(&mode.inner)?;
-        let n = self.inner.mesh.n_nodes();
-        let conv: Vec<NpC64> = flat.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        let arr = numpy::ndarray::Array2::from_shape_vec((n, 3), conv).expect("shape");
-        Some(arr.into_pyarray(py))
+    ) -> Option<Bound<'py, PyArray2<Complex64>>> {
+        Some(per_node(self.inner.eigenmode_field_at_nodes(&mode.inner)?, py))
     }
 
     /// Monk-style residual error indicator η per tetrahedron at
@@ -368,19 +341,10 @@ impl PySweepResult {
     /// S-parameter matrix, shape `[n_freq, n_driven, n_driven]`, dtype complex128.
     /// Indexing: `S[freq_idx, observation_port, excitation_port]`.
     #[getter]
-    fn sparams<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<NpC64>> {
+    fn sparams<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray3<Complex64>> {
         let n_freq = self.inner.frequencies.len();
         let n = self.inner.n_driven;
-        let mut flat: Vec<NpC64> = Vec::with_capacity(n_freq * n * n);
-        for f_mat in &self.inner.sparams {
-            for row in f_mat {
-                for c in row {
-                    // num_complex::Complex64 ↔ numpy::Complex64 are bit-identical layout.
-                    let v: Complex64 = *c;
-                    flat.push(NpC64::new(v.re, v.im));
-                }
-            }
-        }
+        let flat: Vec<Complex64> = self.inner.sparams.iter().flatten().flatten().copied().collect();
         let arr = numpy::ndarray::Array3::from_shape_vec((n_freq, n, n), flat)
             .expect("shape matches data");
         arr.into_pyarray(py)
@@ -411,9 +375,8 @@ impl PyEigenmode {
 
     /// E-field DOF coefficient vector for this mode (complex128).
     #[getter]
-    fn field<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<NpC64>> {
-        let conv: Vec<NpC64> = self.inner.field.iter().map(|c| NpC64::new(c.re, c.im)).collect();
-        conv.into_pyarray(py)
+    fn field<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<Complex64>> {
+        self.inner.field.clone().into_pyarray(py)
     }
 }
 
@@ -434,47 +397,47 @@ impl PyRadiationPattern {
     /// Directivity D(theta, phi) in dBi, shape `[n_phi, n_theta]`, float64.
     #[getter]
     fn directivity_dbi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        flatten_2d(&self.inner.directivity_dbi, py)
+        grid2(&self.inner.directivity_dbi, py)
     }
 
     /// Realised gain G(theta, phi) in dBi (directivity minus mismatch/loss),
     /// shape `[n_phi, n_theta]`, float64.
     #[getter]
     fn gain_dbi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        flatten_2d(&self.inner.gain_dbi, py)
+        grid2(&self.inner.gain_dbi, py)
     }
 
     /// Axial ratio in dB (0 = circular, large = linear polarisation),
     /// shape `[n_phi, n_theta]`, float64.
     #[getter]
     fn axial_ratio_db<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        flatten_2d(&self.inner.axial_ratio_db, py)
+        grid2(&self.inner.axial_ratio_db, py)
     }
 
     /// Left-hand circular polarisation gain in dBi, shape `[n_phi, n_theta]`,
     /// float64.
     #[getter]
     fn lcp_dbi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        flatten_2d(&self.inner.lcp_dbi, py)
+        grid2(&self.inner.lcp_dbi, py)
     }
 
     /// Right-hand circular polarisation gain in dBi, shape `[n_phi, n_theta]`,
     /// float64.
     #[getter]
     fn rcp_dbi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        flatten_2d(&self.inner.rcp_dbi, py)
+        grid2(&self.inner.rcp_dbi, py)
     }
 
     /// Complex E_theta(theta, phi), shape `[n_phi, n_theta]`.
     #[getter]
-    fn e_theta<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<NpC64>> {
-        flatten_2d_complex(&self.inner.e_theta, py)
+    fn e_theta<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<Complex64>> {
+        grid2(&self.inner.e_theta, py)
     }
 
     /// Complex E_phi(theta, phi), shape `[n_phi, n_theta]`.
     #[getter]
-    fn e_phi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<NpC64>> {
-        flatten_2d_complex(&self.inner.e_phi, py)
+    fn e_phi<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<Complex64>> {
+        grid2(&self.inner.e_phi, py)
     }
 
     /// Peak directivity over the sampled sphere, in dBi.
@@ -490,28 +453,17 @@ impl PyRadiationPattern {
     fn radiated_power(&self) -> f64 { self.inner.radiated_power }
 }
 
-fn flatten_2d<'py>(grid: &[Vec<f64>], py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-    let n_phi = grid.len();
-    let n_theta = grid.first().map(|r| r.len()).unwrap_or(0);
-    let mut flat: Vec<f64> = Vec::with_capacity(n_phi * n_theta);
-    for row in grid {
-        flat.extend_from_slice(row);
-    }
-    let arr = numpy::ndarray::Array2::from_shape_vec((n_phi, n_theta), flat).expect("shape");
-    arr.into_pyarray(py)
+/// A row-major grid (`[n_rows][n_cols]`, rows of equal length) as a 2D array.
+fn grid2<'py, T: numpy::Element + Copy>(grid: &[Vec<T>], py: Python<'py>) -> Bound<'py, PyArray2<T>> {
+    let n_cols = grid.first().map_or(0, |r| r.len());
+    let flat: Vec<T> = grid.iter().flatten().copied().collect();
+    numpy::ndarray::Array2::from_shape_vec((grid.len(), n_cols), flat).expect("shape").into_pyarray(py)
 }
 
-fn flatten_2d_complex<'py>(grid: &[Vec<Complex64>], py: Python<'py>) -> Bound<'py, PyArray2<NpC64>> {
-    let n_phi = grid.len();
-    let n_theta = grid.first().map(|r| r.len()).unwrap_or(0);
-    let mut flat: Vec<NpC64> = Vec::with_capacity(n_phi * n_theta);
-    for row in grid {
-        for c in row {
-            flat.push(NpC64::new(c.re, c.im));
-        }
-    }
-    let arr = numpy::ndarray::Array2::from_shape_vec((n_phi, n_theta), flat).expect("shape");
-    arr.into_pyarray(py)
+/// A flat `[x, y, z]`-per-node vector as an `(n_nodes, 3)` array.
+fn per_node<'py>(flat: Vec<Complex64>, py: Python<'py>) -> Bound<'py, PyArray2<Complex64>> {
+    let n = flat.len() / 3;
+    numpy::ndarray::Array2::from_shape_vec((n, 3), flat).expect("shape").into_pyarray(py)
 }
 
 /// rapidfem, frequency- and time-domain EM FEM solver.

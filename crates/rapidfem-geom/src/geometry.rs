@@ -704,10 +704,8 @@ impl Geometry {
         let mut out: BTreeMap<u32, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for f in m.faces.iter().filter(|f| f.patch != rapidmesh::NONE) {
             let [a, b, c] = f.tri.map(|v| m.points[v]);
-            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(f64::MIN_POSITIVE);
+            let n = rapidfem_core::geom::tri_area_vector(a, b, c);
+            let l = rapidfem_core::geom::norm(n).max(f64::MIN_POSITIVE);
             let (pos, nor) = out.entry(f.patch).or_default();
             for p in [a, b, c] {
                 pos.extend(p);

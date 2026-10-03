@@ -15,7 +15,7 @@ non-positive imaginary parts for loss):
       u is clamped to 0 OUTSIDE the layer, so a point before the inner face
       gives s = (1, 1, 1).
 
-  (B) Lossy-dielectric complex permittivity, `build_material_tensors`:
+  (B) Lossy-dielectric complex permittivity, `material_tensors`:
         εr*(ω) = εr·(1 - j·tanδ) - j·σ/(ω·ε₀),   ω = 2π f
 
 Both forms are algebraic, so the ground truth is exact (no numerics). We mirror
@@ -158,7 +158,7 @@ HEADER = """\
 //   (B) Lossy dielectric      εr* = εr·(1 - j·tanδ) - j·σ/(ω·ε₀)
 // Both pinned to the exact closed forms the Rust implements (e^{+jωt}).
 
-use rapidfem_core::materials::{build_material_tensors, Dispersion, Material, PmlRegion};
+use rapidfem_core::materials::{material_tensors, Dispersion, Material, PmlRegion};
 
 fn rel_err(got: f64, want: f64) -> f64 {
     let scale = want.abs().max(1e-300);
@@ -225,7 +225,7 @@ def emit_diel_case(name, er, tand, sigma, freq):
     out += "        ur_diag: None,\n"
     out += "        dispersion: Dispersion::None,\n"
     out += "    };\n"
-    out += f"    let (er_t, _ur_t) = build_material_tensors(1, &[mat], {f64(freq)});\n"
+    out += f"    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), {f64(freq)}, true, None);\n"
     out += f"    let want_re = {f64(z.real)};\n"
     out += f"    let want_im = {f64(z.imag)};\n"
     out += "    let mut max_err = 0.0_f64;\n"

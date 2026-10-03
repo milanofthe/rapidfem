@@ -20,6 +20,7 @@ use i_overlay::float::simplify::SimplifyShape;
 use i_overlay::float::single::SingleFloatOverlay;
 use rapidmesh::shapes::Sheet;
 use rapidmesh::Transform;
+use rapidfem_core::geom::{add, cross, dot, norm, scale, sub, unit};
 
 type P2 = [f64; 2];
 type P3 = [f64; 3];
@@ -46,33 +47,7 @@ struct Loops {
     holes: Vec<Vec<P3>>,
 }
 
-fn sub(a: P3, b: P3) -> P3 {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
 
-fn add(a: P3, b: P3) -> P3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scale(a: P3, s: f64) -> P3 {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-fn dot(a: P3, b: P3) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: P3, b: P3) -> P3 {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
-fn norm(a: P3) -> f64 {
-    dot(a, a).sqrt()
-}
-
-fn unit(a: P3) -> P3 {
-    scale(a, 1.0 / norm(a))
-}
 
 /// `p` rotated by `angle` about the axis `axis` through `center` (Rodrigues).
 fn rotate(p: P3, angle: f64, axis: P3, center: P3) -> P3 {

@@ -21,8 +21,6 @@
 //! when every entity has the same count. The two differ by a permutation of the
 //! unknowns; the assembled system is the same up to that relabelling.)
 
-use crate::mesh::Mesh;
-
 /// Which geometric entity a local element DOF belongs to, and its index within
 /// that entity. An element reports this once per local DOF; the map turns it
 /// into a global index. Nothing else needs to know the element's internal order.
@@ -86,19 +84,6 @@ impl DofMap {
             cell_base,
             n_field: cell_base + n_cell_dofs,
         }
-    }
-
-    /// The uniform Nédélec first-kind order-2 space: 2 DOFs on every edge, 2 on
-    /// every face, none in the interior.
-    pub fn uniform_r2(mesh: &Mesh) -> DofMap {
-        DofMap::new(
-            mesh.n_edges(),
-            mesh.n_tris(),
-            mesh.n_tets(),
-            |_| 2,
-            |_| 2,
-            |_| 0,
-        )
     }
 
     #[inline]

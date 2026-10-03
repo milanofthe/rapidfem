@@ -104,12 +104,6 @@ impl OrderMap {
         OrderMap { cell, edge, face }
     }
 
-    /// True when every cell is at the same order, the case in which the element
-    /// is the plain uniform one and the interpolatory basis is still valid.
-    pub fn is_uniform(&self, p: u8) -> bool {
-        self.cell.iter().all(|&q| q == p)
-    }
-
     /// The orders of tet `t`'s six edges, in `TET_EDGE_LOCAL` order.
     #[inline]
     pub fn tet_edge_orders(&self, mesh: &Mesh, t: usize) -> [u8; 6] {

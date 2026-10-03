@@ -14,22 +14,9 @@
 //! the solver's normalised units (`c = ε₀ = μ₀ = 1`).
 
 use crate::constants::{COAX_RADIUS_FLOOR, Field};
+use rapidfem_core::geom::{cross, dot};
 /// Pi in the operator's working precision (`Field`).
 const PI: Field = std::f64::consts::PI as Field;
-
-#[inline]
-fn dot(a: [Field; 3], b: [Field; 3]) -> Field {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn cross(a: [Field; 3], b: [Field; 3]) -> [Field; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
 
 /// A rectangular-waveguide port: its in-plane coordinate frame, cross
 /// section, and `TE_mn` mode.

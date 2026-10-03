@@ -24,10 +24,8 @@ pub struct Group {
 }
 
 fn signed_volume(a: [f64; 3], b: [f64; 3], c: [f64; 3], d: [f64; 3]) -> f64 {
-    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-    let w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
-    u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0]) + u[2] * (v[0] * w[1] - v[1] * w[0])
+    use rapidfem_core::geom::{cross, dot, sub};
+    dot(sub(b, a), cross(sub(c, a), sub(d, a)))
 }
 
 /// The solver mesh of `mesh`, with `ftag_to_tri` from `face_groups` (B-rep

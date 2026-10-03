@@ -8,7 +8,7 @@
 // policy picks the right cells, but it does so on the eigenproblem. The driven
 // solve adds three things the eigenproblem does not exercise: the Robin/port
 // surface term, the excitation RHS, and S-parameter extraction. This drives a real
-// two-port waveguide solve through `assemble_and_solve` and checks that a mixed
+// two-port waveguide solve through `frequency_sweep` and checks that a mixed
 // order gives the same S-matrix as uniform order 2.
 //
 // The reduction here is HAND-PICKED, not taken from the policy: cells near the side
@@ -22,7 +22,7 @@ mod common;
 
 use common::{boundary_tris, box_mesh};
 use num_complex::Complex64 as C64;
-use rapidfem_fd::assembly::assemble_and_solve;
+use rapidfem_fd::assembly::frequency_sweep;
 use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::excitation::Excitation;
 use rapidfem_fd::interp::{eval_field_in_tet, TetGrid};
@@ -67,7 +67,6 @@ fn te10_port(port_number: usize, z: f64, zsign: f64) -> RectWaveguide {
         power: 1.0,
         mode: (1, 0),
         er: 1.0,
-        polarization: 1.0,
         dims: (A, B),
         cs: CoordinateSystem::new(
             [A / 2.0, B / 2.0, z],
@@ -88,8 +87,9 @@ fn solve_s(mesh: &Mesh, orders: OrderMap) -> [[C64; 2]; 2] {
     let ports: [&dyn Port; 2] = [&port1, &port2];
     let port_tris: [&[usize]; 2] = [&pt1, &pt2];
 
-    let res = assemble_and_solve(mesh, &basis, &ports, &port_tris, &pec, FREQ, None)
-        .expect("the driven solve must succeed");
+    let res = frequency_sweep(mesh, &basis, &ports, &port_tris, &pec, &[FREQ], None, None, None)
+        .expect("the driven solve must succeed")
+        .remove(0);
     assert_eq!(res.solutions.len(), 2, "two driven ports -> two excitation solves");
 
     let exc = Excitation::new(FREQ, mesh.l0);

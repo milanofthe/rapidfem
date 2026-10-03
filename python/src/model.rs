@@ -95,17 +95,16 @@ impl PyModel {
         self.inner.faces.push(FaceSpec::Rectangular { tag, width, height, mode, er, power });
     }
 
-    #[pyo3(signature = (tag, *, scan_theta_deg, scan_phi_deg, mode_nr, er, power))]
+    #[pyo3(signature = (tag, *, scan_theta_deg, scan_phi_deg, mode_nr, power))]
     fn add_floquet_port(
         &mut self,
         tag: i32,
         scan_theta_deg: f64,
         scan_phi_deg: f64,
         mode_nr: u32,
-        er: f64,
         power: f64,
     ) {
-        self.inner.faces.push(FaceSpec::Floquet { tag, scan_theta_deg, scan_phi_deg, mode_nr, er, power });
+        self.inner.faces.push(FaceSpec::Floquet { tag, scan_theta_deg, scan_phi_deg, mode_nr, power });
     }
 
     #[pyo3(signature = (tag, *, e_field, power))]

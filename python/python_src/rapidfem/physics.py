@@ -541,8 +541,6 @@ class FloquetPort(_Physics):
         azimuth scan angle :math:`\\phi` in degrees
     mode_nr : int
         polarisation of the plane wave: 1 = TE (s-pol), 2 = TM (p-pol)
-    er : float
-        relative permittivity of the port medium
     power : float
         incident power in watts
     """
@@ -551,19 +549,17 @@ class FloquetPort(_Physics):
                  scan_theta_deg: float = 0.0,
                  scan_phi_deg: float = 0.0,
                  mode_nr: int = 1,
-                 er: float = 1.0,
                  power: float = 1.0):
         super().__init__(*targets)
         self.scan_theta_deg = float(scan_theta_deg)
         self.scan_phi_deg = float(scan_phi_deg)
         self.mode_nr = int(mode_nr)
-        self.er = float(er)
         self.power = float(power)
 
     def _add_to(self, model, tag) -> None:
         model.add_floquet_port(tag, scan_theta_deg=self.scan_theta_deg,
                                scan_phi_deg=self.scan_phi_deg,
-                               mode_nr=self.mode_nr, er=self.er, power=self.power)
+                               mode_nr=self.mode_nr, power=self.power)
 
 
 # BOUNDARY CONDITIONS ===================================================================

@@ -81,7 +81,6 @@ use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::tet_assembly::assemble_global_matrices;
 use crate::constants::*;
-use std::collections::HashSet;
 
 /// A Ritz pair is accepted as a mode only if its relative eigenpair residual is
 /// below this. Far tighter than any physical tolerance, because a converged mode
@@ -154,41 +153,17 @@ pub fn solve_eigenmode(
     let n_tets = mesh.n_tets();
     let n_field = basis.n_field;
 
-    let (er, ur) = if let Some(mats) = materials {
-        crate::materials::build_material_tensors(n_tets, mats, target_freq)
-    } else {
-        let id: [[C64; 3]; 3] = [
-            [C64::new(1.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0)],
-            [C64::new(0.0, 0.0), C64::new(1.0, 0.0), C64::new(0.0, 0.0)],
-            [C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(1.0, 0.0)],
-        ];
-        (vec![id; n_tets], vec![id; n_tets])
-    };
+    let (er, ur) = crate::materials::material_tensors(n_tets, materials, target_freq, true, None);
 
     let t0 = web_time::Instant::now();
     let (rows, cols, data_e, data_b) = assemble_global_matrices(mesh, basis, &er, &ur);
     eprintln!("  Eigenmode: assembled E,B in {:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
 
     // PEC DOFs, and the free-DOF renumbering.
-    let mut pec_ids: HashSet<usize> = HashSet::new();
-    for &ti in pec_tri_indices {
-        for &ei in &mesh.tri_to_edge[ti] {
-            for &d in basis.edge_dofs(ei) {
-                pec_ids.insert(d);
-            }
-        }
-        for &d in basis.tri_dofs(ti) {
-            pec_ids.insert(d);
-        }
-    }
-    let free_dofs: Vec<usize> = (0..n_field).filter(|d| !pec_ids.contains(d)).collect();
+    let (free_dofs, dof_to_free) = basis.free_dofs(mesh, pec_tri_indices);
     let n_free = free_dofs.len();
     if n_free == 0 {
         return Err("every DOF is constrained: nothing to solve".to_string());
-    }
-    let mut dof_to_free = vec![usize::MAX; n_field];
-    for (fi, &d) in free_dofs.iter().enumerate() {
-        dof_to_free[d] = fi;
     }
     eprintln!("  Eigenmode: {} free DOFs, target = {:.4e} Hz", n_free, target_freq);
 
@@ -204,7 +179,7 @@ pub fn solve_eigenmode(
     let mut shift_vals: Vec<C64> = Vec::new();
     for i in 0..rows.len() {
         let (r, c) = (rows[i], cols[i]);
-        if pec_ids.contains(&r) || pec_ids.contains(&c) {
+        if dof_to_free[r] == usize::MAX || dof_to_free[c] == usize::MAX {
             continue;
         }
         idx_r.push(dof_to_free[r]);

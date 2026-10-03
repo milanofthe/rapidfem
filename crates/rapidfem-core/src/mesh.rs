@@ -14,6 +14,7 @@
 //! the faces in another slot order (`FACE_OF_TOPOLOGY`).
 
 use hashbrown::HashMap;
+use crate::geom::{centroid, dot, norm, scale, sub, tri_area_vector, unit};
 use rapidmesh_topo::{TetTopology, Tets, NONE};
 
 /// Local edge order within a tetrahedron, as 0-indexed node pairs.
@@ -173,16 +174,46 @@ impl Mesh {
     pub fn n_tris(&self) -> usize { self.tris.len() }
     pub fn n_tets(&self) -> usize { self.tets.len() }
 
-    /// Get boundary triangles (only one adjacent tet).
-    pub fn boundary_tris(&self) -> Vec<usize> {
-        (0..self.n_tris())
-            .filter(|&i| self.tri_to_tet[i][1] == usize::MAX)
-            .collect()
-    }
-
     /// Get triangles for a face tag.
     pub fn tris_for_tag(&self, tag: i32) -> &[usize] {
         self.ftag_to_tri.get(&tag).map_or(&[], |v| v.as_slice())
+    }
+
+    /// A mask over the nodes: `true` for a node on a triangle of any of the
+    /// face groups `tags`.
+    pub fn nodes_on_tags(&self, tags: &[i32]) -> Vec<bool> {
+        let mut mask = vec![false; self.n_nodes()];
+        for &tag in tags {
+            for &t in self.tris_for_tag(tag) {
+                for n in self.tris[t] {
+                    mask[n] = true;
+                }
+            }
+        }
+        mask
+    }
+
+    /// The distinct nodes of triangles `tris`, in first-seen order.
+    pub fn tri_nodes(&self, tris: &[usize]) -> Vec<usize> {
+        let mut seen = hashbrown::HashSet::new();
+        tris.iter()
+            .flat_map(|&t| self.tris[t])
+            .filter(|&n| seen.insert(n))
+            .collect()
+    }
+
+    /// The unit normal of triangle `t` pointing into the first tet it
+    /// bounds, `None` for a degenerate triangle or one no tet touches.
+    pub fn tri_inward_normal(&self, t: usize) -> Option<[f64; 3]> {
+        let [a, b, c] = self.tris[t].map(|n| self.nodes[n]);
+        let area = tri_area_vector(a, b, c);
+        if norm(area) < 1e-300 {
+            return None;
+        }
+        let tet = self.tri_to_tet[t].into_iter().find(|&x| x != usize::MAX)?;
+        let n = unit(area);
+        let into = sub(centroid(&self.nodes, self.tets[tet]), a);
+        Some(if dot(n, into) < 0.0 { scale(n, -1.0) } else { n })
     }
 }
 

@@ -40,6 +40,7 @@ use rapidfem_core::mesh::TRI_EDGE_LOCAL;
 use crate::coefficients::area_coeff_exps;
 use crate::dofmap::DofOwner;
 use crate::tet_assembly::{edge_fns, face_fns, BasisFn};
+use rapidfem_core::geom::{cross, unit};
 
 type V2 = [f64; 2];
 
@@ -53,26 +54,15 @@ fn dot2(a: &V2, b: &V2) -> f64 {
     a[0] * b[0] + a[1] * b[1]
 }
 
-#[inline]
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-}
-
-#[inline]
-fn norm3(a: [f64; 3]) -> [f64; 3] {
-    let n = (a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).sqrt();
-    [a[0]/n, a[1]/n, a[2]/n]
-}
-
 /// Local right-handed 2-D frame of a triangle: returns (rotation rows, xs, ys)
 /// with vertex 0 at the origin, edge 0→1 along x̂, n̂ = ê1×ê2 as ẑ.
 pub fn tri_local_cs(v: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [f64; 3]) {
     let o = v[0];
     let e1 = [v[1][0]-o[0], v[1][1]-o[1], v[1][2]-o[2]];
     let e2 = [v[2][0]-o[0], v[2][1]-o[1], v[2][2]-o[2]];
-    let zhat = norm3(cross3(e1, e2));
-    let xhat = norm3(e1);
-    let yhat = norm3(cross3(zhat, xhat));
+    let zhat = unit(cross(e1, e2));
+    let xhat = unit(e1);
+    let yhat = unit(cross(zhat, xhat));
     let basis = [xhat, yhat, zhat];
     let mut xs = [0.0; 3];
     let mut ys = [0.0; 3];

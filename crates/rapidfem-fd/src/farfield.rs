@@ -32,9 +32,10 @@ use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::interp;
-use crate::error_estimator::eval_curl_in_tet;
+use crate::interp::eval_curl_in_tet;
 use crate::quadrature::gaus_quad_tri;
 use crate::constants::*;
+use rapidfem_core::geom::{centroid, cross, dot, norm, sub};
 
 /// Far-field radiation pattern result.
 ///
@@ -121,16 +122,13 @@ pub fn compute_farfield(
     let mut e_theta = vec![vec![C64::new(0.0, 0.0); n_theta]; n_phi];
     let mut e_phi = vec![vec![C64::new(0.0, 0.0); n_theta]; n_phi];
 
-    let centroid_of = |tri: [usize; 3]| -> [f64; 3] {
-        let [a, b, c] = tri.map(|v| mesh.nodes[v]);
-        std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0)
-    };
+    let centroid_of = |tri: [usize; 3]| centroid(&mesh.nodes, tri);
     // area-weighted centroid of the surface, for the inner triangles' normals
     let mut surface_centre = [0.0; 3];
     let mut surface_area = 0.0;
     for &t in surface_tris {
         let [a, b, c] = mesh.tris[t].map(|v| mesh.nodes[v]);
-        let area = 0.5 * norm3(cross3(sub3(b, a), sub3(c, a)));
+        let area = 0.5 * norm(cross(sub(b, a), sub(c, a)));
         let m = centroid_of(mesh.tris[t]);
         for k in 0..3 {
             surface_centre[k] += area * m[k];
@@ -158,19 +156,18 @@ pub fn compute_farfield(
     for &tri_idx in surface_tris {
         let tri = mesh.tris[tri_idx];
         let [v0, v1, v2] = tri.map(|v| mesh.nodes[v]);
-        let cr = cross3(sub3(v1, v0), sub3(v2, v0));
-        let area = 0.5 * norm3(cr);
+        let cr = cross(sub(v1, v0), sub(v2, v0));
+        let area = 0.5 * norm(cr);
         let mut normal = cr.map(|c| c / (2.0 * area));
         let [t0, t1] = mesh.tri_to_tet[tri_idx];
         let centre = centroid_of(tri);
         let away_from = if t1 == usize::MAX {
             // outward: away from the one tet
-            let tet = mesh.tets[t0];
-            std::array::from_fn(|k| tet.iter().map(|&v| mesh.nodes[v][k]).sum::<f64>() / 4.0)
+            centroid(&mesh.nodes, mesh.tets[t0])
         } else {
             surface_centre
         };
-        if dot3(normal, sub3(centre, away_from)) < 0.0 {
+        if dot(normal, sub(centre, away_from)) < 0.0 {
             normal = normal.map(|c| -c);
         }
         let tet = t0;
@@ -209,7 +206,7 @@ pub fn compute_farfield(
         let images: Vec<SurfPoint> = surf_data
             .iter()
             .map(|sp| {
-                let d = dot3(sub3(sp.pos, p0), n);
+                let d = dot(sub(sp.pos, p0), n);
                 SurfPoint {
                     pos: std::array::from_fn(|k| sp.pos[k] - 2.0 * d * n[k]),
                     j: reflect(sp.j).map(|c| c * sj),
@@ -247,7 +244,7 @@ pub fn compute_farfield(
             let theta_hat = [cos_t * cos_p, cos_t * sin_p, -sin_t];
             let phi_hat = [-sin_p, cos_p, 0.0];
             // behind an image plane there is no field
-            if image.is_some_and(|ip| dot3(r_hat, ip.normal) < -1e-12) {
+            if image.is_some_and(|ip| dot(r_hat, ip.normal) < -1e-12) {
                 return (ip, it, C64::new(0.0, 0.0), C64::new(0.0, 0.0), 0.0);
             }
 
@@ -396,20 +393,4 @@ pub fn compute_farfield(
         peak_gain_dbi: peak_g,
         radiated_power: total_power,
     }
-}
-
-fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn norm3(a: [f64; 3]) -> f64 {
-    dot3(a, a).sqrt()
 }

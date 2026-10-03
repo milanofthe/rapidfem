@@ -28,6 +28,7 @@
 
 use crate::mesh::Mesh;
 use num_complex::Complex64 as C64;
+use rapidfem_core::geom::{centroid, cross, dot, norm, scale, sub, unit};
 
 /// g(r/δ): (r/δ, Re g, Im g), from the 2D reference at t/δ = 50.
 const G_TABLE: [(f64, f64, f64); 15] = [
@@ -93,13 +94,8 @@ impl EdgeProfile {
         let geo: Vec<([f64; 3], [f64; 3])> = tri_ids
             .iter()
             .map(|&t| {
-                let [a, b, c] = mesh.tris[t].map(|v| mesh.nodes[v]);
-                let n = unit(cross(sub(b, a), sub(c, a)));
-                let centre: [f64; 3] = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
-                let tet = mesh.tets[mesh.tri_to_tet[t][0]];
-                let tc: [f64; 3] = std::array::from_fn(|k| tet.iter().map(|&v| mesh.nodes[v][k]).sum::<f64>() / 4.0);
-                let n = if dot(n, sub(tc, centre)) > 0.0 { n.map(|x| -x) } else { n };
-                (n, centre)
+                let into_conductor = mesh.tri_inward_normal(t).map_or([0.0; 3], |n| scale(n, -1.0));
+                (into_conductor, centroid(&mesh.nodes, mesh.tris[t]))
             })
             .collect();
         // mesh edge -> the surface triangles on it
@@ -353,22 +349,6 @@ fn gauss_legendre_16() -> ([f64; 16], [f64; 16]) {
     (x, w)
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-fn norm(a: [f64; 3]) -> f64 {
-    dot(a, a).sqrt()
-}
-fn unit(a: [f64; 3]) -> [f64; 3] {
-    let l = norm(a).max(1e-300);
-    a.map(|x| x / l)
-}
 fn min3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|k| a[k].min(b[k]))
 }

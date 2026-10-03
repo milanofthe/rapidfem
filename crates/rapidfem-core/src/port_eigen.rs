@@ -38,6 +38,9 @@
 /// and which nodes lie on the boundary (PEC wall) of the cross-section.
 /// Rim edges on a PMC wall (a symmetry plane of a half model) are left to
 /// the natural condition.
+use crate::geom::{cross, dot};
+use crate::linalg::free_index;
+
 #[derive(Clone, Debug)]
 pub struct PortMesh2D {
     /// Local 2D coordinates of each distinct cross-section node.
@@ -63,20 +66,6 @@ pub struct PortMesh2D {
     pub u_hat: [f64; 3],
     pub v_hat: [f64; 3],
     pub origin: [f64; 3],
-}
-
-#[inline]
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-#[inline]
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
 }
 
 impl PortMesh2D {
@@ -114,7 +103,7 @@ impl PortMesh2D {
         pmc_global: Option<&[bool]>,
     ) -> PortMesh2D {
         // Normalise the out-of-plane axis.
-        let nl = dot3(inward_normal, inward_normal).sqrt();
+        let nl = dot(inward_normal, inward_normal).sqrt();
         let w_hat = [
             inward_normal[0] / nl,
             inward_normal[1] / nl,
@@ -126,15 +115,15 @@ impl PortMesh2D {
         let p0 = global_nodes[t0[0]];
         let p1 = global_nodes[t0[1]];
         let mut e = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let edn = dot3(e, w_hat);
+        let edn = dot(e, w_hat);
         e = [
             e[0] - edn * w_hat[0],
             e[1] - edn * w_hat[1],
             e[2] - edn * w_hat[2],
         ];
-        let el = dot3(e, e).sqrt();
+        let el = dot(e, e).sqrt();
         let u_hat = [e[0] / el, e[1] / el, e[2] / el];
-        let v_hat = cross3(w_hat, u_hat);
+        let v_hat = cross(w_hat, u_hat);
         let origin = p0;
 
         // Collect distinct nodes (remap global → local index) and project.
@@ -150,7 +139,7 @@ impl PortMesh2D {
                 p[1] - origin[1],
                 p[2] - origin[2],
             ];
-            [dot3(d, u_hat), dot3(d, v_hat)]
+            [dot(d, u_hat), dot(d, v_hat)]
         };
         for &t in face_tris {
             let mut local = [0usize; 3];
@@ -271,6 +260,63 @@ pub enum ModeKind {
     Te,
 }
 
+/// The cross-section solve of a wave port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortSolve {
+    /// The scalar Helmholtz mode of a homogeneously filled guide.
+    Scalar(ModeKind),
+    /// The full-vector hybrid mode with per-triangle permittivity, the
+    /// quasi-TEM mode of an inhomogeneous line.
+    Vector,
+}
+
+/// Mode `mode_index` of the port face `tris` of `mesh`: the face flattened
+/// along its inward normal, `pec` / `pmc` (per mesh node) marking internal
+/// conductors and PMC walls, each face triangle with the relative
+/// permittivity of the tet behind it (`eps_per_tet`, 1 where empty).
+/// Returns the mode and its effective index at `k0` (1/mesh length; a
+/// scalar mode below cutoff or `k0 <= 0` gives 0). `None` when the face
+/// has no inward normal or the solve finds fewer modes.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_port_face(
+    mesh: &crate::mesh::Mesh,
+    tris: &[usize],
+    solve: PortSolve,
+    mode_index: usize,
+    eps_per_tet: &[f64],
+    k0: f64,
+    pec: Option<&[bool]>,
+    pmc: Option<&[bool]>,
+) -> Option<(NumericalMode, f64)> {
+    let nrm = mesh.tri_inward_normal(*tris.first()?)?;
+    let face_tris: Vec<[usize; 3]> = tris.iter().map(|&t| mesh.tris[t]).collect();
+    let pm = PortMesh2D::from_face_with_pmc(&mesh.nodes, &face_tris, nrm, pec, pmc);
+    match solve {
+        PortSolve::Scalar(kind) => {
+            let modes = solve_modes(&pm, kind, mode_index + 1);
+            let mode = modes.get(mode_index)?;
+            let beta = (k0 * k0 - mode.k_c * mode.k_c).max(0.0).sqrt();
+            let n_eff = if k0 > 0.0 { beta / k0 } else { 0.0 };
+            Some((NumericalMode::from_scalar(pm, mode, kind), n_eff))
+        }
+        PortSolve::Vector => {
+            let eps_face: Vec<f64> = tris
+                .iter()
+                .map(|&t| {
+                    mesh.tri_to_tet[t]
+                        .into_iter()
+                        .find(|&x| x != usize::MAX)
+                        .and_then(|e| eps_per_tet.get(e).copied())
+                        .unwrap_or(1.0)
+                })
+                .collect();
+            let modes = solve_vector_modes(&pm, &eps_face, k0, mode_index + 1);
+            let mode = modes.get(mode_index)?;
+            Some((NumericalMode::from_vector(pm, mode), mode.n_eff))
+        }
+    }
+}
+
 /// Solve the scalar Helmholtz eigenproblem `S ψ = k_c² diag(m) ψ` on the
 /// cross-section, returning the `n_modes` lowest-cutoff propagating modes
 /// (smallest positive `k_c²`), sorted ascending.
@@ -297,19 +343,13 @@ pub fn solve_modes(
     let pec = |i: usize| {
         mesh.on_boundary[i] || mesh.on_pec.get(i).copied().unwrap_or(false)
     };
-    let keep: Vec<usize> = match kind {
-        ModeKind::Tm => (0..n_full).filter(|&i| !pec(i)).collect(),
-        ModeKind::Te => (0..n_full)
-            .filter(|&i| !mesh.on_pec.get(i).copied().unwrap_or(false))
-            .collect(),
+    let (keep, reduced) = match kind {
+        ModeKind::Tm => free_index(n_full, pec),
+        ModeKind::Te => free_index(n_full, |i| mesh.on_pec.get(i).copied().unwrap_or(false)),
     };
     let n = keep.len();
     if n == 0 || n_modes == 0 {
         return Vec::new();
-    }
-    let mut reduced = vec![usize::MAX; n_full];
-    for (li, &i) in keep.iter().enumerate() {
-        reduced[i] = li;
     }
 
     // K = D^{-1/2} S D^{-1/2} on the kept nodes, as triplets.
@@ -494,19 +534,8 @@ fn krylov_lowest(
 #[derive(Clone, Debug)]
 pub struct NumericalMode {
     mesh: PortMesh2D,
-    /// Transverse electric field `E_t` at each cross-section node, in the
-    /// port-plane `(u, v)` components, the **scalar**-path profile
-    /// (`from_scalar`); `e_profile` barycentric-interpolates it. Empty
-    /// when the Ned-2 representation is used.
-    e_uv_node: Vec<[f64; 2]>,
-    /// The **vector**-path profile (`from_vector`): the full Nédélec
-    /// first-kind order-2 edge + face coefficient set plus the per-triangle edge
-    /// data, so `e_profile` evaluates the degree-2 vector field *directly*
-    /// at each query point. This matches the basis the 3-D `NedelecBasis`
-    /// carries on a port face, so the mode projection in `sparam_waveport`
-    /// is exact (modulo Galerkin error) rather than the `O(h)` lossy
-    /// projection a Nédélec-1 / P1 hybrid would produce. `None` for scalar.
-    ned2: Option<Ned2ModeData>,
+    /// The field representation `e_profile` evaluates.
+    profile: Profile,
     /// Inverse peak `|E_t|` over the cross-section, the unit-peak
     /// normalisation.
     inv_peak: f64,
@@ -516,6 +545,23 @@ pub struct NumericalMode {
     cutoff: f64,
     /// Modal-impedance model for the forward/backward split.
     z_model: ImpedanceModel,
+}
+
+/// A numerical mode's field representation.
+#[derive(Clone, Debug)]
+enum Profile {
+    /// The **scalar**-path profile (`from_scalar`): `E_t` at each
+    /// cross-section node in the port-plane `(u, v)` components,
+    /// barycentric-interpolated.
+    Nodal(Vec<[f64; 2]>),
+    /// The **vector**-path profile (`from_vector`): the full Nédélec
+    /// first-kind order-2 edge + face coefficient set plus the per-triangle
+    /// edge data, evaluated *directly* at each query point. This matches the
+    /// basis the 3-D `NedelecBasis` carries on a port face, so the mode
+    /// projection in `sparam_waveport` is exact (modulo Galerkin error)
+    /// rather than the `O(h)` lossy projection a Nédélec-1 / P1 hybrid would
+    /// produce.
+    Ned2(Ned2ModeData),
 }
 
 /// Per-mode Ned-2 coefficient bundle and per-triangle edge data needed for
@@ -593,7 +639,7 @@ impl NumericalMode {
             ModeKind::Te => ImpedanceModel::Te { k_c: mode.k_c },
             ModeKind::Tm => ImpedanceModel::Tm { k_c: mode.k_c },
         };
-        let w_hat = cross3(mesh.u_hat, mesh.v_hat);
+        let w_hat = cross(mesh.u_hat, mesh.v_hat);
         let peak = e_uv_node
             .iter()
             .map(|e| (e[0] * e[0] + e[1] * e[1]).sqrt())
@@ -601,8 +647,7 @@ impl NumericalMode {
         let inv_peak = if peak > 0.0 { 1.0 / peak } else { 0.0 };
         NumericalMode {
             mesh,
-            e_uv_node,
-            ned2: None,
+            profile: Profile::Nodal(e_uv_node),
             inv_peak,
             w_hat,
             cutoff: mode.k_c,
@@ -641,11 +686,10 @@ impl NumericalMode {
             }
         }
         let inv_peak = if peak > 0.0 { 1.0 / peak } else { 0.0 };
-        let w_hat = cross3(mesh.u_hat, mesh.v_hat);
+        let w_hat = cross(mesh.u_hat, mesh.v_hat);
         NumericalMode {
             mesh,
-            e_uv_node: Vec::new(),
-            ned2: Some(Ned2ModeData {
+            profile: Profile::Ned2(Ned2ModeData {
                 e_edge, e_face, tri_edges, e_z_node, e_z_edge,
             }),
             inv_peak,
@@ -712,7 +756,7 @@ impl NumericalMode {
     fn to_uv(&self, x: [f64; 3]) -> [f64; 2] {
         let o = self.mesh.origin;
         let d = [x[0] - o[0], x[1] - o[1], x[2] - o[2]];
-        [dot3(d, self.mesh.u_hat), dot3(d, self.mesh.v_hat)]
+        [dot(d, self.mesh.u_hat), dot(d, self.mesh.v_hat)]
     }
 
     /// Transverse electric-field profile at a global point on the port
@@ -723,8 +767,8 @@ impl NumericalMode {
         let uv = self.to_uv(x);
         let (ti, l) = self.locate(uv);
         let mut ez = 0.0f64;
-        let e: [f64; 2] = match &self.ned2 {
-            Some(nd) => {
+        let e: [f64; 2] = match &self.profile {
+            Profile::Ned2(nd) => {
                 let t = self.mesh.tris[ti];
                 let (_a, g) = self.mesh.tri_geom(t);
                 // Longitudinal E_z: P2 over the 3 vertices + 3 edge midpoints.
@@ -737,12 +781,12 @@ impl NumericalMode {
                 }
                 ned2_et_at(te, &g, &nd.e_edge, &nd.e_face[ti], ti, l)
             }
-            None => {
+            Profile::Nodal(e_uv_node) => {
                 let t = self.mesh.tris[ti];
                 let mut e = [0.0f64; 2];
                 for k in 0..3 {
-                    e[0] += l[k] * self.e_uv_node[t[k]][0];
-                    e[1] += l[k] * self.e_uv_node[t[k]][1];
+                    e[0] += l[k] * e_uv_node[t[k]][0];
+                    e[1] += l[k] * e_uv_node[t[k]][1];
                 }
                 e
             }
@@ -759,7 +803,7 @@ impl NumericalMode {
     /// Transverse magnetic-field profile `h_t = ŵ × e_t` at a global
     /// point, the inward-propagating partner of `e_t`. Global coords.
     pub fn h_profile(&self, x: [f64; 3]) -> [f64; 3] {
-        cross3(self.w_hat, self.e_profile(x))
+        cross(self.w_hat, self.e_profile(x))
     }
 }
 
@@ -769,13 +813,6 @@ impl NumericalMode {
 pub struct VectorMode {
     /// Effective index `n_eff = β / k0` (`n_eff² = λ`, the eigenvalue).
     pub n_eff: f64,
-    /// Operating free-space wavenumber the solve was run at.
-    pub k0: f64,
-    /// Transverse electric field `E_t` at each cross-section node, in the
-    /// port-plane `(u, v)` components, recovered (area-averaged) from the
-    /// edge-element solution. Convenience for inspection; the sharp profile
-    /// uses the Ned-2 / face / P2 coefficient arrays directly.
-    pub e_uv_node: Vec<[f64; 2]>,
     /// Nédélec first-kind order-2 edge solution, 2 coefficients per global
     /// cross-section edge `[mode0, mode1]`. Mode 0 is "λ_a-weighted", mode
     /// 1 is "λ_b-weighted" where (a, b) is the edge's canonical endpoint
@@ -999,19 +1036,11 @@ fn p2_grad(dof: usize, g: &[[f64; 2]; 3], l: [f64; 3]) -> [f64; 2] {
     }
 }
 
-/// Strang's 7-point Gauss-Dunavant quadrature on the reference triangle,
-/// exact for polynomials up to degree 5. Each entry is `(weight, l0, l1, l2)`
-/// with weights summing to 1 (multiply integrand by triangle area to get the
-/// actual surface integral). Used by the Ned-2 + P2 element-matrix assembly.
-const NED2_QPTS_DEG5: [(f64, f64, f64, f64); 7] = [
-    (0.225,                  1.0/3.0,            1.0/3.0,            1.0/3.0),
-    (0.132_394_152_788_506_2,    0.05971587178976982, 0.4701420641051151,  0.4701420641051151),
-    (0.132_394_152_788_506_2,    0.4701420641051151,  0.05971587178976982, 0.4701420641051151),
-    (0.132_394_152_788_506_2,    0.4701420641051151,  0.4701420641051151,  0.05971587178976982),
-    (0.12593918054482717,    0.7974269853530873,  0.10128650732345633, 0.10128650732345633),
-    (0.12593918054482717,    0.10128650732345633, 0.7974269853530873,  0.10128650732345633),
-    (0.12593918054482717,    0.10128650732345633, 0.10128650732345633, 0.7974269853530873),
-];
+/// The 7-point degree-5 Dunavant rule on the reference triangle, `[w, l0,
+/// l1, l2]` with weights summing to 1 (scale by the triangle area). Used by
+/// the Ned-2 + P2 element-matrix assembly.
+static NED2_QPTS_DEG5: std::sync::LazyLock<Vec<crate::quadrature::TriQuadPoint>> =
+    std::sync::LazyLock::new(|| crate::quadrature::gaus_quad_tri(5));
 
 /// Enumerate unique mesh edges and, per triangle, the global index,
 /// orientation sign and length of its three local edges. Also returns the
@@ -1182,12 +1211,10 @@ pub fn solve_vector_modes(
     };
     let mut modes = solve_vector_modes_core(&scaled, eps_r, k0 * ell, n_modes);
     for m in modes.iter_mut() {
-        // n_eff is ℓ-invariant; report the physical k0. Map Eₜ coefficients
-        // back to the physical frame (×ℓ); E_z and the eigenvalue are unchanged.
-        m.k0 = k0;
+        // n_eff is ℓ-invariant. Map Eₜ coefficients back to the physical
+        // frame (×ℓ); E_z and the eigenvalue are unchanged.
         for c in m.e_edge_ned2.iter_mut() { c[0] *= ell; c[1] *= ell; }
         for c in m.e_face_ned2.iter_mut() { c[0] *= ell; c[1] *= ell; }
-        for c in m.e_uv_node.iter_mut() { c[0] *= ell; c[1] *= ell; }
     }
     modes
 }
@@ -1220,10 +1247,8 @@ fn solve_vector_modes_core(
     // Reduced numbering compresses the free DOFs into a contiguous range
     // 0..ndof; constrained DOFs map to `usize::MAX`.
 
-    let edge_free: Vec<usize> =
-        (0..n_edge).filter(|&e| !edge_pec[e]).collect();
-    let node_free: Vec<usize> =
-        (0..n_node).filter(|&i| !node_pec[i]).collect();
+    let (edge_free, edge_red) = free_index(n_edge, |e| edge_pec[e]);
+    let (node_free, node_red) = free_index(n_node, |i| node_pec[i]);
     let ne = edge_free.len();
     let nn = node_free.len();
     let n_tri = mesh.tris.len();
@@ -1243,14 +1268,6 @@ fn solve_vector_modes_core(
     let off_et_face = off_et_edge + n_et_edge;
     let off_ez_node = off_et_face + n_et_face;
     let off_ez_edge = off_ez_node + n_ez_node;
-    let mut edge_red = vec![usize::MAX; n_edge];
-    for (r, &g) in edge_free.iter().enumerate() {
-        edge_red[g] = r;
-    }
-    let mut node_red = vec![usize::MAX; n_node];
-    for (r, &g) in node_free.iter().enumerate() {
-        node_red[g] = r;
-    }
 
     // Per-triangle 14-DOF local layout (matches the basis-evaluator comment
     // above): [0..6]=edge·mode, [6..8]=face·mode, [8..11]=P2 vertex,
@@ -1316,7 +1333,7 @@ fn solve_vector_modes_core(
         let mut curl_qp = vec![[0.0f64; 8]; nqp];
         let mut p2_qp = vec![[0.0f64; 6]; nqp];
         let mut p2grad_qp = vec![[[0.0f64; 2]; 6]; nqp];
-        for (qi, &(_w, l1, l2, l3)) in NED2_QPTS_DEG5.iter().enumerate() {
+        for (qi, &[_w, l1, l2, l3]) in NED2_QPTS_DEG5.iter().enumerate() {
             let l = [l1, l2, l3];
             // Et basis: 6 edge + 2 face = 8 functions.
             for e in 0..3 {
@@ -1345,7 +1362,7 @@ fn solve_vector_modes_core(
                 if dj == usize::MAX { continue; }
                 let mut mass = 0.0;
                 let mut stiff = 0.0;
-                for (qi, &(w, _l1, _l2, _l3)) in NED2_QPTS_DEG5.iter().enumerate() {
+                for (qi, &[w, _l1, _l2, _l3]) in NED2_QPTS_DEG5.iter().enumerate() {
                     let wi = tan_qp[qi][i];
                     let wj = tan_qp[qi][j];
                     mass  += w * (wi[0] * wj[0] + wi[1] * wj[1]);
@@ -1375,7 +1392,7 @@ fn solve_vector_modes_core(
                 let dj_ez = dofs[8 + jn];
                 if dj_ez == usize::MAX { continue; }
                 let mut val = 0.0;
-                for (qi, &(w, _l1, _l2, _l3)) in NED2_QPTS_DEG5.iter().enumerate() {
+                for (qi, &[w, _l1, _l2, _l3]) in NED2_QPTS_DEG5.iter().enumerate() {
                     let wi = tan_qp[qi][i];
                     let pg = p2grad_qp[qi][jn];
                     val += w * (wi[0] * pg[0] + wi[1] * pg[1]);
@@ -1397,7 +1414,7 @@ fn solve_vector_modes_core(
                 if dj == usize::MAX { continue; }
                 let mut grad_ij = 0.0;
                 let mut mass_ij = 0.0;
-                for (qi, &(w, _l1, _l2, _l3)) in NED2_QPTS_DEG5.iter().enumerate() {
+                for (qi, &[w, _l1, _l2, _l3]) in NED2_QPTS_DEG5.iter().enumerate() {
                     let gi = p2grad_qp[qi][i];
                     let gj = p2grad_qp[qi][j];
                     grad_ij += w * (gi[0] * gj[0] + gi[1] * gj[1]);
@@ -1474,7 +1491,7 @@ fn solve_vector_modes_core(
             for m in 0..2 {
                 coef[6 + m] = x[off_et_face + 2 * ti + m];
             }
-            for &(w, l1, l2, l3) in NED2_QPTS_DEG5.iter() {
+            for &[w, l1, l2, l3] in NED2_QPTS_DEG5.iter() {
                 let l = [l1, l2, l3];
                 let mut et = [0.0f64; 2];
                 let mut cz = 0.0f64;
@@ -1525,13 +1542,9 @@ fn solve_vector_modes_core(
     // ∫ φ_i · ê dA over the Eₜ DOFs, ê the reference polarisation.
     let mut polar_rhs: Option<Vec<f64>> = None;
     let _: Option<()> = (|| {
-        let n3 = [
-            mesh.u_hat[1] * mesh.v_hat[2] - mesh.u_hat[2] * mesh.v_hat[1],
-            mesh.u_hat[2] * mesh.v_hat[0] - mesh.u_hat[0] * mesh.v_hat[2],
-            mesh.u_hat[0] * mesh.v_hat[1] - mesh.u_hat[1] * mesh.v_hat[0],
-        ];
+        let n3 = cross(mesh.u_hat, mesh.v_hat);
         let r3 = if n3[0].abs() > 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
-        let mut e0 = [dot3(r3, mesh.u_hat), dot3(r3, mesh.v_hat)];
+        let mut e0 = [dot(r3, mesh.u_hat), dot(r3, mesh.v_hat)];
         let ne0 = (e0[0] * e0[0] + e0[1] * e0[1]).sqrt();
         if ne0 < 1e-9 {
             return None;
@@ -1541,7 +1554,7 @@ fn solve_vector_modes_core(
         for (ti, &tri) in mesh.tris.iter().enumerate() {
             let (area, g) = mesh.tri_geom(tri);
             let te = &tri_edges[ti];
-            for &(w, l1, l2, l3) in NED2_QPTS_DEG5.iter() {
+            for &[w, l1, l2, l3] in NED2_QPTS_DEG5.iter() {
                 let l = [l1, l2, l3];
                 for kk in 0..6 {
                     let r = edge_red[te.gidx[kk / 2]];
@@ -1750,39 +1763,8 @@ fn solve_vector_modes_core(
                 }
             }
 
-            // Convenience nodal Et profile (area-weighted average of the
-            // Ned-2 evaluation at each triangle's corners), kept for the
-            // diagnostics/inspection path used by some tests.
-            let mut acc = vec![[0.0f64; 2]; n_node];
-            let mut wsum = vec![0.0f64; n_node];
-            for (ti, &t) in mesh.tris.iter().enumerate() {
-                let (area, g) = mesh.tri_geom(t);
-                let te = &tri_edges[ti];
-                for vloc in 0..3 {
-                    let mut l = [0.0; 3];
-                    l[vloc] = 1.0;
-                    let et = ned2_et_at(
-                        te, &g, &e_edge_ned2, &e_face_ned2[ti], ti, l,
-                    );
-                    acc[t[vloc]][0] += area * et[0];
-                    acc[t[vloc]][1] += area * et[1];
-                    wsum[t[vloc]] += area;
-                }
-            }
-            let e_uv_node: Vec<[f64; 2]> = (0..n_node)
-                .map(|i| {
-                    if wsum[i] > 0.0 {
-                        [acc[i][0] / wsum[i], acc[i][1] / wsum[i]]
-                    } else {
-                        [0.0, 0.0]
-                    }
-                })
-                .collect();
-
             VectorMode {
                 n_eff: neff2.sqrt(),
-                k0,
-                e_uv_node,
                 e_edge_ned2,
                 e_face_ned2,
                 e_z_node,
@@ -1940,18 +1922,9 @@ mod tests {
             rel < 0.05,
             "vector TE₁₀ n_eff = {got:.4}, want {want:.4} (rel {rel:.3})",
         );
-        // E_t of TE₁₀ is along v̂ = ŷ and peaks mid-width: check the node
-        // nearest (a/2, b/2) has a dominant v-component.
-        let mut best = 0usize;
-        let mut bestd = f64::INFINITY;
-        for (i, n) in pm.nodes.iter().enumerate() {
-            let d = (n[0] - 1.0).powi(2) + (n[1] - 0.5).powi(2);
-            if d < bestd {
-                bestd = d;
-                best = i;
-            }
-        }
-        let e = modes[0].e_uv_node[best];
+        // E_t of TE₁₀ is along ŷ and peaks mid-width: check the profile at
+        // (a/2, b/2) has a dominant y-component.
+        let e = NumericalMode::from_vector(pm, &modes[0]).e_profile([1.0, 0.5, 0.0]);
         assert!(
             e[1].abs() > 2.0 * e[0].abs().max(1e-12),
             "TE₁₀ E_t not dominantly along v̂ at mid-width: {e:?}",
@@ -2257,19 +2230,6 @@ mod tests {
         for l in &pts {
             let s: f64 = (0..6).map(|i| p2_basis(i, *l)).sum();
             assert!((s - 1.0).abs() < 1e-12, "Σ N_i({l:?}) = {s}, want 1");
-        }
-    }
-
-    #[test]
-    fn ned2_quad_rule_sums_to_one() {
-        let sum: f64 = NED2_QPTS_DEG5.iter().map(|q| q.0).sum();
-        assert!((sum - 1.0).abs() < 1e-12, "quad weights sum to {sum}");
-        // Each quadrature point is a valid barycentric triple.
-        for q in &NED2_QPTS_DEG5 {
-            let s = q.1 + q.2 + q.3;
-            assert!((s - 1.0).abs() < 1e-12, "barycentric sum = {s}");
-            assert!(q.1 >= 0.0 && q.2 >= 0.0 && q.3 >= 0.0,
-                "negative bary at {q:?}");
         }
     }
 

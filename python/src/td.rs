@@ -10,7 +10,7 @@ use std::path::Path;
 
 use numpy::ndarray::Array2;
 use numpy::{
-    Complex64 as NpC64, IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2,
+    Complex64, IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2,
     PyReadwriteArray1,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -242,13 +242,12 @@ impl PyTdSession {
         device: &str,
         krylov_dim: usize,
         verbose: bool,
-    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<NpC64>>)> {
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<Complex64>>)> {
         let opts = options(method, device, krylov_dim, 0, verbose)?;
         let s = &mut self.s;
         let (f, h) = with_python(py, Some(&pulse), |w, hook| {
             s.transfer_function(source_dof, probe_dof, w.expect("pulse"), dt, steps, &opts, hook)
         })?;
-        let h: Vec<NpC64> = h.into_iter().map(|z| NpC64::new(z.re, z.im)).collect();
         Ok((f.into_pyarray(py), h.into_pyarray(py)))
     }
 

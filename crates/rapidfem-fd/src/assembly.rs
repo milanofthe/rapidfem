@@ -21,8 +21,6 @@ use crate::basis::NedelecBasis;
 use crate::port::Port;
 use crate::tet_assembly::assemble_global_matrices;
 use crate::tri_assembly::{tri_force, tri_stiff, tri_stiff_tensor};
-use crate::quadrature::gaus_quad_tri;
-use std::collections::HashSet;
 
 /// The surface element's DOF owners for triangle `ti`, from the entity orders the
 /// minimum rule produced. The element and the DOF map read the same list, so they
@@ -57,241 +55,12 @@ fn sweep_iteration_budget(solver: &rapidfem_core::linalg::SymmetricSolver<C64>, 
     (0.5 * flops as f64 / per_iteration) as usize
 }
 
-/// Assemble the driven system and solve for each driven port. Accepts any
-/// Port type via trait objects.
-pub fn assemble_and_solve(
-    mesh: &Mesh,
-    basis: &NedelecBasis,
-    ports: &[&dyn Port],
-    port_tri_indices: &[&[usize]],
-    pec_tri_indices: &[usize],
-    freq: f64,
-    materials: Option<&[crate::materials::Material]>,
-) -> Result<SolveResult, String> {
-    assemble_and_solve_with_pml(mesh, basis, ports, port_tri_indices, pec_tri_indices, freq, materials, None)
-}
-
-pub fn assemble_and_solve_with_pml(
-    mesh: &Mesh,
-    basis: &NedelecBasis,
-    ports: &[&dyn Port],
-    port_tri_indices: &[&[usize]],
-    pec_tri_indices: &[usize],
-    freq: f64,
-    materials: Option<&[crate::materials::Material]>,
-    pml_regions: Option<&[crate::materials::PmlRegion]>,
-) -> Result<SolveResult, String> {
-    let exc = crate::excitation::Excitation::new(freq, mesh.l0);
-    let k0 = exc.k0;
-    let n_field = basis.n_field;
-    let n_tets = mesh.n_tets();
-
-    // Step 1: Build per-tet material tensors.
-    let (er, ur) = if let Some(pml) = pml_regions {
-        crate::materials::build_material_tensors_with_pml(
-            n_tets, materials.unwrap_or(&[]), pml, mesh, freq,
-        )
-    } else if let Some(mats) = materials {
-        crate::materials::build_material_tensors(n_tets, mats, freq)
-    } else {
-        // Default: air (identity tensors)
-        let identity: [[C64; 3]; 3] = [
-            [C64::new(1.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0)],
-            [C64::new(0.0, 0.0), C64::new(1.0, 0.0), C64::new(0.0, 0.0)],
-            [C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(1.0, 0.0)],
-        ];
-        (vec![identity; n_tets], vec![identity; n_tets])
-    };
-
-    let t0 = web_time::Instant::now();
-    let (rows, cols, data_e, data_b) = assemble_global_matrices(mesh, basis, &er, &ur);
-    eprintln!("  Assembled E,B in {:.1}ms ({} entries)", t0.elapsed().as_secs_f64()*1e3, rows.len());
-
-    // Step 2: K = E - k0² * B (defer CSR construction, build solver COO directly later)
-    let t1 = web_time::Instant::now();
-    let k0_sq = C64::from(k0 * k0);
-
-    // Step 3: collect the PEC (perfect-conductor) DOFs to constrain.
-    let mut pec_ids: HashSet<usize> = HashSet::new();
-
-    for &ti in pec_tri_indices {
-        // edge_ids = list(mesh.tri_to_edge[:,tri_ids].flatten())
-        let edges = &mesh.tri_to_edge[ti];
-        for &ei in edges {
-            let edofs = basis.edge_dofs(ei);
-            for &d in edofs {
-                pec_ids.insert(d);
-            }
-        }
-        let tdofs = basis.tri_dofs(ti);
-        for &d in tdofs {
-            pec_ids.insert(d);
-        }
-    }
-    eprintln!("  PEC DOFs: {} of {}", pec_ids.len(), n_field);
-
-    // Step 4: Robin / port boundary term, accumulated into a flat per-tri
-    // buffer (Bempty) and added to K as COO triplets.
-    let gauss_points = gaus_quad_tri(4);
-
-    let mut bempty = basis.empty_tri_matrix();
-
-    for (pi, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
-        let gamma = port.get_gamma(&exc);
-
-        // Robin BC stiffness: for each port tri, compute 8x8 and write into flat array
-        for (k, &ti) in tri_ids.iter().enumerate() {
-            let tri = &mesh.tris[ti];
-            let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
-            let owners = tri_owners(basis, mesh, ti);
-            let bsub = match port.tri_tensor(&exc, k) {
-                Some(tensor) => tri_stiff_tensor(&owners, &verts, &tensor),
-                None => tri_stiff(&owners, &verts, gamma),
-            };
-            // The block reserved for this triangle is n×n, with n from the DOF
-            // map, and the element produced exactly n functions from the same
-            // owner list. Under the minimum rule n need not be 8.
-            let n = basis.tri_dofs(ti).len();
-            debug_assert_eq!(bsub.len(), n * n);
-            let p = basis.tri_block(ti);
-            for ii in 0..n {
-                for jj in 0..n {
-                    bempty[p + ii * n + jj] += bsub[ii * n + jj];
-                }
-            }
-        }
-
-        eprintln!("  Port {} Robin: gamma={:.4e}, {} tris, driven={}", pi, gamma, tri_ids.len(), port.is_driven());
-    }
-
-    eprintln!("  Robin BC assembled in {:.1}ms", t1.elapsed().as_secs_f64()*1e3);
-
-    // Step 5: Port excitation vectors, only for driven ports
-    let mut port_vectors: Vec<Vec<C64>> = Vec::new();
-    let mut driven_port_indices: Vec<usize> = Vec::new();
-
-    for (pi, (port, tri_ids)) in ports.iter().zip(port_tri_indices.iter()).enumerate() {
-        if !port.is_driven() {
-            continue; // ABC: no excitation vector
-        }
-        driven_port_indices.push(pi);
-
-        let mut bvec = vec![C64::new(0.0, 0.0); n_field];
-
-        for &ti in *tri_ids {
-            let tri = &mesh.tris[ti];
-            let verts = [mesh.nodes[tri[0]], mesh.nodes[tri[1]], mesh.nodes[tri[2]]];
-
-            let u_inc_at_qp: Vec<[C64; 3]> = gauss_points.iter().filter_map(|qp| {
-                let (l1, l2, l3) = (qp[1], qp[2], qp[3]);
-                let x = verts[0][0]*l1 + verts[1][0]*l2 + verts[2][0]*l3;
-                let y = verts[0][1]*l1 + verts[1][1]*l2 + verts[2][1]*l3;
-                let z = verts[0][2]*l1 + verts[1][2]*l2 + verts[2][2]*l3;
-                port.get_uinc(x, y, z, &exc)
-            }).collect();
-
-            if u_inc_at_qp.len() == gauss_points.len() {
-                let owners = tri_owners(basis, mesh, ti);
-                let b_tri = tri_force(&owners, &verts, &u_inc_at_qp, &gauss_points);
-                let dofs = basis.tri_dofs(ti);
-                for (i, &d) in dofs.iter().enumerate() {
-                    bvec[d] += b_tri[i];
-                }
-            }
-        }
-
-        let bnorm: f64 = bvec.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
-        eprintln!("  Port {} ||b|| = {:.6e}", pi, bnorm);
-        port_vectors.push(bvec);
-    }
-
-    // Step 6: Eliminate PEC DOFs, build reduced system, solve
-    let free_dofs: Vec<usize> = (0..n_field).filter(|d| !pec_ids.contains(d)).collect();
-    let n_free = free_dofs.len();
-    eprintln!("  Free DOFs: {}", n_free);
-
-    let mut dof_to_free = vec![usize::MAX; n_field];
-    for (fi, &d) in free_dofs.iter().enumerate() {
-        dof_to_free[d] = fi;
-    }
-
-    // Build COO triplets for reduced system: K = (E - k0²*B) + Robin
-    let t2 = web_time::Instant::now();
-    let mut coo_rows: Vec<usize> = Vec::new();
-    let mut coo_cols: Vec<usize> = Vec::new();
-    let mut coo_vals: Vec<C64> = Vec::new();
-
-    for i in 0..rows.len() {
-        let r = rows[i];
-        let c = cols[i];
-        if pec_ids.contains(&r) || pec_ids.contains(&c) { continue; }
-        coo_rows.push(dof_to_free[r]);
-        coo_cols.push(dof_to_free[c]);
-        coo_vals.push(data_e[i] - k0_sq * data_b[i]);
-    }
-    // Robin entries live only on the port triangles; walk just those blocks
-    // instead of every triangle's.
-    let mut robin_nonzero: Vec<usize> = port_tri_indices
-        .iter()
-        .flat_map(|tri_ids| tri_ids.iter().copied())
-        .flat_map(|ti| basis.tri_block(ti)..basis.tri_block(ti + 1))
-        .filter(|&i| !pec_ids.contains(&basis.tri_rows[i])
-            && !pec_ids.contains(&basis.tri_cols[i]))
-        .collect();
-    robin_nonzero.sort_unstable();
-    robin_nonzero.dedup();
-    for &idx in &robin_nonzero {
-        coo_rows.push(dof_to_free[basis.tri_rows[idx]]);
-        coo_cols.push(dof_to_free[basis.tri_cols[idx]]);
-        coo_vals.push(bempty[idx]);
-    }
-    eprintln!("  COO: {} entries, built in {:.1}ms", coo_rows.len(), t2.elapsed().as_secs_f64()*1e3);
-
-    let mut solver = rapidfem_core::linalg::SymmetricSolver::<C64>::new();
-    solver.expect_rhs(port_vectors.len());
-    let t_solve = web_time::Instant::now();
-    solver.factorize(n_free, &coo_rows, &coo_cols, &coo_vals)?;
-    eprintln!("  {}: factorized in {:.1}ms", solver.name(), t_solve.elapsed().as_secs_f64()*1e3);
-
-    // All driven-port RHS against the one factorisation, batched (one factor
-    // traversal for all RHS).
-    let b_frees: Vec<Vec<C64>> = port_vectors.iter()
-        .map(|bvec| free_dofs.iter()
-            .map(|&d| bvec[d]).collect())
-        .collect();
-    let x_frees = solver.solve_many(&b_frees)?;
-    let mut solutions = Vec::new();
-    for (pi, x_free) in x_frees.into_iter().enumerate() {
-        let mut x_full = vec![C64::new(0.0, 0.0); n_field];
-        for (fi, &d) in free_dofs.iter().enumerate() {
-            x_full[d] = x_free[fi];
-        }
-        let xnorm: f64 = x_full.iter().map(|x| x.norm_sqr()).sum::<f64>().sqrt();
-        eprintln!("  Port {} solved ({}) in {:.1}ms, ||x|| = {:.6e}",
-            pi, solver.name(), t_solve.elapsed().as_secs_f64()*1e3, xnorm);
-        solutions.push(x_full);
-    }
-
-    Ok(SolveResult { solutions, n_field })
-}
-
-/// Frequency sweep: solve at multiple frequencies.
+/// Frequency sweep: assembles the driven system and solves it for every
+/// driven port at every frequency (a single frequency is a sweep of one).
 ///
-/// For frequency-independent materials, caches E and B matrices.
+/// For frequency-independent materials the E and B matrices are cached.
 /// Returns the solutions per frequency (`Vec<SolveResult>`).
 pub fn frequency_sweep(
-    mesh: &Mesh,
-    basis: &NedelecBasis,
-    ports: &[&dyn Port],
-    port_tri_indices: &[&[usize]],
-    pec_tri_indices: &[usize],
-    frequencies: &[f64],
-    materials: Option<&[crate::materials::Material]>,
-) -> Result<Vec<SolveResult>, String> {
-    frequency_sweep_with_pml(mesh, basis, ports, port_tri_indices, pec_tri_indices, frequencies, materials, None, None)
-}
-
-pub fn frequency_sweep_with_pml(
     mesh: &Mesh,
     basis: &NedelecBasis,
     ports: &[&dyn Port],
@@ -328,24 +97,8 @@ pub fn frequency_sweep_with_pml(
 
     // Cache E, B for frequency-independent materials
     let n_tets = mesh.n_tets();
-    let identity3: [[C64; 3]; 3] = [
-        [C64::new(1.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0)],
-        [C64::new(0.0, 0.0), C64::new(1.0, 0.0), C64::new(0.0, 0.0)],
-        [C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(1.0, 0.0)],
-    ];
-    let (er, ur) = match (pml_regions, materials) {
-        (Some(pml), _) if sigma_split => crate::materials::build_material_tensors_with_pml_wo_sigma(
-            n_tets, materials.unwrap_or(&[]), pml, mesh, frequencies[0],
-        ),
-        (Some(pml), _) => crate::materials::build_material_tensors_with_pml(
-            n_tets, materials.unwrap_or(&[]), pml, mesh, frequencies[0],
-        ),
-        (None, Some(mats)) if sigma_split => {
-            crate::materials::build_material_tensors_wo_sigma(n_tets, mats, frequencies[0])
-        }
-        (None, Some(mats)) => crate::materials::build_material_tensors(n_tets, mats, frequencies[0]),
-        (None, None) => (vec![identity3; n_tets], vec![identity3; n_tets]),
-    };
+    let pml = pml_regions.map(|p| (p, mesh));
+    let (er, ur) = crate::materials::material_tensors(n_tets, materials, frequencies[0], !sigma_split, pml);
 
     let t0 = web_time::Instant::now();
     let (rows, cols, mut data_e, mut data_b) = assemble_global_matrices(mesh, basis, &er, &ur);
@@ -362,7 +115,7 @@ pub fn frequency_sweep_with_pml(
                 for &ti in &region.tet_indices { sig[ti] = zero3x3; }
             }
         }
-        let ur_id = vec![identity3; n_tets];
+        let ur_id = vec![crate::materials::IDENTITY; n_tets];
         let (_, _, _, bs) = assemble_global_matrices(mesh, basis, &sig, &ur_id);
         Some(bs)
     } else {
@@ -374,19 +127,10 @@ pub fn frequency_sweep_with_pml(
         else if sigma_split { " (cached for sweep, σ mass matrix scaled per frequency)" }
         else { " (cached for sweep)" });
 
-    // PEC DOFs (frequency-independent)
-    let mut pec_ids: HashSet<usize> = HashSet::new();
-    for &ti in pec_tri_indices {
-        for &ei in &mesh.tri_to_edge[ti] {
-            for &d in basis.edge_dofs(ei) { pec_ids.insert(d); }
-        }
-        for &d in basis.tri_dofs(ti) { pec_ids.insert(d); }
-    }
-
-    let free_dofs: Vec<usize> = (0..basis.n_field).filter(|d| !pec_ids.contains(d)).collect();
+    // PEC DOFs (frequency-independent) and the free-DOF renumbering
+    let (free_dofs, dof_to_free) = basis.free_dofs(mesh, pec_tri_indices);
     let n_free = free_dofs.len();
-    let mut dof_to_free = vec![usize::MAX; basis.n_field];
-    for (fi, &d) in free_dofs.iter().enumerate() { dof_to_free[d] = fi; }
+    let is_free = |d: usize| dof_to_free[d] != usize::MAX;
 
     let gauss_points = crate::quadrature::gaus_quad_tri(4);
 
@@ -394,7 +138,7 @@ pub fn frequency_sweep_with_pml(
 
     // Precompute non-PEC COO indices for K entries (reused every frequency)
     let k_free_indices: Vec<usize> = (0..rows.len())
-        .filter(|&i| !pec_ids.contains(&rows[i]) && !pec_ids.contains(&cols[i]))
+        .filter(|&i| is_free(rows[i]) && is_free(cols[i]))
         .collect();
     let k_free_rows: Vec<usize> = k_free_indices.iter().map(|&i| dof_to_free[rows[i]]).collect();
     let k_free_cols: Vec<usize> = k_free_indices.iter().map(|&i| dof_to_free[cols[i]]).collect();
@@ -412,7 +156,7 @@ pub fn frequency_sweep_with_pml(
         .filter(|&idx| {
             let r = basis.tri_rows[idx];
             let c = basis.tri_cols[idx];
-            !pec_ids.contains(&r) && !pec_ids.contains(&c)
+            is_free(r) && is_free(c)
         })
         .collect();
     // Ports share no triangles by construction; dedup defends the pattern
@@ -444,13 +188,7 @@ pub fn frequency_sweep_with_pml(
 
         // Rebuild element matrices when materials are frequency-dependent
         if materials_dispersive && fi > 0 {
-            let (er_f, ur_f) = if let Some(pml) = pml_regions {
-                crate::materials::build_material_tensors_with_pml(
-                    n_tets, materials.unwrap_or(&[]), pml, mesh, freq,
-                )
-            } else {
-                crate::materials::build_material_tensors(n_tets, materials.unwrap_or(&[]), freq)
-            };
+            let (er_f, ur_f) = crate::materials::material_tensors(n_tets, materials, freq, true, pml);
             let (_, _, de, db) = assemble_global_matrices(mesh, basis, &er_f, &ur_f);
             data_e = de;
             data_b = db;

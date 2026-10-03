@@ -18,7 +18,7 @@
 //   (B) Lossy dielectric      εr* = εr·(1 - j·tanδ) - j·σ/(ω·ε₀)
 // Both pinned to the exact closed forms the Rust implements (e^{+jωt}).
 
-use rapidfem_core::materials::{build_material_tensors, Dispersion, Material, PmlRegion};
+use rapidfem_core::materials::{material_tensors, Dispersion, Material, PmlRegion};
 
 fn rel_err(got: f64, want: f64) -> f64 {
     let scale = want.abs().max(1e-300);
@@ -183,7 +183,7 @@ fn lossy_dielectric_matches_closed_form_fr4() {
         ur_diag: None,
         dispersion: Dispersion::None,
     };
-    let (er_t, _ur_t) = build_material_tensors(1, &[mat], 2.40000000000000000e+09);
+    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), 2.40000000000000000e+09, true, None);
     let want_re = 4.40000000000000036e+00;
     let want_im = -8.80000000000000088e-02;
     let mut max_err = 0.0_f64;
@@ -213,7 +213,7 @@ fn lossy_dielectric_matches_closed_form_seawater() {
         ur_diag: None,
         dispersion: Dispersion::None,
     };
-    let (er_t, _ur_t) = build_material_tensors(1, &[mat], 1.00000000000000000e+09);
+    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), 1.00000000000000000e+09, true, None);
     let want_re = 8.10000000000000000e+01;
     let want_im = -7.19004142892527085e+01;
     let mut max_err = 0.0_f64;
@@ -243,7 +243,7 @@ fn lossy_dielectric_matches_closed_form_lossy_combo() {
         ur_diag: None,
         dispersion: Dispersion::None,
     };
-    let (er_t, _ur_t) = build_material_tensors(1, &[mat], 6.00000000000000000e+09);
+    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), 6.00000000000000000e+09, true, None);
     let want_re = 1.01999999999999993e+01;
     let want_im = -6.56585059538552923e-02;
     let mut max_err = 0.0_f64;
@@ -273,7 +273,7 @@ fn lossy_dielectric_matches_closed_form_air() {
         ur_diag: None,
         dispersion: Dispersion::None,
     };
-    let (er_t, _ur_t) = build_material_tensors(1, &[mat], 1.00000000000000000e+10);
+    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), 1.00000000000000000e+10, true, None);
     let want_re = 1.00000000000000000e+00;
     let want_im = 0.00000000000000000e+00;
     let mut max_err = 0.0_f64;
@@ -303,7 +303,7 @@ fn lossy_dielectric_matches_closed_form_low_freq_cond() {
         ur_diag: None,
         dispersion: Dispersion::None,
     };
-    let (er_t, _ur_t) = build_material_tensors(1, &[mat], 1.00000000000000000e+06);
+    let (er_t, _ur_t) = material_tensors(1, Some(&[mat]), 1.00000000000000000e+06, true, None);
     let want_re = 3.00000000000000000e+00;
     let want_im = -8.98758178615659017e+03;
     let mut max_err = 0.0_f64;

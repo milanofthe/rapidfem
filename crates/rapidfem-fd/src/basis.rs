@@ -256,6 +256,20 @@ impl NedelecBasis {
         self.edge.get(i)
     }
 
+    /// The DOFs left free by PEC on triangles `pec_tris` (every DOF on such a
+    /// triangle and its edges is constrained), in order, and the renumbering
+    /// `dof -> free index`, `usize::MAX` for a constrained DOF.
+    pub fn free_dofs(&self, mesh: &Mesh, pec_tris: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let mut pec = vec![false; self.n_field];
+        for &t in pec_tris {
+            for &e in &mesh.tri_to_edge[t] {
+                self.edge_dofs(e).iter().for_each(|&d| pec[d] = true);
+            }
+            self.tri_dofs(t).iter().for_each(|&d| pec[d] = true);
+        }
+        rapidfem_core::linalg::free_index(self.n_field, |d| pec[d])
+    }
+
     /// Offsets into the volume COO arrays: tet `i` owns `[tet_nnz[i], tet_nnz[i+1])`.
     #[inline]
     pub fn tet_nnz_offsets(&self) -> &[usize] {

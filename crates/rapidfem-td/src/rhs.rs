@@ -22,13 +22,12 @@ use crate::geom_factors::{GeometricFactors, all_geometric_factors};
 use crate::waveguide::{
     CoaxPort, FloquetPolarisation, FloquetPort, PortMode, RectPort,
 };
-use rapidfem_core::port_eigen::{
-    ModeKind, NumericalMode, PortMesh2D, solve_modes, solve_vector_modes,
-};
+use rapidfem_core::port_eigen::{solve_port_face, ModeKind, PortSolve};
 use rapidfem_core::mesh::Mesh;
 use rapidfem_core::topology::FaceTopology;
 use rayon::prelude::*;
 use std::sync::Mutex;
+use rapidfem_core::geom::{cross, dot};
 
 /// Physical curl of a vector field on a single element.
 ///
@@ -102,19 +101,6 @@ fn element_curl_into(
     }
 }
 
-#[inline]
-fn dot3(a: [Field; 3], b: [Field; 3]) -> Field {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-#[inline]
-fn cross3(a: [Field; 3], b: [Field; 3]) -> [Field; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
 /// Per (element, local face) flux data.
 pub(crate) struct FaceInfo {
     /// Outward unit normal.
@@ -139,6 +125,15 @@ pub(crate) struct FaceInfo {
 /// `mode = None` the port is a pure characteristic absorbing boundary;
 /// `Some` attaches a waveguide mode (rectangular `TE_mn` or coaxial TEM)
 /// for injection / extraction.
+/// The triangles of face group `face_tag`, their distinct node coordinates
+/// and the inward unit normal of the first one; `None` for an empty tag.
+fn port_face(mesh: &Mesh, face_tag: i32) -> Option<(Vec<usize>, Vec<[Field; 3]>, [Field; 3])> {
+    let tris = mesh.tris_for_tag(face_tag).to_vec();
+    let nrm = mesh.tri_inward_normal(*tris.first()?)?;
+    let coords = mesh.tri_nodes(&tris).into_iter().map(|n| mesh.nodes[n]).collect();
+    Some((tris, coords, nrm))
+}
+
 #[derive(Clone, Debug)]
 pub struct PortSpec {
     /// Mesh triangle indices forming this port's boundary faces.
@@ -176,71 +171,17 @@ impl PortSpec {
         direction: Option<[Field; 3]>,
         z0: Field,
     ) -> Option<PortSpec> {
-        let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
-        if tris.is_empty() {
-            return None;
-        }
-        // Distinct node coordinates of the port face.
-        let mut node_ids: Vec<usize> = Vec::new();
-        for &t in &tris {
-            for &nd in &mesh.tris[t] {
-                if !node_ids.contains(&nd) {
-                    node_ids.push(nd);
-                }
-            }
-        }
-        let coords: Vec<[Field; 3]> = node_ids
-            .iter()
-            .map(|&nd| mesh.nodes[nd].map(|x| x as Field))
-            .collect();
-
-        // Geometric normal of a representative port triangle, oriented to
-        // point into the domain (toward the adjacent tet's centroid).
-        let t0 = tris[0];
-        let [v0, v1, v2] = mesh.tris[t0];
-        let (p0, p1, p2) = (
-            mesh.nodes[v0].map(|x| x as Field),
-            mesh.nodes[v1].map(|x| x as Field),
-            mesh.nodes[v2].map(|x| x as Field),
-        );
-        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let mut nrm = cross3(e1, e2);
-        let len =
-            (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
-        for c in nrm.iter_mut() {
-            *c /= len;
-        }
-        let tet = mesh.tri_to_tet[t0]
-            .iter()
-            .copied()
-            .find(|&x| x != usize::MAX)?;
-        let mut centroid = [0.0; 3];
-        for &nd in &mesh.tets[tet] {
-            for k in 0..3 {
-                centroid[k] += mesh.nodes[nd][k] as Field / 4.0;
-            }
-        }
-        let inward = [
-            centroid[0] - p0[0],
-            centroid[1] - p0[1],
-            centroid[2] - p0[2],
-        ];
-        if dot3(nrm, inward) < 0.0 {
-            for c in nrm.iter_mut() {
-                *c = -*c;
-            }
-        }
+        let (tris, coords, nrm) = port_face(mesh, face_tag)?;
         // A lumped port's voltage-integration direction, if supplied,
         // becomes the port's transverse field axis. Reject one that is
         // zero or parallel to the face normal (no in-plane part to use).
         if let Some(d) = direction {
-            let dl = dot3(d, d).sqrt();
+            let dl = dot(d, d).sqrt();
             if dl < 1e-12 {
                 return None;
             }
             let dn = [d[0] / dl, d[1] / dl, d[2] / dl];
-            let perp = dot3(dn, nrm);
+            let perp = dot(dn, nrm);
             if 1.0 - perp * perp < 1e-9 {
                 return None;
             }
@@ -266,7 +207,7 @@ impl PortSpec {
         mesh: &Mesh,
         face_tag: i32,
     ) -> Option<PortSpec> {
-        let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
+        let tris = mesh.tris_for_tag(face_tag).to_vec();
         if tris.is_empty() {
             return None;
         }
@@ -285,61 +226,7 @@ impl PortSpec {
         face_tag: i32,
         center: Option<[Field; 3]>,
     ) -> Option<PortSpec> {
-        let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
-        if tris.is_empty() {
-            return None;
-        }
-        // Distinct node coordinates of the port face.
-        let mut node_ids: Vec<usize> = Vec::new();
-        for &t in &tris {
-            for &nd in &mesh.tris[t] {
-                if !node_ids.contains(&nd) {
-                    node_ids.push(nd);
-                }
-            }
-        }
-        let coords: Vec<[Field; 3]> = node_ids
-            .iter()
-            .map(|&nd| mesh.nodes[nd].map(|x| x as Field))
-            .collect();
-
-        // Geometric normal of a representative port triangle, oriented to
-        // point into the domain (toward the adjacent tet's centroid).
-        let t0 = tris[0];
-        let [v0, v1, v2] = mesh.tris[t0];
-        let (p0, p1, p2) = (
-            mesh.nodes[v0].map(|x| x as Field),
-            mesh.nodes[v1].map(|x| x as Field),
-            mesh.nodes[v2].map(|x| x as Field),
-        );
-        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let mut nrm = cross3(e1, e2);
-        let len =
-            (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
-        for c in nrm.iter_mut() {
-            *c /= len;
-        }
-        let tet = mesh.tri_to_tet[t0]
-            .iter()
-            .copied()
-            .find(|&x| x != usize::MAX)?;
-        let mut centroid = [0.0; 3];
-        for &nd in &mesh.tets[tet] {
-            for k in 0..3 {
-                centroid[k] += mesh.nodes[nd][k] as Field / 4.0;
-            }
-        }
-        let inward = [
-            centroid[0] - p0[0],
-            centroid[1] - p0[1],
-            centroid[2] - p0[2],
-        ];
-        if dot3(nrm, inward) < 0.0 {
-            for c in nrm.iter_mut() {
-                *c = -*c;
-            }
-        }
+        let (tris, coords, nrm) = port_face(mesh, face_tag)?;
         let coax = CoaxPort::from_face(&coords, nrm, center);
         Some(PortSpec { tris, mode: Some(PortMode::Coax(coax)) })
     }
@@ -372,79 +259,15 @@ impl PortSpec {
         k0: Field,
         pec_nodes: Option<&[bool]>,
     ) -> Option<PortSpec> {
-        let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
-        if tris.is_empty() {
-            return None;
-        }
-        // Inward normal of a representative face triangle (toward the
-        // adjacent tet centroid), same construction as the coax port.
-        let t0 = tris[0];
-        let [v0, v1, v2] = mesh.tris[t0];
-        let (p0, p1, p2) = (
-            mesh.nodes[v0].map(|x| x as Field),
-            mesh.nodes[v1].map(|x| x as Field),
-            mesh.nodes[v2].map(|x| x as Field),
-        );
-        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let mut nrm = cross3(e1, e2);
-        let len =
-            (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
-        for c in nrm.iter_mut() {
-            *c /= len;
-        }
-        let tet = mesh.tri_to_tet[t0]
-            .iter()
-            .copied()
-            .find(|&x| x != usize::MAX)?;
-        let mut centroid = [0.0; 3];
-        for &nd in &mesh.tets[tet] {
-            for k in 0..3 {
-                centroid[k] += mesh.nodes[nd][k] as Field / 4.0;
-            }
-        }
-        let inward =
-            [centroid[0] - p0[0], centroid[1] - p0[1], centroid[2] - p0[2]];
-        if dot3(nrm, inward) < 0.0 {
-            for c in nrm.iter_mut() {
-                *c = -*c;
-            }
-        }
-        // Build the 2D cross-section: all mesh nodes (as Field) plus the
-        // face triangles' global connectivity; `from_face` remaps to the
-        // local node set and projects into the port plane.
-        let global_nodes: Vec<[Field; 3]> =
-            mesh.nodes.iter().map(|p| p.map(|x| x as Field)).collect();
-        let face_tris: Vec<[usize; 3]> =
-            tris.iter().map(|&t| mesh.tris[t]).collect();
-        let pm =
-            PortMesh2D::from_face(&global_nodes, &face_tris, nrm, pec_nodes);
-        if k0 > 0.0 {
-            // Vector hybrid solve: per-face-triangle ε_r from the adjacent
-            // tet (the same tet whose centroid oriented the normal, taken
-            // per triangle). `tris[i]` ↔ `pm.tris[i]` by construction.
-            let eps_face: Vec<Field> = tris
-                .iter()
-                .map(|&t| {
-                    let adj = mesh.tri_to_tet[t]
-                        .iter()
-                        .copied()
-                        .find(|&x| x != usize::MAX);
-                    match (adj, eps_per_tet) {
-                        (Some(e), Some(eps)) => eps[e],
-                        _ => 1.0,
-                    }
-                })
-                .collect();
-            let modes = solve_vector_modes(&pm, &eps_face, k0, mode_index + 1);
-            let mode = modes.get(mode_index)?;
-            let nm = NumericalMode::from_vector(pm, mode);
-            return Some(PortSpec { tris, mode: Some(PortMode::Numerical(Box::new(nm))) });
-        }
-        let kind = if te { ModeKind::Te } else { ModeKind::Tm };
-        let modes = solve_modes(&pm, kind, mode_index + 1);
-        let mode = modes.get(mode_index)?;
-        let nm = NumericalMode::from_scalar(pm, mode, kind);
+        let tris = mesh.tris_for_tag(face_tag).to_vec();
+        let solve = if k0 > 0.0 {
+            PortSolve::Vector
+        } else {
+            PortSolve::Scalar(if te { ModeKind::Te } else { ModeKind::Tm })
+        };
+        let (nm, _) = solve_port_face(
+            mesh, &tris, solve, mode_index, eps_per_tet.unwrap_or(&[]), k0, pec_nodes, None,
+        )?;
         Some(PortSpec { tris, mode: Some(PortMode::Numerical(Box::new(nm))) })
     }
 
@@ -472,61 +295,7 @@ impl PortSpec {
         scan_phi: Field,
         polarisation_override: Option<[Field; 3]>,
     ) -> Option<PortSpec> {
-        let tris = mesh.ftag_to_tri.get(&face_tag)?.clone();
-        if tris.is_empty() {
-            return None;
-        }
-        // Distinct node coordinates of the port face.
-        let mut node_ids: Vec<usize> = Vec::new();
-        for &t in &tris {
-            for &nd in &mesh.tris[t] {
-                if !node_ids.contains(&nd) {
-                    node_ids.push(nd);
-                }
-            }
-        }
-        let coords: Vec<[Field; 3]> = node_ids
-            .iter()
-            .map(|&nd| mesh.nodes[nd].map(|x| x as Field))
-            .collect();
-
-        // Geometric normal of a representative port triangle, oriented to
-        // point into the domain (toward the adjacent tet's centroid).
-        let t0 = tris[0];
-        let [v0, v1, v2] = mesh.tris[t0];
-        let (p0, p1, p2) = (
-            mesh.nodes[v0].map(|x| x as Field),
-            mesh.nodes[v1].map(|x| x as Field),
-            mesh.nodes[v2].map(|x| x as Field),
-        );
-        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-        let mut nrm = cross3(e1, e2);
-        let len =
-            (nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]).sqrt();
-        for c in nrm.iter_mut() {
-            *c /= len;
-        }
-        let tet = mesh.tri_to_tet[t0]
-            .iter()
-            .copied()
-            .find(|&x| x != usize::MAX)?;
-        let mut centroid = [0.0; 3];
-        for &nd in &mesh.tets[tet] {
-            for k in 0..3 {
-                centroid[k] += mesh.nodes[nd][k] as Field / 4.0;
-            }
-        }
-        let inward = [
-            centroid[0] - p0[0],
-            centroid[1] - p0[1],
-            centroid[2] - p0[2],
-        ];
-        if dot3(nrm, inward) < 0.0 {
-            for c in nrm.iter_mut() {
-                *c = -*c;
-            }
-        }
+        let (tris, coords, nrm) = port_face(mesh, face_tag)?;
         let floquet = FloquetPort::from_face(
             &coords,
             nrm,
@@ -846,7 +615,7 @@ fn periodic_face_centroid(
         let pc = mesh.nodes[c].map(|x| x as Field);
         let e1 = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
         let e2 = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-        let n = cross3(e1, e2);
+        let n = cross(e1, e2);
         let area =
             0.5 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
         for k in 0..3 {
@@ -1526,10 +1295,10 @@ impl MaxwellOperator {
             for m in 0..nfp {
                 let (et, ht) = pd.profiles[face_idx * nfp + m];
                 // Incident-field flux: jumps [E] = −e_t, [H] = −h_t.
-                let nxe = cross3(n, et);
-                let nxh = cross3(n, ht);
-                let nne = cross3(n, nxe);
-                let nnh = cross3(n, nxh);
+                let nxe = cross(n, et);
+                let nxh = cross(n, ht);
+                let nne = cross(n, nxe);
+                let nnh = cross(n, nxh);
                 let s_de = [
                     nxh[0] - nne[0],
                     nxh[1] - nne[1],
@@ -1585,10 +1354,10 @@ impl MaxwellOperator {
                 let base = (e * np + vi) * 6;
                 let ef = [y[base], y[base + 1], y[base + 2]];
                 let hf = [y[base + 3], y[base + 4], y[base + 5]];
-                e_dot += w * dot3(ef, et);
-                e_norm += w * dot3(et, et);
-                h_dot += w * dot3(hf, ht);
-                h_norm += w * dot3(ht, ht);
+                e_dot += w * dot(ef, et);
+                e_norm += w * dot(et, et);
+                h_dot += w * dot(hf, ht);
+                h_norm += w * dot(ht, ht);
             }
         }
         let p_e = if e_norm > 0.0 { e_dot / e_norm } else { 0.0 };
@@ -1741,8 +1510,8 @@ impl MaxwellOperator {
                     (em, hm)
                 } else if fi.neighbor == usize::MAX {
                     // PEC ghost: [E] = 2·E_tangential, [H] = 2·H_normal.
-                    let edn = dot3(n, em);
-                    let hdn = dot3(n, hm);
+                    let edn = dot(n, em);
+                    let hdn = dot(n, hm);
                     (
                         [
                             2.0 * (em[0] - edn * n[0]),
@@ -1772,8 +1541,8 @@ impl MaxwellOperator {
                         ],
                     )
                 };
-                let nxjh = cross3(n, jh);
-                let nxje = cross3(n, je);
+                let nxjh = cross(n, jh);
+                let nxje = cross(n, je);
                 // Upwind penalty n̂×(n̂×[·]) = -[·]_tangential, dissipative,
                 // damps the discontinuous spurious modes. Port faces are
                 // always fully characteristic (the port absorbs outgoing
@@ -1783,8 +1552,8 @@ impl MaxwellOperator {
                 } else {
                     self.flux_alpha
                 };
-                let pe = cross3(n, cross3(n, je));
-                let ph = cross3(n, cross3(n, jh));
+                let pe = cross(n, cross(n, je));
+                let ph = cross(n, cross(n, jh));
                 for i in 0..np {
                     let w = coef * self.re.lift[i * cols + f * nfp + m];
                     for c in 0..3 {

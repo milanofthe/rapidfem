@@ -131,14 +131,7 @@ pub fn operator_from_model(
     // Numerical wave ports read the per-tet ε and mark every node on a PEC
     // face as an internal conductor of the cross-section.
     let eps_per_tet: Vec<f64> = materials.iter().map(|m| m.eps[0]).collect();
-    let mut pec_nodes = vec![false; mesh.n_nodes()];
-    for &tag in &model.pec_tags {
-        for &t in mesh.ftag_to_tri.get(&tag).map(|v| v.as_slice()).unwrap_or(&[]) {
-            for &n in &mesh.tris[t] {
-                pec_nodes[n] = true;
-            }
-        }
-    }
+    let pec_nodes = mesh.nodes_on_tags(&model.pec_tags);
     for f in &model.faces {
         if let FaceSpec::WaveNumerical { tag, f0, mode_index, kind, .. } = f {
             // A vector solve at k0 = 2π f0 / c; without f0 the scalar TE/TM

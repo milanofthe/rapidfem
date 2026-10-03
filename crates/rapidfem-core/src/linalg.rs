@@ -307,6 +307,18 @@ impl<T: Scalar> SymmetricSolver<T> {
     pub fn name(&self) -> &'static str { "rslab LDLᵀ" }
 }
 
+/// Compress the unknowns `0..n` that are not `fixed` into a contiguous
+/// range: returns the free indices in order and the map from a full index to
+/// its free position (`usize::MAX` for a fixed one).
+pub fn free_index(n: usize, fixed: impl Fn(usize) -> bool) -> (Vec<usize>, Vec<usize>) {
+    let free: Vec<usize> = (0..n).filter(|&i| !fixed(i)).collect();
+    let mut to_free = vec![usize::MAX; n];
+    for (r, &i) in free.iter().enumerate() {
+        to_free[i] = r;
+    }
+    (free, to_free)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

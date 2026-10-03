@@ -103,7 +103,7 @@ pub enum FaceSpec {
     /// Plane-wave port of a unit cell. `mode_nr` 1 = TE (s), 2 = TM (p).
     /// Exact at normal incidence; at oblique scan the transverse phase factor
     /// is dropped.
-    Floquet { tag: i32, scan_theta_deg: f64, scan_phi_deg: f64, mode_nr: u32, er: f64, power: f64 },
+    Floquet { tag: i32, scan_theta_deg: f64, scan_phi_deg: f64, mode_nr: u32, power: f64 },
     /// Uniform constant tangential field across the face.
     UserDefined { tag: i32, e_field: [f64; 3], power: f64 },
     /// Analytic coaxial TEM mode. `origin`/`z_axis` are fitted when `None`.
@@ -184,19 +184,6 @@ impl FaceSpec {
             | FaceSpec::WaveNumerical { tag, .. }
             | FaceSpec::SurfaceImpedance { tag, .. } => *tag,
         }
-    }
-
-    /// Whether this entry is a driven port (it gets an S-parameter index).
-    pub fn is_port(&self) -> bool {
-        matches!(
-            self,
-            FaceSpec::Rectangular { .. }
-                | FaceSpec::Floquet { .. }
-                | FaceSpec::UserDefined { .. }
-                | FaceSpec::Coax { .. }
-                | FaceSpec::Lumped { .. }
-                | FaceSpec::WaveNumerical { .. }
-        )
     }
 }
 

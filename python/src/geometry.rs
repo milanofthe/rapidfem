@@ -21,6 +21,7 @@ use rapidfem_core::model::{Debye, Drude, FaceSpec, MaterialSpec, PmlSpec, WaveKi
 use rapidfem_geom::fem_mesh::{fem_mesh, viewer_mesh, Group, MeshStats};
 use rapidfem_geom::geometry::{normalized, polygon_sheet, EdgeOp, Extent, FaceSel, Geometry, ObjId, SELECT_TOL};
 use rapidfem_geom::msh::{write_msh, MeshScene};
+use rapidfem_geom::rfic::Scene;
 use rapidfem_geom::setup::{Condition, Physics, Setup, Tagging, Target};
 use rapidfem_geom::sheet_ops::SheetOp;
 use rapidmesh::shapes::{Cone, Cuboid, Cylinder, Helix, Import, Sheet, Sphere, Torus, Wedge};
@@ -111,11 +112,11 @@ pub struct PyGeometry {
     grading: bool,
     /// The size `mesh()` takes when its call passes none.
     #[pyo3(get, set)]
-    mesh_maxh: Option<f64>,
+    pub(crate) mesh_maxh: Option<f64>,
     /// The elements across every region `mesh()` asks for when its call
     /// passes none.
     #[pyo3(get, set)]
-    cells_across: Option<f64>,
+    pub(crate) cells_across: Option<f64>,
     mesh: Option<rapidmesh::Mesh>,
     /// The tags of the last `mesh()`, with the setup revision they are of.
     meshed: Option<(u64, Tagging)>,
@@ -126,17 +127,66 @@ impl PyGeometry {
     #[new]
     #[pyo3(signature = (maxh=None, grading=true))]
     fn new(maxh: Option<f64>, grading: bool) -> Self {
-        PyGeometry {
-            inner: Geometry::new(maxh),
-            setup: Setup::default(),
-            materials: Vec::new(),
-            scene: None,
-            grading,
-            mesh_maxh: maxh,
-            cells_across: None,
-            mesh: None,
-            meshed: None,
+        PyGeometry::fresh(maxh, grading)
+    }
+
+    /// The physics objects from index `start` on as `(kind, params,
+    /// targets)`: the Python class name, its constructor parameters and
+    /// the target keys, for the Python objects of physics a native builder
+    /// placed.
+    fn physics_since<'py>(&self, py: Python<'py>, start: usize) -> PyResult<Vec<(String, Bound<'py, PyDict>, Vec<Bound<'py, PyAny>>)>> {
+        let mut out = Vec::new();
+        for p in self.setup.physics().iter().skip(start) {
+            let d = PyDict::new(py);
+            let kind = match &p.condition {
+                Condition::Pec => "PEC",
+                Condition::FarField => "FarFieldSurface",
+                Condition::Pml(s) => {
+                    d.set_item("direction", s.direction)?;
+                    d.set_item("inner_face", s.inner_face)?;
+                    d.set_item("thickness", s.thickness)?;
+                    d.set_item("er_base", s.er_base)?;
+                    d.set_item("ur_base", s.ur_base)?;
+                    d.set_item("exponent", s.exponent)?;
+                    d.set_item("delta_max", s.delta_max)?;
+                    "PML"
+                }
+                Condition::Face(FaceSpec::Abc { .. }) => "ABC",
+                Condition::Face(FaceSpec::Pmc { .. }) => "PMC",
+                Condition::Face(FaceSpec::Lumped { z0, l, c, direction, width, height, power, .. }) => {
+                    d.set_item("direction", *direction)?;
+                    d.set_item("z0", *z0)?;
+                    d.set_item("l", *l)?;
+                    d.set_item("c", *c)?;
+                    d.set_item("power", *power)?;
+                    d.set_item("width", *width)?;
+                    d.set_item("height", *height)?;
+                    "LumpedPort"
+                }
+                Condition::Face(FaceSpec::SurfaceImpedance { conductivity, mur, er, thickness, two_sided, sheet, zs, .. }) => {
+                    d.set_item("conductivity", *conductivity)?;
+                    d.set_item("mur", *mur)?;
+                    d.set_item("er", *er)?;
+                    d.set_item("thickness", *thickness)?;
+                    d.set_item("two_sided", *two_sided)?;
+                    d.set_item("sheet", *sheet)?;
+                    d.set_item("zs", *zs)?;
+                    "SurfaceImpedance"
+                }
+                other => return Err(PyNotImplementedError::new_err(format!("no Python object for the native physics {other:?}"))),
+            };
+            let keys = p
+                .targets
+                .iter()
+                .map(|t| match t {
+                    Target::Face(sel) => sel.key().into_pyobject(py).map(|k| k.into_any()),
+                    Target::Object(o) => Ok(o.into_pyobject(py)?.into_any()),
+                    Target::Group { name, .. } => Ok(name.into_pyobject(py)?.into_any()),
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            out.push((kind.to_string(), d, keys));
         }
+        Ok(out)
     }
 
     // ── objects ─────────────────────────────────────────────────────────
@@ -921,6 +971,46 @@ impl PyGeometry {
 }
 
 impl PyGeometry {
+    pub(crate) fn fresh(maxh: Option<f64>, grading: bool) -> Self {
+        PyGeometry {
+            inner: Geometry::new(maxh),
+            setup: Setup::default(),
+            materials: Vec::new(),
+            scene: None,
+            grading,
+            mesh_maxh: maxh,
+            cells_across: None,
+            mesh: None,
+            meshed: None,
+        }
+    }
+
+    /// Runs a native builder on the scene; the materials it added become
+    /// `rapidfem.materials` objects.
+    pub(crate) fn build<R>(&mut self, py: Python<'_>, f: impl FnOnce(&mut Scene) -> Result<R, String>) -> PyResult<R> {
+        let mut scene = Scene::new(&mut self.inner, &mut self.setup);
+        let out = f(&mut scene).map_err(PyValueError::new_err)?;
+        let added = std::mem::take(&mut scene.materials);
+        let module = py.import("rapidfem.materials")?;
+        for (index, m) in added {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("maxh", m.maxh)?;
+            let object = if m.air {
+                module.getattr("Air")?.call((), Some(&kwargs))?
+            } else {
+                kwargs.set_item("tand", m.tand)?;
+                kwargs.set_item("conductivity", m.conductivity)?;
+                kwargs.set_item("cond_diag", m.cond_diag)?;
+                module.getattr("Dielectric")?.call((m.er,), Some(&kwargs))?
+            };
+            if index != self.materials.len() {
+                return Err(PyRuntimeError::new_err("a native builder added materials out of order"));
+            }
+            self.materials.push(object.unbind());
+        }
+        Ok(out)
+    }
+
     /// The scene, for a change; refused in mesh mode.
     fn geo(&mut self) -> PyResult<&mut Geometry> {
         match self.scene {

@@ -25,7 +25,6 @@ import numpy as np
 
 from . import _native
 from .materials import Material
-from ._geometry_gds import _GdsMixin
 from ._geometry_import import _ImportMixin
 from ._geometry_primitives import _PrimitivesMixin
 
@@ -417,7 +416,7 @@ class GeoObject:
         self._entity.maxh = value
 
 
-class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
+class Geometry(_PrimitivesMixin, _ImportMixin):
     """Top-level geometry builder on the native rapidmesh scene.
 
     Build with primitive factory methods (:meth:`box`, :meth:`cylinder`,
@@ -467,6 +466,57 @@ class Geometry(_GdsMixin, _PrimitivesMixin, _ImportMixin):
         self._physics: list = []
         self._fem_mesh = None
         self.mesh_stats: MeshStats | None = None
+
+    @classmethod
+    def _adopt(cls, native, name: str = "rapidfem") -> "Geometry":
+        """The geometry around a native scene a native builder made."""
+        g = cls.__new__(cls)
+        g._native, g.name = native, name
+        g._physics, g._fem_mesh, g.mesh_stats = [], None, None
+        g._sync_physics()
+        return g
+
+    def _sync_physics(self) -> None:
+        """The Python objects of the physics a native builder placed."""
+        from . import physics
+        for kind, params, keys in self._native.physics_since(len(self._physics)):
+            p = object.__new__(getattr(physics, kind))
+            p.__dict__.update({k: tuple(v) if isinstance(v, list) else v
+                               for k, v in params.items()})
+            p._entities = [self._face(k) if isinstance(k, tuple) else _Entity(self, 3, k)
+                           for k in keys]
+            p._geometry, p._index = self, len(self._physics)
+            self._physics.append(p)
+
+    def _objects(self, ids) -> list[GeoObject]:
+        return [GeoObject(self, i) for i in ids]
+
+    @staticmethod
+    def from_gds(path: str, stack, top_cell: str | None = None,
+                 bbox: tuple[float, float, float, float] | None = None,
+                 merge: bool = True, thin_conductors: bool = False) -> "Geometry":
+        """Load a GDSII layout and extrude every polygon on a stack layer.
+
+        Each polygon on a (gds, datatype) of ``stack`` becomes a prism at the
+        layer's z with the layer's thickness, named after the layer, so all of
+        a layer can be selected at once. Cell references are resolved.
+
+        Args:
+            path: Path to the .gds file.
+            stack: A `rapidfem.rfic.Stack` mapping (gds, datatype) to layers.
+            top_cell: Cell name to extrude. ``None`` picks the unique
+                top-level cell.
+            bbox: Optional (xmin, ymin, xmax, ymax) crop box in meters;
+                polygons outside are skipped.
+            merge: Fuse co-layer polygons into one conductor region, so
+                touching traces carry no internal faces.
+            thin_conductors: Metal layers become sheets at the layer's
+                bottom z (thin-conductor approximation, t << w).
+        """
+        native, cell = _native.rfic_from_gds(
+            str(path), stack, top_cell=top_cell, bbox=bbox, merge=merge,
+            thin_conductors=thin_conductors)
+        return Geometry._adopt(native, name=cell or "gds_import")
 
     @property
     def objects(self) -> list[GeoObject]:

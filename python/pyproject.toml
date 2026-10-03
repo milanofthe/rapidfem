@@ -36,9 +36,6 @@ dependencies = [
 ui = [
     "flask>=3.0",
 ]
-gds = [
-    "gdstk>=0.9",
-]
 io = [
     "scikit-rf>=0.30",
     "pyvista>=0.43",
@@ -50,6 +47,8 @@ td = [
 test = [
     "pytest>=8.0",
     "scipy>=1.11",
+    # writes the GDS fixtures; reading is native
+    "gdstk>=0.9",
 ]
 
 [tool.pytest.ini_options]

@@ -9,6 +9,7 @@
 
 mod geometry;
 mod model;
+mod rfic;
 mod td;
 
 use num_complex::Complex64;
@@ -644,5 +645,9 @@ fn rapidfem_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<td::PyTdSession>()?;
     m.add_class::<td::PyGaussianPulse>()?;
     m.add_function(wrap_pyfunction!(renormalize_sparams, m)?)?;
+    m.add_function(wrap_pyfunction!(rfic::rfic_build, m)?)?;
+    m.add_function(wrap_pyfunction!(rfic::rfic_from_gds, m)?)?;
+    m.add_function(wrap_pyfunction!(rfic::rfic_from_fem_json, m)?)?;
+    rapidfem_geom::rfic::python::register(m)?;
     Ok(())
 }

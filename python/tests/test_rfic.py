@@ -300,12 +300,13 @@ def test_from_fem_json_meshes():
     """One representative layout through the full mesh path, with stats."""
     layout = rfic.from_fem_json(_fixture("fd_rfic_spiral_from_json.fem.json"))
     g = layout.geometry
-    import rapidfem as rf
-    all_conductors = [v for vs in layout.conductors.values() for v in vs]
-    rf.PEC(*(v.faces for v in all_conductors), *layout.ground_patches)
-    for port in layout.ports.values():
-        rf.LumpedPort(port, direction=(0, 0, 1), z0=50.0)
-    rf.ABC(*layout.air.faces.outer)
+    from rapidfem.physics import ABC, PEC, LumpedPort
+    kinds = [type(p) for p in g._physics]
+    assert kinds.count(PEC) == 1 and kinds.count(ABC) == 1
+    assert kinds.count(LumpedPort) == len(layout.ports)
+    # conductors are holes, as in build()
+    vols = [v for vs in layout.conductors.values() for v in vs]
+    assert all(g._native.is_void(v._id) for v in vols)
     g.mesh()
     s = g.mesh_stats
     assert s is not None

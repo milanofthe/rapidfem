@@ -101,7 +101,8 @@ rf.PEC(*pml_xp.faces.outer, *pml_xm.faces.outer,
 # .hull (not .outer): the air box is PML-wrapped on five sides, so only its
 # z = 0 bottom face touches the model bbox; .outer would return that single
 # face, not the closed box. .hull keys off air's own bbox and returns all six.
-# The solver closes the surface on the z = 0 ground plane via the PEC faces.
+# Its z = 0 face lies on the ground plane: the solver takes that plane as an
+# infinite ground and closes the surface with the images of the other five.
 rf.FarFieldSurface(*air.faces.hull)
 
 rf.show(g)
@@ -109,17 +110,12 @@ rf.show(g)
 
 # %% Mesh
 g.auto_refine_features(base_maxh=MAXH)
-# Netgen-optimize crashes deterministically under bake's fd-captured
-# stderr on this geometry (5 PML slabs + substrate + thin plate stack),
-# triggering heap corruption that the Python-level OSError handler
-# cannot catch. Disabling the post-pass optimiser keeps the mesh slightly
-# slivery but lets the bake subprocess complete cleanly.
-g.mesh(optimize=False)
+g.mesh()
 rf.show(g)
 
 
 # %% Problem + Sweep
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 result = prob.sweep(FREQUENCIES)
 rf.show(prob)
 rf.show(result)

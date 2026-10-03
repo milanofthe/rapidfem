@@ -28,6 +28,19 @@ pub struct CscPattern {
     pub row_idx: Vec<usize>,
 }
 
+impl<T: crate::scalar::Demote> CscMatrix<T> {
+    /// This matrix in the lower-precision field (same pattern), the input of
+    /// a [`MixedPrecision`](crate::MixedPrecision) factor.
+    pub fn demoted(&self) -> CscMatrix<T::Low> {
+        CscMatrix {
+            n: self.n,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            values: self.values.iter().map(|&v| v.demote()).collect(),
+        }
+    }
+}
+
 impl<T: Scalar> CscMatrix<T> {
     /// Number of stored nonzeros (lower triangle only).
     pub fn nnz(&self) -> usize {

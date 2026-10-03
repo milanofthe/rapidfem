@@ -1,7 +1,7 @@
 # rapidfem developer tasks. `make help` lists targets.
 # The test suite has two pillars (see issue #36):
-#   1. sympy kernel goldens   — Rust tests pinned to symbolic ground truth
-#   2. phenomenon geometries  — Python tests vs analytical / conservation laws
+#   1. sympy kernel goldens:  Rust tests pinned to symbolic ground truth
+#   2. phenomenon geometries: Python tests vs analytical / conservation laws
 
 .PHONY: help test test-rust test-py test-py-fast build gen-goldens
 
@@ -22,7 +22,7 @@ test-rust: ## fast: core/fd unit + all sympy kernel goldens (incl. TD)
 build: ## rebuild the python extension (release; needed after any Rust change)
 	cd python && maturin develop --release
 
-test-py-fast: ## fast python tests only (renormalization math, no FEM solves)
+test-py-fast: ## fast python tests (everything not marked slow)
 	cd python && python3 -m pytest -m "not slow" -q
 
 test-py: ## full phenomenon suite (real FEM solves, several minutes)

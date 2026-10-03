@@ -62,7 +62,13 @@ impl CmodPlan {
                 p0 + v[p0..].partition_point(|&g| (g as usize) < first + ncol),
             )
         };
-        let mut spans = Vec::with_capacity(updaters.len());
+        // A list a finished plan on this thread left behind, when there is one.
+        let mut spans = SPANS
+            .try_with(|v| v.borrow_mut().pop())
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        spans.clear();
         let mut flops: usize = 0;
         for &k in updaters {
             let k = k as usize;
@@ -93,6 +99,20 @@ impl CmodPlan {
             tiled: forks && ncol >= 2 * tile_w,
         }
     }
+}
+
+impl Drop for CmodPlan {
+    fn drop(&mut self) {
+        let spans = std::mem::take(&mut self.spans);
+        let _ = SPANS.try_with(|v| v.borrow_mut().push(spans));
+    }
+}
+
+thread_local! {
+    /// The span lists of this thread's finished plans, for its next ones: a
+    /// stack, since a node's plan can be alive while the thread runs another
+    /// node it stole.
+    static SPANS: std::cell::RefCell<Vec<Vec<Span>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {

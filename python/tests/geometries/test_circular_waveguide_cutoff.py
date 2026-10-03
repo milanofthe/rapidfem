@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Circular waveguide — dominant-mode (TE11) cutoff from the Bessel zero.
+
+"""Circular waveguide, dominant-mode (TE11) cutoff from the Bessel zero.
 
 A hollow circular guide of radius ``R`` carries as its dominant mode the
 TE11, whose cutoff wavenumber is the first zero of ``J1'``:
@@ -20,7 +21,7 @@ analytic TE11 propagation constant is
     β(f) = sqrt(εr·k0² − (p'11/R)²).
 
 The absolute S21 phase carries a port-orientation convention (a constant
-offset), so — exactly as in the WR-90 exemplar — we use the gauge-free phase
+offset), so, exactly as in the WR-90 exemplar, we use the gauge-free phase
 SLOPE: between two frequencies Δφ_S21 = −Δβ·L. Matching that slope to the
 circular-guide β proves the (p'11/R)² cutoff term, i.e. the Bessel zero. As a
 recovered figure we also least-squares fit k_c back out of the measured slopes
@@ -43,7 +44,7 @@ from harness import case, references as ref
 R = 10.0e-3
 LENGTH = 40.0e-3
 
-# Bessel-zero cutoff constants (LOCAL — niche to this test).
+# Bessel-zero cutoff constants (LOCAL, niche to this test).
 P11_PRIME = float(jnp_zeros(1, 1)[0])   # 1.8412, first zero of J1' → TE11
 P01 = float(jn_zeros(0, 1)[0])          # 2.4048, first zero of J0  → TM01
 
@@ -87,7 +88,7 @@ def _fit_cutoff_wavenumber(freqs, dbeta_meas) -> float:
 def test_circular_waveguide_te11_cutoff():
     fc_te11 = _circ_cutoff(P11_PRIME, R)
     fc_tm01 = _circ_cutoff(P01, R)
-    # Anchor: the band is single-mode and propagating — above TE11 cutoff,
+    # Anchor: the band is single-mode and propagating, above TE11 cutoff,
     # below the next (TM01) mode, so only the dominant TE11 carries power.
     assert FREQS.min() > fc_te11 + 0.3e9, f"band dips toward cutoff {fc_te11/1e9:.2f} GHz"
     assert FREQS.max() < fc_tm01 - 0.3e9, f"band reaches TM01 {fc_tm01/1e9:.2f} GHz"
@@ -110,7 +111,7 @@ def test_circular_waveguide_te11_cutoff():
 
     # Phase SLOPE: each consecutive ΔβL is < π (no wrap ambiguity), and must
     # match the circular-guide dispersion Δφ = −Δβ·L. This is the load-bearing
-    # assertion — the (p'11/R)² term in β is the Bessel-zero cutoff.
+    # assertion, the (p'11/R)² term in β is the Bessel-zero cutoff.
     phase = np.angle(s21)
     dphi = np.array([np.angle(np.exp(1j * (phase[i + 1] - phase[i])))
                      for i in range(len(FREQS) - 1)])
@@ -121,7 +122,7 @@ def test_circular_waveguide_te11_cutoff():
     )
 
     # Recover the cutoff wavenumber from the measured slopes and check it lands
-    # on the Bessel-zero value within 3 % (don't fudge — report it).
+    # on the Bessel-zero value within 3 % (don't fudge, report it).
     dbeta_meas = -dphi / LENGTH
     kc_meas = _fit_cutoff_wavenumber(FREQS, dbeta_meas)
     fc_meas = ref.C0 * kc_meas / (2.0 * np.pi)

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Binary packing for display-event payloads.
 
 A baked example, or a live display event, carries bulk numeric arrays:
@@ -11,9 +15,8 @@ soon as the 3-D view opens) and ``field`` (field and trajectory data,
 fetched only when the field viewer is shown), replacing each array with
 a compact ``$bin`` reference. The JSON that remains is pure structure.
 
-Both the static-demo bake and the live WebSocket protocol use this one
-packer; only what they do with the returned buffers differs (sidecar
-files vs. binary frames).
+The static-demo bake (``scripts/bake_demo.py``) writes the returned
+buffers as sidecar files next to the JSON.
 
 ``$bin`` reference shapes
 -------------------------
@@ -92,11 +95,11 @@ def _pack_mesh(geo: _Buffer, payload: dict) -> None:
 
 
 def _pack_geometry(geo: _Buffer, payload: dict) -> None:
-    """OCC geometry-preview payload, per-entity triangulation / wireframe."""
+    """Geometry-preview payload, per-entity triangulation / wireframe."""
     for ent in payload.get("entities", []):
         if not isinstance(ent, dict):
             continue
-        for key in ("positions", "normals", "lines"):
+        for key in ("positions", "normals"):
             v = ent.get(key)
             if isinstance(v, list) and v:
                 ent[key] = _pack_array(geo, "geo", v, "f32")

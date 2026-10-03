@@ -35,7 +35,7 @@ python/python_src/rapidfem/ui/frontend-src/node_modules/
 python/python_src/rapidfem/ui/frontend-src/.svelte-kit/
 python/python_src/rapidfem/ui/frontend-src/build/
 
-# Stray workdir leftovers — when `rapidfem serve` is started from this
+# Stray workdir leftovers: when `rapidfem serve` is started from this
 # repo root, opening any bundled example copies it here. Not real source.
 /coax_step*.py
 /iris_filter*.py

@@ -19,6 +19,17 @@ pub(crate) struct SupernodalAnalysis {
 }
 
 impl SupernodalAnalysis {
+    /// Heap bytes held: the symbolic factorization, the levels, and the input
+    /// program and schedule once built.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |i| {
+            i.sym.heap_bytes()
+                + crate::memory::nested_bytes(&i.by_level)
+                + i.input.get().map_or(0, |p| p.heap_bytes())
+                + i.ll_schedule.get().map_or(0, |s| s.heap_bytes())
+        })
+    }
+
     /// The fill-reducing ordering the analysis settled on (`perm[k]` the column that became
     /// column `k`); empty for `n = 0`.
     pub fn permutation(&self) -> &[usize] {

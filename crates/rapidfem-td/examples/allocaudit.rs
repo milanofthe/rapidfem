@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Allocation audit, counts heap allocations on the TD hot paths.
 //!
 //! A counting global allocator wraps the system allocator; the audit then
@@ -49,7 +53,7 @@ fn main() {
     );
     for &c in &[2usize, 4, 6] {
         let mesh = structured_box(c, c, c, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let n_elem = mesh.n_tets();
         let y: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).sin()).collect();
@@ -71,7 +75,7 @@ fn main() {
 
     // --- one exponential step: apply count × per-apply allocations -------
     let mesh = structured_box(4, 4, 4, 1.0, 1.0, 1.0);
-    let op = MaxwellOperator::new(&mesh, 2, 1.0);
+    let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
     let n = op.n_dof();
     let y: Vec<f64> = (0..n).map(|i| (i as f64 * 0.07).cos()).collect();
 

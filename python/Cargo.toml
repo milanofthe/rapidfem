@@ -2,6 +2,7 @@
 name = "rapidfem-python"
 version = "0.22.1"
 edition = "2021"
+license = "AGPL-3.0-only"
 
 [lib]
 name = "rapidfem"
@@ -11,6 +12,13 @@ crate-type = ["cdylib"]
 rapidfem-core = { path = "../crates/rapidfem-core" }
 rapidfem-fd = { path = "../crates/rapidfem-fd" }
 rapidfem-td = { path = "../crates/rapidfem-td", features = ["gpu"] }
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
-numpy = "0.22"
+rapidfem-geom = { path = "../crates/rapidfem-geom", features = ["python"] }
+# float_roundtrip: exact float parsing (the stack JSON round-trips)
+serde_json = { version = "1", features = ["float_roundtrip"] }
+rapidmesh = { path = "../vendor/rapidmesh/crates/rapidmesh" }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
+numpy = "0.29"
 num-complex = "0.4.6"
+
+[lints]
+workspace = true

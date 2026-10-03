@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! The curl-conforming tetrahedral element: Nédélec first kind, orders 1 and 2.
 //!
@@ -42,6 +39,7 @@ use crate::coefficients::volume_coeff_exps;
 use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::dofmap::DofOwner;
+use rapidfem_core::geom::cross;
 
 type V3 = [f64; 3];
 
@@ -67,15 +65,6 @@ fn matinv3(m: &[[C64; 3]; 3]) -> [[C64; 3]; 3] {
         [(m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv,
          (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv,
          (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv],
-    ]
-}
-
-#[inline]
-fn cross(a: &V3, b: &V3) -> V3 {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
     ]
 }
 
@@ -127,7 +116,7 @@ pub fn barycentric_grads(xs: &[f64; 4], ys: &[f64; 4], zs: &[f64; 4]) -> ([V3; 4
     // Sliver guard: a near-degenerate tet has 6V → 0 while edges stay O(1),
     // so ∇L = (b,c,d)/6V would blow up to ±∞/NaN and poison the whole global
     // factorization. Floor |6V| at q = SLIVER_NORMVOL_FLOOR of h_mean³ so one
-    // bad tet stays locally wrong but bounded. (Diagnostics: `core::quality`.)
+    // bad tet stays locally wrong but bounded.
     let mut sum_len = 0.0;
     for &(a, b) in &[(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
         let dx = xs[a] - xs[b];
@@ -218,7 +207,7 @@ impl BasisFn {
 ///     minimum rule keeps "the functions up to order p", which is only a subset if
 ///     the low-order space nests).
 ///   * Mode 1 is a pure gradient, so `∇×φ_e1 = 0` exactly and the curl kernel is
-///     explicit in the element matrix — the local exact-sequence property
+///     explicit in the element matrix, the local exact-sequence property
 ///     (Schöberl & Zaglmayr, COMPEL 24 (2005) 374).
 ///
 /// The interpolatory pair `{ℓ·L_a·W_ab, ℓ·L_b·W_ab}` spanned the same total 20-dim
@@ -255,8 +244,8 @@ pub fn face_fns(n0: usize, n1: usize, n2: usize, d02: f64, d01: f64) -> [BasisFn
 
 /// Build one basis function per entry of `owners`.
 ///
-/// The element does not enumerate its own DOFs. The owner list — produced by
-/// `basis::tet_dof_owners` from the entity orders — says which entity each local
+/// The element does not enumerate its own DOFs. The owner list, produced by
+/// `basis::tet_dof_owners` from the entity orders, says which entity each local
 /// DOF belongs to and which of that entity's functions it is, and this reads that
 /// list off. So a DOF exists in the element exactly when it exists in the DOF map,
 /// in the same position, whatever the orders happen to be. There is no second
@@ -324,7 +313,7 @@ fn curl_term(t: &Term, grads: &[V3; 4], out: &mut Vec<(f64, [u8; 4], V3)>) {
         out.push((
             t.coeff * ek as f64,
             e,
-            cross(&grads[k], &grads[t.grad as usize]),
+            cross(grads[k], grads[t.grad as usize]),
         ));
     }
 }
@@ -529,7 +518,7 @@ mod tests {
          [C64::new(0.0,0.0),C64::new(0.0,0.0),C64::new(1.0,0.0)]]
     }
 
-    /// A fully coplanar (degenerate) tet must not produce inf/NaN gradients —
+    /// A fully coplanar (degenerate) tet must not produce inf/NaN gradients, 
     /// the volume floor keeps 1/6V finite.
     #[test]
     fn degenerate_tet_grads_are_finite() {
@@ -586,7 +575,7 @@ mod tests {
         let (coeff, exps, vec) = out[0];
         assert_eq!(coeff, 2.0, "e_0 = 2 -> coefficient 2");
         assert_eq!(exps, [1, 0, 0, 0], "L_0^2 -> L_0");
-        let want = cross(&grads[0], &grads[1]);
+        let want = cross(grads[0], grads[1]);
         for k in 0..3 {
             assert!((vec[k] - want[k]).abs() < 1e-14);
         }

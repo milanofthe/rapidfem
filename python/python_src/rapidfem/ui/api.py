@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """JSON API endpoints for the rapidfem UI.
 
 Registered onto the Flask app by ``rapidfem.ui.server.create_app``.
@@ -36,11 +40,11 @@ if _WIN:
 
 
 @contextmanager
-def _capture_streams(on_line, stage: str = "cell"):
-    """OS-level fd capture so Rust eprintln! and gmsh output reach the UI.
+def _capture_streams(on_line):
+    """OS-level fd capture so Rust eprintln! output reaches the UI.
 
     ``on_line(kind, text)`` is called per line as soon as the pipe delivers
-    it. ``stage`` is accepted for call-site clarity. Used by the notebook
+    it. Used by the notebook
     worker and the demo baker to fold native stdout/stderr into a cell run.
     """
     sys.stdout.flush(); sys.stderr.flush()
@@ -139,153 +143,6 @@ def _capture_streams(on_line, stage: str = "cell"):
         t_err.join(timeout=1.0)
 
 
-def _td_timeseries_payload(obj) -> dict[str, Any]:
-    """``TdResponse`` / ``TdTransfer`` → a line-plot payload.
-
-    A response carries real probe samples on a time axis; a transfer
-    function carries a complex ``H`` on a frequency axis. ``domain``
-    tells the frontend which it is.
-    """
-    import numpy as np
-
-    cls = type(obj).__name__
-    if cls == "TdResponse":
-        x = np.asarray(obj.times, dtype=float).ravel()
-        resp = np.asarray(obj.responses, dtype=float)
-        labels = list(obj.probe_labels) or [
-            f"probe {k}" for k in range(resp.shape[0])
-        ]
-        series = [
-            {"label": labels[k], "y": resp[k].astype(float).tolist()}
-            for k in range(resp.shape[0])
-        ]
-        return {
-            "domain": "time",
-            "x_label": "Time",
-            "x": x.tolist(),
-            "series": series,
-            "source_label": obj.source_label,
-        }
-    # TdTransfer, complex frequency response
-    x = np.asarray(obj.frequencies, dtype=float).ravel()
-    H = np.asarray(obj.H)
-    return {
-        "domain": "freq",
-        "x_label": "Frequency (Hz)",
-        "x": x.tolist(),
-        "series": [{
-            "label": f"H · {obj.probe_label}",
-            "y_re": np.real(H).astype(float).tolist(),
-            "y_im": np.imag(H).astype(float).tolist(),
-        }],
-        "source_label": obj.source_label,
-    }
-
-
-def _td_trajectory_payload(
-    traj, *, max_frames: int = 180,
-) -> dict[str, Any]:
-    """``TdTrajectory`` → a self-contained DG-corner mesh + per-node field.
-
-    Emits the DG element corners deduplicated into unique nodes plus the
-    tet connectivity, and, per kept frame, per unique node, the ``|E|``
-    and ``|H|`` field magnitude. The frontend samples a point cloud from
-    that mesh *at runtime* (energy-weighted, like the frequency-domain
-    ``viz.ts`` sampler) at whatever density the user picks, then evaluates
-    the per-frame field at the fixed sample points. This mirrors the FD
-    field viz and lets the baked payload stay small (a few thousand nodes,
-    not a fixed 16k-point cloud).
-
-    Per-frame magnitudes are quantised to integers ``0…1000`` of the
-    global per-channel maximum (``field_max``), ample for an additive
-    colour ramp and an order of magnitude smaller on the wire than raw
-    floats. The viewer rescales by ``field_max`` and holds that colour
-    scale fixed across the animation. Snapshots are decimated to at most
-    ``max_frames``.
-    """
-    import numpy as np
-
-    p = getattr(traj, "_problem", None)
-    if p is None:
-        raise RuntimeError(
-            "trajectory carries no ProblemTD reference, it must come "
-            "straight from ProblemTD.transient()"
-        )
-    states = np.ascontiguousarray(traj, dtype=np.float64)
-    if states.ndim == 1:
-        states = states[None, :]
-    n_snap, n_dof = states.shape
-
-    o = int(p.order)
-    np_ = (o + 1) * (o + 2) * (o + 3) // 6
-    n_elem = n_dof // (6 * np_)
-    corners = np.asarray(p._op.corner_local_nodes(), dtype=np.int64)
-    coords = np.asarray(p._op.node_coords(), dtype=float).reshape(n_elem, np_, 3)
-    corner_xyz = coords[:, corners, :]                     # [n_elem, 4, 3]
-
-    # Decimate snapshots to a bounded frame count.
-    if n_snap > max_frames:
-        idx = np.unique(np.linspace(0, n_snap - 1, max_frames).round()
-                        .astype(int))
-    else:
-        idx = np.arange(n_snap)
-    # Corner field of every kept frame, [n_frame, n_elem, 4, 6].
-    cstates = states[idx].reshape(len(idx), n_elem, np_, 6)[:, :, corners, :]
-
-    # ── Deduplicate the n_elem·4 corner coordinates into unique nodes ───
-    # DG elements duplicate every shared corner; rounding to a tolerance
-    # then np.unique by row collapses them so the runtime sampler sees a
-    # continuous mesh. `inverse` maps each (elem, corner) flat index to a
-    # unique-node index → the tet connectivity.
-    flat_xyz = corner_xyz.reshape(-1, 3)                   # [n_elem*4, 3]
-    span = float(np.ptp(flat_xyz)) or 1.0
-    quant = np.round(flat_xyz / (span * 1e-7)).astype(np.int64)
-    _, first, inverse = np.unique(
-        quant, axis=0, return_index=True, return_inverse=True)
-    inverse = np.asarray(inverse, dtype=np.int64).ravel()
-    nodes = flat_xyz[first]                                # [n_node, 3]
-    n_node = int(nodes.shape[0])
-    tets = inverse.reshape(n_elem, 4).astype(np.int32)     # [n_elem, 4]
-
-    # ── Per-node field magnitude per kept frame ─────────────────────────
-    # |E|/|H| at every (elem, corner) corner, then averaged over all
-    # corners that map to the same unique node. counts[node] is the number
-    # of contributing (elem, corner) pairs.
-    evec = cstates[..., 0:3]                               # [n_frame,n_elem,4,3]
-    hvec = cstates[..., 3:6]
-    em = np.linalg.norm(evec, axis=-1).reshape(len(idx), -1)  # [n_frame,n_elem*4]
-    hm = np.linalg.norm(hvec, axis=-1).reshape(len(idx), -1)
-    counts = np.bincount(inverse, minlength=n_node).astype(float)
-    counts[counts == 0] = 1.0
-    node_e = np.zeros((len(idx), n_node))
-    node_h = np.zeros((len(idx), n_node))
-    for fi in range(len(idx)):
-        node_e[fi] = np.bincount(inverse, weights=em[fi], minlength=n_node) / counts
-        node_h[fi] = np.bincount(inverse, weights=hm[fi], minlength=n_node) / counts
-
-    e_max = max(float(node_e.max()), 1e-30)
-    h_max = max(float(node_h.max()), 1e-30)
-    qe = np.clip(np.round(node_e / e_max * 1000.0), 0, 1000).astype(np.int16)
-    qh = np.clip(np.round(node_h / h_max * 1000.0), 0, 1000).astype(np.int16)
-
-    dt = getattr(traj, "_dt", None)
-    times = (np.asarray(idx, dtype=float) * dt).tolist() if dt else \
-        np.asarray(idx, dtype=float).tolist()
-
-    return {
-        "nodes": nodes.astype(np.float32).ravel().tolist(),
-        "tets": tets.ravel().tolist(),
-        "n_node": n_node,
-        "n_elem": int(n_elem),
-        "bbox": _bbox_for_nodes(nodes),
-        "n_snapshots": len(idx),
-        "times": times,
-        "field_max": {"E": e_max, "H": h_max},
-        "frames_e": [row.tolist() for row in qe],
-        "frames_h": [row.tolist() for row in qh],
-    }
-
-
 # Capture kinds whose display payload is built from a single item, with no
 # sim+result pairing, so they can be streamed the instant show() runs.
 _STREAMABLE_KINDS = frozenset({
@@ -302,7 +159,8 @@ def _serialize_streamable(item) -> dict[str, Any] | None:
     event on failure), or ``None`` for kinds deferred to
     :func:`_serialize_paired`. Never raises.
     """
-    from rapidfem.ui.serialize import geometry_to_payload
+    from rapidfem.ui.serialize import (
+        geometry_to_payload, td_timeseries_payload, td_trajectory_payload)
 
     if item.kind == "geometry":
         try:
@@ -316,9 +174,9 @@ def _serialize_streamable(item) -> dict[str, Any] | None:
         # A transfer function reuses the time-series payload builder (it sets
         # domain="freq" itself).
         _td_builder = {
-            "td_timeseries": _td_timeseries_payload,
-            "td_transfer": _td_timeseries_payload,
-            "td_trajectory": _td_trajectory_payload,
+            "td_timeseries": td_timeseries_payload,
+            "td_transfer": td_timeseries_payload,
+            "td_trajectory": td_trajectory_payload,
         }[item.kind]
         try:
             return {"kind": item.kind, "name": item.name,
@@ -343,7 +201,7 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
     passes ``eager_fields=True`` to embed every field inline; ``binpack`` then
     lifts them into ``<name>.field.bin`` for the static web demo.
 
-    ``kind="simulation"`` covers :class:`rapidfem.Problem`; we extract its
+    ``kind="simulation"`` covers :class:`rapidfem.ProblemFD`; we extract its
     ``.native`` here once, so the rest of the function works with the
     Rust-side accessors directly (``mesh_nodes``, ``field_at_nodes``, ...).
     """
@@ -360,7 +218,7 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
         if item.kind == "geometry":
             last_geo = item.obj
         elif item.kind == "simulation":
-            # Captured object is a rapidfem.Problem; reach into its native
+            # Captured object is a rapidfem.ProblemFD; reach into its native
             # solver for mesh + field accessors. If the user show()ed the
             # Problem before running any analysis, .native raises, surface
             # that as a display-level error rather than crashing the bake.
@@ -381,25 +239,10 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
     # Pair sim+result into mesh+field displays.
     if last_sim is not None:
         try:
-            mesh_payload = mesh_to_payload(last_geo, maxh=0.0)
-        except Exception:
-            try:
-                nodes_np = np.asarray(last_sim.mesh_nodes)
-                mesh_payload = {
-                    "kind": "mesh",
-                    "nodes": nodes_np.ravel().tolist(),
-                    "tets": np.asarray(last_sim.mesh_tets).ravel().tolist(),
-                    "tris": [], "tri_phys": [], "tet_phys": [1] * int(last_sim.mesh_tets.shape[0]),
-                    "phys_names": {"1": "mesh"}, "phys_dim": {"1": 3}, "name_to_tag": {"mesh": 1},
-                    "bbox": _bbox_for_nodes(nodes_np),
-                    "stats": {"n_nodes": int(nodes_np.shape[0]),
-                              "n_tets": int(last_sim.mesh_tets.shape[0]),
-                              "n_tris": 0, "mesh_time_s": 0.0, "msh_bytes": 0},
-                }
-            except Exception:
-                mesh_payload = None
-        if mesh_payload is not None:
-            out.append({"kind": "mesh", "name": "simulation", "payload": mesh_payload})
+            out.append({"kind": "mesh", "name": "simulation",
+                        "payload": mesh_to_payload(last_geo, maxh=0.0)})
+        except Exception as e:  # noqa: BLE001
+            out.append({"kind": "error", "name": "simulation", "error": _format_exception(e)})
 
     # Eigenmode result: one "frequency" per mode, no port dimension. We
     # reuse the existing `result` payload shape, frontends already know
@@ -420,19 +263,8 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
                 float(m.q_factor) if math.isfinite(m.q_factor) else None
                 for m in modes
             ]
-            fields_payload = []
-            for m in modes:
-                # n_driven = 1 (the "port axis" collapses for eigenmodes)
-                E = last_sim.mode_field_at_nodes(m)
-                if E is None:
-                    fields_payload.append([None])
-                    continue
-                re = np.asarray(E.real); im = np.asarray(E.imag)
-                A = np.sum(re * re, axis=1)
-                B = np.sum(im * im, axis=1)
-                C = np.sum(re * im, axis=1)
-                bin_vals = np.stack([A, B, C], axis=1).astype(np.float32).ravel().tolist()
-                fields_payload.append([bin_vals])
+            # n_driven = 1 (the "port axis" collapses for eigenmodes)
+            fields_payload = [[_list(last_sim.mode_field_abc(m))] for m in modes]
             sparams_payload = [[[]] for _ in range(n_mode)]
             out.append({
                 "kind": "result", "name": "eigenmodes",
@@ -454,16 +286,7 @@ def _serialize_paired(captures: list, *, eager_fields: bool = False) -> list[dic
         try:
             s = last_result.sparams
             n_freq, n_p, _ = s.shape
-            sparams_payload = []
-            for fi in range(n_freq):
-                f_mat = []
-                for r in range(n_p):
-                    row = []
-                    for c in range(n_p):
-                        v = s[fi, r, c]
-                        row.append([float(v.real), float(v.imag)])
-                    f_mat.append(row)
-                sparams_payload.append(f_mat)
+            sparams_payload = np.stack([s.real, s.imag], axis=-1).tolist()
             payload = {
                 "frequencies": last_result.frequencies.tolist(),
                 "sparams": sparams_payload,
@@ -523,15 +346,6 @@ def _serialize_captures_for_protocol(
     return out
 
 
-def _bbox_for_nodes(nodes_np) -> dict[str, list[float]]:
-    """Bounding box from a (n_nodes, 3) array."""
-    if nodes_np is None or len(nodes_np) == 0:
-        return {"min": [-1.0, -1.0, -1.0], "max": [1.0, 1.0, 1.0]}
-    mn = nodes_np.min(axis=0).tolist()
-    mx = nodes_np.max(axis=0).tolist()
-    return {"min": mn, "max": mx}
-
-
 def _available_field_channels(sim, result) -> list[str]:
     """Which of E / J / H the backend can actually produce for this result.
 
@@ -541,58 +355,32 @@ def _available_field_channels(sim, result) -> list[str]:
     channels that will render something instead of blanking on selection.
     """
     chans = ["E"]
-    for name, getter in (("J", sim.current_density_at_nodes),
-                          ("H", sim.h_field_at_nodes)):
+    for name in ("J", "H"):
         try:
-            if getter(result, 0, 0) is not None:
+            if sim.field_abc(result, 0, 0, name) is not None:
                 chans.append(name)
         except Exception:  # noqa: BLE001
             pass
     return chans
 
 
-def _abc_phasor(vec_complex) -> list[float] | None:
-    """(n_nodes, 3) complex → flat [A, B, C, ...] per node.
-
-    Encodes |E(t)|² = A·cos²(ωt) + B·sin²(ωt) − 2·C·sin·cos with
-    A = |Re|², B = |Im|², C = Re·Im, the same animation-friendly form the
-    splat shader composites against a phase uniform. Returns `None` if the
-    backend produced no field for this (freq, port).
-    """
-    if vec_complex is None:
-        return None
-    import numpy as np
-    re = np.asarray(vec_complex.real)
-    im = np.asarray(vec_complex.imag)
-    A = np.sum(re * re, axis=1)
-    B = np.sum(im * im, axis=1)
-    C = np.sum(re * im, axis=1)
-    return np.stack([A, B, C], axis=1).astype(np.float32).ravel().tolist()
+def _list(abc) -> list[float] | None:
+    """A native ABC-phasor buffer as a JSON list (None stays None)."""
+    return None if abc is None else abc.tolist()
 
 
 def _build_channel_payloads(sim, result, n_freq: int, n_p: int) -> dict[str, list]:
-    """Build per-channel ``[freq][port][flat_abc]`` payloads for E, J, H.
+    """Per-channel ``[freq][port][flat_abc]`` payloads for E, J, H.
 
-    Each channel uses the same (A, B, C) phasor encoding; the frontend's
-    non-lazy field path feeds the flat array straight into the splat sampler.
-    Used by the offline bake (``scripts/bake_demo.py``), which has no live
-    worker to answer ``/api/field`` on demand, so the static web demo needs
-    the fields embedded eagerly and packed into ``<name>.field.bin``. The
-    live ``rapidfem serve`` path keeps them lazy instead.
+    Each channel is the (A, B, C) phasor encoding of ``field_abc``; the
+    frontend's non-lazy field path feeds the flat array straight into the
+    splat sampler. Used by the offline bake (``scripts/bake_demo.py``), which
+    has no live worker to answer ``/api/field``, so the static web demo needs
+    the fields embedded and packed into ``<name>.field.bin``.
     """
-    out: dict[str, list] = {"E": [], "J": [], "H": []}
-    for fi in range(n_freq):
-        e_freq: list = []
-        j_freq: list = []
-        h_freq: list = []
-        for pi in range(n_p):
-            e_freq.append(_abc_phasor(sim.field_at_nodes(result, fi, pi)))
-            j_freq.append(_abc_phasor(sim.current_density_at_nodes(result, fi, pi)))
-            h_freq.append(_abc_phasor(sim.h_field_at_nodes(result, fi, pi)))
-        out["E"].append(e_freq)
-        out["J"].append(j_freq)
-        out["H"].append(h_freq)
-    return out
+    return {ch: [[_list(sim.field_abc(result, fi, pi, ch)) for pi in range(n_p)]
+                 for fi in range(n_freq)]
+            for ch in ("E", "J", "H")}
 
 
 def register(app: Flask) -> None:
@@ -698,13 +486,8 @@ def register(app: Flask) -> None:
         except OSError as e:
             return jsonify({"ok": False, "error": str(e)}), 500
         # Drop the kernel so a future file at the same path starts fresh.
-        # Tolerate either the new runner module or absence (legacy single
-        # in-process kernel was removed).
-        try:
-            from rapidfem.ui import runner
-            runner._remove(str(target))
-        except Exception:
-            pass
+        from rapidfem.ui import runner
+        runner._remove(str(target))
         return jsonify({"ok": True, "path": rel})
 
     @app.post("/api/files/rename")

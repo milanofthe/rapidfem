@@ -131,7 +131,7 @@ prob = None
 result = None
 
 for it in range(N_AMR_ITERATIONS + 1):
-    prob = rf.Problem(g)
+    prob = rf.ProblemFD(g)
     result = prob.sweep(FREQUENCIES)
 
     mags = np.array([abs(result.sparams[i, 0, 0])
@@ -162,7 +162,7 @@ for it in range(N_AMR_ITERATIONS + 1):
     target_h = float(errs.h_k[errs.marked].mean() * AMR_REFINE_RATIO)
     print(f"  refining {len(errs.marked)} tets, target h = "
           f"{target_h * 1e3:.3f} mm")
-    g.refine_near_points(hot, h=target_h, distance=5.0 * target_h)
+    g.refine_near_points(hot, h=target_h)
     g.mesh()
 
     prev_s11min = s11_min

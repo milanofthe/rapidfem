@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Scale invariance — the same electrical problem gives the same S-parameters.
+
+"""Scale invariance, the same electrical problem gives the same S-parameters.
 
 rapidfem non-dimensionalizes geometry by a characteristic length L0 before
 assembly ("lever ④"), so a structure must produce IDENTICAL S-parameters
@@ -14,13 +15,13 @@ L·s driven at f/s (same number of wavelengths across every feature). So solving
 Two phenomena are locked here:
 
   (1) a mismatched 2-port (an air→dielectric step in a WR-90 guide). The whole
-      complex S-matrix — reflection AND transmission — is scale invariant.
+      complex S-matrix, reflection AND transmission, is scale invariant.
   (2) a PML-terminated guide. The reflection off the coordinate-stretched PML
       slab is scale invariant. This is the regression gate for the lever-④ PML
       fix: a PML stretch that is NOT L0-normalized makes the stretched-layer
       impedance depend on absolute length, so |S11| would diverge between the
       two scales. The slab is deliberately UNDER-tuned (small delta_max) so the
-      reflection is a robust ~0.5 — not a well-matched absorber's near-zero
+      reflection is a robust ~0.5, not a well-matched absorber's near-zero
       floor, which is a near-cancellation quantity dominated by mesh
       discretization noise and so unfit for a tight relative comparison.
 
@@ -40,7 +41,7 @@ F_MAX = 12.0e9
 # Two scales spanning three orders of magnitude. Both produce the same mesh
 # topology and the same DOF count, because maxh tracks the (scaled) wavelength.
 SCALE_REF = 1.0      # ~cm features, GHz drive
-SCALE_SMALL = 1e-3   # ~µm features, THz drive — same electrical problem
+SCALE_SMALL = 1e-3   # ~µm features, THz drive, same electrical problem
 
 
 def _maxh(scale, er_max=1.0):
@@ -117,15 +118,15 @@ PML_T = 15.0e-3            # PML slab thickness at scale = 1
 # at a robust ~0.5 instead of a near-zero, mesh-noise-limited absorber floor.
 # The reflection still comes entirely from the coordinate stretch (with no PML
 # the back wall is PEC and |S11| = 1), so its value directly probes the stretch
-# profile — the exact thing lever-④ must L0-normalize.
+# profile, the exact thing lever-④ must L0-normalize.
 PML_DELTA_MAX = 0.3
 
 
 def _build_pml_guide(g, scale):
     """WR-90 air section driven at z=min, terminated by a coordinate-stretched
     PML slab. A correctly L0-normalized stretch reflects identically at any
-    scale; an un-normalized stretch makes the stretched-layer impedance — hence
-    |S11| — depend on absolute length."""
+    scale; an un-normalized stretch makes the stretched-layer impedance, hence
+    |S11|, depend on absolute length."""
     a, b = A * scale, B * scale
     l_inner, t = PML_INNER * scale, PML_T * scale
     inner = g.box(a, b, l_inner, position=(-a / 2, -b / 2, 0.0), material=rf.Air())

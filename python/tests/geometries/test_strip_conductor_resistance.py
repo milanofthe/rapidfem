@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Strip resistance R'(f) of a finite-thickness RFIC trace vs a 2D reference.
 
 A 10 um x 3 um strip (sigma = 3.03e7, TopMetal-like) runs 10 um above ground
@@ -79,7 +80,7 @@ def _attenuation(model, f, *, lossy_len, h_strip, t=TS):
     g.fragment(air, s1, s2, mid)
     g.cut(air, s1, s2)                              # PEC stubs are holes
 
-    eps = 0.2 * um                                  # gmsh bbox padding
+    eps = 0.2 * um                                  # bbox tolerance
     def in_strip(b):
         return (b[0] > X0 - eps and b[3] < X0 + WS + eps
                 and b[2] > Z0 - eps and b[5] < Z0 + TS + eps)
@@ -142,12 +143,20 @@ def test_volume_conductor_matches_reference(f):
 
 @pytest.mark.slow
 @case.phenomenon
-@pytest.mark.parametrize("f, tol", [(1e8, 0.03), (1e9, 0.03), (1e11, 0.06)])
-def test_hollow_sibc_matches_reference_outside_transition(f, tol):
-    """t/delta = 0.33, 1.0 and 10.3: where rfic keeps the surface model."""
+@pytest.mark.parametrize("f, lo, hi", [(1e8, 0.97, 1.04), (1e9, 0.97, 1.04),
+                                        (2e10, 0.96, 1.03), (1e11, 0.97, 1.03)])
+def test_hollow_sibc_against_reference(f, lo, hi):
+    """t/delta = 0.33, 1.0, 4.6 and 10.3.
+
+    Below the skin depth the surface model is DC exact. From 4 skin depths up
+    the edge correction carries the current crowding into the strip edges
+    that a per-face impedance misses: without it the 3D value is 0.75 at
+    t/delta = 4.6 and 0.87 at 10.3, with it 0.98 and 1.01 (1.00 to 1.04 on
+    1.0 and 0.7 um walls).
+    """
     got = _resistance("hollow_sibc", f, lengths=(50 * um, 100 * um), h_strip=1.5 * um)
     want = _reference().series_impedance(f).real
-    assert abs(got / want - 1.0) < tol, f"R' {got:.1f} vs reference {want:.1f}"
+    assert lo < got / want < hi, f"R' {got:.1f} vs reference {want:.1f}"
 
 
 @pytest.mark.slow

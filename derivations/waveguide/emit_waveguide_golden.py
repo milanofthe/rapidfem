@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Emit the Rust golden test for the RectWaveguide analytic modal quantities.
 
 Pins the clean-room Rust `RectWaveguide` (crates/rapidfem-fd/src/waveguide.rs)
@@ -14,13 +15,13 @@ Engineering*, §3.3) for several (a, b, mode, frequency) cases:
 The field uses the *exact* Rust convention: a port-LOCAL coordinate frame whose
 origin sits at the face centre, and components
 
-  E_v = pol·amp·cos(mπ x_l/a)·cos(nπ y_l/b)   -> local E_y
-  E_h = pol·amp·sin(mπ x_l/a)·sin(nπ y_l/b)   -> local E_x
+  E_v = amp·cos(mπ x_l/a)·cos(nπ y_l/b)   -> local E_y
+  E_h = amp·sin(mπ x_l/a)·sin(nπ y_l/b)   -> local E_x
   E_z = 0
 
 all scaled by qmode = sqrt(Z_TE/Z0), then rotated back to global components.
 With the centred local frame (x_l = x − a/2) the TE10 vertical component reduces
-to the textbook  E_y = q·pol·amp·sin(π x/a)  — verified symbolically below.
+to the textbook  E_y = q·amp·sin(π x/a), verified symbolically below.
 
 Constants are taken byte-for-byte from rapidfem-core/src/constants.rs so the
 golden matches the Rust f64 arithmetic to rounding.
@@ -45,13 +46,13 @@ PI = math.pi  # IEEE-754 double nearest to pi == std::f64::consts::PI
 # field chain reduces to the textbook half-sine for TE10.
 # ---------------------------------------------------------------------------
 def _symbolic_selfcheck() -> None:
-    x, a, amp, q, pol = sp.symbols("x a amp q pol", positive=True)
+    x, a, amp, q = sp.symbols("x a amp q", positive=True)
     # Rust local field for TE10 (m=1, n=0) with centred local coord x_l = x - a/2.
     x_l = x - a / 2
-    ey_local = q * pol * amp * sp.cos(sp.pi * x_l / a) * sp.cos(0)
-    ex_local = q * pol * amp * sp.sin(sp.pi * x_l / a) * sp.sin(0)
-    textbook = q * pol * amp * sp.sin(sp.pi * x / a)
-    assert sp.simplify(ey_local - textbook) == 0, "TE10 E_y must equal q·pol·amp·sin(pi x/a)"
+    ey_local = q * amp * sp.cos(sp.pi * x_l / a) * sp.cos(0)
+    ex_local = q * amp * sp.sin(sp.pi * x_l / a) * sp.sin(0)
+    textbook = q * amp * sp.sin(sp.pi * x / a)
+    assert sp.simplify(ey_local - textbook) == 0, "TE10 E_y must equal q·amp·sin(pi x/a)"
     assert sp.simplify(ex_local) == 0, "TE10 E_x must vanish"
 
 
@@ -82,7 +83,7 @@ def qmode_of(a, b, m, n, er, freq) -> float:
 
 
 def amplitude_of(power, a, b) -> float:
-    # get_amplitude: sqrt(power * 4 * Z0 / (a*b)); Z0 (not Z_TE), polarization excluded.
+    # get_amplitude: sqrt(power * 4 * Z0 / (a*b)); Z0 (not Z_TE).
     return math.sqrt(power * 4.0 * Z0 / (a * b))
 
 
@@ -93,22 +94,21 @@ def field_global(case, x, y, z) -> tuple[float, float, float]:
     ox, oy = case["ox"], case["oy"]
     amp = amplitude_of(case["power"], a, b)
     q = qmode_of(a, b, m, n, case["er"], case["freq"])
-    pol = case["pol"]
     # in_local_cs with identity axes: subtract origin.
     xl, yl = x - ox, y - oy
-    ev = pol * amp * math.cos(PI * m * xl / a) * math.cos(PI * n * yl / b)
-    eh = pol * amp * math.sin(PI * m * xl / a) * math.sin(PI * n * yl / b)
+    ev = amp * math.cos(PI * m * xl / a) * math.cos(PI * n * yl / b)
+    eh = amp * math.sin(PI * m * xl / a) * math.sin(PI * n * yl / b)
     ex, ey, ez = eh, ev, 0.0
     # in_global_basis with identity axes: unchanged.
     return (q * ex, q * ey, q * ez)
 
 
-# (name, a, b, m, n, er, freq, pol, power). Origin sits at the face centre.
+# (name, a, b, m, n, er, freq, power). Origin sits at the face centre.
 CASES = [
-    ("wr90_te10_10ghz", 22.86e-3, 10.16e-3, 1, 0, 1.0, 10e9, 1.0, 1.0),
-    ("wr90_te10_12ghz", 22.86e-3, 10.16e-3, 1, 0, 1.0, 12e9, 1.0, 1.0),
-    ("wr90_te20_20ghz", 22.86e-3, 10.16e-3, 2, 0, 1.0, 20e9, 1.0, 1.0),
-    ("diel_te10_8ghz", 22.86e-3, 10.16e-3, 1, 0, 2.2, 8e9, -1.0, 0.5),
+    ("wr90_te10_10ghz", 22.86e-3, 10.16e-3, 1, 0, 1.0, 10e9, 1.0),
+    ("wr90_te10_12ghz", 22.86e-3, 10.16e-3, 1, 0, 1.0, 12e9, 1.0),
+    ("wr90_te20_20ghz", 22.86e-3, 10.16e-3, 2, 0, 1.0, 20e9, 1.0),
+    ("diel_te10_8ghz", 22.86e-3, 10.16e-3, 1, 0, 2.2, 8e9, 0.5),
 ]
 
 
@@ -117,8 +117,8 @@ def f64(v) -> str:
 
 
 def make_case(rec):
-    name, a, b, m, n, er, freq, pol, power = rec
-    case = dict(a=a, b=b, m=m, n=n, er=er, freq=freq, pol=pol, power=power,
+    name, a, b, m, n, er, freq, power = rec
+    case = dict(a=a, b=b, m=m, n=n, er=er, freq=freq, power=power,
                 ox=a / 2.0, oy=b / 2.0, name=name)
     # Sample cross-section points (global coords); y at mid-height.
     xs = [a / 8.0, a / 4.0, 3.0 * a / 8.0, a / 2.0, 5.0 * a / 8.0, 3.0 * a / 4.0]
@@ -145,8 +145,7 @@ def emit_arr(name, vals):
 def emit_case(case):
     n = case["name"]
     o = f"\n// ===== case {n}: a={case['a']*1e3:g}mm b={case['b']*1e3:g}mm " \
-        f"TE{case['m']}{case['n']} f={case['freq']/1e9:g}GHz er={case['er']:g} " \
-        f"pol={case['pol']:g} =====\n"
+        f"TE{case['m']}{case['n']} f={case['freq']/1e9:g}GHz er={case['er']:g} =====\n"
     o += emit_arr(f"SX_{n}", case["sx"])
     o += emit_arr(f"SY_{n}", case["sy"])
     o += emit_arr(f"SZ_{n}", case["sz"])
@@ -161,7 +160,6 @@ fn rect_waveguide_matches_pozar_{n}() {{
         power: {f64(case['power'])},
         mode: ({case['m']}, {case['n']}),
         er: {f64(case['er'])},
-        polarization: {f64(case['pol'])},
         dims: ({f64(case['a'])}, {f64(case['b'])}),
         cs: CoordinateSystem::new(
             [{f64(case['ox'])}, {f64(case['oy'])}, 0.0],
@@ -202,11 +200,21 @@ fn rect_waveguide_matches_pozar_{n}() {{
 
 
 HEADER = """\
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// GENERATED by derivations/waveguide/emit_waveguide_golden.py — do not edit.
+
+// Generated literal tables and loops: precision, naming and indexing follow
+// the derivation, not the lints.
+#![allow(
+    non_upper_case_globals,
+    clippy::approx_constant,
+    clippy::excessive_precision,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
+
+// GENERATED by derivations/waveguide/emit_waveguide_golden.py, do not edit.
 // Golden modal quantities for the analytic RectWaveguide port, pinned against
 // closed-form rectangular-waveguide theory (Pozar, Microwave Engineering §3.3):
 //   beta = sqrt(er*k0^2 - (m*pi/a)^2 - (n*pi/b)^2)   (3.119)
@@ -214,7 +222,6 @@ HEADER = """\
 //   transverse TE_mn E-field profile at sample points.
 // Excitation is built as the solver does, Excitation::new(freq, 1.0) (physical
 // units, l0 = 1 so k0 is the physical free-space wavenumber).
-#![allow(non_upper_case_globals)]
 
 use rapidfem_fd::waveguide::{CoordinateSystem, RectWaveguide};
 use rapidfem_fd::excitation::Excitation;

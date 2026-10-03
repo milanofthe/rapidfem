@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Lever ①: a better-conditioned R2 basis via a constant congruence transform.
 
 Grounds the analysis in the *exact* canonical R2 element rapidfem assembles

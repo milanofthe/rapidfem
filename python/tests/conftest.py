@@ -1,12 +1,12 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """pytest configuration for the rapidfem test suite.
 
 Layout:
   tests/harness/      build→solve helpers + analytical references
   tests/geometries/   one module per physics phenomenon (the breadth suite)
-  tests/kernel/       sympy/analytical kernel checks driven from Python (if any)
 
 Markers (also declared in pyproject [tool.pytest.ini_options]):
   slow         full FD sweep or TD transient; opt out with -m "not slow"

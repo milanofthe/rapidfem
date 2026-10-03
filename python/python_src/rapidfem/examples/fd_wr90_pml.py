@@ -1,7 +1,7 @@
 """WR-90 waveguide terminated in a PML, single-port matched load.
 
 A PML volume absorbs outgoing waves with vastly less reflection than
-a 1st/2nd-order ABC, especially at oblique incidence, the trade is that
+a first-order ABC, especially at oblique incidence, the trade is that
 PML is a *volumetric* region (a mesh-resolved shell) rather than a
 single boundary surface.
 
@@ -55,7 +55,7 @@ rf.show(g)
 
 
 # %% Problem + Sweep
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 result = prob.sweep(FREQUENCIES)
 rf.show(prob)
 rf.show(result)

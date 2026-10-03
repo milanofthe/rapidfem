@@ -1,6 +1,7 @@
 //! The numeric LDL^T factorization: the permuted input, the left-looking
 //! driver over the assembly forest, and the emit of each finished panel.
 
+use super::bunch_kaufman::BkPools;
 use super::node::ll_factor_node;
 use super::pivots::LdltPivots;
 use crate::numeric::supernodal::analysis::{recommend_threads_for_sym, SupernodalAnalysis};
@@ -10,7 +11,7 @@ use crate::inertia::Inertia;
 use crate::numeric::settings::{
     stack_for_depth, supernode_tree_depth, SolverSettings, ZeroPivotAction,
 };
-use crate::numeric::supernodal::panel::{finish_panel, PanelArena, PanelFactor, PanelOut};
+use crate::numeric::supernodal::panel::{PanelArena, PanelFactor, PanelOut, PanelStorage};
 use crate::numeric::supernodal::{emit_refcount_offsets, Cells, Input, InputProgram, LlSchedule};
 use crate::scalar::Scalar;
 use crate::sparse::csc::CscMatrix;
@@ -36,6 +37,8 @@ pub(crate) fn factor_numeric<T: Scalar>(
     a: &CscMatrix<T>,
     scale: Option<&[f64]>,
     opts: &SolverSettings,
+    storage: Option<PanelStorage<T>>,
+    pools: &BkPools<T>,
 ) -> Result<LdltNumeric<T>, RslabError> {
     a.validate()?;
     let n = symb.n;
@@ -92,30 +95,9 @@ pub(crate) fn factor_numeric<T: Scalar>(
     opts.threads.run(
         stack,
         |cap| recommend_threads_for_sym(symb, cap),
-        || factor_left_looking(sym, sched, inp, opts),
+        || factor_left_looking(sym, sched, inp, opts, storage, pools),
     )
 }
-
-/// One factored supernode's left-looking payload: the dense panel, the
-/// Bunch-Kaufman D (diagonal + sub-diagonal + 2x2 flags, pivoted order), and
-/// the within-panel pivot permutation (identity on the off-diagonal rows).
-pub(super) struct LdltSlot<T> {
-    pub(super) d: Vec<T>,
-    pub(super) dsub: Vec<T>,
-    pub(super) two: Vec<bool>,
-    pub(super) lperm: Vec<usize>,
-}
-impl<T> Default for LdltSlot<T> {
-    fn default() -> Self {
-        LdltSlot {
-            d: Vec::new(),
-            dsub: Vec::new(),
-            two: Vec::new(),
-            lperm: Vec::new(),
-        }
-    }
-}
-pub(super) type LlStore<T> = crate::numeric::supernodal::SlotStore<LdltSlot<T>>;
 
 /// Compact (CSC-fragment) form of one supernode's L factor, produced the moment
 /// its last consumer pulls from it so the dense panel can be freed during
@@ -138,12 +120,24 @@ pub(super) struct LlEmitLdlt<T> {
 }
 
 impl<T: Scalar> LlEmitLdlt<T> {
-    fn new(sym: &SymbolicFactorization, sched: &LlSchedule) -> Self {
+    /// The emit state, the arena in `storage` (the buffer of an earlier
+    /// factor of this analysis) when given.
+    fn new(
+        sym: &SymbolicFactorization,
+        sched: &LlSchedule,
+        storage: Option<PanelStorage<T>>,
+    ) -> Self {
         let nsuper = sym.supernodes.len();
         let n = sym.n;
         let (refcount, e_offset) = emit_refcount_offsets(sym, sched);
-        let arena =
-            PanelArena::new((0..nsuper).map(|s| sched.rows(s).len() * sym.supernodes[s].ncol));
+        let shapes = (0..nsuper).map(|s| {
+            let w = sym.supernodes[s].ncol;
+            (w, sched.rows(s).len() - w)
+        });
+        let arena = match storage {
+            Some(v) => PanelArena::reuse(v, shapes),
+            None => PanelArena::new(shapes),
+        };
         LlEmitLdlt {
             refcount,
             e_offset,
@@ -163,6 +157,22 @@ impl<T: Scalar> LlEmitLdlt<T> {
     unsafe fn eg(&self, g: usize) -> usize {
         *self.e_of_g.get(g)
     }
+
+    /// Supernode `k`'s `D` in its pivoted column order: the diagonal, the
+    /// sub-diagonal of the 2x2 blocks and the flags marking each block's
+    /// first column.
+    ///
+    /// # Safety
+    /// `k` (of `ncol` columns) is factored: its writes happened-before.
+    #[inline]
+    pub(super) unsafe fn d_of(&self, k: usize, ncol: usize) -> (&[T], &[T], &[bool]) {
+        let r = self.e_offset[k]..self.e_offset[k] + ncol;
+        (
+            self.d_diag.slice(r.clone()),
+            self.d_subdiag.slice(r.clone()),
+            self.two_by_two.slice(r),
+        )
+    }
 }
 
 /// Compact supernode `k`'s L factor and free its dense panel + D/lperm. Called the
@@ -170,7 +180,6 @@ impl<T: Scalar> LlEmitLdlt<T> {
 /// the legacy L emit (unit diagonal, skip the 2x2 `d21` coupling row).
 fn ldlt_emit_and_free<T: Scalar>(
     k: usize,
-    store: &LlStore<T>,
     emit: &LlEmitLdlt<T>,
     sym: &SymbolicFactorization,
     sched: &LlSchedule,
@@ -178,36 +187,19 @@ fn ldlt_emit_and_free<T: Scalar>(
 ) {
     let ncol = sym.supernodes[k].ncol;
     let nrow = sched.rows(k).len();
-    // SAFETY: the owner of supernode `k` emits it exactly once, after its last
-    // updater has read the slot (refcount zero); nobody reads it afterwards.
-    let slot = unsafe { store.take(k) };
-    let panel = unsafe { emit.arena.slot_mut(k) };
-    let (lperm, t2) = (&slot.lperm, &slot.two);
-    debug_assert_eq!(panel.len(), nrow * ncol);
-    debug_assert!(
-        (0..ncol)
-            .all(|p| unsafe { emit.eg(sched.rows(k)[lperm[p]] as usize) } == emit.e_offset[k] + p),
-        "the diagonal block is in elimination order"
-    );
-    let e_rows: Vec<u32> = (ncol..nrow)
-        .map(|i| unsafe { emit.eg(sched.rows(k)[lperm[i]] as usize) } as u32)
-        .collect();
-    let out = finish_panel(panel, ncol, e_rows, Some(&t2[..ncol]), drop_tol);
-    unsafe { emit.panels.set(k, out) };
-    if ldlt_no_free() {
-        // The debugging hold: keep an (emptied) shell in place.
-        unsafe { store.set(k, LdltSlot::default()) };
+    // SAFETY (the slot accesses below): the owner of supernode `k` emits it
+    // exactly once, after its last updater has read the panel (refcount
+    // zero); nobody reads it afterwards.
+    debug_assert_eq!(emit.arena.slot_len(k), nrow * ncol);
+    // The pivoting stays inside the diagonal block, so the off-diagonal rows
+    // are in the schedule's order; the 2x2 flags are in the emit cells.
+    let rows = unsafe { emit.arena.rows_mut(k) };
+    for (r, &g) in rows.iter_mut().zip(&sched.rows(k)[ncol..nrow]) {
+        *r = unsafe { emit.eg(g as usize) } as u32;
     }
-}
-
-static LDLT_NO_FREE_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-#[inline]
-fn ldlt_no_free() -> bool {
-    *LDLT_NO_FREE_FLAG.get_or_init(|| {
-        std::env::var("RLA_NO_FREE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    let (_, _, two) = unsafe { emit.d_of(k, ncol) };
+    let out = unsafe { emit.arena.finish_slot(k, ncol, Some(two), drop_tol) };
+    unsafe { emit.panels.set(k, out) };
 }
 
 /// Static-pivot floor (absolute), translated from rslab's ZeroPivotAction.
@@ -241,17 +233,17 @@ fn factor_left_looking<T: Scalar>(
     sched: &LlSchedule,
     inp: Input<T>,
     opts: &SolverSettings,
+    storage: Option<PanelStorage<T>>,
+    pools: &BkPools<T>,
 ) -> Result<LdltNumeric<T>, RslabError> {
     let n = sym.n;
     let perturb_floor = static_pivot_floor(inp.values(), opts);
 
-    let nsuper = sym.supernodes.len();
     // Factor in parallel over the assembly forest: sibling subtrees concurrently,
     // each node after its subtree (whose panels are its only updaters). Panels are
     // written once and read only by ancestors -> no synchronization needed beyond
-    // the recursion structure (see `LlStore`).
-    let store = LlStore::<T>::new(nsuper);
-    let emit = LlEmitLdlt::<T>::new(sym, sched);
+    // the forest's dependency order.
+    let emit = LlEmitLdlt::<T>::new(sym, sched, storage);
     let n_perturbed_atomic = AtomicUsize::new(0);
     let kt = opts.kernel();
     let factor_node = |s: usize| {
@@ -260,16 +252,15 @@ fn factor_left_looking<T: Scalar>(
             sym,
             inp,
             sched,
-            &store,
+            pools,
             &emit,
             perturb_floor,
             &n_perturbed_atomic,
             kt,
         )
     };
-    let emit_free = |k: usize| ldlt_emit_and_free(k, &store, &emit, sym, sched, opts.drop_tol);
+    let emit_free = |k: usize| ldlt_emit_and_free(k, &emit, sym, sched, opts.drop_tol);
     crate::numeric::supernodal::ll_forest(sym, sched, &emit.refcount, &factor_node, &emit_free)?;
-    drop(store); // panels moved into the emit cells; release the shells
     let n_perturbed = n_perturbed_atomic.load(Ordering::Relaxed);
     let kept: Vec<bool> = sym.supernodes.iter().map(|sn| sn.ncol > 0).collect();
     let supernode_parent = crate::symbolic::supernode_parents(&sym.supernodes, &kept);

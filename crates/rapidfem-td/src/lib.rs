@@ -1,17 +1,13 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! rapidfem-td, time-domain DGTD backend.
 //!
-//! The DG spatial operator, the Krylov/ETD exponential propagator, the
-//! state-space export and model-order reduction land here. See
-//! issue #27 for the work-package breakdown.
+//! The DG spatial operator, the exponential, explicit and adaptive
+//! steppers, the state-space export, the GPU backend and the runs on top
+//! ([`session`]).
 
-pub mod absorber;
 pub mod build;
 pub mod constants;
 pub mod dg_basis;
@@ -24,4 +20,5 @@ pub mod gpu;
 pub mod mesh_gen;
 pub mod propagator;
 pub mod rhs;
+pub mod session;
 pub mod waveguide;

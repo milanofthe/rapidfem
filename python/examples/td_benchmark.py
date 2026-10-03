@@ -2,10 +2,10 @@
 
 Where the Rust `bench` example measures the DGTD hot path on a structured
 box, this measures it on the geometry a production run actually sees: the
-dielectric ring resonator of ``td_ring_resonator.py``, a torus embedded
-in an air cavity, meshed unstructured by gmsh. That matters for the flux
+dielectric ring resonator, a torus embedded
+in an air cavity, meshed unstructured. That matters for the flux
 term's neighbour gather: on a structured box neighbouring elements sit
-close in memory, on a real gmsh mesh the element numbering scatters them,
+close in memory, on an unstructured mesh the element numbering scatters them,
 which is the access pattern the operator hits in practice.
 
 Two questions are measured, per mesh resolution:
@@ -32,7 +32,7 @@ import rapidfem as rf
 
 mm = 1e-3
 
-# Ring-resonator geometry, identical to examples/td_ring_resonator.py.
+# Ring-resonator geometry: a high-permittivity torus in an air cavity.
 R_MAJ = 11.0 * mm        # ring radius, tube-centre to torus axis
 R_MIN = 2.6 * mm         # ring tube (cross-section) radius
 ER = 10.0                # high-permittivity ceramic ring
@@ -76,7 +76,7 @@ def representative_state(ptd):
     """A mid-transient field state: a probe-point pulse propagated a few
     steps, so the Krylov benchmark sees a smooth field rather than the
     delta pulse the adaptive subspace would find artificially hard."""
-    y = np.zeros(ptd.n_dof)
+    y = np.zeros(ptd.n_dofs)
     y[ptd.probe_dof((R_MAJ, 0.0, 0.0), field="E", component="z")] = 1.0
     for _ in range(PROPAGATE_STEPS):
         y = ptd.step(y, DT, KRYLOV_DIM)
@@ -88,7 +88,7 @@ def spectral_radius(ptd):
     magnitude ratio ||A.v|| / ||v|| approaches rho as v aligns with the
     largest-magnitude eigenvector."""
     rng = np.random.default_rng(1)
-    v = rng.standard_normal(ptd.n_dof)
+    v = rng.standard_normal(ptd.n_dofs)
     v /= np.linalg.norm(v)
     rho = 0.0
     for _ in range(POWER_ITERS):
@@ -102,7 +102,7 @@ def cfl_limit(ptd, rho):
     """Largest physical step that keeps LSERK4 bounded. Probes the
     dimensionless product z = h_solver * rho across a bracket and returns
     (z, h_physical) for the largest stable z, with a safety margin."""
-    y0 = np.zeros(ptd.n_dof)
+    y0 = np.zeros(ptd.n_dofs)
     y0[ptd.probe_dof((R_MAJ, 0.0, 0.0), field="E", component="z")] = 1.0
     stable = None
     for z in (2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0):
@@ -136,7 +136,7 @@ def main():
     rows = []
     for maxh_air, maxh_ring in resolutions:
         ptd = build(maxh_air, maxh_ring)
-        n = ptd.n_dof
+        n = ptd.n_dofs
         y = representative_state(ptd)
 
         ptd.rhs(y)  # warm

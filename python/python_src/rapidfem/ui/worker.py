@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """rapidfem worker subprocess.
 
 Per-file kernel that runs notebook cells in a clean, isolated Python process.
@@ -106,7 +110,7 @@ _field_store: dict[str, Any] = {"sim": None, "result": None}
 
 
 def _reset_namespace() -> None:
-    """Wipe the worker's Python namespace and any gmsh model state."""
+    """Wipe the worker's Python namespace."""
     global _namespace
     import rapidfem
     _namespace = {
@@ -116,12 +120,6 @@ def _reset_namespace() -> None:
     }
     _field_store["sim"] = None
     _field_store["result"] = None
-    try:
-        import gmsh
-        if gmsh.isInitialized():
-            gmsh.clear()
-    except Exception:
-        pass
 
 
 def initialize() -> None:
@@ -148,20 +146,8 @@ def initialize() -> None:
 
     _reset_namespace()
 
-    # gmsh installs a SIGINT handler that only works on the main thread;
-    # eager init here keeps later Geometry() calls quick.
-    try:
-        import gmsh
-        if not gmsh.isInitialized():
-            gmsh.initialize()
-            gmsh.option.setNumber("General.Terminal", 0)
-    except Exception:
-        pass
-
-    # Restore Python's default SIGINT handler, gmsh.initialize() installs
-    # one that suppresses the signal, but we want SIGINT to raise
-    # KeyboardInterrupt inside the current cell so the parent can interrupt
-    # a long-running solve.
+    # Python's default SIGINT handler: SIGINT raises KeyboardInterrupt inside
+    # the current cell, so the parent can interrupt a long-running solve.
     try:
         signal.signal(signal.SIGINT, signal.default_int_handler)
     except (ValueError, OSError):
@@ -293,30 +279,13 @@ def handle_field_query(msg: dict) -> None:
         return
     try:
         import base64
-        import numpy as np
-        fi = int(msg.get("freq", 0))
-        pi = int(msg.get("port", 0))
         channel = str(msg.get("channel", "E"))
-        if channel in ("J", "j"):
-            arr = sim.current_density_at_nodes(result, fi, pi)
-        elif channel in ("H", "h"):
-            arr = sim.h_field_at_nodes(result, fi, pi)
-        else:
-            arr = sim.field_at_nodes(result, fi, pi)
-        if arr is None:
-            send({"type": "field-result", "qid": qid, "ok": True, "data": ""})
-            return
-        # ABC phasor (A=Σre², B=Σim², C=Σre·im per node), packed f32 → base64.
-        # The backend serves the decoded buffer raw; the viewer reads its
-        # byteLength, so no element count needs to ride along.
-        re = np.asarray(arr.real)
-        im = np.asarray(arr.imag)
-        a = np.sum(re * re, axis=1)
-        b = np.sum(im * im, axis=1)
-        c = np.sum(re * im, axis=1)
-        buf = np.stack([a, b, c], axis=1).astype(np.float32).tobytes()
-        send({"type": "field-result", "qid": qid, "ok": True,
-              "data": base64.b64encode(buf).decode("ascii")})
+        abc = sim.field_abc(result, int(msg.get("freq", 0)), int(msg.get("port", 0)),
+                            "E" if channel not in ("J", "j", "H", "h") else channel)
+        # The ABC phasor as packed f32; the backend serves the decoded buffer
+        # raw and the viewer reads its byteLength.
+        data = "" if abc is None else base64.b64encode(abc.tobytes()).decode("ascii")
+        send({"type": "field-result", "qid": qid, "ok": True, "data": data})
     except Exception as e:  # noqa: BLE001
         send({"type": "field-result", "qid": qid, "ok": False, "error": str(e)})
 
@@ -334,7 +303,7 @@ def run_cell(msg_id: str, code: str) -> None:
         send({"type": "error", "id": msg_id, "error": "Worker not initialized"})
         return
 
-    from rapidfem import _show_capture
+    from rapidfem.ui import capture as _show_capture
     _show_capture.start_capture(on_item=_stream_display,
                                 sweep_cb=_make_sweep_progress())
     try:

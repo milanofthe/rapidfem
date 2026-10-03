@@ -8,6 +8,7 @@ use super::structure::LuStructure;
 use crate::error::RslabError;
 use crate::numeric::settings::SolverSettings;
 use crate::numeric::supernodal::analysis::analyze_with;
+use crate::numeric::supernodal::panel::{PanelFactor, PanelStorage};
 use crate::scalar::Scalar;
 use crate::sparse::general::GeneralCsc;
 use std::sync::Mutex;
@@ -132,9 +133,9 @@ pub struct LuSymbolic {
     pub(super) analyze_ms: f64,
     pub(super) requested_ordering: crate::symbolic::OrderingMethod,
     /// [`estimate_memory`](Self::estimate_memory) results, keyed by scalar
-    /// size (the estimate depends on `T` only through `size_of::<T>()`, and
-    /// rebuilding the supernode row structures per call is expensive).
-    pub(super) est_cache: Mutex<Vec<(usize, crate::diagnostics::MemoryEstimate)>>,
+    /// size and complexity (the estimate depends on `T` only through them,
+    /// and walking every node's updaters per call is expensive).
+    pub(super) est_cache: Mutex<Vec<((usize, bool), crate::diagnostics::MemoryEstimate)>>,
     /// The split permuted input's program ([`InputProgram::general`](crate::numeric::supernodal::InputProgram)), built at the first
     /// factorization: every (re)factorization reduces to one linear values
     /// scatter (row matching and equilibration applied on the way).
@@ -145,6 +146,21 @@ pub struct LuSymbolic {
 }
 
 impl LuSymbolic {
+    /// Heap bytes this analysis holds: the ordering, the supernodes, the
+    /// permuted pattern and, once a factorization has built them, the
+    /// schedule and the input program every later factorization reuses.
+    /// The analysis stays alive while it is factored, so these bytes are part
+    /// of every factorization's footprint.
+    pub fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        self.symb.heap_bytes()
+            + self.structure.heap_bytes()
+            + self.input.get().map_or(0, |p| p.heap_bytes())
+            + self.matching.as_ref().map_or(0, |m| {
+                vec_bytes(&m.row_of) + vec_bytes(&m.r) + vec_bytes(&m.c)
+            })
+    }
+
     /// The fill-reducing column ordering of the analysis (`perm[k]` the column of the
     /// (row-matched) matrix that became column `k`): pass it to
     /// [`SolverSettings::with_permutation`] to analyse a nearby pattern without a new
@@ -276,17 +292,112 @@ impl LuSymbolic {
         a: &GeneralCsc<T>,
         opts: &SolverSettings,
     ) -> Result<LuSolver<T>, RslabError> {
+        let pools = super::node::LuPools::new();
+        let (l, ut, factors, nnz, mut diagnostics, opts) = self.numeric(a, opts, None, &pools)?;
+        // Solve layout: supernodal panels of `L` and `U^T` plus the tree
+        // schedule; the CSC arrays are released so the factor is held once.
+        let t = crate::clock::Instant::now();
+        let plan_l = crate::numeric::supernodal::solve::SolvePlan::from_panels(
+            l,
+            &factors.supernode_parent,
+            true,
+            opts.solve,
+        );
+        let plan_u = crate::numeric::supernodal::solve::SolvePlan::from_panels(
+            ut,
+            &factors.supernode_parent,
+            false,
+            opts.solve,
+        );
+        diagnostics.push(
+            "solve-layout",
+            t.elapsed().as_secs_f64() * 1e3,
+            0,
+            (plan_l.bytes() + plan_u.bytes()) as u64,
+        );
+        Ok(LuSolver {
+            solve_threads: opts.threads,
+            factors,
+            plan_l,
+            plan_u,
+            nnz,
+            diagnostics,
+            solves: Default::default(),
+            factored: true,
+            // A one-time factor does not hold on to the scratch; the first
+            // refactorization grows its own and keeps it.
+            pools: super::node::LuPools::new(),
+        })
+    }
+
+    /// Factor `a` again into `lu`, a factor of this analysis (the next
+    /// Newton step): the numeric factorization of [`factor`](Self::factor),
+    /// its panels written into `lu`'s buffers and `lu`'s solve schedule kept
+    /// where pivoting left the rows unchanged. The same bits as a fresh
+    /// [`factor`](Self::factor). After an error `lu` holds no factor and
+    /// refuses to solve until a refactorization succeeds.
+    pub fn refactor<T: Scalar>(
+        &self,
+        a: &GeneralCsc<T>,
+        opts: &SolverSettings,
+        lu: &mut LuSolver<T>,
+    ) -> Result<(), RslabError> {
+        lu.factored = false;
+        let storage = (lu.plan_l.take_storage(), lu.plan_u.take_storage());
+        let (l, ut, factors, nnz, mut diagnostics, opts) =
+            self.numeric(a, opts, Some(storage), &lu.pools)?;
+        let t = crate::clock::Instant::now();
+        lu.plan_l
+            .refill(l, &factors.supernode_parent, true, opts.solve);
+        lu.plan_u
+            .refill(ut, &factors.supernode_parent, false, opts.solve);
+        diagnostics.push(
+            "solve-layout",
+            t.elapsed().as_secs_f64() * 1e3,
+            0,
+            (lu.plan_l.bytes() + lu.plan_u.bytes()) as u64,
+        );
+        lu.factors = factors;
+        lu.nnz = nnz;
+        lu.diagnostics = diagnostics;
+        lu.solve_threads = opts.threads;
+        lu.factored = true;
+        Ok(())
+    }
+
+    /// The numeric factorization both [`factor`](Self::factor) and
+    /// [`refactor`](Self::refactor) run: the panels of `L` and `U^T` (in
+    /// `storage` when given), the pivots, the fill, the diagnostics and the
+    /// settings pinned to the resolved thread count.
+    #[allow(clippy::type_complexity)]
+    fn numeric<T: Scalar>(
+        &self,
+        a: &GeneralCsc<T>,
+        opts: &SolverSettings,
+        storage: Option<(PanelStorage<T>, PanelStorage<T>)>,
+        pools: &super::node::LuPools<T>,
+    ) -> Result<
+        (
+            PanelFactor<T>,
+            PanelFactor<T>,
+            LuPivots,
+            usize,
+            crate::diagnostics::Diagnostics,
+            SolverSettings,
+        ),
+        RslabError,
+    > {
         let estimate = self.estimate_memory::<T>();
         let resolved_threads = opts.threads.resolve(|cap| {
             crate::numeric::supernodal::analysis::auto_threads(&self.symb, &estimate, cap)
         });
-        let opts = &opts.pinned(resolved_threads);
+        let opts = opts.pinned(resolved_threads);
         let warnings = opts.ignored_on(crate::numeric::settings::FactorPath::Lu);
         for w in &warnings {
             crate::logging::warn(&format!("lu settings: {w}"));
         }
         let t = crate::clock::Instant::now();
-        let numeric = factor_general_lu_numeric(self, a, opts)?;
+        let numeric = factor_general_lu_numeric(self, a, &opts, storage, pools)?;
         let factor_ms = t.elapsed().as_secs_f64() * 1e3;
         let nnz = numeric.factor_nnz() as u64;
         let factor_bytes = numeric.bytes() as u64;
@@ -319,36 +430,7 @@ impl LuSymbolic {
         if crate::logging::enabled(crate::logging::LogLevel::Info) {
             crate::logging::info(&format!("lu factor: {}", diagnostics.summary()));
         }
-        // Solve layout: supernodal panels of `L` and `U^T` plus the tree
-        // schedule; the CSC arrays are released so the factor is held once.
-        let t = crate::clock::Instant::now();
-        let plan_l = crate::numeric::supernodal::solve::SolvePlan::from_panels(
-            l,
-            &factors.supernode_parent,
-            true,
-            opts.solve,
-        );
-        let plan_u = crate::numeric::supernodal::solve::SolvePlan::from_panels(
-            ut,
-            &factors.supernode_parent,
-            false,
-            opts.solve,
-        );
-        diagnostics.push(
-            "solve-layout",
-            t.elapsed().as_secs_f64() * 1e3,
-            0,
-            (plan_l.bytes() + plan_u.bytes()) as u64,
-        );
-        Ok(LuSolver {
-            solve_threads: opts.threads,
-            factors,
-            plan_l,
-            plan_u,
-            nnz: nnz as usize,
-            diagnostics,
-            solves: Default::default(),
-        })
+        Ok((l, ut, factors, nnz as usize, diagnostics, opts))
     }
 
     /// The analyzed dimension.
@@ -403,78 +485,152 @@ impl LuSymbolic {
     }
 
     pub fn estimate_memory<T: Scalar>(&self) -> crate::diagnostics::MemoryEstimate {
-        let value_bytes = std::mem::size_of::<T>();
-        // Cache per scalar size: the estimate is a pure function of the
-        // structure and `size_of::<T>()`, and `tuned` + phased `factor` ask
-        // for it repeatedly.
+        // Cache per scalar kind (size and complexity): the estimate is a pure
+        // function of the structure and the scalar type, and `tuned` + phased
+        // `factor` ask for it repeatedly.
+        let key = (std::mem::size_of::<T>(), T::COMPLEX);
         if let Ok(cache) = self.est_cache.lock() {
-            if let Some(&(_, est)) = cache.iter().find(|&&(vb, _)| vb == value_bytes) {
+            if let Some(&(_, est)) = cache.iter().find(|&&(k, _)| k == key) {
                 return est;
             }
         }
-        let est = self.estimate_memory_for(value_bytes);
+        let est = self.estimate_memory_for::<T>();
         if let Ok(mut cache) = self.est_cache.lock() {
-            if !cache.iter().any(|&(vb, _)| vb == value_bytes) {
-                cache.push((value_bytes, est));
+            if !cache.iter().any(|&(k, _)| k == key) {
+                cache.push((key, est));
             }
         }
         est
     }
 
     /// The uncached estimate body, a pure function of the symbolic structure
-    /// and the scalar size.
-    fn estimate_memory_for(&self, value_bytes: usize) -> crate::diagnostics::MemoryEstimate {
-        let Some((sym, _levels)) = self.symb.sym_and_levels() else {
-            return crate::diagnostics::estimate_left_looking(
-                0,
-                &|_| 0,
-                &|_| 0,
-                &|_| &[],
+    /// and the scalar type. Its peak is the [`memory_plan`](Self::memory_plan)
+    /// on all cores, the most scratch the kernels can hold.
+    fn estimate_memory_for<T: Scalar>(&self) -> crate::diagnostics::MemoryEstimate {
+        let value_bytes = std::mem::size_of::<T>();
+        let Some((sym, _)) = self.symb.sym_and_levels() else {
+            return crate::diagnostics::MemoryEstimate {
                 value_bytes,
-                0,
-                false,
-            );
-        };
-        let nsuper = sym.supernodes.len();
-        let Some(sched) = self.symb.ll_schedule() else {
-            return crate::diagnostics::estimate_left_looking(
-                0,
-                &|_| 0,
-                &|_| 0,
-                &|_| &[],
-                value_bytes,
-                0,
-                false,
-            );
+                ..Default::default()
+            };
         };
         // The `L` and `U^T` panels of a supernode, `(w + m_l) x w` and
-        // `(w + m_u) x w` on the exact structure; they are the stored factor
-        // (no compact copy, see `PanelFactor`).
+        // `(w + m_u) x w` on the exact structure; they are the stored factor.
         let st = &self.structure;
-        let panel_bytes = |s: usize| -> u64 {
-            let nc = sym.supernodes[s].ncol;
-            ((st.rows_l(s).len() + st.cols_u(s).len()) * nc * value_bytes) as u64
-        };
-        let compact_bytes = panel_bytes;
-        // The split permuted input: its values (per factorization) and structure
-        // (per analysis, `u32` indices and `usize` positions).
-        let input_bytes = (self.nnz * (value_bytes + 12)) as u64;
-        let mut est = crate::diagnostics::estimate_left_looking(
-            nsuper,
-            &panel_bytes,
-            &compact_bytes,
-            &|s| sched.updaters(s),
-            value_bytes,
-            input_bytes,
-            true,
-        );
-        est.factor_flops = (0..nsuper)
-            .map(|s| {
-                let nc = sym.supernodes[s].ncol as u64;
-                (st.rows_l(s).len() * st.cols_u(s).len()) as u64 * nc
-            })
+        let nsuper = sym.supernodes.len();
+        let panels: u64 = (0..nsuper)
+            .map(|s| ((st.rows_l(s).len() + st.cols_u(s).len()) * sym.supernodes[s].ncol) as u64)
             .sum();
-        est
+        let settings = SolverSettings {
+            threads: crate::numeric::settings::Threads::Fixed(0),
+            ..SolverSettings::default()
+        };
+        let plan = self.memory_plan::<T>(&settings, 1);
+        crate::diagnostics::MemoryEstimate {
+            value_bytes,
+            factor_nnz: panels,
+            factor_bytes: plan.factor_bytes,
+            panels_all_bytes: panels * value_bytes as u64,
+            panel_live_peak_bytes: panels * value_bytes as u64,
+            transient_peak_bytes: plan.peak_bytes(),
+            factor_flops: (0..nsuper)
+                .map(|s| {
+                    let nc = sym.supernodes[s].ncol as u64;
+                    (st.rows_l(s).len() * st.cols_u(s).len()) as u64 * nc
+                })
+                .sum(),
+            critical_path_flops: 0,
+            max_tree_width: 0,
+        }
+    }
+
+    /// The heap a factorization of scalar type `T` under `opts` needs, and a
+    /// solve of `nrhs` right-hand sides after it, predicted from this
+    /// analysis before any numeric work: for a preflight check
+    /// ([`MemoryPlan::fits_in`](crate::MemoryPlan::fits_in)) and for
+    /// scheduling factorizations side by side. The kernels' scratch grows
+    /// with the worker count, so plan with the threads the factorization
+    /// will run on.
+    pub fn memory_plan<T: Scalar>(&self, opts: &SolverSettings, nrhs: usize) -> crate::MemoryPlan {
+        let threads = opts.resolved_threads();
+        let mut plan = crate::MemoryPlan {
+            threads,
+            nrhs,
+            ..Default::default()
+        };
+        let (Some((sym, _)), Some(sched)) = (self.symb.sym_and_levels(), self.symb.ll_schedule())
+        else {
+            return plan;
+        };
+        // After the schedule above is built: it is part of the analysis.
+        plan.analysis_bytes = self.heap_bytes();
+        let vb = std::mem::size_of::<T>();
+        let k = opts.kernel().k;
+        let st = &self.structure;
+        let (n, nnz, ns) = (sym.n, self.nnz, sym.supernodes.len());
+        let w = |s: usize| sym.supernodes[s].ncol;
+        let widths: Vec<usize> = (0..ns).map(w).collect();
+        let off_l: Vec<usize> = (0..ns).map(|s| st.rows_l(s).len() - w(s)).collect();
+        let off_u: Vec<usize> = (0..ns).map(|s| st.cols_u(s).len() - w(s)).collect();
+        let panels: usize = (0..ns)
+            .map(|s| (2 * w(s) + off_l[s] + off_u[s]) * w(s))
+            .sum();
+        let rows: usize = off_l.iter().sum::<usize>() + off_u.iter().sum::<usize>();
+        let kept: Vec<bool> = sym.supernodes.iter().map(|sn| sn.ncol > 0).collect();
+        let parent = crate::symbolic::supernode_parents(&sym.supernodes, &kept);
+        let layout = |off: &[usize]| {
+            crate::numeric::supernodal::solve::layout_size(
+                &parent,
+                &widths,
+                off,
+                &opts.solve,
+                crate::numeric::settings::all_cores(),
+            )
+        };
+        let (layout_l, layout_u) = (layout(&off_l), layout(&off_u));
+        // The input program the first factorization keeps (two index arrays
+        // and the positions, two pointer arrays), and the peak of its build.
+        let (growth, growth_build) = if self.input.get().is_some() {
+            (0, 0)
+        } else {
+            (12 * nnz + 16 * (n + 1), 28 * nnz + 48 * n)
+        };
+        // Held by the factor: the `L` and `U^T` panels with their schedules,
+        // `U`'s reciprocal diagonal, both permutations and scalings, and the
+        // supernode tree.
+        let factor = vb * (panels + n) + (layout_l.held + layout_u.held) as usize + 32 * n + 8 * ns;
+        // While the forest is factored: the scalings, the permuted values,
+        // both arenas, the emit cells (refcounts, offsets, panel records,
+        // positions and permutations) and the forest's lists, every node's
+        // row permutation and emitted rows until the end, the workers'
+        // scratch and the heaviest set of nodes running at once.
+        let cells = ns * (8 + 8 + 80 + 24 + 8 + 8 + 8) + 32 * n;
+        let slots = 8 * (0..ns).map(|s| st.rows_l(s).len()).sum::<usize>() + 4 * rows;
+        let scratch: Vec<(u64, usize, usize)> = (0..ns)
+            .map(|s| super::node::lu_node_scratch::<T>(s, sym, sched, st, &k, threads))
+            .collect();
+        let mut planes: Vec<(usize, usize)> = scratch.iter().map(|&(_, p, c)| (p, c)).collect();
+        let (workers, kept) = crate::memory::worker_bytes::<T>(n, 2, threads, &mut planes);
+        // The node kernel's, the tiled `cmod`'s and the arena's pools.
+        let largest = scratch.iter().map(|&(b, _, _)| b).max().unwrap_or(0);
+        let pooled = crate::memory::pooled_bytes(3, threads, largest);
+        let nodes = crate::memory::concurrent_peak(sym, threads, |s| scratch[s].0);
+        let during =
+            (16 * n + vb * nnz + vb * panels + cells + slots) as u64 + workers + pooled + nodes;
+        // After it: the factor, with the emitted row lists until the plans
+        // have copied them, and a plan's build.
+        let after =
+            factor as u64 + (4 * rows + 48 * ns) as u64 + layout_l.build.max(layout_u.build);
+        plan.analysis_growth_bytes = growth as u64;
+        plan.factor_bytes = factor as u64;
+        plan.kept_bytes = kept + pooled;
+        plan.factor_peak_bytes = (growth_build as u64).max(growth as u64 + during.max(after))
+            + crate::memory::BOOKKEEPING;
+        // The permuted right-hand sides, the solution and the larger of the
+        // two sweeps' scratch.
+        plan.solve_bytes = (nrhs * vb) as u64
+            * (2 * n as u64 + layout_l.solve_per_rhs.max(layout_u.solve_per_rhs));
+        plan
     }
 }
 
@@ -496,9 +652,22 @@ pub struct LuSolver<T> {
     /// The worker policy the factorization ran with, which a Krylov solve
     /// preconditioned by this factor orthogonalizes under.
     solve_threads: crate::numeric::settings::Threads,
+    /// Whether it holds a factor: a failed [`LuSymbolic::refactor`] leaves
+    /// it without one.
+    factored: bool,
+    /// The kernels' scratch: empty after [`LuSymbolic::factor`], grown by
+    /// the first refactorization and kept for the next ones, which then
+    /// allocate nothing of their own.
+    pools: super::node::LuPools<T>,
 }
 
 impl<T: Scalar> LuSolver<T> {
+    /// Heap bytes this factor holds: its values in solve layout, the pivots,
+    /// the permutations and the solve schedule. `L` and `U^T` each have their own.
+    pub fn heap_bytes(&self) -> u64 {
+        self.plan_l.heap_bytes() + self.plan_u.heap_bytes() + self.factors.heap_bytes()
+    }
+
     /// One-shot analyze + equilibrate + factor of a general matrix `A`.
     pub fn factor(a: &GeneralCsc<T>, opts: &SolverSettings) -> Result<Self, RslabError> {
         LuSymbolic::analyze(a, opts)?.factor(a, opts)
@@ -546,7 +715,19 @@ impl<T: Scalar> crate::numeric::direct::SolveCore<T> for LuSolver<T> {
     /// gathers through the row side, sweeps `L` forward and `U` backward and
     /// scatters through the column side; `A^T x = b` is the mirror image,
     /// `U^T` forward and `L^T` backward.
-    fn solve_raw(&self, b: &[T], nrhs: usize, transpose: bool) -> Result<Vec<T>, RslabError> {
+    fn solve_raw_into(
+        &self,
+        b: &[T],
+        nrhs: usize,
+        transpose: bool,
+        x: &mut [T],
+        work: &mut crate::SolveWork<T>,
+    ) -> Result<(), RslabError> {
+        if !self.factored {
+            return Err(RslabError::InvalidInput(
+                "the last refactorization failed; refactor before solving".to_string(),
+            ));
+        }
         let f = &self.factors;
         let n = f.n;
         let (gather, g_scale, scatter, s_scale) = if transpose {
@@ -555,28 +736,30 @@ impl<T: Scalar> crate::numeric::direct::SolveCore<T> for LuSolver<T> {
             (&f.perm_row, &f.d_row, &f.perm, &f.d_col)
         };
         // The sweeps take the block row-major: y[e * nrhs + c].
-        let mut y = vec![T::zero(); n * nrhs];
+        let y = &mut work.y;
+        y.clear();
+        y.resize(n * nrhs, T::zero());
         for (e, &orig) in gather.iter().enumerate() {
             let s = T::from_real(g_scale[orig]);
             for c in 0..nrhs {
                 y[e * nrhs + c] = b[c * n + orig] * s;
             }
         }
+        let plan = &mut work.plan;
         if transpose {
-            self.plan_u.forward(nrhs, &mut y);
-            self.plan_l.backward(nrhs, &mut y);
+            self.plan_u.forward(nrhs, y, plan);
+            self.plan_l.backward(nrhs, y, plan);
         } else {
-            self.plan_l.forward(nrhs, &mut y);
-            self.plan_u.backward(nrhs, &mut y);
+            self.plan_l.forward(nrhs, y, plan);
+            self.plan_u.backward(nrhs, y, plan);
         }
-        let mut out = vec![T::zero(); n * nrhs];
         for (e, &orig) in scatter.iter().enumerate() {
             let s = T::from_real(s_scale[orig]);
             for c in 0..nrhs {
-                out[c * n + orig] = y[e * nrhs + c] * s;
+                x[c * n + orig] = y[e * nrhs + c] * s;
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 

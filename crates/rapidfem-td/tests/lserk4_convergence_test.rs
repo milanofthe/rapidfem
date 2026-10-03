@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
+
 // Analytical convergence pin for the explicit LSERK4 integrator
 // (explicit.rs). The semi-discrete DG system is the linear ODE
 // dy/dt = A*y, whose exact flow over time T is the matrix exponential:
@@ -149,7 +149,7 @@ fn integrate(a: &[f64], y0: &[f64], t_end: f64, nsteps: usize) -> Vec<f64> {
     let mut y = y0.to_vec();
     let mut ws = LserkWorkspace::new();
     for _ in 0..nsteps {
-        ws.step_into(|x, ax| matvec(a, x, ax), &mut y, dt);
+        ws.step_into(|x, ax| matvec(a, x, ax), &mut y, dt, None);
     }
     y
 }

@@ -13,6 +13,29 @@ pub(super) fn grow_scratch<T: Scalar>(buf: &mut Vec<T>, len: usize) {
     }
 }
 
+/// The largest [`split_plane_entries`](crate::dense::gemm_backend::split_plane_entries)
+/// of a [`lower_tile_gemm`] call with these arguments, one per tile.
+pub(super) fn lower_tile_planes(
+    m: usize,
+    ncols: usize,
+    k: usize,
+    par_cdiv: usize,
+    ks: &crate::KernelSettings,
+) -> usize {
+    let mut worst = 0;
+    let mut c0 = 0;
+    while c0 < ncols {
+        let tw = ks.schur_tile.max(1).min(ncols - c0);
+        let mrows = m - c0;
+        let par = (mrows as u128) * (tw as u128) * (k as u128) >= par_cdiv as u128;
+        worst = worst.max(crate::dense::gemm_backend::split_plane_entries(
+            mrows, tw, k, par, ks,
+        ));
+        c0 += tw;
+    }
+    worst
+}
+
 /// Symmetric trailing-update GEMM computed **only on and below the tile
 /// diagonal**: `TMP[:, j] = G * L21^T[:, j]` for rows `>= tile start`. The
 /// consumers (the front Schur subtraction and the left-looking panel

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 #########################################################################################
 ##
 ##                                  MATERIALS
@@ -10,10 +14,6 @@
 from __future__ import annotations
 
 from typing import Sequence
-
-
-
-# HELPERS ===============================================================================
 
 
 # DISPERSIVE MODELS =====================================================================
@@ -143,9 +143,8 @@ class Material:
     ----
     Materials are attached to volumes at construction time via the
     primitive's ``material=`` keyword. Multiple volumes can share one
-    ``Material`` instance, they then end up in the same physical
-    group at mesh time, which compresses the TOML config the Rust
-    solver consumes.
+    ``Material`` instance, they then share one material tag of the
+    solver mesh.
 
 
     Example
@@ -230,30 +229,6 @@ class Material:
         self.drude = drude
         self.maxh = float(maxh) if maxh is not None else None
 
-    def _add_to(self, model, volume_tag: int) -> None:
-        """place this material on the native model under a volume tag
-
-        Parameters
-        ----------
-        model : rapidfem._native.Model
-            the model being built
-        volume_tag : int
-            physical-group tag of the volume this material is attached to
-        """
-        debye = drude = None
-        if self.debye is not None:
-            d = self.debye
-            debye = (d.er_inf, d.er_static, d.tau_s)
-        if self.drude is not None:
-            d = self.drude
-            drude = (d.er_inf, d.plasma_freq_hz, d.damping_freq_hz)
-        vec = lambda v: None if v is None else [float(x) for x in v]
-        model.add_material(
-            volume_tag, er=self.er, ur=self.ur, tand=self.tand,
-            conductivity=self.conductivity, cond_diag=vec(self.cond_diag),
-            er_diag=vec(self.er_diag), ur_diag=vec(self.ur_diag),
-            debye=debye, drude=drude)
-
 
 
 # NAMED PRESETS =========================================================================
@@ -263,10 +238,8 @@ class Air(Material):
     :math:`\\tan\\delta = \\sigma = 0`.
 
     The simplest material; sets every permittivity, permeability, and
-    loss term to its free-space default. Convenient as a placeholder
-    for air boxes, padding regions, and inside :class:`PML` slabs
-    (the PML's coordinate stretch overrides the bulk permittivity, so
-    the material here only fills the volume role).
+    loss term to its free-space default, for air boxes and padding
+    regions.
 
 
     Example

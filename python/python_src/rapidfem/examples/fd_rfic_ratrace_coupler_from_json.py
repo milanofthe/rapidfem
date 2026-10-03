@@ -7,8 +7,8 @@ a difference at port 4 (port 3 isolated), and vice-versa for port 3.
 
 The geometry hits the polygon-with-holes pipeline in rapidfem, the ring
 is exported as a single annular polygon whose inner boundary is a hole,
-and the FEM bridge round-trips it through gmsh's Boolean cut so the
-inside of the ring stays oxide, not metal.
+and the FEM bridge keeps the hole in the extruded prism, so the inside
+of the ring stays oxide, not metal.
 
 At the chosen 10 GHz operating point the on-chip ring is too small for
 the design wavelength (this PDK + dimensions land deep below the
@@ -41,17 +41,8 @@ print(f"  ports: {list(layout.ports)}")
 rf.show(layout.geometry)
 
 
-# %% Wire BCs: every conductor PEC, all 4 ports lumped, outer air ABC
-all_volumes = [v for vols in layout.conductors.values() for v in vols]
-rf.PEC(*(v.faces for v in all_volumes), *layout.ground_patches)
-
-for port in layout.ports.values():
-    rf.LumpedPort(port, direction=(0, 0, 1), z0=50.0)
-
-rf.ABC(*layout.air.faces.outer)
-
-
-# %% Mesh
+# %% Mesh (the bridge placed the physics: PEC conductor
+# walls, 50 Ohm lumped ports, ABC outside)
 layout.geometry.mesh()
 rf.show(layout.geometry)
 
@@ -59,7 +50,7 @@ rf.show(layout.geometry)
 # %% Sweep
 FREQS_HZ = np.linspace(2e9, 30e9, 12)
 
-prob = rf.Problem(layout.geometry)
+prob = rf.ProblemFD(layout.geometry)
 result = prob.sweep(FREQS_HZ)
 rf.show(prob)
 rf.show(result)

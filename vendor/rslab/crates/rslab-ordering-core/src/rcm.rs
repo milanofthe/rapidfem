@@ -173,22 +173,17 @@ mod tests {
     /// Build a full-symmetric CSC pattern from an edge list (both directions
     /// added; diagonal included) for the ordering contract.
     fn pattern_from_edges(n: usize, edges: &[(usize, usize)]) -> (Vec<i32>, Vec<i32>) {
-        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for v in 0..n {
-            adj[v].push(v);
-        }
+        let mut adj: Vec<Vec<usize>> = (0..n).map(|v| vec![v]).collect();
         for &(a, b) in edges {
             adj[a].push(b);
             adj[b].push(a);
         }
         let mut col_ptr = vec![0i32];
         let mut row_idx = Vec::new();
-        for v in 0..n {
-            adj[v].sort_unstable();
-            adj[v].dedup();
-            for &w in &adj[v] {
-                row_idx.push(w as i32);
-            }
+        for nbrs in &mut adj {
+            nbrs.sort_unstable();
+            nbrs.dedup();
+            row_idx.extend(nbrs.iter().map(|&w| w as i32));
             col_ptr.push(row_idx.len() as i32);
         }
         (col_ptr, row_idx)
@@ -294,7 +289,7 @@ mod tests {
         let pat = CscPattern::new(4, &col_ptr, &row_idx).unwrap();
         let perm = rcm_order(&pat).unwrap();
         assert_eq!(perm.len(), 4);
-        let mut seen = vec![false; 4];
+        let mut seen = [false; 4];
         for &p in &perm {
             seen[p as usize] = true;
         }

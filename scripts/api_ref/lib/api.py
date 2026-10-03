@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """
 API extraction utilities using griffe.
 """
@@ -139,7 +143,7 @@ def _extract_module_obj(obj: griffe.Object, module_path: str) -> dict:
 
 
 def _should_skip_member(name: str) -> bool:
-    """Skip private members — only the public API is documented.
+    """Skip private members, only the public API is documented.
 
     `__init__` is kept so constructor parameters can be extracted; every
     other underscore-prefixed name (dunders and single-underscore privates)

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """rapidfem, frequency- and time-domain electromagnetic FEM solver in Rust.
 
 Quick start::
@@ -6,7 +10,7 @@ Quick start::
     g = rf.Geometry(maxh=rf.lambda_maxh(f_max=12e9))
     ...                                   # build geometry, assign physics
     g.mesh()
-    result = rf.Problem(g).sweep(freqs)
+    result = rf.ProblemFD(g).sweep(freqs)
     print(result.frequencies.shape, result.sparams.shape)
 
 Every sparse solve runs on the vendored pure-Rust rslab complex-symmetric
@@ -23,12 +27,12 @@ from rapidfem.physics import (
     PEC, PMC, ABC, SurfaceImpedance, LumpedElement, PML, PeriodicBoundary,
     FarFieldSurface,
 )
-from rapidfem.problem import Problem, ProblemFD, ProblemTD, Adaptive, ErrorIndicator
+from rapidfem.problem import ProblemFD, ProblemTD, ErrorIndicator
 from rapidfem.excitation import GaussianPulse
-from rapidfem import io  # registers .to_network/.to_touchstone/.to_hdf5 on SweepResult
-from rapidfem import rfic  # RFIC builder helpers (Stack, microstrip, via, gsg_port, ...)
+from rapidfem import io  # registers .to_network/.to_hdf5 on SweepResult
+from rapidfem import rfic  # RFIC: process stacks, the GDS model builder, rapidpassives bridge
 from rapidfem import structures  # general RF structure builders (coax, microstrip, ...)
-from rapidfem import _show_capture
+from rapidfem.ui import capture as _show_capture
 
 
 _C0 = 299_792_458.0
@@ -115,7 +119,7 @@ def show(obj, name: str = "default"):
     -------
     .. code-block:: python
 
-        rf.show(g)                  # OCC preview pre-mesh, tet mesh post-mesh
+        rf.show(g)                  # face preview pre-mesh, tet mesh post-mesh
         rf.show(prob)               # E-field point cloud (after .sweep())
         rf.show(result)             # |S-params| plot
         rf.show(ptd.transient(...)) # 3-D time-domain field animation
@@ -123,11 +127,11 @@ def show(obj, name: str = "default"):
 
     Parameters
     ----------
-    obj : Geometry, Problem, SweepResult, list[Eigenmode], or a \
+    obj : Geometry, ProblemFD, SweepResult, list[Eigenmode], or a \
         time-domain result
         anything renderable by the UI; pre-mesh geometries render a
-        coarse OCC surface preview, post-mesh ones render the FEM tet
-        mesh; Problem + SweepResult render :math:`|\\mathbf{E}(t, r)|^2`
+        coarse face preview, post-mesh ones render the FEM tet
+        mesh; ProblemFD + SweepResult render :math:`|\\mathbf{E}(t, r)|^2`
         point clouds plus an S-parameter plot. The :class:`ProblemTD`
         verb results render too, a :meth:`~rapidfem.ProblemTD.transient`
         trajectory as a 3-D field animation, and
@@ -159,7 +163,7 @@ __all__ = [
     "UserDefinedPort", "FloquetPort",
     "PEC", "PMC", "ABC", "SurfaceImpedance", "LumpedElement", "PML",
     "PeriodicBoundary", "FarFieldSurface",
-    "Problem", "ProblemFD", "ProblemTD", "Adaptive", "ErrorIndicator", "GaussianPulse",
+    "ProblemFD", "ProblemTD", "ErrorIndicator", "GaussianPulse",
     "io", "rfic", "structures", "show", "lambda_maxh",
 ]
 __version__ = "0.22.1"

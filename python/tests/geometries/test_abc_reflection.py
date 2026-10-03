@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""First-order ABC termination — bounded, predictable modal reflection.
+
+"""First-order ABC termination, bounded, predictable modal reflection.
 
 A WR-90 (X-band) section is driven by a single RectWaveguidePort at z=min and
 terminated at z=max by a first-order (Sommerfeld) absorbing boundary instead of
@@ -31,7 +32,7 @@ import pytest
 import rapidfem as rf
 from harness import case, references as ref
 
-# WR-90 (X-band, 8.2–12.4 GHz)
+# WR-90 (X-band, 8.2-12.4 GHz)
 A, B = 22.86e-3, 10.16e-3
 LENGTH = 30.0e-3       # driven air section, ABC on its far face
 

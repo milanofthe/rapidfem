@@ -52,7 +52,7 @@ export const features: Feature[] = [
 	},
 	{
 		title: 'Adaptive Refinement',
-		description: 'Residual error estimator with Dörfler marking, exports a size field for gmsh re-meshing.'
+		description: 'Residual error estimator with Dörfler marking, exports a size field for re-meshing.'
 	},
 	{
 		title: 'Time-Domain DGTD',

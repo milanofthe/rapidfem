@@ -5,9 +5,9 @@ build-backend = "maturin"
 [project]
 name = "rapidfem"
 version = "0.22.1"
-description = "Frequency-domain electromagnetic FEM solver in Rust, with a Python API and an optional local web UI."
+description = "Frequency- and time-domain electromagnetic FEM solver in Rust, with a Python API and an optional local web UI."
 readme = { file = "../README.md", content-type = "text/markdown" }
-license = { text = "GPL-3.0-or-later" }
+license = { text = "AGPL-3.0-only" }
 requires-python = ">=3.10"
 authors = [
     { name = "Milan Rother", email = "sporkhomat@gmail.com" },
@@ -16,7 +16,7 @@ keywords = ["fem", "electromagnetic", "microwave", "antenna", "simulation", "max
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
@@ -30,15 +30,11 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.26",
-    "gmsh>=4.11",
 ]
 
 [project.optional-dependencies]
 ui = [
     "flask>=3.0",
-]
-gds = [
-    "gdstk>=0.9",
 ]
 io = [
     "scikit-rf>=0.30",
@@ -51,6 +47,8 @@ td = [
 test = [
     "pytest>=8.0",
     "scipy>=1.11",
+    # writes the GDS fixtures; reading is native
+    "gdstk>=0.9",
 ]
 
 [tool.pytest.ini_options]
@@ -66,7 +64,7 @@ Repository = "https://github.com/milanofthe/rapidfem"
 Issues = "https://github.com/milanofthe/rapidfem/issues"
 
 [project.scripts]
-rapidfem = "rapidfem._cli:main"
+rapidfem = "rapidfem.ui.cli:main"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
@@ -78,7 +76,7 @@ include = [
     { path = "python_src/rapidfem/rfic/data/*.xml", format = ["sdist", "wheel"] },
 ]
 # The pre-baked demo cases (~150 MB) and the extracted API reference are only
-# consumed by the static GitHub Pages build — the locally-served UI ships
+# consumed by the static GitHub Pages build, the locally-served UI ships
 # neither the marketing landing nor the API docs. Excluded here so the wheel
 # stays lean and under PyPI's 100 MB per-file cap.
 exclude = [

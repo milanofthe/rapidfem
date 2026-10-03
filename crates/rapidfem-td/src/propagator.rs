@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Krylov-subspace exponential propagator.
 //!
@@ -22,59 +19,15 @@ use crate::constants::{
     ARNOLDI_BREAKDOWN, ARNOLDI_MIN_CHUNK, ARNOLDI_TASKS_PER_THREAD, Accum,
     EXPM_SCALE_THRESHOLD, EXPM_TAYLOR_TERMS,
 };
+use crate::dg_basis::matmul_into;
 
 /// Dense matrix exponential of an `n×n` row-major matrix, via
-/// scaling-and-squaring with a Taylor core.
+/// scaling-and-squaring with a Taylor core. Allocating wrapper around
+/// `expm_into`.
 pub fn expm(a: &[Accum], n: usize) -> Vec<Accum> {
-    // Infinity norm.
-    let mut norm = 0.0_f64;
-    for i in 0..n {
-        let row: Accum = (0..n).map(|j| a[i * n + j].abs()).sum();
-        norm = norm.max(row);
-    }
-    // Scale so the ∞-norm is within EXPM_SCALE_THRESHOLD.
-    let s: u32 = if norm > EXPM_SCALE_THRESHOLD {
-        (norm.log2().ceil() as i64 + 1).max(0) as u32
-    } else {
-        0
-    };
-    let scale = 2.0_f64.powi(s as i32);
-    let b: Vec<Accum> = a.iter().map(|x| x / scale).collect();
-
-    // exp(B) = Σ Bᵏ/k!  (≈18 terms suffice for ‖B‖ ≤ 1/2).
-    let mut result = identity(n);
-    let mut term = identity(n);
-    for k in 1..=EXPM_TAYLOR_TERMS {
-        term = matmul(&term, &b, n);
-        let inv = 1.0 / k as Accum;
-        for x in term.iter_mut() {
-            *x *= inv;
-        }
-        for (r, t) in result.iter_mut().zip(&term) {
-            *r += *t;
-        }
-    }
-    // Square s times.
-    for _ in 0..s {
-        result = matmul(&result, &result, n);
-    }
-    result
-}
-
-/// `out ← A·B` for `n×n` row-major matrices; `out` must not alias `a`/`b`.
-fn matmul_into(a: &[Accum], b: &[Accum], n: usize, out: &mut [Accum]) {
-    out[..n * n].fill(0.0);
-    for i in 0..n {
-        for k in 0..n {
-            let aik = a[i * n + k];
-            if aik == 0.0 {
-                continue;
-            }
-            for j in 0..n {
-                out[i * n + j] += aik * b[k * n + j];
-            }
-        }
-    }
+    let mut out = vec![0.0; n * n];
+    expm_into(a, n, &mut out, &mut ExpmScratch::new());
+    out
 }
 
 /// Scratch for the dense matrix exponential, five `n×n` buffers, grown on
@@ -112,11 +65,12 @@ impl ExpmScratch {
 }
 
 /// `exp(A)` of an `n×n` row-major matrix into `out`, reusing `s`, the
-/// allocation-free counterpart of [`expm`].
+/// allocation-free form of [`expm`].
 fn expm_into(a: &[Accum], n: usize, out: &mut [Accum], s: &mut ExpmScratch) {
     let nn = n * n;
     s.ensure(nn);
 
+    // Infinity norm, then scale so it is within EXPM_SCALE_THRESHOLD.
     let mut norm = 0.0_f64;
     for i in 0..n {
         let row: Accum = (0..n).map(|j| a[i * n + j].abs()).sum();
@@ -141,7 +95,7 @@ fn expm_into(a: &[Accum], n: usize, out: &mut [Accum], s: &mut ExpmScratch) {
     }
     // exp(B) = Σ Bᵏ/k!  (≈18 terms suffice for ‖B‖ ≤ 1/2).
     for k in 1..=EXPM_TAYLOR_TERMS {
-        matmul_into(&s.term[..nn], &s.b[..nn], n, &mut s.term2);
+        matmul_into(&s.term[..nn], &s.b[..nn], n, n, n, &mut s.term2[..nn]);
         let inv = 1.0 / k as Accum;
         for x in s.term2[..nn].iter_mut() {
             *x *= inv;
@@ -153,7 +107,7 @@ fn expm_into(a: &[Accum], n: usize, out: &mut [Accum], s: &mut ExpmScratch) {
     }
     // Square sq times.
     for _ in 0..sq {
-        matmul_into(&s.result[..nn], &s.result[..nn], n, &mut s.tmp);
+        matmul_into(&s.result[..nn], &s.result[..nn], n, n, n, &mut s.tmp[..nn]);
         s.result[..nn].copy_from_slice(&s.tmp[..nn]);
     }
     out[..nn].copy_from_slice(&s.result[..nn]);
@@ -371,13 +325,16 @@ impl KrylovWorkspace {
         dim
     }
 
-    /// Allocation-free ETD step of `dy/dt = A·y + b` with `b` constant over
-    /// the step: `y ← exp(hA)·y + h·φ₁(hA)·b`, written into `out` (`n`).
+    /// Allocation-free exponential-time-differencing step of
+    /// `dy/dt = A·y + b` with the source `b` held constant over the step:
+    /// `y ← exp(hA)·y + h·φ₁(hA)·b`, written into `out` (`n`).
     ///
-    /// Uses the augmented-matrix identity (see [`etd_step`]), the Krylov
-    /// projection runs on the `(n+1)`-dimensional augmented system, reusing
-    /// this workspace throughout. `max_dim` / `tol` cap and adaptively
-    /// truncate the Krylov subspace exactly as in [`expmv_into`](Self::expmv_into).
+    /// Uses the augmented-matrix identity
+    /// `exp(h·[[A, b],[0, 0]])·[y; 1] = [exp(hA)y + h·φ₁(hA)b ; 1]`, so the
+    /// Krylov projection on the `(n+1)`-dimensional augmented system handles
+    /// the φ-function with no extra machinery, reusing this workspace
+    /// throughout. `max_dim` / `tol` cap and adaptively truncate the Krylov
+    /// subspace exactly as in [`expmv_into`](Self::expmv_into).
     pub fn etd_step_into<F>(
         &mut self,
         matvec: F,
@@ -420,184 +377,36 @@ impl KrylovWorkspace {
 ///
 /// `matvec` computes `A·x`. `m` is the Krylov dimension; Arnoldi stops early
 /// on a lucky breakdown. Allocating wrapper around
-/// [`KrylovWorkspace::expmv_into`], reuse a [`KrylovWorkspace`] directly to
-/// step without allocating.
+/// [`KrylovWorkspace::expmv_into`] with `tol = 0` (the fixed full-`m`
+/// subspace), reuse a [`KrylovWorkspace`] directly to step without
+/// allocating.
 pub fn expmv<F>(matvec: F, v: &[Accum], t: Accum, m: usize) -> Vec<Accum>
 where
     F: Fn(&[Accum]) -> Vec<Accum>,
 {
     let mut ws = KrylovWorkspace::new();
     let mut out = vec![0.0; v.len()];
-    // tol = 0 → the fixed full-`m` subspace, the behaviour callers of the
-    // allocating `expmv` (and the ETD wrappers) rely on.
     ws.expmv_into(|x, ax| ax.copy_from_slice(&matvec(x)), v, t, m, 0.0, &mut out);
     out
 }
 
 /// One exponential-time-differencing step of `dy/dt = A·y + b`, with the
 /// source `b` held constant across the step:
-/// `y ← exp(h·A)·y + h·φ₁(h·A)·b`.
-///
-/// Uses the augmented-matrix identity
-/// `exp(h·[[A, b],[0, 0]])·[y; 1] = [exp(hA)y + h·φ₁(hA)b ; 1]`, so the
-/// Krylov `expmv` handles the φ-function with no extra machinery, the
-/// homogeneous part is exact at any `h`.
+/// `y ← exp(h·A)·y + h·φ₁(h·A)·b`. Allocating wrapper around
+/// [`KrylovWorkspace::etd_step_into`] with `tol = 0` (the fixed full-`m`
+/// subspace).
 pub fn etd_step<F>(matvec: F, y: &[Accum], b: &[Accum], h: Accum, m: usize) -> Vec<Accum>
 where
     F: Fn(&[Accum]) -> Vec<Accum>,
 {
-    let n = y.len();
-    let mut z = Vec::with_capacity(n + 1);
-    z.extend_from_slice(y);
-    z.push(1.0);
-    let aug = |zz: &[Accum]| -> Vec<Accum> {
-        let xi = zz[n];
-        let mut out = matvec(&zz[..n]);
-        for (o, bk) in out.iter_mut().zip(b) {
-            *o += xi * bk;
-        }
-        out.push(0.0);
-        out
-    };
-    let r = expmv(aug, &z, h, m);
-    r[..n].to_vec()
-}
-
-/// Second-order ETD step of `dy/dt = A·y + b(t)`, with the source taken
-/// **linear** across the step from `b0 = b(tₙ)` to `b1 = b(tₙ+h)`:
-/// `y ← exp(hA)y + h·φ₁(hA)·b0 + h²·φ₂(hA)·d`,  `d = (b1-b0)/h`.
-///
-/// Uses a two-row augmentation, `exp(h·[[A, d, b0],[0,0,1],[0,0,0]])` applied
-/// to `[y; 0; 1]`, so the Krylov `expmv` produces both φ-functions with no
-/// extra machinery. Exact when `b` is linear; second-order otherwise.
-pub fn etd_step2<F>(
-    matvec: F,
-    y: &[Accum],
-    b0: &[Accum],
-    b1: &[Accum],
-    h: Accum,
-    m: usize,
-) -> Vec<Accum>
-where
-    F: Fn(&[Accum]) -> Vec<Accum>,
-{
-    let n = y.len();
-    let d: Vec<Accum> =
-        b0.iter().zip(b1).map(|(a, b)| (b - a) / h).collect();
-    // Augmented state [y; p; q] with p(0)=0, q(0)=1 ⇒ q≡1, p≡t.
-    let mut z = Vec::with_capacity(n + 2);
-    z.extend_from_slice(y);
-    z.push(0.0);
-    z.push(1.0);
-    let aug = |zz: &[Accum]| -> Vec<Accum> {
-        let (p, q) = (zz[n], zz[n + 1]);
-        let mut out = matvec(&zz[..n]);
-        for k in 0..n {
-            out[k] += d[k] * p + b0[k] * q;
-        }
-        out.push(q);
-        out.push(0.0);
-        out
-    };
-    let r = expmv(aug, &z, h, m);
-    r[..n].to_vec()
-}
-
-/// Matrix-free `exp(t·A)·v` with an **automatically chosen** Krylov dimension.
-///
-/// The subspace grows one vector at a time; after each step the Arnoldi
-/// a-posteriori error estimate `β·h_{m+1,m}·|(exp(t·H_m))_{m,1}|` is checked,
-/// and the process stops once it drops below `tol` (or on a lucky breakdown,
-/// or at `max_dim`). Returns the result and the dimension actually used.
-pub fn expmv_adaptive<F>(
-    matvec: F,
-    v: &[Accum],
-    t: Accum,
-    tol: Accum,
-    max_dim: usize,
-) -> (Vec<Accum>, usize)
-where
-    F: Fn(&[Accum]) -> Vec<Accum>,
-{
-    let n = v.len();
-    let beta = norm2(v);
-    if beta == 0.0 {
-        return (vec![0.0; n], 0);
-    }
-    let md = max_dim.max(1);
-    let mut basis: Vec<Vec<Accum>> =
-        vec![v.iter().map(|x| x / beta).collect()];
-    let mut h = vec![0.0; md * md];
-
-    for j in 0..md {
-        let mut w = matvec(&basis[j]);
-        for i in 0..=j {
-            let hij = dot(&w, &basis[i]);
-            h[i * md + j] = hij;
-            for k in 0..n {
-                w[k] -= hij * basis[i][k];
-            }
-        }
-        let hn = norm2(&w);
-        let m = j + 1;
-
-        // exp(t·H_m) on the m×m leading block.
-        let mut th = vec![0.0; m * m];
-        for a in 0..m {
-            for b in 0..m {
-                th[a * m + b] = t * h[a * md + b];
-            }
-        }
-        let e = expm(&th, m);
-        let estimate = beta * hn * e[(m - 1) * m].abs();
-
-        if estimate < tol || hn < ARNOLDI_BREAKDOWN || m == md {
-            let mut out = vec![0.0; n];
-            for i in 0..m {
-                let c = beta * e[i * m];
-                for k in 0..n {
-                    out[k] += c * basis[i][k];
-                }
-            }
-            return (out, m);
-        }
-
-        h[(j + 1) * md + j] = hn;
-        basis.push(w.iter().map(|x| x / hn).collect());
-    }
-    unreachable!("loop returns at m == md")
-}
-
-fn identity(n: usize) -> Vec<Accum> {
-    let mut m = vec![0.0; n * n];
-    for i in 0..n {
-        m[i * n + i] = 1.0;
-    }
-    m
-}
-
-fn matmul(a: &[Accum], b: &[Accum], n: usize) -> Vec<Accum> {
-    let mut c = vec![0.0; n * n];
-    for i in 0..n {
-        for k in 0..n {
-            let aik = a[i * n + k];
-            if aik == 0.0 {
-                continue;
-            }
-            for j in 0..n {
-                c[i * n + j] += aik * b[k * n + j];
-            }
-        }
-    }
-    c
-}
-
-fn dot(a: &[Accum], b: &[Accum]) -> Accum {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let mut ws = KrylovWorkspace::new();
+    let mut out = vec![0.0; y.len()];
+    ws.etd_step_into(|x, ax| ax.copy_from_slice(&matvec(x)), y, b, h, m, 0.0, &mut out);
+    out
 }
 
 fn norm2(a: &[Accum]) -> Accum {
-    dot(a, a).sqrt()
+    a.iter().map(|x| x * x).sum::<Accum>().sqrt()
 }
 
 #[cfg(test)]
@@ -606,7 +415,7 @@ mod tests {
 
     #[test]
     fn expm_of_zero_is_identity() {
-        let e = expm(&vec![0.0; 9], 3);
+        let e = expm(&[0.0; 9], 3);
         for i in 0..3 {
             for j in 0..3 {
                 let want = if i == j { 1.0 } else { 0.0 };
@@ -641,7 +450,7 @@ mod tests {
         use crate::mesh_gen::structured_box;
         use crate::rhs::MaxwellOperator;
         let mesh = structured_box(1, 1, 1, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let a = op.assemble_dense();
         let t = 0.05;
@@ -676,54 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_expmv_matches_serial_arnoldi_on_a_larger_mesh() {
-        // The reusable-workspace expmv must agree with the independent
-        // serial Arnoldi of expmv_adaptive on a mesh well past the small
-        // cavities the other tests use.
-        use crate::mesh_gen::structured_box;
-        use crate::rhs::MaxwellOperator;
-        let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
-        let n = op.n_dof();
-
-        let v: Vec<f64> =
-            (0..n).map(|i| (0.4 + i as f64 * 0.013).sin()).collect();
-        let t = 0.01;
-
-        let mut ws = KrylovWorkspace::new();
-        let mut got = vec![0.0; n];
-        ws.expmv_into(
-            |x, ax| ax.copy_from_slice(&op.apply(x)),
-            &v,
-            t,
-            150,
-            0.0,
-            &mut got,
-        );
-        let (want, _) = expmv_adaptive(|x| op.apply(x), &v, t, 1e-11, 200);
-
-        let err: f64 = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let scale: f64 = want.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(
-            err < 1e-8 * scale,
-            "blocked CGS2 vs serial Arnoldi: rel.err {}",
-            err / scale
-        );
-    }
-
-    #[test]
     fn adaptive_expmv_into_stops_early_and_stays_accurate() {
         // With a tolerance, expmv_into must truncate the Krylov subspace
         // well before `max_dim` yet still match the full-dimension result.
         use crate::mesh_gen::structured_box;
         use crate::rhs::MaxwellOperator;
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let v: Vec<f64> =
             (0..n).map(|i| (0.3 + i as f64 * 0.011).sin()).collect();
@@ -791,52 +559,13 @@ mod tests {
     }
 
     #[test]
-    fn etd_step2_is_second_order_and_exact_for_linear_sources() {
-        // A = 0: with no dynamics, etd_step2 integrates b(t) = b0 + d·t
-        // exactly, the trapezoidal value y0 + h·(b0+b1)/2.
-        let zero = |x: &[f64]| vec![0.0; x.len()];
-        let y0 = [1.0, -2.0];
-        let (b0, b1) = ([0.5, 1.5], [2.5, -0.5]);
-        let h = 0.4;
-        let got = etd_step2(zero, &y0, &b0, &b1, h, 6);
-        for k in 0..2 {
-            let want = y0[k] + h * 0.5 * (b0[k] + b1[k]);
-            assert!((got[k] - want).abs() < 1e-12, "A=0 trapezoid {got:?}");
-        }
-
-        // Second order: the error quarters when the step halves.
-        let omega = 1.7;
-        let matvec = |x: &[f64]| vec![-omega * x[1], omega * x[0]];
-        let src = |t: f64| vec![(2.3 * t).cos(), 0.4 * t];
-        let t_end = 1.2;
-        let integrate = |nsteps: usize| -> Vec<f64> {
-            let h = t_end / nsteps as f64;
-            let mut y = vec![1.0, 0.0];
-            for s in 0..nsteps {
-                let t = s as f64 * h;
-                y = etd_step2(matvec, &y, &src(t), &src(t + h), h, 6);
-            }
-            y
-        };
-        let reference = integrate(2048);
-        let err = |n: usize| -> f64 {
-            let y = integrate(n);
-            ((y[0] - reference[0]).powi(2)
-                + (y[1] - reference[1]).powi(2))
-            .sqrt()
-        };
-        let rate = err(16) / err(32);
-        assert!(rate > 3.5, "etd_step2 not ~2nd order, error ratio {rate:.2}");
-    }
-
-    #[test]
     fn central_flux_propagation_conserves_energy() {
         // P4.4: a central-flux transient run conserves the discrete field
         // energy yᵀM̃y exactly (up to the Krylov tolerance) over many steps.
         use crate::mesh_gen::structured_box;
         use crate::rhs::MaxwellOperator;
         let mesh = structured_box(1, 1, 1, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 0.0);
+        let op = MaxwellOperator::new(&mesh, 2, 0.0, Default::default());
         let n = op.n_dof();
         let mm = op.assemble_energy_mass();
         let energy = |y: &[f64]| -> f64 {
@@ -860,12 +589,13 @@ mod tests {
 
     #[test]
     fn adaptive_krylov_dimension_meets_tolerance() {
-        // expmv_adaptive picks the Krylov dimension itself; the result must
-        // match the dense reference, and the chosen dimension stay modest.
+        // With a tolerance, expmv_into picks the Krylov dimension itself; the
+        // result must match the dense reference, and the chosen dimension
+        // stay modest.
         use crate::mesh_gen::structured_box;
         use crate::rhs::MaxwellOperator;
         let mesh = structured_box(1, 1, 1, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let t = 0.05;
 
@@ -881,7 +611,12 @@ mod tests {
             }
         }
 
-        let (got, dim) = expmv_adaptive(|x| op.apply(x), &v, t, 1e-9, 200);
+        let mut ws = KrylovWorkspace::new();
+        let mut got = vec![0.0; n];
+        let dim = ws.expmv_into(
+            |x, ax| ax.copy_from_slice(&op.apply(x)),
+            &v, t, 200, 1e-9, &mut got,
+        );
         let err: f64 = got
             .iter()
             .zip(&want)

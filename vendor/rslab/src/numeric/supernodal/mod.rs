@@ -16,4 +16,4 @@ pub(crate) use forest::ll_forest;
 pub(crate) use input::{Input, InputProgram};
 pub(crate) use node::{perturb_pivot, CmodPlan, Gloc, Span};
 pub(crate) use schedule::{emit_refcount_offsets, Li, LlSchedule};
-pub(crate) use store::{Cells, PanelPtr, SlotStore};
+pub(crate) use store::{Cells, PanelPtr, ScratchPool};

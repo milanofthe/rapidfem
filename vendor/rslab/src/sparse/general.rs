@@ -20,6 +20,19 @@ pub struct GeneralCsc<T> {
     pub values: Vec<T>,
 }
 
+impl<T: crate::scalar::Demote> GeneralCsc<T> {
+    /// This matrix in the lower-precision field (same pattern), the input of
+    /// a [`MixedPrecision`](crate::MixedPrecision) factor.
+    pub fn demoted(&self) -> GeneralCsc<T::Low> {
+        GeneralCsc {
+            n: self.n,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            values: self.values.iter().map(|&v| v.demote()).collect(),
+        }
+    }
+}
+
 impl<T: Scalar> GeneralCsc<T> {
     /// Build from `(row, col, value)` triplets. Indices are 0-based; duplicates
     /// are summed; rows within a column are sorted.

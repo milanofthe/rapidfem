@@ -1,6 +1,7 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Local conditioning of the canonical R2 element under sliver degeneration,
 and the solution-preserving remedies (diagonal equilibration + iterative
 refinement). Grounds the implementation in `crates/rapidfem-fd`.
@@ -10,7 +11,7 @@ conditioning numbers are for the *exact* element rapidfem assembles.
 
 Three parts:
   (1) Sweep a tetrahedron from regular to sliver; show how 6V, cond(D),
-      cond(F) and cond(A = D + F) blow up — this fixes the floor threshold.
+      cond(F) and cond(A = D + F) blow up, this fixes the floor threshold.
   (2) Diagonal (Jacobi) equilibration A -> S A S and a Ruiz sweep: prove it
       preserves the solution and quantify the conditioning gain.
   (3) Iterative refinement: derive and demonstrate the error contraction that
@@ -213,7 +214,7 @@ def part3_iterative_refinement():
     print("  => each re-solve reuses the factorization and contracts the error by")
     print("     ~rho, down to the working precision floor. CEILING: when")
     print("     cond*u_factor > 1 (a true sliver, cond > 1/u ~ 4.5e15 in double)")
-    print("     refinement DIVERGES — no solver-side trick rescues it; only the")
+    print("     refinement DIVERGES, no solver-side trick rescues it; only the")
     print("     volume floor (part 1b) and not meshing slivers do.")
 
 

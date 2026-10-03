@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """The R2 surface element is the tangential trace of the R2 volume element.
 
 `crates/rapidfem-fd/src/tri_assembly.rs` assembles the Robin / port boundary

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Opt-in dump of the linear systems a frequency sweep factors, for solver
 //! benchmarks.
 //!
@@ -29,7 +33,6 @@ pub(crate) fn target() -> Option<(PathBuf, String)> {
 /// - `n`, `rows`, `cols`, `vals`: the full `n x n` matrix as COO triplets,
 ///   both triangles, duplicates allowed (they are summed).
 /// - `rhs`: right-hand sides, each of length `n`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_system(
     (dir, tag): &(PathBuf, String),
     index: usize,

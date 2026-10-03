@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Surface (boundary-triangle) assembly for the Robin / port BC.
 //!
@@ -22,7 +19,7 @@
 //! surface element.
 //!
 //! `build_surface_basis` therefore calls `tet_assembly::edge_fns` and
-//! `face_fns` — the same generators the volume element is built from — on the
+//! `face_fns`, the same generators the volume element is built from, on the
 //! triangle's own three nodes. It does not restate the functions, so it cannot
 //! disagree with the volume element about their sign. (It used to restate them,
 //! with a comment claiming the signs had been matched by hand.) The identity is
@@ -30,7 +27,7 @@
 //! the volume element on real tetrahedra in `tests/face_trace_test.rs`.
 //!
 //! The Robin term ∫ γ (n̂×φ_i)·(n̂×φ_j) dA reduces, for tangential fields, to
-//! γ ∫ φ_i·φ_j dA — the surface mass matrix. The forcing is ∫ φ_i·u_inc dA. Both
+//! γ ∫ φ_i·φ_j dA, the surface mass matrix. The forcing is ∫ φ_i·u_inc dA. Both
 //! integrate exactly with the barycentric area coefficients; no quadrature is
 //! needed for the mass.
 //!
@@ -43,28 +40,18 @@ use rapidfem_core::mesh::TRI_EDGE_LOCAL;
 use crate::coefficients::area_coeff_exps;
 use crate::dofmap::DofOwner;
 use crate::tet_assembly::{edge_fns, face_fns, BasisFn};
+use rapidfem_core::geom::{cross, unit};
 
 type V2 = [f64; 2];
 
-/// Number of DOFs on the surface element at uniform order 2: 3 edges × 2 modes
-/// + 1 face × 2. Under the minimum rule it can be less; ask the DOF map, do not
-/// assume this.
+/// Number of DOFs on the surface element at uniform order 2: 3 edges with 2
+/// modes each plus 2 face modes. Under the minimum rule it can be less; ask the
+/// DOF map, do not assume this.
 pub const N_TRI_DOFS_P2: usize = 8;
 
 #[inline]
 fn dot2(a: &V2, b: &V2) -> f64 {
     a[0] * b[0] + a[1] * b[1]
-}
-
-#[inline]
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-}
-
-#[inline]
-fn norm3(a: [f64; 3]) -> [f64; 3] {
-    let n = (a[0]*a[0] + a[1]*a[1] + a[2]*a[2]).sqrt();
-    [a[0]/n, a[1]/n, a[2]/n]
 }
 
 /// Local right-handed 2-D frame of a triangle: returns (rotation rows, xs, ys)
@@ -73,9 +60,9 @@ pub fn tri_local_cs(v: &[[f64; 3]; 3]) -> ([[f64; 3]; 3], [f64; 3], [f64; 3]) {
     let o = v[0];
     let e1 = [v[1][0]-o[0], v[1][1]-o[1], v[1][2]-o[2]];
     let e2 = [v[2][0]-o[0], v[2][1]-o[1], v[2][2]-o[2]];
-    let zhat = norm3(cross3(e1, e2));
-    let xhat = norm3(e1);
-    let yhat = norm3(cross3(zhat, xhat));
+    let zhat = unit(cross(e1, e2));
+    let xhat = unit(e1);
+    let yhat = unit(cross(zhat, xhat));
     let basis = [xhat, yhat, zhat];
     let mut xs = [0.0; 3];
     let mut ys = [0.0; 3];
@@ -124,7 +111,7 @@ fn node_dist(xs: &[f64; 3], ys: &[f64; 3], i: usize, j: usize) -> f64 {
 ///
 /// Built from the volume element's own generators on the triangle's three nodes
 /// (see the module docs). The triangle has no fourth node, so `exps[3]` is zero
-/// and no term gradients it — asserted below, because that is precisely the trace
+/// and no term gradients it, asserted below, because that is precisely the trace
 /// property the construction relies on.
 pub fn build_surface_basis(
     owners: &[DofOwner],
@@ -212,6 +199,49 @@ pub fn tri_stiff(
     let fns = build_surface_basis(owners, &xs, &ys);
     let m = surface_mass(&fns, &grads, 0.5 * two_a.abs());
     m.iter().map(|&v| gamma * C64::from(v)).collect()
+}
+
+/// Anisotropic surface Robin stiffness: `∫ φ_i·Γ·φ_j dA` for a constant
+/// tensor `Γ` (global frame, only its tangential part acts).
+pub fn tri_stiff_tensor(
+    owners: &[DofOwner],
+    glob_vertices: &[[f64; 3]; 3],
+    tensor: &[[C64; 3]; 3],
+) -> Vec<C64> {
+    let (frame, xs, ys) = tri_local_cs(glob_vertices);
+    let (grads, two_a) = bary_grads_2d(&xs, &ys);
+    let fns = build_surface_basis(owners, &xs, &ys);
+    let area = 0.5 * two_a.abs();
+    // Γ in the triangle's frame: w[a][b] = frame[a]·Γ·frame[b]
+    let w: [[C64; 2]; 2] = std::array::from_fn(|a| {
+        std::array::from_fn(|b| {
+            let mut s = C64::new(0.0, 0.0);
+            for i in 0..3 {
+                for j in 0..3 {
+                    s += C64::from(frame[a][i] * frame[b][j]) * tensor[i][j];
+                }
+            }
+            s
+        })
+    });
+    let n = fns.len();
+    let mut m = vec![C64::new(0.0, 0.0); n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = C64::new(0.0, 0.0);
+            for ti in &fns[i].terms {
+                for tj in &fns[j].terms {
+                    let (gi, gj) = (grads[ti.grad as usize], grads[tj.grad as usize]);
+                    let gwg = C64::from(gi[0]) * (w[0][0] * gj[0] + w[0][1] * gj[1])
+                        + C64::from(gi[1]) * (w[1][0] * gj[0] + w[1][1] * gj[1]);
+                    let e: [u8; 3] = std::array::from_fn(|k| ti.exps[k] + tj.exps[k]);
+                    acc += gwg * C64::from(ti.coeff * tj.coeff * area_coeff_exps(e) * area);
+                }
+            }
+            m[i * n + j] = acc * C64::from(fns[i].scale * fns[j].scale);
+        }
+    }
+    m
 }
 
 /// Surface excitation: `∫ φ_i·u_inc dA` by quadrature, an 8-vector.

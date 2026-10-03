@@ -17,8 +17,7 @@ Wave ports at the substrate's x-min / x-max cross-sections drive both ends
 with the microstrip's quasi-TEM mode (``mode_kind="auto"``). A first-order
 ABC on the lateral y-walls and the air top opens the enclosure so the
 structure radiates instead of trapping energy in a lossless cavity (see the
-boundary-condition note below for why that matters and why second order is
-wrong here). The sweep covers 5.2 - 6.2 GHz, 21 points and reproduces the
+boundary-condition note below for why that matters). The sweep covers 5.2 - 6.2 GHz, 21 points and reproduces the
 EMerge pass-band shape centred near 5.7 GHz; the open lateral walls sit
 close to the trace, so the modelled insertion loss (~-5 to -6 dB) runs
 above EMerge's -1.1 dB reference by the extra lateral-radiation loss
@@ -27,7 +26,6 @@ above EMerge's -1.1 dB reference by the extra lateral-radiation loss
 
 # %% Parameters
 import math
-import warnings
 
 import numpy as np
 
@@ -196,11 +194,7 @@ for strand in strands:
         for (x_lo, y_lo, x_hi, y_hi) in strand
     ]
     if len(plates) > 1:
-        # fuse() warns that merged faces lose their names, irrelevant here,
-        # PEC is attached to the merged plate object directly below.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            g.fuse(plates[0], *plates[1:])
+        g.fuse(plates[0], *plates[1:])
     trace_plates.append(plates[0])
 
 g.fragment(sub, air, *trace_plates)
@@ -239,15 +233,13 @@ rf.show(g)
 
 
 # %% Mesh
-# Skip auto_refine_features here: the per-entity maxh on trace plates already
-# carries the small-feature constraint, and auto_refine_features on a 70x22mm
-# board with hundreds of edges runs into a long Distance-field pre-pass.
+# The per-plate maxh on the traces carries the small-feature constraint.
 g.mesh()
 rf.show(g)
 
 
 # %% Problem + Sweep
-prob = rf.Problem(g)
+prob = rf.ProblemFD(g)
 result = prob.sweep(FREQUENCIES)
 rf.show(prob)
 rf.show(result)

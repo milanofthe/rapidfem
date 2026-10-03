@@ -5,7 +5,7 @@
 Electromagnetic FEM solver written in Rust, distributed as a Python package on PyPI. Two backends sit
 behind one geometry / material / physics API: a frequency-domain solver (Nédélec first-kind
 curl-conforming elements, complex-symmetric sparse linear algebra) and a time-domain DGTD solver
-(nodal discontinuous Galerkin, Krylov/ETD exponential time integration, model-order reduction). The
+(nodal discontinuous Galerkin, Krylov/ETD exponential, explicit and adaptive time integration). The
 geometry is non-dimensionalised before assembly, so sub-micron RFIC passives and metre-scale
 structures use the same numerical path. An optional Flask-based local UI provides a code editor and a
 live viewer.
@@ -18,8 +18,9 @@ pip install rapidfem[ui]        # solver + local UI
 ```
 
 Wheels for Windows, Linux, and macOS are built in CI; the Rust core is compiled ahead of time, so no
-Rust toolchain is needed on the user's machine. Gmsh (the `gmsh` Python wheel) is pulled in
-automatically and provides the OpenCASCADE geometry kernel and mesher used by `rapidfem.Geometry`.
+Rust toolchain is needed on the user's machine. Geometry and meshing run on the built-in
+[rapidmesh](https://github.com/milanofthe/rapidmesh) mesher, the sparse solves on the built-in
+rslab solver; there are no other native dependencies.
 
 ## Quick start (Python API)
 
@@ -39,7 +40,7 @@ rf.PEC(*air.faces.unassigned)
 g.mesh()
 
 # Define the problem once, run any number of analyses on it
-prob = rf.Problem(g)                      # Problem is the frequency-domain ProblemFD
+prob = rf.ProblemFD(g)                      # the frequency-domain problem
 result = prob.sweep(np.linspace(8e9, 12e9, 21))
 print(result.frequencies.shape, result.sparams.shape)
 
@@ -53,39 +54,35 @@ stepped-impedance filters, patch / Vivaldi / inverted-F antennas (PML + far-fiel
 dielectric resonators, and the `fd_rfic_*` on-chip passives. RFIC geometry comes from a process stack
 and layout via `rapidfem.rfic` (`rfic.Stack`, `Geometry.from_gds`).
 
-## Importing external CAD and meshes
+## Importing external geometry and meshes
 
 `g.load(path)` brings external geometry into the scene; the action is chosen from the file extension.
 
 ```python
 g = rf.Geometry(maxh=rf.lambda_maxh(f_max=20e9))
 
-# STEP / IGES / BREP land in the same OpenCASCADE kernel as the primitives,
-# so the result is a normal GeoObject: boolean it, transform it, select its
-# faces, attach materials and physics, exactly like a g.box(...).
-part = g.load("horn.step", material=rf.Air())   # mm STEP -> metres by default
+# A STEP file brings one solid per body, its faces on their true surfaces, in
+# metres whatever unit the file declares: a normal GeoObject, so boolean it,
+# transform it, select its faces, attach materials and physics, exactly like
+# a g.box(...). rotation= and position= place the part.
+part = g.load("horn.step", material=rf.Air(),
+              rotation=(math.pi, (0, 0, 1)), position=(0, 0, 5e-3))
 post = g.cylinder(radius=0.5e-3, height=5e-3)
-g.cut(part, post)                                # compose CAD with primitives
+g.cut(part, post)                                # compose with primitives
 g.rotate(part, math.pi / 2, axis=(0, 1, 0))      # full transform API applies
 rf.RectWaveguidePort(part.faces.max(axis="z"))
 rf.PEC(*part.faces.unassigned)
 g.mesh()
 
-# Place/orient any import at load time, like a primitive's position= kwarg:
-part = g.load("horn.step", position=(0, 0, 5e-3), rotation=(math.pi, (0, 0, 1)))
+# A closed STL or OBJ surface becomes a solid too, split into smooth faces at
+# its creases; STL carries no unit, unit= names the file's.
+blob = g.load("antenna.stl", unit="MM", material=rf.Air())
 
-# STL is a surface triangulation, healed into a meshable solid. It is a discrete
-# body (its geometry is the mesh), so it stays standalone: it takes a material,
-# physics, placement and meshing, but it cannot be combined with OCC primitives
-# or boolean ops (export STEP/IGES/BREP for that). STL is unit-less; pass scale=
-# (metres per file unit) for a model authored in mm.
-g = rf.Geometry(maxh=0.5e-3)
-blob = g.load("antenna.stl", material=rf.Air(), scale=1e-3, position=(0, 0, 1e-3))
-
-# A pre-built .msh volume mesh is already tessellated, so loading one switches
-# the geometry into mesh mode: its named physical groups become selectable
-# handles for materials and physics. g.mesh() bakes the bindings (no remeshing)
-# and the usual Problem/sweep pipeline runs unchanged.
+# A pre-built .msh volume mesh (gmsh MSH 4.1 or 2.2) is already tessellated, so
+# loading one switches the geometry into mesh mode: its named physical groups
+# become selectable handles for materials and physics. g.mesh() bakes the
+# bindings (no remeshing) and the usual Problem/sweep pipeline runs unchanged.
+# g.save_mesh(path) writes such a file, the groups named as the solver sees them.
 g = rf.Geometry()
 scene = g.load("waveguide.msh")
 scene.group("air").material = rf.Air()
@@ -93,12 +90,11 @@ rf.RectWaveguidePort(scene.group("port_in"))
 rf.RectWaveguidePort(scene.group("port_out"))
 rf.PEC(scene.group("walls"))
 g.mesh()
-result = rf.Problem(g).sweep(np.linspace(8e9, 12e9, 21))
+result = rf.ProblemFD(g).sweep(np.linspace(8e9, 12e9, 21))
 ```
 
-`unit=` sets the target unit OpenCASCADE converts a STEP/IGES file into (default `"M"`, so a
-millimetre file arrives at metre coordinates); `scale=` is an extra metres-per-file-unit factor for
-unit-less STL or a mis-declared CAD unit. `examples/fd_step_import.py` is a full STEP-driven sweep.
+IGES and BREP are not supported; export STEP. `examples/fd_stl_import.py` is a full STL-driven
+sweep.
 
 ## Local UI
 
@@ -113,16 +109,17 @@ frequency and port. `rapidfem.show(g)` sends a geometry to the viewer.
 
 ## Features
 
-- Geometry builder: OpenCASCADE primitives with boolean ops, transforms, and fillet/chamfer.
+- Geometry builder on the vendored rapidmesh: primitives with boolean ops, transforms, and
+  fillet/chamfer.
   Ready-made RF structures in `rf.structures` (coax, microstrip, CPW, stripline, waveguides, helix)
   build geometry and ports in one call.
-- External CAD / mesh import: `g.load(path)` pulls in STEP / IGES / BREP solids as composable
-  primitives, heals STL surfaces into meshable solids, or loads a pre-built `.msh` and exposes its
-  named physical groups for material / physics binding.
+- External CAD / mesh import: `g.load(path)` pulls in STEP solids as composable primitives, closed
+  STL / OBJ surfaces as solids, or loads a pre-built `.msh` and exposes its named groups for
+  material / physics binding.
 - RFIC / GDS: `rapidfem.rfic` process stacks and `Geometry.from_gds` build on-chip passives, solved
   after non-dimensionalisation down to sub-micron features.
 - Element: Nédélec first-kind curl-conforming tetrahedral elements, order 2 (20 DOFs per cell), in a
-  hierarchical basis. Opt-in per-cell mixed order (1-2) via `[element] order_policy = "adaptive"`;
+  hierarchical basis. Opt-in per-cell mixed order (1-2) via `ProblemFD.sweep(order="adaptive")`;
   the default is uniform order 2.
 - Excitations: rectangular waveguide ports (arbitrary TE modes), lumped ports (TEM, multi-line
   voltage integral), coax and wave ports, Floquet plane-wave port (normal incidence), first-order
@@ -147,20 +144,22 @@ frequency and port. `rapidfem.show(g)` sends a geometry to the viewer.
 exposes it as a model at every level:
 
 - DGTD: nodal discontinuous Galerkin on tetrahedra, upwind or energy-conserving central flux.
-- Exponential time integration: matrix-free Krylov/ETD propagator, exact for the linear system at any
-  step size (no CFL limit).
-- Model export / reduction: the RHS, the verbatim sparse operator `A`, an exponential stepper, or
-  Krylov-projected reduced models.
+- Time integration: matrix-free Krylov/ETD propagator, exact for the linear system at any step
+  size (no CFL limit); explicit LSERK4 substepped within the CFL limit; embedded KCL RK4(3) with
+  PI step control. CPU or OpenCL GPU.
+- Model export: the RHS, the verbatim sparse operator `A`, an exponential stepper.
 - Materials: heterogeneous, lossy, anisotropic, and Debye-dispersive media; matched absorbing layers;
   periodic boundaries.
 - Output: field probes, RFT transfer function, VTK field-animation export.
 
 ```python
+import numpy as np
 import rapidfem as rf
 
 ptd  = rf.ProblemTD.box(size=(1, 1, 1), cells=(2, 2, 2), order=2)
+y0   = np.random.default_rng(0).standard_normal(ptd.n_dofs)
 traj = ptd.transient(y0, dt=0.02, steps=200)   # turnkey transient
-rom  = ptd.reduce(y0, dim=60)                   # model-order reduction
+f    = ptd.resonances(n=4)                      # cavity resonances
 A    = ptd.state_space()                        # the verbatim operator
 ```
 
@@ -197,5 +196,5 @@ derivations and cross-checks are in [`derivations/`](derivations/).
 
 ## License
 
-GPL-3.0-or-later with the Gmsh additional permission; see [LICENSE](LICENSE). Copyright (C) Milan
+AGPL-3.0-only; see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright (C) Milan
 Rother and rapidfem contributors; commercial terms available.

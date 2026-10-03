@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! DG reference element on the unit tetrahedron.
 //!
@@ -21,22 +18,20 @@
 //! Equispaced nodes keep this first version simple; for `p ≳ 5` the
 //! Vandermonde conditioning degrades and Warp&Blend nodes become worthwhile.
 
+use std::ops::{AddAssign, Mul};
+
 use crate::constants::Field;
 
 /// Reference DG element of polynomial order `p` on the unit tetrahedron.
 ///
 /// All matrices are `n_nodes × n_nodes`, stored row-major.
 pub struct ReferenceElement {
-    /// Polynomial order.
-    pub order: usize,
     /// Node count, `Np = (p+1)(p+2)(p+3)/6`.
     pub n_nodes: usize,
     /// Node coordinates on the reference tet, `(r, s, t)`.
     pub nodes: Vec<[Field; 3]>,
     /// Mass matrix, `M[i,j] = ∫ φ_i φ_j dV`.
     pub mass: Vec<Field>,
-    /// Inverse mass matrix.
-    pub mass_inv: Vec<Field>,
     /// `∂/∂r` differentiation matrix: `(∂u/∂r)(node_i) = Σ_j diff_r[i,j] u_j`.
     pub diff_r: Vec<Field>,
     /// `∂/∂s` differentiation matrix.
@@ -89,7 +84,7 @@ impl ReferenceElement {
             }
         }
         // Mass M = Cᵀ G C.
-        let mass = triple_product(&c, &gram, &c, n);
+        let mass = triple_product(&c, &gram, n);
         let mass_inv = invert(&mass, n);
 
         // Derivative Vandermondes Vr/Vs/Vt, then D = V_d · C.
@@ -102,19 +97,17 @@ impl ReferenceElement {
                 vt[ni * n + mi] = eval_mono_d(*m, *nd, 2);
             }
         }
-        let diff_r = matmul(&vr, &c, n);
-        let diff_s = matmul(&vs, &c, n);
-        let diff_t = matmul(&vt, &c, n);
+        let diff_r = matmul(&vr, &c, n, n, n);
+        let diff_s = matmul(&vs, &c, n, n, n);
+        let diff_t = matmul(&vt, &c, n, n, n);
 
         let (n_face_nodes, face_nodes, lift, face_node_weights) =
             build_lift(p, &mass_inv, n);
 
         ReferenceElement {
-            order: p,
             n_nodes: n,
             nodes,
             mass,
-            mass_inv,
             diff_r,
             diff_s,
             diff_t,
@@ -141,16 +134,11 @@ fn monomials(p: usize) -> Vec<[usize; 3]> {
 
 /// Equispaced nodes `(i,j,k)/p` with `i+j+k ≤ p` on the reference tet.
 fn equispaced_nodes(p: usize) -> Vec<[Field; 3]> {
-    let mut v = Vec::new();
     let pp = p as Field;
-    for i in 0..=p {
-        for j in 0..=(p - i) {
-            for k in 0..=(p - i - j) {
-                v.push([i as Field / pp, j as Field / pp, k as Field / pp]);
-            }
-        }
-    }
-    v
+    equispaced_ijk(p)
+        .into_iter()
+        .map(|c| c.map(|i| i as Field / pp))
+        .collect()
 }
 
 /// `n!` as an `Field`.
@@ -225,40 +213,60 @@ fn invert(src: &[Field], n: usize) -> Vec<Field> {
     inv
 }
 
-/// `A · B` for `n×n` row-major matrices.
-fn matmul(a: &[Field], b: &[Field], n: usize) -> Vec<Field> {
-    let mut c = vec![0.0; n * n];
-    for i in 0..n {
-        for k in 0..n {
-            let aik = a[i * n + k];
-            if aik == 0.0 {
+/// `out = A * B` for row-major `A` (`rows x inner`) and `B` (`inner x cols`),
+/// skipping zero entries of `A`; `out` must not alias `a` / `b`. The one
+/// dense product of the crate, generic so the `Field` reference operators
+/// and the `Accum` matrix exponential share it whatever their precisions.
+pub(crate) fn matmul_into<T>(
+    a: &[T],
+    b: &[T],
+    rows: usize,
+    inner: usize,
+    cols: usize,
+    out: &mut [T],
+) where
+    T: Copy + Default + PartialEq + AddAssign + Mul<Output = T>,
+{
+    let zero = T::default();
+    out[..rows * cols].fill(zero);
+    for i in 0..rows {
+        for k in 0..inner {
+            let aik = a[i * inner + k];
+            if aik == zero {
                 continue;
             }
-            for j in 0..n {
-                c[i * n + j] += aik * b[k * n + j];
+            for j in 0..cols {
+                out[i * cols + j] += aik * b[k * cols + j];
             }
         }
     }
+}
+
+/// Allocating [`matmul_into`].
+fn matmul(a: &[Field], b: &[Field], rows: usize, inner: usize, cols: usize) -> Vec<Field> {
+    let mut c = vec![0.0; rows * cols];
+    matmul_into(a, b, rows, inner, cols, &mut c);
     c
 }
 
-/// `Aᵀ · G · A` for `n×n` row-major matrices.
-fn triple_product(a: &[Field], g: &[Field], a2: &[Field], n: usize) -> Vec<Field> {
-    // (Aᵀ G) then · A
-    let mut at_g = vec![0.0; n * n];
+/// `C^T * G * C` for `n x n` row-major matrices.
+fn triple_product(c: &[Field], g: &[Field], n: usize) -> Vec<Field> {
+    // (C^T G) then * C
+    let mut ct_g = vec![0.0; n * n];
     for i in 0..n {
         for k in 0..n {
             let mut acc = 0.0;
             for m in 0..n {
-                acc += a[m * n + i] * g[m * n + k];
+                acc += c[m * n + i] * g[m * n + k];
             }
-            at_g[i * n + k] = acc;
+            ct_g[i * n + k] = acc;
         }
     }
-    matmul(&at_g, a2, n)
+    matmul(&ct_g, c, n, n, n)
 }
 
-/// Integer node multi-indices `(i,j,k)`, same order as [`equispaced_nodes`].
+/// Integer node multi-indices `(i,j,k)` with `i+j+k <= p`, the order every
+/// node array follows.
 fn equispaced_ijk(p: usize) -> Vec<[usize; 3]> {
     let mut v = Vec::new();
     for i in 0..=p {
@@ -274,23 +282,6 @@ fn equispaced_ijk(p: usize) -> Vec<[usize; 3]> {
 /// Exact integral of `u^a v^b` over the unit right triangle.
 fn tri_integral(a: usize, b: usize) -> Field {
     factorial(a) * factorial(b) / factorial(a + b + 2)
-}
-
-/// `A·B` for general row-major matrices (`ar×ac` times `ac×bc`).
-fn mat_mul(a: &[Field], ar: usize, ac: usize, b: &[Field], bc: usize) -> Vec<Field> {
-    let mut c = vec![0.0; ar * bc];
-    for i in 0..ar {
-        for k in 0..ac {
-            let aik = a[i * ac + k];
-            if aik == 0.0 {
-                continue;
-            }
-            for j in 0..bc {
-                c[i * bc + j] += aik * b[k * bc + j];
-            }
-        }
-    }
-    c
 }
 
 /// Build the per-face node sets and the lift matrix.
@@ -375,7 +366,7 @@ fn build_lift(
             }
         }
         // Face mass Mf = C2ᵀ G2 C2.
-        let mf = triple_product(&c2inv, &g2, &c2inv, nfp);
+        let mf = triple_product(&c2inv, &g2, nfp);
         // Scatter into Emat.
         for a in 0..nfp {
             let vi = face_nodes[f][a];
@@ -389,7 +380,7 @@ fn build_lift(
             .collect();
     }
 
-    let lift = mat_mul(mass_inv, n, n, &emat, cols);
+    let lift = matmul(mass_inv, &emat, n, n, cols);
     (nfp, face_nodes, lift, face_node_weights)
 }
 
@@ -442,7 +433,7 @@ mod tests {
         for p in 1..=4 {
             let re = ReferenceElement::new(p);
             let n = re.n_nodes;
-            let id = matmul(&re.mass, &re.mass_inv, n);
+            let id = matmul(&re.mass, &invert(&re.mass, n), n, n, n);
             for i in 0..n {
                 for j in 0..n {
                     let want = if i == j { 1.0 } else { 0.0 };

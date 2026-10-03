@@ -70,7 +70,7 @@ rf.show(g)
 
 # %% Build the time-domain problem
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
-print(f"DGTD pyramidal horn - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD pyramidal horn - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive the feed and watch the pulse radiate out of the aperture

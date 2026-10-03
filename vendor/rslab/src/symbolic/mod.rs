@@ -70,6 +70,23 @@ pub struct SymbolicFactorization {
     pub resolved_amalgamation: AmalgamationStrategy,
 }
 
+impl SymbolicFactorization {
+    /// Heap bytes held: the permutations, the supernodes and the permuted pattern.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.perm)
+            + vec_bytes(&self.perm_inv)
+            + vec_bytes(&self.supernodes)
+            + self
+                .supernodes
+                .iter()
+                .map(|s| vec_bytes(&s.children))
+                .sum::<u64>()
+            + vec_bytes(&self.permuted_pattern.col_ptr)
+            + vec_bytes(&self.permuted_pattern.row_idx)
+    }
+}
+
 /// Analyze the lower triangle (`col_ptr`, `row_idx`) of an `n x n` pattern.
 pub fn analyze(
     n: usize,

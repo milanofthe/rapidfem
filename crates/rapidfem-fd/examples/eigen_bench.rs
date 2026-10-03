@@ -1,15 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Eigenmode-solver timing on a PEC cavity.
 //!
 //! The rewritten solver reorthogonalises the Lanczos basis fully, in the B inner
 //! product, twice per step. That is O(m²·n) and is the price of not producing ghost
-//! modes — but it is a price, so measure it against the factorisation it sits next to
+//! modes, but it is a price, so measure it against the factorisation it sits next to
 //! rather than assume it is negligible.
 //!
 //!   cargo run --release -p rapidfem-fd --example eigen_bench [N] [MODES]

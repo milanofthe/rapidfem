@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Barycentric (natural-coordinate) integration coefficients.
 //!
@@ -62,7 +59,7 @@ pub fn area_coeff_exps(e: [u8; 3]) -> f64 {
     num as f64 / FACTORIALS[sum + 2] as f64
 }
 
-/// Volume coefficient by VERTEX INDICES: a,b,c,d in [0,4], where 0 means
+/// Volume coefficient by VERTEX INDICES: a, b, c, d in `[0, 4]`, where 0 means
 /// "unused" and 1-4 select a barycentric coordinate. A thin wrapper over
 /// `volume_coeff_exps` that converts the index list to an exponent multi-index;
 /// kept because the golden test and the derivation are written against it.
@@ -95,7 +92,7 @@ pub fn area_coeff(a: usize, b: usize, c: usize, d: usize) -> f64 {
 fn indices_to_exps4(a: usize, b: usize, c: usize, d: usize) -> [u8; 4] {
     let mut e = [0u8; 4];
     for idx in [a, b, c, d] {
-        if idx >= 1 && idx <= 4 {
+        if (1..=4).contains(&idx) {
             e[idx - 1] += 1;
         }
     }

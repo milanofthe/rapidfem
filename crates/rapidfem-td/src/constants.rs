@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Centralised numerical constants for the time-domain backend.
 //!
@@ -87,7 +84,6 @@ pub const ARNOLDI_MIN_CHUNK: usize = 256;
 /// deriving the chunk from `n` and the thread count fixes that.
 pub const ARNOLDI_TASKS_PER_THREAD: usize = 4;
 
-
 // ── Dense matrix exponential (scaling-and-squaring) ───────────────────────
 
 /// Scaling-and-squaring threshold: the matrix is halved until its
@@ -103,8 +99,8 @@ pub const EXPM_TAYLOR_TERMS: usize = 18;
 
 /// `a` coefficients of the Carpenter-Kennedy 5-stage 4th-order low-storage
 /// Runge-Kutta scheme (LSERK4). The explicit alternative to the Krylov
-/// exponential propagator: five matvecs per step, two state registers, and
-///, unlike the unconditionally stable exponential integrator, a CFL step
+/// exponential propagator: five matvecs per step, two state registers and,
+/// unlike the unconditionally stable exponential integrator, a CFL step
 /// limit set by the spectral radius of the operator. Standard nodal-DG
 /// integrator (Hesthaven & Warburton, *Nodal DG Methods*).
 pub const LSERK4_A: [Field; 5] = [
@@ -214,7 +210,7 @@ pub const APPLY_TASKS_PER_THREAD: usize = 4;
 /// centroids agree (after translation) to within `PERIODIC_MATCH_REL_TOL`
 /// times the period magnitude. A meshing-symmetric pair lines up to
 /// machine precision; this loose-ish tolerance keeps the matcher robust to
-/// gmsh's floating-point round-off without ever wandering onto a wrong
+/// floating-point round-off without ever wandering onto a wrong
 /// partner (the next nearest triangle on a structured face is one cell
 /// size away, orders of magnitude beyond this).
 pub const PERIODIC_MATCH_REL_TOL: Field = 1e-9;
@@ -224,3 +220,97 @@ pub const PERIODIC_MATCH_REL_TOL: Field = 1e-9;
 /// guarded so the matcher's tolerance never collapses to zero. A pair this
 /// close in absolute terms is effectively coincident.
 pub const PERIODIC_MATCH_ABS_FLOOR: Field = 1e-12;
+
+// ── Explicit CFL limit (LSERK4) ───────────────────────────────────────────
+//
+// The exponential propagator is unconditionally stable; the explicit
+// stepper is not, so [`crate::session::TdSession::cfl_dt`] brackets its
+// stability limit empirically. The dimensionless product `z = h·ρ(A)` is
+// bisected between a known-stable and a known-unstable value, each
+// candidate probed by a short explicit run from the dominant eigenvector.
+
+/// Power-iteration count for the spectral radius `ρ(A)`.
+pub const CFL_POWER_ITERS: usize = 40;
+
+/// Explicit steps per stability probe, long enough to see the slow
+/// non-normal growth rates a 16-step probe missed.
+pub const CFL_PROBE_STEPS: usize = 64;
+
+/// Bisection steps bracketing the stability limit.
+pub const CFL_BISECT_ITERS: usize = 7;
+
+/// `z = h·ρ` known stable for LSERK4 on DG Maxwell.
+pub const CFL_Z_STABLE: Field = 3.0;
+
+/// `z = h·ρ` known to diverge.
+pub const CFL_Z_UNSTABLE: Field = 15.0;
+
+/// Absolute norm growth over a probe that fails it outright.
+pub const CFL_GROWTH_FACTOR: Field = 10.0;
+
+/// Largest per-step geometric-mean amplification above 1 for a stable
+/// probe: an upwind-DG operator is non-normal, so a mode bounded over a
+/// short probe can still drift to NaN over a long run; a strict per-step
+/// rate catches that drift.
+pub const CFL_GROWTH_RATE_TOL: Field = 1e-3;
+
+/// Margin applied to the bracketed stability limit.
+pub const CFL_SAFETY: Field = 0.8;
+
+// ── Adaptive step control (KCL RK4(3)5[2R+]C) ────────────────────────────
+//
+// The embedded error is weighted against `atol + rtol·|y|` into a scalar
+// `err_norm`, and the next step grows or shrinks by a PI rule (Söderlind /
+// Gustafsson). These are the defaults of [`crate::session::Controller`].
+
+/// Absolute error floor, the noise level a quiet DOF may carry without
+/// contributing to `err_norm`.
+pub const KCL_ATOL: Field = 1e-8;
+
+/// Relative tolerance per DOF. 1e-4 keeps the phase error well under one
+/// wavelength over a typical run while sitting near LSERK4's CFL step on a
+/// near-uniform mesh.
+pub const KCL_RTOL: Field = 1e-4;
+
+/// Safety factor of the step-size update (Hairer-Wanner).
+pub const KCL_SAFETY: Field = 0.9;
+
+/// Largest step growth between accepted steps.
+pub const KCL_GROWTH_LIMIT: Field = 5.0;
+
+/// Smallest step factor per update.
+pub const KCL_SHRINK_LIMIT: Field = 0.2;
+
+/// PI exponents, scaled by `1/p̂` with `p̂ = min(p, p_emb) + 1 = 4`.
+pub const KCL_PI_ALPHA: Field = 0.7 / 4.0;
+
+/// See [`KCL_PI_ALPHA`].
+pub const KCL_PI_BETA: Field = 0.4 / 4.0;
+
+/// The run aborts once the controller's step falls below this fraction
+/// of the output cadence, rather than spinning on a stiff operator.
+pub const KCL_MIN_STEP_FACTOR: Field = 1e-10;
+
+/// Error norm assumed for a non-finite trial step, so the controller
+/// shrinks it by a definite factor.
+pub const KCL_NONFINITE_ERR: Field = 10.0;
+
+/// Floor of the error norm carried into the PI blend.
+pub const KCL_ERR_FLOOR: Field = 1e-12;
+
+// ── Spectrum and spectra ──────────────────────────────────────────────────
+
+/// Eigenvalues with `|ω|` below this fraction of the largest are the
+/// near-static modes, dropped from the resonance list.
+pub const RESONANCE_STATIC_FRACTION: Field = 1e-3;
+
+/// Two resonances closer than this relative distance are one.
+pub const RESONANCE_MERGE_REL: Field = 1e-3;
+
+/// A transfer function `R/G` is formed only where the drive spectrum is
+/// above this fraction of its peak; outside the band the division only
+/// amplifies noise and `H` is zero.
+pub const TRANSFER_BAND_FRACTION: Field = 1e-2;
+
+/// Progress lines per run (one every `steps / RUN_LOG_LINES` frames).
+pub const RUN_LOG_LINES: usize = 10;

@@ -34,7 +34,7 @@ jobs:
           if-no-files-found: error
 
   build-wheels:
-    name: Wheels — ${{ matrix.os }} / py${{ matrix.python-version }}
+    name: Wheels, ${{ matrix.os }} / py${{ matrix.python-version }}
     needs: build-frontend
     runs-on: ${{ matrix.os }}
     strategy:
@@ -110,7 +110,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
-    # Only fires on a published GitHub Release (any semver — major / minor /
+    # Only fires on a published GitHub Release (any semver, major / minor /
     # patch). Bare `v*` tag pushes still build artifacts but do not publish,
     # so accidental test tags can't reach PyPI.
     if: github.event_name == 'release' && github.event.action == 'published'

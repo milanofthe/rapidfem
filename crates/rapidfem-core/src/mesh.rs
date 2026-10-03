@@ -1,20 +1,21 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Mesh data structure: nodes, edges, tris, tets, and connectivity.
 //!
-//! Edges and faces are extracted from the tetrahedra, deduplicated by sorted
-//! node keys, and cross-referenced (tet↔edge, tet↔face, face↔edge, face↔tet).
-//! The local edge/face traversal orders below are a fixed interface convention
-//! that, together with sorted global node keys, gives every shared edge/face a
-//! consistent orientation across elements — required by the curl-conforming
-//! Nédélec DOFs.
+//! Edges and faces and their incidences (tet↔edge, tet↔face, face↔edge,
+//! face↔tet) come from rapidmesh's [`TetTopology`]: edges `(min, max)`, faces
+//! with ascending vertices. The local edge/face traversal orders below are the
+//! element's fixed interface convention; together with the sorted global
+//! vertex keys they give every shared edge/face a consistent orientation
+//! across elements, required by the curl-conforming Nédélec DOFs. They hold
+//! the same edges (face vertex sets) per slot as rapidmesh's local orders,
+//! the faces in another slot order (`FACE_OF_TOPOLOGY`).
 
 use hashbrown::HashMap;
+use crate::geom::{centroid, dot, norm, scale, sub, tri_area_vector, unit};
+use rapidmesh_topo::{TetTopology, Tets, NONE};
 
 /// Local edge order within a tetrahedron, as 0-indexed node pairs.
 /// The reversed entry (3,1) for the 5th edge is part of the convention and is
@@ -35,6 +36,10 @@ pub const TET_EDGE_LOCAL: [[usize; 2]; 6] = [
 /// surface element share the volume element's edge DOFs.
 pub const TRI_EDGE_LOCAL: [[usize; 2]; 3] = [[0, 1], [1, 2], [0, 2]];
 
+/// The rapidmesh local face (face `i` leaves out vertex `i`) in each slot of
+/// [`TET_FACE_LOCAL`].
+const FACE_OF_TOPOLOGY: [usize; 4] = [3, 1, 2, 0];
+
 /// Local face order within a tetrahedron, as 0-indexed node triples.
 /// The 3rd entry (0,3,1) is intentionally not in ascending order.
 pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [
@@ -44,14 +49,15 @@ pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [
     [1, 2, 3], // (2,3,4)
 ];
 
+#[derive(Clone)]
 pub struct Mesh {
-    /// Node coordinates: nodes[i] = [x, y, z]
+    /// Node coordinates: `nodes[i] = [x, y, z]`
     pub nodes: Vec<[f64; 3]>,
-    /// Edges: edges[e] = [n1, n2] sorted (min, max)
+    /// Edges: `edges[e] = [n1, n2]` sorted (min, max)
     pub edges: Vec<[usize; 2]>,
-    /// Triangles: tris[t] = [n1, n2, n3] sorted
+    /// Triangles: `tris[t] = [n1, n2, n3]` sorted
     pub tris: Vec<[usize; 3]>,
-    /// Tetrahedra: tets[t] = [n1, n2, n3, n4] in gmsh node order (sorted)
+    /// Tetrahedra: `tets[t] = [n1, n2, n3, n4]`, positively oriented
     pub tets: Vec<[usize; 4]>,
 
     /// Per-tet: 6 edge indices in TET_EDGE_LOCAL order
@@ -66,13 +72,12 @@ pub struct Mesh {
     /// Edge lengths
     pub edge_lengths: Vec<f64>,
 
-    /// Inverse maps for fast lookup during construction
-    pub inv_edges: HashMap<(usize, usize), usize>,
+    /// Triangle index by its sorted vertices.
     pub inv_tris: HashMap<(usize, usize, usize), usize>,
 
-    /// Gmsh face tag → list of triangle indices
+    /// Face group tag → list of triangle indices
     pub ftag_to_tri: HashMap<i32, Vec<usize>>,
-    /// Gmsh volume tag → list of tet indices
+    /// Volume group tag → list of tet indices
     pub vtag_to_tet: HashMap<i32, Vec<usize>>,
 
     /// Characteristic length L₀ (m) the node coordinates were divided by to
@@ -84,71 +89,30 @@ pub struct Mesh {
 }
 
 impl Mesh {
-    /// Build all connectivity from raw nodes and tets.
-    /// Extracts edges and triangles from tetrahedra, builds inverse maps.
+    /// Build all connectivity from raw nodes and tets, through rapidmesh's
+    /// topology.
     pub fn from_tets(nodes: Vec<[f64; 3]>, tets: Vec<[usize; 4]>) -> Self {
-        let n_tets = tets.len();
-        let mut inv_edges: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut inv_tris: HashMap<(usize, usize, usize), usize> = HashMap::new();
-        let mut edges: Vec<[usize; 2]> = Vec::new();
-        let mut tris: Vec<[usize; 3]> = Vec::new();
-        let mut tet_to_edge = vec![[0usize; 6]; n_tets];
-        let mut tet_to_tri = vec![[0usize; 4]; n_tets];
+        let tets32: Vec<[u32; 4]> = tets.iter().map(|t| t.map(|v| v as u32)).collect();
+        let topo = TetTopology::build(&Tets { tets: &tets32, n_verts: nodes.len() });
+        let idx = |v: u32| if v == NONE { usize::MAX } else { v as usize };
+        let edges: Vec<[usize; 2]> = topo.edges.iter().map(|e| e.map(|v| v as usize)).collect();
+        let tris: Vec<[usize; 3]> = topo.faces.iter().map(|f| f.map(|v| v as usize)).collect();
+        let tet_to_edge = topo.tet_edges.iter().map(|e| e.map(|v| v as usize)).collect();
+        let tet_to_tri = topo
+            .tet_faces
+            .iter()
+            .map(|f| FACE_OF_TOPOLOGY.map(|k| f[k] as usize))
+            .collect();
+        let tri_to_edge = topo.face_edges.iter().map(|e| e.map(|v| v as usize)).collect();
+        let tri_to_tet = topo.face_tets.iter().map(|t| t.map(idx)).collect();
 
-        for (ti, tet) in tets.iter().enumerate() {
-            // Extract 6 edges
-            for (ei, &[li, lj]) in TET_EDGE_LOCAL.iter().enumerate() {
-                let (a, b) = (tet[li], tet[lj]);
-                let key = if a < b { (a, b) } else { (b, a) };
-                let edge_idx = *inv_edges.entry(key).or_insert_with(|| {
-                    let idx = edges.len();
-                    edges.push([key.0, key.1]);
-                    idx
-                });
-                tet_to_edge[ti][ei] = edge_idx;
-            }
-
-            // Extract 4 faces
-            for (fi, &[li, lj, lk]) in TET_FACE_LOCAL.iter().enumerate() {
-                let mut face = [tet[li], tet[lj], tet[lk]];
-                face.sort();
-                let key = (face[0], face[1], face[2]);
-                let tri_idx = *inv_tris.entry(key).or_insert_with(|| {
-                    let idx = tris.len();
-                    tris.push(face);
-                    idx
-                });
-                tet_to_tri[ti][fi] = tri_idx;
-            }
+        // A face shared by three or more tets means a non-manifold mesh: the
+        // topology keeps the first two, the DG face-jump terms on it are wrong.
+        let mut on_face = vec![0u8; tris.len()];
+        for f in topo.tet_faces.iter().flatten() {
+            on_face[*f as usize] = on_face[*f as usize].saturating_add(1);
         }
-
-        let n_tris = tris.len();
-        let mut tri_to_edge = vec![[0usize; 3]; n_tris];
-        for (ti, tri) in tris.iter().enumerate() {
-            for (ei, &[li, lj]) in TRI_EDGE_LOCAL.iter().enumerate() {
-                let (a, b) = (tri[li], tri[lj]);
-                let key = if a < b { (a, b) } else { (b, a) };
-                tri_to_edge[ti][ei] = inv_edges[&key];
-            }
-        }
-
-        // Build tri_to_tet. An interior face is shared by exactly two tets,
-        // a boundary face by one. A face shared by three or more tets means
-        // a non-manifold mesh; report it rather than silently overwriting
-        // slot [1], which would corrupt the DG face-jump terms downstream.
-        let mut tri_to_tet = vec![[usize::MAX; 2]; n_tris];
-        let mut non_manifold = 0usize;
-        for (ti, tet_tris) in tet_to_tri.iter().enumerate() {
-            for &tri_idx in tet_tris {
-                if tri_to_tet[tri_idx][0] == usize::MAX {
-                    tri_to_tet[tri_idx][0] = ti;
-                } else if tri_to_tet[tri_idx][1] == usize::MAX {
-                    tri_to_tet[tri_idx][1] = ti;
-                } else {
-                    non_manifold += 1;
-                }
-            }
-        }
+        let non_manifold: usize = on_face.iter().map(|&c| c.saturating_sub(2) as usize).sum();
         if non_manifold > 0 {
             eprintln!(
                 "WARNING: non-manifold mesh: {} face-tet incidences beyond \
@@ -158,18 +122,19 @@ impl Mesh {
             );
         }
 
-        // Compute edge lengths
-        let edge_lengths: Vec<f64> = edges.iter().map(|&[a, b]| {
-            let dx = nodes[b][0] - nodes[a][0];
-            let dy = nodes[b][1] - nodes[a][1];
-            let dz = nodes[b][2] - nodes[a][2];
-            (dx*dx + dy*dy + dz*dz).sqrt()
-        }).collect();
+        let edge_lengths: Vec<f64> = edges
+            .iter()
+            .map(|&[a, b]| {
+                let d = [nodes[b][0] - nodes[a][0], nodes[b][1] - nodes[a][1], nodes[b][2] - nodes[a][2]];
+                (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            })
+            .collect();
+        let inv_tris = tris.iter().enumerate().map(|(i, t)| ((t[0], t[1], t[2]), i)).collect();
 
         Mesh {
             nodes, edges, tris, tets,
             tet_to_edge, tet_to_tri, tri_to_edge, tri_to_tet,
-            edge_lengths, inv_edges, inv_tris,
+            edge_lengths, inv_tris,
             ftag_to_tri: HashMap::new(),
             vtag_to_tet: HashMap::new(),
             l0: 1.0,
@@ -181,8 +146,8 @@ impl Mesh {
     /// on O(1) coordinates regardless of the mesh's physical scale. Returns L₀.
     ///
     /// Idempotent: a no-op if already normalized (`l0 != 1.0`) or degenerate
-    /// (zero mean edge). The transform is exactly reversible — physical
-    /// coordinates are `node * l0` — so callers restore physical units for
+    /// (zero mean edge). The transform is exactly reversible, physical
+    /// coordinates are `node * l0`, so callers restore physical units for
     /// output by multiplying back. Connectivity is coordinate-independent and
     /// untouched; `edge_lengths` is rescaled in step.
     pub fn normalize_characteristic_length(&mut self) -> f64 {
@@ -190,7 +155,7 @@ impl Mesh {
             return self.l0;
         }
         let mean: f64 = self.edge_lengths.iter().sum::<f64>() / self.edge_lengths.len() as f64;
-        if !(mean > 0.0) {
+        if mean.is_nan() || mean <= 0.0 {
             return 1.0;
         }
         let inv = 1.0 / mean;
@@ -209,16 +174,46 @@ impl Mesh {
     pub fn n_tris(&self) -> usize { self.tris.len() }
     pub fn n_tets(&self) -> usize { self.tets.len() }
 
-    /// Get boundary triangles (only one adjacent tet).
-    pub fn boundary_tris(&self) -> Vec<usize> {
-        (0..self.n_tris())
-            .filter(|&i| self.tri_to_tet[i][1] == usize::MAX)
-            .collect()
-    }
-
     /// Get triangles for a face tag.
     pub fn tris_for_tag(&self, tag: i32) -> &[usize] {
         self.ftag_to_tri.get(&tag).map_or(&[], |v| v.as_slice())
+    }
+
+    /// A mask over the nodes: `true` for a node on a triangle of any of the
+    /// face groups `tags`.
+    pub fn nodes_on_tags(&self, tags: &[i32]) -> Vec<bool> {
+        let mut mask = vec![false; self.n_nodes()];
+        for &tag in tags {
+            for &t in self.tris_for_tag(tag) {
+                for n in self.tris[t] {
+                    mask[n] = true;
+                }
+            }
+        }
+        mask
+    }
+
+    /// The distinct nodes of triangles `tris`, in first-seen order.
+    pub fn tri_nodes(&self, tris: &[usize]) -> Vec<usize> {
+        let mut seen = hashbrown::HashSet::new();
+        tris.iter()
+            .flat_map(|&t| self.tris[t])
+            .filter(|&n| seen.insert(n))
+            .collect()
+    }
+
+    /// The unit normal of triangle `t` pointing into the first tet it
+    /// bounds, `None` for a degenerate triangle or one no tet touches.
+    pub fn tri_inward_normal(&self, t: usize) -> Option<[f64; 3]> {
+        let [a, b, c] = self.tris[t].map(|n| self.nodes[n]);
+        let area = tri_area_vector(a, b, c);
+        if norm(area) < 1e-300 {
+            return None;
+        }
+        let tet = self.tri_to_tet[t].into_iter().find(|&x| x != usize::MAX)?;
+        let n = unit(area);
+        let into = sub(centroid(&self.nodes, self.tets[tet]), a);
+        Some(if dot(n, into) < 0.0 { scale(n, -1.0) } else { n })
     }
 }
 

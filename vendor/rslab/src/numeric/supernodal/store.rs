@@ -1,46 +1,8 @@
-//! Per-supernode storage of the left-looking factorizations: the slot store
-//! written once by a node's owner and read by its ancestors, the per-index
-//! cells of the emit state, and the raw panel pointer for disjoint parallel
-//! writes.
+//! Per-supernode storage of the left-looking factorizations: the per-index
+//! cells of the emit state, the raw panel pointer for disjoint parallel
+//! writes, and the scratch pool the node kernels borrow from.
 
-/// One `UnsafeCell` payload per supernode, written exactly once by the
-/// supernode's owner and read only by nodes that are (transitively) its
-/// assembly-tree ancestors - the single-writer-before-readers discipline the
-/// left-looking schedule guarantees. `free` resets a slot once its last
-/// consumer is done.
-pub(crate) struct SlotStore<P> {
-    slots: Vec<std::cell::UnsafeCell<P>>,
-}
-
-// SAFETY: single-writer-before-readers, disjoint indices (see the type doc).
-unsafe impl<P: Send> Sync for SlotStore<P> {}
-
-impl<P: Default> SlotStore<P> {
-    pub fn new(nsuper: usize) -> Self {
-        SlotStore {
-            slots: (0..nsuper)
-                .map(|_| std::cell::UnsafeCell::new(P::default()))
-                .collect(),
-        }
-    }
-
-    /// SAFETY: `k` must be a fully-factored descendant of the current node
-    /// (its owner's write happened-before this read).
-    pub unsafe fn get(&self, k: usize) -> &P {
-        &*self.slots[k].get()
-    }
-
-    /// SAFETY: only the owner of supernode `s` calls this, exactly once.
-    pub unsafe fn set(&self, s: usize, p: P) {
-        *self.slots[s].get() = p;
-    }
-
-    /// Move the panel out, leaving the default in its place. SAFETY: the
-    /// owner of supernode `k`, after its last reader is done.
-    pub unsafe fn take(&self, k: usize) -> P {
-        std::mem::take(&mut *self.slots[k].get())
-    }
-}
+use crate::memory::{HeapBytes, SCRATCH_KEEP};
 
 /// Raw base pointer of a panel buffer, smuggled across rayon workers so each
 /// task can write its own **disjoint row range** of a column-major panel. Safe
@@ -112,5 +74,76 @@ impl<V> Cells<V> {
     #[inline]
     pub unsafe fn get_mut(&self, i: usize) -> &mut V {
         &mut *self.0[i].get()
+    }
+}
+
+impl<V> Cells<V> {
+    /// The cells `r` as one slice (`UnsafeCell<V>` is laid out as `V`).
+    ///
+    /// # Safety
+    /// Every write to `r` happened-before this read, and none follows while
+    /// the slice lives.
+    #[inline]
+    pub unsafe fn slice(&self, r: std::ops::Range<usize>) -> &[V] {
+        std::slice::from_raw_parts(self.0[r.clone()].as_ptr() as *const V, r.len())
+    }
+}
+
+/// Scratch the node kernels borrow, one object per running kernel: taken on
+/// entry and given back on exit, so the kernels of one factorization share
+/// a handful of objects (about one per worker) whose buffers stay grown,
+/// instead of allocating their own per supernode. An object heavier than
+/// [`SCRATCH_KEEP`](crate::memory::SCRATCH_KEEP) is freed instead of kept.
+pub(crate) struct ScratchPool<S>(std::sync::Mutex<Vec<S>>);
+
+impl<S: Default + HeapBytes> ScratchPool<S> {
+    pub fn new() -> Self {
+        ScratchPool(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// A scratch object for the caller until the guard drops.
+    pub fn take(&self) -> Lent<'_, S> {
+        let s = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|mut v| v.pop())
+            .unwrap_or_default();
+        Lent {
+            pool: self,
+            s: std::mem::ManuallyDrop::new(s),
+        }
+    }
+}
+
+/// A [`ScratchPool`] object on loan, returned when dropped.
+pub(crate) struct Lent<'p, S: HeapBytes> {
+    pool: &'p ScratchPool<S>,
+    s: std::mem::ManuallyDrop<S>,
+}
+
+impl<S: HeapBytes> std::ops::Deref for Lent<'_, S> {
+    type Target = S;
+    fn deref(&self) -> &S {
+        &self.s
+    }
+}
+
+impl<S: HeapBytes> std::ops::DerefMut for Lent<'_, S> {
+    fn deref_mut(&mut self) -> &mut S {
+        &mut self.s
+    }
+}
+
+impl<S: HeapBytes> Drop for Lent<'_, S> {
+    fn drop(&mut self) {
+        // SAFETY: the object is taken once, here, and never touched again.
+        let s = unsafe { std::mem::ManuallyDrop::take(&mut self.s) };
+        if s.heap_bytes() > SCRATCH_KEEP {
+            return;
+        }
+        if let Ok(mut v) = self.pool.0.lock() {
+            v.push(s);
+        }
     }
 }

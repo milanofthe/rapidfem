@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! GPU representation of the DG Maxwell operator.
 //!
@@ -19,15 +16,16 @@
 use opencl3::kernel::{ExecuteKernel, Kernel};
 use opencl3::memory::Buffer;
 use opencl3::program::Program;
-use opencl3::types::{CL_BLOCKING, cl_double, cl_float, cl_int};
+use opencl3::types::{cl_double, cl_float, cl_int};
 
 use super::GpuContext;
 use crate::constants::{
-    Field, KCL_A, KCL_B, KCL_BHAT, KCL_STAGES, KRYLOV_CHUNK,
+    Field, KCL_A, KCL_B, KCL_BHAT, KCL_ERR_FLOOR, KCL_NONFINITE_ERR, KCL_STAGES, KRYLOV_CHUNK,
     LSERK4_A, LSERK4_B, LSERK4_STAGES,
 };
 use crate::propagator::expm;
 use crate::rhs::MaxwellOperator;
+use crate::session::{Controller, Drive};
 
 /// Apply-kernel source, with `NP` / `NFP` / `COLS` prepended at build time.
 const APPLY_SRC: &str = include_str!("apply.cl");
@@ -41,14 +39,26 @@ const EXPMV_SRC: &str = include_str!("expmv.cl");
 /// KCL RK4(3)5[2R+]C adaptive stage / error-reduction kernel source.
 const KCL_SRC: &str = include_str!("kcl.cl");
 
-/// Source-injection mode for the GPU KCL adaptive transient. Free runs
-/// homogeneously; the two driven variants mirror the LSERK4 GPU paths
-/// (single-DOF point hold and full-vector hold), zeroth-order over each
-/// output frame.
-enum DrivenMode<'a> {
-    Free,
-    Point { source_dof: usize, g_values: &'a [f32] },
-    Vector { g_values: &'a [f32] },
+/// The source held across one step, added to the matvec result after
+/// each right-hand-side evaluation: none, a single DOF with its value, or
+/// the device-resident pattern `src` scaled by the waveform value.
+#[derive(Clone, Copy)]
+enum Hold {
+    None,
+    Point(cl_int, f32),
+    Vector(f32),
+}
+
+impl Hold {
+    /// The source of `drive` held at waveform sample `g[i]`; a free run
+    /// never reads `g`.
+    fn at(drive: Drive<'_>, g: &[f32], i: usize) -> Self {
+        match drive {
+            Drive::Free => Hold::None,
+            Drive::Point(dof) => Hold::Point(dof as cl_int, g[i]),
+            Drive::Vector(_) => Hold::Vector(g[i]),
+        }
+    }
 }
 
 /// Target work-group size for the `apply` kernel. A work-group processes
@@ -220,7 +230,7 @@ impl GpuOperator {
                 fn_flat.push(op.re.face_nodes[f][m] as i32);
             }
         }
-        let face_nodes = gpu.upload_i32(&fn_flat)?;
+        let face_nodes = gpu.upload(&fn_flat)?;
 
         // Per-element geometric factors and materials.
         let mut jinv = Vec::with_capacity(n_elem * 9);
@@ -276,10 +286,10 @@ impl GpuOperator {
         }
         let face_normal = gpu.upload(&normal)?;
         let face_fscale = gpu.upload(&fscale)?;
-        let face_neighbor = gpu.upload_i32(&neighbor)?;
-        let face_nbr_local = gpu.upload_i32(&nbr_local)?;
-        let face_port = gpu.upload_i32(&port)?;
-        let face_perm = gpu.upload_i32(&perm)?;
+        let face_neighbor = gpu.upload(&neighbor)?;
+        let face_nbr_local = gpu.upload(&nbr_local)?;
+        let face_port = gpu.upload(&port)?;
+        let face_perm = gpu.upload(&perm)?;
 
         // Build the kernel with the element dimensions baked in. EPG (the
         // elements per work-group) is chosen so the group sits near the
@@ -506,37 +516,54 @@ impl GpuOperator {
         y_host: &[f32],
     ) -> Result<Vec<f32>, String> {
         assert_eq!(y_host.len(), self.n_dof, "state length mismatch");
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y_host, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
+        gpu.write(&mut self.y, y_host)?;
         self.enqueue_apply(gpu)?;
         // The blocking download serialises behind the kernel.
         gpu.download(&self.dy, self.n_dof)
     }
 
-    /// `f64` host wrapper around [`Self::apply`] for the macromodel
-    /// build: cast `f64 -> f32`, run the device matvec, cast back
-    /// `f32 -> f64`. The mixed-precision drift is bounded by
-    /// [`crate::constants::GPU_REL_TOL`] per matvec; the block-Krylov
-    /// build calls this once per basis vector and the projection
-    /// onto the orthonormal `V` averages the rounding noise to that
-    /// scale across the macromodel.
-    ///
-    /// Used by the `apply_fn` closure that
-    /// [`crate::macromodel::MacroModel::build_with_apply_fn`] takes,
-    /// so the CPU and GPU build paths share the same block-CGS2
-    /// orthogonalisation and Hessenberg loop. The GPU does the
-    /// `n_dof`-sized work; the CPU does the small dot products.
-    pub fn apply_f64(
+    /// Enqueue the right-hand side `dy = A.input + b*g`: the matvec on
+    /// `input`, then the held source `hold` added to its result.
+    fn enqueue_rhs(
+        &self,
+        gpu: &GpuContext,
+        input: &Buffer<cl_float>,
+        hold: Hold,
+    ) -> Result<(), String> {
+        self.enqueue_apply_from(gpu, input)?;
+        match hold {
+            Hold::None => Ok(()),
+            Hold::Point(dof, g) => self.enqueue_add_source(gpu, dof, g),
+            Hold::Vector(g) => self.enqueue_add_source_vec(gpu, g),
+        }
+    }
+
+    /// Start a transient: check `drive` against its `n_samples` waveform
+    /// samples `g` (a free run takes none), upload the pattern of a vector
+    /// drive to `src` and load `y0` into the device state.
+    fn load(
         &mut self,
         gpu: &GpuContext,
-        y_host: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        let y_f32: Vec<f32> = y_host.iter().map(|&v| v as f32).collect();
-        let dy_f32 = self.apply(gpu, &y_f32)?;
-        Ok(dy_f32.into_iter().map(|v| v as f64).collect())
+        y0: &[f32],
+        drive: Drive<'_>,
+        g: &[f32],
+        n_samples: usize,
+    ) -> Result<(), String> {
+        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
+        match drive {
+            Drive::Free => {}
+            Drive::Point(dof) => {
+                assert!(dof < self.n_dof, "source_dof out of range");
+            }
+            Drive::Vector(b) => {
+                assert_eq!(b.len(), self.n_dof, "source length mismatch");
+                gpu.write(&mut self.src, &f32v(b))?;
+            }
+        }
+        if !matches!(drive, Drive::Free) {
+            assert_eq!(g.len(), n_samples, "wrong number of waveform samples");
+        }
+        gpu.write(&mut self.y, y0)
     }
 
     /// Enqueue the soft-source add: `dy[source_dof] += val`.
@@ -715,7 +742,8 @@ impl GpuOperator {
         Ok(())
     }
 
-    /// Run a complete five-stage KCL step on the device-resident state.
+    /// Run a complete five-stage KCL step of `dy/dt = A·y + b·g` on the
+    /// device-resident state, the source `hold` held across the step.
     /// Caller must have backed up `y` first (so a controller reject can
     /// roll back). After this returns, `y` holds the candidate `y_{n+1}`
     /// and `kcl_err` holds the per-DOF embedded-error vector.
@@ -723,70 +751,19 @@ impl GpuOperator {
         &self,
         gpu: &GpuContext,
         h: f32,
+        hold: Hold,
     ) -> Result<(), String> {
-        // Stage 0: matvec at y_n, the kcl_stage0 kernel initialises
-        // dtF/err and advances y to S2 after stage 0.
-        self.enqueue_apply(gpu)?;
+        // Stage 0: right-hand side at y_n, the kcl_stage0 kernel
+        // initialises dtF/err and advances y to S2 after stage 0.
+        self.enqueue_rhs(gpu, &self.y, hold)?;
         self.enqueue_kcl_stage0(
             gpu, h, KCL_B[0] as f32, (KCL_BHAT[0] - KCL_B[0]) as f32,
         )?;
-        // Stages 1..s, build stage state, matvec, accumulate.
+        // Stages 1..s, build stage state, right-hand side, accumulate.
         for stage in 1..KCL_STAGES {
             let amb = (KCL_A[stage - 1] - KCL_B[stage - 1]) as f32;
             self.enqueue_kcl_build_stage(gpu, amb)?;
-            self.enqueue_apply_from(gpu, &self.kcl_stage_buf)?;
-            let b = KCL_B[stage] as f32;
-            let eweight = (KCL_BHAT[stage] - KCL_B[stage]) as f32;
-            self.enqueue_kcl_stage_accum(gpu, h, b, eweight)?;
-        }
-        Ok(())
-    }
-
-    /// Same as [`Self::enqueue_kcl_step`] but for `dy/dt = A·y + b·g(t)`
-    /// with a full source-vector hold (modal-port injection). `g_val`
-    /// is the waveform value held across the step.
-    fn enqueue_kcl_step_driven_vec(
-        &self,
-        gpu: &GpuContext,
-        h: f32,
-        g_val: f32,
-    ) -> Result<(), String> {
-        self.enqueue_apply(gpu)?;
-        self.enqueue_add_source_vec(gpu, g_val)?;
-        self.enqueue_kcl_stage0(
-            gpu, h, KCL_B[0] as f32, (KCL_BHAT[0] - KCL_B[0]) as f32,
-        )?;
-        for stage in 1..KCL_STAGES {
-            let amb = (KCL_A[stage - 1] - KCL_B[stage - 1]) as f32;
-            self.enqueue_kcl_build_stage(gpu, amb)?;
-            self.enqueue_apply_from(gpu, &self.kcl_stage_buf)?;
-            self.enqueue_add_source_vec(gpu, g_val)?;
-            let b = KCL_B[stage] as f32;
-            let eweight = (KCL_BHAT[stage] - KCL_B[stage]) as f32;
-            self.enqueue_kcl_stage_accum(gpu, h, b, eweight)?;
-        }
-        Ok(())
-    }
-
-    /// Same as [`Self::enqueue_kcl_step`] but for `dy/dt = A·y + e_dof·g(t)`
-    /// with a single-DOF source hold. `g_val` is the held source value.
-    fn enqueue_kcl_step_driven_point(
-        &self,
-        gpu: &GpuContext,
-        h: f32,
-        source_dof: cl_int,
-        g_val: f32,
-    ) -> Result<(), String> {
-        self.enqueue_apply(gpu)?;
-        self.enqueue_add_source(gpu, source_dof, g_val)?;
-        self.enqueue_kcl_stage0(
-            gpu, h, KCL_B[0] as f32, (KCL_BHAT[0] - KCL_B[0]) as f32,
-        )?;
-        for stage in 1..KCL_STAGES {
-            let amb = (KCL_A[stage - 1] - KCL_B[stage - 1]) as f32;
-            self.enqueue_kcl_build_stage(gpu, amb)?;
-            self.enqueue_apply_from(gpu, &self.kcl_stage_buf)?;
-            self.enqueue_add_source(gpu, source_dof, g_val)?;
+            self.enqueue_rhs(gpu, &self.kcl_stage_buf, hold)?;
             let b = KCL_B[stage] as f32;
             let eweight = (KCL_BHAT[stage] - KCL_B[stage]) as f32;
             self.enqueue_kcl_stage_accum(gpu, h, b, eweight)?;
@@ -832,154 +809,30 @@ impl GpuOperator {
         Ok((total / n as f64).sqrt() as f32)
     }
 
-    /// Step-size update factor from the PI controller. On a rejected step
-    /// the previous-error blend is dropped (I-only); on acceptance the
-    /// PI smoothing avoids step-size oscillations across many frames.
-    fn kcl_step_factor(
-        err_norm: f32,
-        prev_err_norm: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        reject: bool,
-    ) -> f32 {
-        let f = if reject || prev_err_norm <= 0.0 {
-            safety * err_norm.powf(-pi_alpha)
-        } else {
-            safety
-                * err_norm.powf(-pi_alpha)
-                * prev_err_norm.powf(pi_beta)
-        };
-        if reject {
-            f.max(shrink_limit)
-        } else {
-            f.max(shrink_limit).min(growth_limit)
-        }
-    }
-
-    /// KCL adaptive transient (free system `dy/dt = A·y`), state device-
+    /// KCL adaptive transient of `dy/dt = A·y + b·g(t)`, state device-
     /// resident, state-vector trajectory returned flat `[(steps+1) * n_dof]`
-    /// with row 0 the initial state. The Rust-side PI controller decides
-    /// per-substep accept/reject from a device-computed `err_norm`; only
-    /// the scalar `err_norm` (per substep) and the state snapshot (per
-    /// accepted frame) cross the bus.
+    /// with row 0 the initial state. A driven run holds `g[k]`, the
+    /// waveform sampled at `k*dt` (`steps` samples, none for a free run),
+    /// across the substeps inside output frame `k`, the same zeroth-order
+    /// hold per output cadence as the LSERK4 path. The Rust-side PI
+    /// controller decides per-substep accept/reject from a device-computed
+    /// `err_norm`; only the scalar `err_norm` (per substep) and the state
+    /// snapshot (per accepted frame) cross the bus.
     ///
     /// Returns `(traj, n_accepted, n_rejected, h_min, h_max)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn transient_kcl_traj(
+    pub fn transient_kcl(
         &mut self,
         gpu: &GpuContext,
         y0: &[f32],
         dt: f32,
         steps: usize,
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
+        drive: Drive<'_>,
+        g: &[f32],
+        ctl: &Controller,
     ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
-        self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
-            DrivenMode::Free,
-        )
-    }
-
-    /// KCL adaptive transient with full-vector source `dy/dt = A·y + b·g(t)`,
-    /// the modal-port injection path. `b` is uploaded once into the device-
-    /// resident source buffer; `g_values[k]` is the waveform sampled at
-    /// `k*dt` and held across the substeps inside output frame `k`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn transient_kcl_traj_driven_vec(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        b_src: &[f32],
-        g_values: &[f32],
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
-    ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
-        assert_eq!(b_src.len(), self.n_dof, "source length mismatch");
-        assert_eq!(g_values.len(), steps, "g_values must have `steps` entries");
-        unsafe {
-            gpu.queue().enqueue_write_buffer(
-                &mut self.src, CL_BLOCKING, 0, b_src, &[],
-            )
-        }
-        .map_err(|e| format!("source upload failed: {e}"))?;
-        self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
-            DrivenMode::Vector { g_values },
-        )
-    }
-
-    /// KCL adaptive transient with point source `dy/dt = A·y + e_dof·g(t)`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn transient_kcl_traj_driven(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        source_dof: usize,
-        g_values: &[f32],
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
-    ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
-        assert!(source_dof < self.n_dof, "source_dof out of range");
-        assert_eq!(g_values.len(), steps, "g_values must have `steps` entries");
-        self.transient_kcl_traj_impl(
-            gpu, y0, dt, steps, atol, rtol, safety, growth_limit,
-            shrink_limit, pi_alpha, pi_beta, min_step_factor,
-            DrivenMode::Point { source_dof, g_values },
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn transient_kcl_traj_impl(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        atol: f32,
-        rtol: f32,
-        safety: f32,
-        growth_limit: f32,
-        shrink_limit: f32,
-        pi_alpha: f32,
-        pi_beta: f32,
-        min_step_factor: f32,
-        mode: DrivenMode<'_>,
-    ) -> Result<(Vec<f32>, usize, usize, f32, f32), String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
+        self.load(gpu, y0, drive, g, steps)?;
         self.ensure_kcl_err_partial(gpu)?;
         let n = self.n_dof;
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
 
         let mut traj = Vec::with_capacity((steps + 1) * n);
         traj.extend_from_slice(y0);
@@ -987,7 +840,7 @@ impl GpuOperator {
         // Controller state, carried across output frames.
         let mut h = dt;
         let mut prev_err = 0.0_f32;
-        let h_min = min_step_factor * dt;
+        let h_min = ctl.min_step_factor as f32 * dt;
         let mut n_acc = 0_usize;
         let mut n_rej = 0_usize;
         let mut h_min_log = f32::INFINITY;
@@ -995,39 +848,22 @@ impl GpuOperator {
 
         for k in 0..steps {
             let mut t_rel = 0.0_f32;
-            // Per-frame source-hold value (zeroth-order hold across the
-            // frame): for the point/vector driven cases, the controller's
-            // substep convention matches the LSERK4 driven GPU path,
-            // waveform sampled once per output cadence.
-            let g_val = match &mode {
-                DrivenMode::Free => 0.0_f32,
-                DrivenMode::Point { g_values, .. } => g_values[k],
-                DrivenMode::Vector { g_values } => g_values[k],
-            };
+            let hold = Hold::at(drive, g, k);
             while t_rel < dt {
                 let h_try = h.min(dt - t_rel);
                 // Backup, attempt, evaluate err, decide.
                 self.enqueue_kcl_backup(gpu)?;
-                match &mode {
-                    DrivenMode::Free => self.enqueue_kcl_step(gpu, h_try)?,
-                    DrivenMode::Point { source_dof, .. } => self
-                        .enqueue_kcl_step_driven_point(
-                            gpu, h_try, *source_dof as cl_int, g_val,
-                        )?,
-                    DrivenMode::Vector { .. } => self
-                        .enqueue_kcl_step_driven_vec(gpu, h_try, g_val)?,
-                }
-                let err_norm = self.read_kcl_err_norm(gpu, atol, rtol)?;
+                self.enqueue_kcl_step(gpu, h_try, hold)?;
+                let err_norm =
+                    self.read_kcl_err_norm(gpu, ctl.atol as f32, ctl.rtol as f32)?;
                 let accept = err_norm.is_finite() && err_norm <= 1.0;
                 if accept {
                     t_rel += h_try;
                     n_acc += 1;
-                    let factor = Self::kcl_step_factor(
-                        err_norm.max(1e-12), prev_err, safety, growth_limit,
-                        shrink_limit, pi_alpha, pi_beta, false,
-                    );
+                    let factor =
+                        ctl.factor(err_norm as f64, prev_err as f64, false) as f32;
                     h = h_try * factor;
-                    prev_err = err_norm.max(1e-12);
+                    prev_err = err_norm.max(KCL_ERR_FLOOR as f32);
                     h_min_log = h_min_log.min(h);
                     h_max_log = h_max_log.max(h);
                 } else {
@@ -1036,19 +872,17 @@ impl GpuOperator {
                     let probe = if err_norm.is_finite() {
                         err_norm
                     } else {
-                        10.0
+                        KCL_NONFINITE_ERR as f32
                     };
-                    let factor = Self::kcl_step_factor(
-                        probe, prev_err, safety, growth_limit, shrink_limit,
-                        pi_alpha, pi_beta, true,
-                    );
+                    let factor = ctl.factor(probe as f64, prev_err as f64, true) as f32;
                     h = h_try * factor;
                 }
                 if h < h_min {
                     return Err(format!(
                         "GPU KCL: step size collapsed below \
-                         {min_step_factor:e}·dt after {n_acc} accepted, \
-                         {n_rej} rejected substeps"
+                         {:e}·dt after {n_acc} accepted, \
+                         {n_rej} rejected substeps",
+                        ctl.min_step_factor
                     ));
                 }
             }
@@ -1058,193 +892,46 @@ impl GpuOperator {
         Ok((traj, n_acc, n_rej, h_min_log, h_max_log))
     }
 
-    /// Propagate `y0` for `steps` LSERK4 steps of size `dt`, fully on the
-    /// device: the state stays resident, only `y0` (up) and the final
-    /// state (down) cross the bus.
+    /// LSERK4 transient of `dy/dt = A.y + b·g(t)`, the state device-
+    /// resident. `dt` is the output cadence; the integrator takes
+    /// `substeps` LSERK4 steps of `dt/substeps` per output frame, so the
+    /// caller can keep the substep within the CFL limit while sampling at
+    /// any cadence. A driven run holds `g[k*substeps + j]` across substep
+    /// `j` of frame `k` (`steps*substeps` samples, none for a free run),
+    /// the zeroth-order hold of the CPU LSERK4 stepper.
+    ///
+    /// With `record` the result is the trajectory, flat `[(steps+1) * n_dof]`
+    /// with row 0 the initial state, one snapshot downloaded per frame;
+    /// without, it is the final state, the only transfer after `y0`.
     pub fn transient(
         &mut self,
         gpu: &GpuContext,
         y0: &[f32],
         dt: f32,
         steps: usize,
+        substeps: usize,
+        drive: Drive<'_>,
+        g: &[f32],
+        record: bool,
     ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
+        let substeps = substeps.max(1);
+        self.load(gpu, y0, drive, g, steps * substeps)?;
         // Zero the residual register once; stage 0 (a = 0) keeps it reset
         // every step thereafter.
-        let zeros = vec![0.0_f32; self.n_dof];
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.p, CL_BLOCKING, 0, &zeros, &[])
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
-
-        for _ in 0..steps {
-            for stage in 0..LSERK4_STAGES {
-                self.enqueue_apply(gpu)?;
-                self.enqueue_lserk(
-                    gpu,
-                    LSERK4_A[stage] as f32,
-                    LSERK4_B[stage] as f32,
-                    dt,
-                )?;
-            }
-        }
-        gpu.queue()
-            .finish()
-            .map_err(|e| format!("transient sync failed: {e}"))?;
-        gpu.download(&self.y, self.n_dof)
-    }
-
-    /// Like [`transient`](Self::transient) but returns the full field
-    /// trajectory, flat `[(steps+1) * n_dof]` with row 0 the initial
-    /// state. `dt` is the output cadence; the explicit integrator takes
-    /// `substeps` LSERK4 steps of `dt/substeps` between snapshots, so the
-    /// caller can keep the substep within the CFL limit while sampling at
-    /// any cadence. One snapshot is downloaded per output step; the state
-    /// itself steps device-resident.
-    pub fn transient_traj(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        substeps: usize,
-    ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        let n = self.n_dof;
-        let substeps = substeps.max(1);
-        let h = dt / substeps as f32;
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
-        let zeros = vec![0.0_f32; n];
-        unsafe {
-            gpu.queue().enqueue_write_buffer(
-                &mut self.p, CL_BLOCKING, 0, &zeros, &[],
-            )
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
-
-        let mut traj = Vec::with_capacity((steps + 1) * n);
-        traj.extend_from_slice(y0);
-        for _ in 0..steps {
-            for _ in 0..substeps {
-                for stage in 0..LSERK4_STAGES {
-                    self.enqueue_apply(gpu)?;
-                    self.enqueue_lserk(
-                        gpu,
-                        LSERK4_A[stage] as f32,
-                        LSERK4_B[stage] as f32,
-                        h,
-                    )?;
-                }
-            }
-            let row = gpu.download(&self.y, n)?;
-            traj.extend_from_slice(&row);
-        }
-        Ok(traj)
-    }
-
-    /// Driven transient: `dy/dt = A.y + b`, with `b` a single-DOF soft
-    /// source held constant across each step (the zeroth-order hold the
-    /// CPU `step_driven` uses). `source_values[k]` is the source amplitude
-    /// for step `k`, and its length sets the step count.
-    pub fn transient_driven(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        source_dof: usize,
-        source_values: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        assert!(source_dof < self.n_dof, "source_dof out of range");
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
-        let zeros = vec![0.0_f32; self.n_dof];
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.p, CL_BLOCKING, 0, &zeros, &[])
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
-
-        let dof = source_dof as cl_int;
-        for &g in source_values {
-            for stage in 0..LSERK4_STAGES {
-                self.enqueue_apply(gpu)?;
-                self.enqueue_add_source(gpu, dof, g)?;
-                self.enqueue_lserk(
-                    gpu,
-                    LSERK4_A[stage] as f32,
-                    LSERK4_B[stage] as f32,
-                    dt,
-                )?;
-            }
-        }
-        gpu.queue()
-            .finish()
-            .map_err(|e| format!("driven transient sync failed: {e}"))?;
-        gpu.download(&self.y, self.n_dof)
-    }
-
-    /// Driven transient returning the full trajectory, flat
-    /// `[(steps+1) * n_dof]` with row 0 the initial state. `dt` is the
-    /// output cadence; the integrator takes `substeps` LSERK4 steps of
-    /// `dt/substeps` between snapshots. `source_values` holds one source
-    /// amplitude per substep (length `steps * substeps`), so the caller
-    /// re-samples the waveform per substep.
-    pub fn transient_driven_traj(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        substeps: usize,
-        source_dof: usize,
-        source_values: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        assert!(source_dof < self.n_dof, "source_dof out of range");
-        let substeps = substeps.max(1);
-        assert_eq!(
-            source_values.len(),
-            steps * substeps,
-            "source values must have steps*substeps entries",
-        );
+        gpu.write(&mut self.p, &vec![0.0_f32; self.n_dof])?;
         let n = self.n_dof;
         let h = dt / substeps as f32;
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
-        let zeros = vec![0.0_f32; n];
-        unsafe {
-            gpu.queue().enqueue_write_buffer(
-                &mut self.p, CL_BLOCKING, 0, &zeros, &[],
-            )
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
 
-        let dof = source_dof as cl_int;
-        let mut traj = Vec::with_capacity((steps + 1) * n);
-        traj.extend_from_slice(y0);
+        let mut traj = Vec::new();
+        if record {
+            traj.reserve((steps + 1) * n);
+            traj.extend_from_slice(y0);
+        }
         for k in 0..steps {
             for j in 0..substeps {
-                let g = source_values[k * substeps + j];
+                let hold = Hold::at(drive, g, k * substeps + j);
                 for stage in 0..LSERK4_STAGES {
-                    self.enqueue_apply(gpu)?;
-                    self.enqueue_add_source(gpu, dof, g)?;
+                    self.enqueue_rhs(gpu, &self.y, hold)?;
                     self.enqueue_lserk(
                         gpu,
                         LSERK4_A[stage] as f32,
@@ -1253,132 +940,16 @@ impl GpuOperator {
                     )?;
                 }
             }
-            let row = gpu.download(&self.y, n)?;
-            traj.extend_from_slice(&row);
-        }
-        Ok(traj)
-    }
-
-    /// Upload the source spatial pattern `b` to the device-resident `src`
-    /// buffer. Call once before a vector-source drive; the per-step
-    /// waveform is then applied by [`enqueue_add_source_vec`].
-    fn upload_source(
-        &mut self,
-        gpu: &GpuContext,
-        source: &[f32],
-    ) -> Result<(), String> {
-        assert_eq!(source.len(), self.n_dof, "source length mismatch");
-        unsafe {
-            gpu.queue().enqueue_write_buffer(
-                &mut self.src, CL_BLOCKING, 0, source, &[],
-            )
-        }
-        .map_err(|e| format!("source upload failed: {e}"))?;
-        Ok(())
-    }
-
-    /// Vector-source driven transient: `dy/dt = A.y + b·g(t)`, with `b` the
-    /// full spatial source pattern (modal-port injection) held constant
-    /// across each step. `source` is `b` (length `n_dof`); `source_values`
-    /// holds one waveform amplitude `g` per step. Returns the final state.
-    pub fn transient_driven_vec(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        source: &[f32],
-        source_values: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        self.upload_source(gpu, source)?;
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
-        }
-        .map_err(|e| format!("state upload failed: {e}"))?;
-        let zeros = vec![0.0_f32; self.n_dof];
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.p, CL_BLOCKING, 0, &zeros, &[])
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
-
-        for &g in source_values {
-            for stage in 0..LSERK4_STAGES {
-                self.enqueue_apply(gpu)?;
-                self.enqueue_add_source_vec(gpu, g)?;
-                self.enqueue_lserk(
-                    gpu,
-                    LSERK4_A[stage] as f32,
-                    LSERK4_B[stage] as f32,
-                    dt,
-                )?;
+            if record {
+                let row = gpu.download(&self.y, n)?;
+                traj.extend_from_slice(&row);
             }
         }
-        gpu.queue()
-            .finish()
-            .map_err(|e| format!("driven transient sync failed: {e}"))?;
-        gpu.download(&self.y, self.n_dof)
-    }
-
-    /// Vector-source driven transient returning the full trajectory, flat
-    /// `[(steps+1) * n_dof]` with row 0 the initial state. The GPU
-    /// counterpart of the CPU
-    /// [`LserkWorkspace::step_with_source_into`](crate::explicit::LserkWorkspace::step_with_source_into)
-    /// loop. `source` is the spatial pattern `b`; `source_values` holds one
-    /// amplitude per substep (length `steps * substeps`).
-    pub fn transient_driven_vec_traj(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        substeps: usize,
-        source: &[f32],
-        source_values: &[f32],
-    ) -> Result<Vec<f32>, String> {
-        assert_eq!(y0.len(), self.n_dof, "state length mismatch");
-        let substeps = substeps.max(1);
-        assert_eq!(
-            source_values.len(),
-            steps * substeps,
-            "source values must have steps*substeps entries",
-        );
-        let n = self.n_dof;
-        let h = dt / substeps as f32;
-        self.upload_source(gpu, source)?;
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.y, CL_BLOCKING, 0, y0, &[])
+        if record {
+            Ok(traj)
+        } else {
+            gpu.download(&self.y, n)
         }
-        .map_err(|e| format!("state upload failed: {e}"))?;
-        let zeros = vec![0.0_f32; n];
-        unsafe {
-            gpu.queue()
-                .enqueue_write_buffer(&mut self.p, CL_BLOCKING, 0, &zeros, &[])
-        }
-        .map_err(|e| format!("register init failed: {e}"))?;
-
-        let mut traj = Vec::with_capacity((steps + 1) * n);
-        traj.extend_from_slice(y0);
-        for k in 0..steps {
-            for j in 0..substeps {
-                let g = source_values[k * substeps + j];
-                for stage in 0..LSERK4_STAGES {
-                    self.enqueue_apply(gpu)?;
-                    self.enqueue_add_source_vec(gpu, g)?;
-                    self.enqueue_lserk(
-                        gpu,
-                        LSERK4_A[stage] as f32,
-                        LSERK4_B[stage] as f32,
-                        h,
-                    )?;
-                }
-            }
-            let row = gpu.download(&self.y, n)?;
-            traj.extend_from_slice(&row);
-        }
-        Ok(traj)
     }
 
     /// Ensure the f64 Krylov buffers are allocated for dimension `m`.
@@ -1394,14 +965,14 @@ impl GpuOperator {
             let n_groups = n.div_ceil(NORM_WORK_GROUP);
             self.krylov = Some(Krylov {
                 cap_dim: m,
-                basis: gpu.alloc_f64((m + 1) * n)?,
-                w: gpu.alloc_f64(n)?,
-                proj: gpu.alloc_f64(m + 1)?,
-                out: gpu.alloc_f64(n)?,
-                partials: gpu.alloc_f64(n_groups)?,
-                h: gpu.alloc_f64(m * m)?,
-                hnext: gpu.alloc_f64(1)?,
-                src64: gpu.alloc_f64(n)?,
+                basis: gpu.alloc((m + 1) * n)?,
+                w: gpu.alloc(n)?,
+                proj: gpu.alloc(m + 1)?,
+                out: gpu.alloc(n)?,
+                partials: gpu.alloc(n_groups)?,
+                h: gpu.alloc(m * m)?,
+                hnext: gpu.alloc(1)?,
+                src64: gpu.alloc(n)?,
                 n_groups,
             });
         }
@@ -1414,7 +985,6 @@ impl GpuOperator {
     /// device Hessenberg, the norm is finished on the device, so the
     /// Hessenberg is the *only* thing the host reads back, once, at the
     /// end. Fixed dimension `m` (no breakdown check).
-    #[allow(clippy::too_many_arguments)]
     fn arnoldi(
         &self,
         gpu: &GpuContext,
@@ -1557,7 +1127,7 @@ impl GpuOperator {
             .map_err(|e| format!("scale_recip launch failed: {e}"))?;
         }
         // The Hessenberg is the only host round-trip, downloaded once.
-        let h = gpu.download_f64(h_dev, m * m)?;
+        let h = gpu.download(h_dev, m * m)?;
         Ok((h, m))
     }
 
@@ -1573,7 +1143,7 @@ impl GpuOperator {
         let dim_i = coef.len() as cl_int;
         let elem_global =
             self.n_dof.div_ceil(DOF_WORK_GROUP) * DOF_WORK_GROUP;
-        let coef_buf = gpu.upload_f64(coef)?;
+        let coef_buf = gpu.upload(coef)?;
         let ek = self
             .expmv_kernels
             .as_ref()
@@ -1650,8 +1220,8 @@ impl GpuOperator {
 
         // basis[0] = v / beta; zero the device Hessenberg.
         let b0: Vec<f64> = v.iter().map(|x| x / beta).collect();
-        gpu.write_f64(&mut kry.basis, &b0)?;
-        gpu.write_f64(&mut kry.h, &vec![0.0_f64; m * m])?;
+        gpu.write(&mut kry.basis, &b0)?;
+        gpu.write(&mut kry.h, &vec![0.0_f64; m * m])?;
         let (h, dim) = self.arnoldi(
             gpu, &kry.basis, &kry.w, &kry.proj, &kry.partials, &kry.h,
             &kry.hnext, kry.n_groups, m,
@@ -1671,7 +1241,7 @@ impl GpuOperator {
         gpu.queue()
             .finish()
             .map_err(|e| format!("expmv sync failed: {e}"))?;
-        let result = gpu.download_f64(&kry.out, n)?;
+        let result = gpu.download(&kry.out, n)?;
         self.krylov = Some(kry);
         Ok(result)
     }
@@ -1710,7 +1280,7 @@ impl GpuOperator {
         // Upload the source pattern once; every sub-step reuses it.
         {
             let mut kry = self.krylov.take().expect("krylov allocated");
-            gpu.write_f64(&mut kry.src64, b)?;
+            gpu.write(&mut kry.src64, b)?;
             self.krylov = Some(kry);
         }
         let k = m.div_ceil(KRYLOV_CHUNK).max(1);
@@ -1752,7 +1322,7 @@ impl GpuOperator {
         // basis[0].vec = v/beta on the device; the augmented scalar parts
         // live host-side in `s`, with s[0] = (1)/beta.
         let b0: Vec<f64> = v.iter().map(|x| x * inv_beta).collect();
-        gpu.write_f64(&mut kry.basis, &b0)?;
+        gpu.write(&mut kry.basis, &b0)?;
         let mut s = vec![0.0_f64; m + 1];
         s[0] = inv_beta;
         let mut h_host = vec![0.0_f64; m * m];
@@ -1826,14 +1396,14 @@ impl GpuOperator {
                 .map_err(|e| format!("dot_rows launch failed: {e}"))?;
                 // Blocking read serialises behind dot_rows on the in-order
                 // queue.
-                let mut proj_host = gpu.download_f64(&kry.proj, cols)?;
+                let mut proj_host = gpu.download(&kry.proj, cols)?;
                 for i in 0..cols {
                     proj_host[i] += s[i] * w_scalar;
                     h_host[i * m + j] += proj_host[i];
                 }
                 let dscalar: f64 =
                     (0..cols).map(|i| proj_host[i] * s[i]).sum();
-                gpu.write_f64(&mut kry.proj, &proj_host)?;
+                gpu.write(&mut kry.proj, &proj_host)?;
                 unsafe {
                     ExecuteKernel::new(&ek.axpy_basis)
                         .set_arg(&kry.w)
@@ -1867,13 +1437,13 @@ impl GpuOperator {
                     .enqueue_nd_range(gpu.queue())
             }
             .map_err(|e| format!("partial_norm2 launch failed: {e}"))?;
-            let partials = gpu.download_f64(&kry.partials, kry.n_groups)?;
+            let partials = gpu.download(&kry.partials, kry.n_groups)?;
             let wvec_n2: f64 = partials.iter().sum();
             let hnext = (wvec_n2 + w_scalar * w_scalar).sqrt();
             h_host[(j + 1) * m + j] = hnext;
 
             // basis[j+1].vec = w_vec / hnext (device); s[j+1] = w_scalar / hnext.
-            gpu.write_f64(&mut kry.hnext, &[hnext])?;
+            gpu.write(&mut kry.hnext, &[hnext])?;
             let dst_off = ((j + 1) * n) as cl_int;
             unsafe {
                 ExecuteKernel::new(&ek.scale_recip)
@@ -1891,7 +1461,7 @@ impl GpuOperator {
         }
 
         // exp(tau·H) on the host; out_vec = beta·Σ_i basis_vec[i]·exp[i,0]
-        //, the first n components of the augmented result. The augmented
+        //the first n components of the augmented result. The augmented
         // scalar component is preserved at 1 and discarded.
         let dim = m;
         let mut th = vec![0.0_f64; dim * dim];
@@ -1907,34 +1477,11 @@ impl GpuOperator {
         gpu.queue()
             .finish()
             .map_err(|e| format!("etd expmv sync failed: {e}"))?;
-        let result = gpu.download_f64(&kry.out, n)?;
+        let result = gpu.download(&kry.out, n)?;
         self.krylov = Some(kry);
         Ok(result)
     }
 
-    /// Exponential-warmup hybrid transient: the first `warmup` steps use
-    /// the exact exponential propagator, the rest the cheaper explicit
-    /// LSERK4 stepper. The exact integrator carries the opening transient,
-    /// then hands the smooth state to the explicit stepper.
-    pub fn transient_hybrid(
-        &mut self,
-        gpu: &GpuContext,
-        y0: &[f32],
-        dt: f32,
-        steps: usize,
-        warmup: usize,
-        krylov_dim: usize,
-    ) -> Result<Vec<f32>, String> {
-        let warmup = warmup.min(steps);
-        // Warmup: exact exponential steps in f64.
-        let mut y: Vec<f64> = y0.iter().map(|&v| v as f64).collect();
-        for _ in 0..warmup {
-            y = self.expmv(gpu, &y, dt as f64, krylov_dim)?;
-        }
-        // Remainder: device-resident explicit LSERK4.
-        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
-        self.transient(gpu, &y32, dt, steps - warmup)
-    }
 
 }
 
@@ -1956,11 +1503,11 @@ mod tests {
         let err: f64 = cpu
             .iter()
             .zip(gpu)
-            .map(|(&c, &g)| (c as f64 - g as f64).powi(2))
+            .map(|(&c, &g)| (c - g as f64).powi(2))
             .sum::<f64>()
             .sqrt();
         let scale: f64 =
-            cpu.iter().map(|&c| (c as f64).powi(2)).sum::<f64>().sqrt();
+            cpu.iter().map(|&c| c.powi(2)).sum::<f64>().sqrt();
         err / scale
     }
 
@@ -1979,12 +1526,13 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let vacuum = MaxwellOperator::new(&mesh, 2, 1.0);
-        let dielectric = MaxwellOperator::new_with_materials(
+        let vacuum = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
+        let mats = vec![ElemMaterial::isotropic(4.0, 1.0, 0.0); mesh.n_tets()];
+        let dielectric = MaxwellOperator::new(
             &mesh,
             2,
             1.0,
-            &vec![ElemMaterial::isotropic(4.0, 1.0, 0.0); mesh.n_tets()],
+            crate::rhs::OperatorOptions { materials: &mats, ..Default::default() },
         );
 
         for (label, op) in
@@ -2018,7 +1566,6 @@ mod tests {
         // produces a trajectory that tracks the CPU adaptive run frame by
         // frame, within the f32 GPU_REL_TOL budget. Both controllers start
         // from the same atol/rtol/seed so the substep paths line up.
-        use crate::explicit_adaptive::KclWorkspace;
 
         let gpu = match GpuContext::new() {
             Ok(g) => g,
@@ -2028,7 +1575,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let y0: Vec<Field> =
             (0..n).map(|i| (0.2 + i as Field * 0.011).sin()).collect();
@@ -2047,83 +1594,33 @@ mod tests {
         let dt = 1.0 / rho;
         let steps = 60;
 
-        // Controller params shared between CPU and GPU. atol/rtol loose
-        // enough that f32 GPU noise doesn't make the two paths diverge.
-        let atol = 1e-6_f32;
-        let rtol = 1e-3_f32;
-        let safety = 0.9_f32;
-        let growth = 5.0_f32;
-        let shrink = 0.2_f32;
-        let alpha = 0.7 / 4.0_f32;
-        let beta = 0.4 / 4.0_f32;
-        let min_step = 1e-10_f32;
+        // One controller for both runs, atol/rtol loose enough that the
+        // f32 GPU noise does not make the two paths diverge.
+        let ctl = Controller { atol: 1e-6, rtol: 1e-3, ..Controller::default() };
 
-        // CPU reference using the same controller logic (mirrored locally
-        // since the CPU controller lives in Python). The trajectory only
-        // needs to match at output cadence, not substep-by-substep.
-        let mut y_cpu = y0.clone();
-        let mut ws = KclWorkspace::new();
-        let mut err = vec![0.0; n];
-        let mut h_cpu = dt;
-        let mut prev_err = 0.0_f64;
-        let mut traj_cpu = Vec::with_capacity((steps + 1) * n);
-        traj_cpu.extend_from_slice(&y_cpu);
-        for _ in 0..steps {
-            let mut t_rel = 0.0_f64;
-            while t_rel < dt {
-                let h_try = h_cpu.min(dt - t_rel);
-                let y_pre = y_cpu.clone();
-                ws.step_into(
-                    |x, ax| op.apply_into(x, ax),
-                    &mut y_cpu, &mut err, h_try,
-                );
-                let mut s2 = 0.0_f64;
-                for i in 0..n {
-                    let scale = atol as f64
-                        + rtol as f64
-                            * y_pre[i].abs().max(y_cpu[i].abs());
-                    let r = err[i] / scale;
-                    s2 += r * r;
-                }
-                let err_norm = (s2 / n as f64).sqrt();
-                if err_norm <= 1.0 && err_norm.is_finite() {
-                    t_rel += h_try;
-                    let f = if prev_err <= 0.0 {
-                        safety as f64
-                            * err_norm.max(1e-12).powf(-(alpha as f64))
-                    } else {
-                        safety as f64
-                            * err_norm.max(1e-12).powf(-(alpha as f64))
-                            * prev_err.powf(beta as f64)
-                    };
-                    let f = f.max(shrink as f64).min(growth as f64);
-                    h_cpu = h_try * f;
-                    prev_err = err_norm.max(1e-12);
-                } else {
-                    y_cpu = y_pre;
-                    let probe = if err_norm.is_finite() {
-                        err_norm
-                    } else {
-                        10.0
-                    };
-                    let f = (safety as f64
-                        * probe.max(1e-12).powf(-(alpha as f64)))
-                        .max(shrink as f64);
-                    h_cpu = h_try * f;
-                }
-            }
-            traj_cpu.extend_from_slice(&y_cpu);
-        }
+        // CPU reference: the session's adaptive run on the same operator.
+        let mut session =
+            crate::session::TdSession::new(MaxwellOperator::new(&mesh, 2, 1.0, Default::default()), 1.0);
+        let opts = crate::session::RunOptions {
+            method: crate::session::Method::Adaptive,
+            verbose: false,
+            controller: ctl,
+            ..Default::default()
+        };
+        let traj_cpu = session
+            .transient(
+                Some(&y0), dt, steps, crate::session::Drive::Free, None,
+                crate::session::Record::States, &opts, &mut || Ok(()),
+            )
+            .expect("CPU adaptive run")
+            .data;
 
         // GPU run with matched parameters.
         let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
         let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
         let (traj_gpu, n_acc, n_rej, h_min, h_max) = gop
-            .transient_kcl_traj(
-                &gpu, &y0_32, dt as f32, steps, atol, rtol, safety,
-                growth, shrink, alpha, beta, min_step,
-            )
-            .expect("transient_kcl_traj");
+            .transient_kcl(&gpu, &y0_32, dt as f32, steps, Drive::Free, &[], &ctl)
+            .expect("transient_kcl");
 
         eprintln!(
             "GPU KCL adaptive: {n_acc} accepted, {n_rej} rejected; \
@@ -2159,7 +1656,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let y0: Vec<Field> =
             (0..n).map(|i| (0.2 + i as Field * 0.011).sin()).collect();
@@ -2182,14 +1679,14 @@ mod tests {
         let mut y_cpu = y0.clone();
         let mut ws = LserkWorkspace::new();
         for _ in 0..steps {
-            ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_cpu, dt);
+            ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_cpu, dt, None);
         }
 
         // GPU, device-resident.
         let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
         let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
         let y_gpu = gop
-            .transient(&gpu, &y0_32, dt as f32, steps)
+            .transient(&gpu, &y0_32, dt as f32, steps, 1, Drive::Free, &[], false)
             .expect("transient");
 
         let rel = rel_l2(&y_gpu, &y_cpu);
@@ -2207,7 +1704,7 @@ mod tests {
     fn gpu_driven_transient_matches_cpu() {
         // P2.3 gate: the GPU driven transient (soft source) matches the
         // CPU driven LSERK4 within GPU_REL_TOL.
-        use crate::explicit::LserkWorkspace;
+        use crate::explicit::{LserkWorkspace, Source};
 
         let gpu = match GpuContext::new() {
             Ok(g) => g,
@@ -2217,7 +1714,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
 
         let mut v: Vec<Field> =
@@ -2241,12 +1738,11 @@ mod tests {
         let mut y_cpu = vec![0.0; n];
         let mut ws = LserkWorkspace::new();
         for &g in &src {
-            ws.step_driven_into(
+            ws.step_into(
                 |x, ax| op.apply_into(x, ax),
                 &mut y_cpu,
                 dt,
-                sdof,
-                g,
+                Some(Source::Point { dof: sdof, value: g }),
             );
         }
 
@@ -2255,7 +1751,7 @@ mod tests {
         let y0 = vec![0.0_f32; n];
         let src32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
         let y_gpu = gop
-            .transient_driven(&gpu, &y0, dt as f32, sdof, &src32)
+            .transient(&gpu, &y0, dt as f32, steps, 1, Drive::Point(sdof), &src32, false)
             .expect("driven transient");
 
         let rel = rel_l2(&y_gpu, &y_cpu);
@@ -2271,10 +1767,10 @@ mod tests {
     #[test]
     fn gpu_vector_source_transient_matches_cpu() {
         // Vector-source parity: the GPU full-vector driven transient (the
-        // modal-port injection path) matches the CPU LSERK4
-        // step_with_source_into within GPU_REL_TOL. The source spreads over
-        // many DOFs, unlike the single-DOF point case above.
-        use crate::explicit::LserkWorkspace;
+        // modal-port injection path) matches the CPU LSERK4 with a vector
+        // source within GPU_REL_TOL. The source spreads over many DOFs,
+        // unlike the single-DOF point case above.
+        use crate::explicit::{LserkWorkspace, Source};
 
         let gpu = match GpuContext::new() {
             Ok(g) => g,
@@ -2284,7 +1780,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
 
         let mut v: Vec<Field> =
@@ -2311,21 +1807,20 @@ mod tests {
         let mut ws = LserkWorkspace::new();
         for &g in &gvals {
             let bg: Vec<Field> = b.iter().map(|&bi| bi * g).collect();
-            ws.step_with_source_into(
+            ws.step_into(
                 |x, ax| op.apply_into(x, ax),
                 &mut y_cpu,
                 dt,
-                &bg,
+                Some(Source::Vector(&bg)),
             );
         }
 
         // GPU, one substep per step, so the loops line up one-to-one.
         let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
         let y0 = vec![0.0_f32; n];
-        let b32: Vec<f32> = b.iter().map(|&v| v as f32).collect();
         let g32: Vec<f32> = gvals.iter().map(|&v| v as f32).collect();
         let y_gpu = gop
-            .transient_driven_vec(&gpu, &y0, dt as f32, &b32, &g32)
+            .transient(&gpu, &y0, dt as f32, steps, 1, Drive::Vector(&b), &g32, false)
             .expect("vector-source transient");
 
         let rel = rel_l2(&y_gpu, &y_cpu);
@@ -2354,7 +1849,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let v: Vec<Field> =
             (0..n).map(|i| (0.3 + i as Field * 0.013).sin()).collect();
@@ -2391,73 +1886,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn gpu_hybrid_transient_matches_cpu() {
-        // P2.4 gate: the GPU exponential-warmup hybrid matches a CPU hybrid
-        // (warmup expmv steps, then LSERK4) within GPU_REL_TOL.
-        use crate::explicit::LserkWorkspace;
-        use crate::propagator::expmv;
-
-        let gpu = match GpuContext::new() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("skipping GPU test: {e}");
-                return;
-            }
-        };
-        let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
-        let n = op.n_dof();
-        let y0: Vec<Field> =
-            (0..n).map(|i| (0.15 + i as Field * 0.009).sin()).collect();
-
-        let mut v = y0.clone();
-        let mut rho = 1.0;
-        for _ in 0..30 {
-            let av = op.apply(&v);
-            rho = av.iter().map(|x| x * x).sum::<Field>().sqrt();
-            let inv = 1.0 / rho;
-            for (vi, &a) in v.iter_mut().zip(&av) {
-                *vi = a * inv;
-            }
-        }
-        let dt = 1.0 / rho;
-        let (steps, warmup, m) = (120, 10, 40);
-
-        // CPU hybrid: warmup exponential steps, then LSERK4.
-        let mut y_cpu = y0.clone();
-        for _ in 0..warmup {
-            y_cpu = expmv(|x| op.apply(x), &y_cpu, dt, m);
-        }
-        let mut ws = LserkWorkspace::new();
-        for _ in 0..(steps - warmup) {
-            ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_cpu, dt);
-        }
-
-        // GPU hybrid.
-        let mut gop = GpuOperator::new(&gpu, &op).expect("GpuOperator");
-        let y0_32: Vec<f32> = y0.iter().map(|&v| v as f32).collect();
-        let y_gpu = match gop
-            .transient_hybrid(&gpu, &y0_32, dt as f32, steps, warmup, m)
-        {
-            Ok(o) => o,
-            Err(e) if fp64_unavailable(&e) => {
-                eprintln!("skipping GPU hybrid test (no fp64): {e}");
-                return;
-            }
-            Err(e) => panic!("hybrid transient: {e}"),
-        };
-
-        let rel = rel_l2(&y_gpu, &y_cpu);
-        eprintln!(
-            "GPU hybrid transient vs CPU [{warmup}+{} steps]: rel L2 = {rel:.3e}",
-            steps - warmup
-        );
-        assert!(
-            rel < GPU_REL_TOL,
-            "GPU hybrid rel.err {rel:.3e} exceeds GPU_REL_TOL",
-        );
-    }
 
     #[test]
     fn gpu_etd_step_matches_cpu() {
@@ -2475,7 +1903,7 @@ mod tests {
             }
         };
         let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let y: Vec<Field> =
             (0..n).map(|i| (0.25 + i as Field * 0.013).sin()).collect();

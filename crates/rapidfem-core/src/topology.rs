@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! DG mesh topology, per-element face adjacency, outward normals and areas.
 //!
@@ -15,6 +12,7 @@
 //! and the face area (surface-integral scaling).
 
 use crate::mesh::{Mesh, TET_FACE_LOCAL};
+use crate::geom::{cross, dot, norm, sub};
 
 /// Local index of the tet vertex opposite each of the 4 local faces
 /// (`TET_FACE_LOCAL` lists 3 of the 4 local node indices; this is the 4th).
@@ -90,27 +88,6 @@ impl FaceTopology {
         }
         FaceTopology { faces }
     }
-}
-
-#[inline]
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-#[inline]
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-#[inline]
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-#[inline]
-fn norm(a: [f64; 3]) -> f64 {
-    dot(a, a).sqrt()
 }
 
 #[cfg(test)]

@@ -1,35 +1,38 @@
-rapidfem — NOTICE
-==================
+rapidfem - NOTICE
+=================
 
-See LICENSE for the full GNU GPL v3 text with the Gmsh additional permission.
+See LICENSE for the full text of the GNU Affero General Public License v3.
 
-────────────────────────────────────────────────────────────────────────
+------------------------------------------------------------------------
 0. Licensing
-────────────────────────────────────────────────────────────────────────
+------------------------------------------------------------------------
 
 All rapidfem source code is original work, copyright (C) Milan Rother and
 rapidfem contributors. The public distribution is offered under
-GPL-3.0-or-later (with the Gmsh additional permission): free for hobby and
-academic use. Because the copyright is held wholly by the project, it may
-also be licensed under separate commercial terms; the GPL grant does not
-waive that right. Commercial licensing is available on request.
+AGPL-3.0-only: free for hobby and academic use. Because the copyright is
+held wholly by the project, it may also be licensed under separate
+commercial terms; the AGPL grant does not waive that right. Commercial
+licensing is available on request.
 
-The only copyleft obligation on a distributed binary comes from linking Gmsh
-(GPL-2.0-or-later) at runtime — not from any rapidfem source.
+------------------------------------------------------------------------
+1. Vendored code (vendor/)
+------------------------------------------------------------------------
 
-────────────────────────────────────────────────────────────────────────
-1. Third-party runtime dependencies
-────────────────────────────────────────────────────────────────────────
+  rapidmesh              AGPL-3.0-only   (mesher, milanofthe/rapidmesh)
+  rslab                  MIT             (sparse direct solver, milanofthe/rslab)
 
-  gmsh                   GPL-2.0-or-later (with Gmsh additional permission)
+------------------------------------------------------------------------
+2. Third-party runtime dependencies
+------------------------------------------------------------------------
+
   faer (Rust)            MIT
+  hashbrown (Rust)       MIT / Apache-2.0
   num-complex (Rust)     MIT / Apache-2.0
-  ndarray (Rust)         MIT / Apache-2.0
+  rayon (Rust)           MIT / Apache-2.0
   pyo3 (Rust)            MIT / Apache-2.0
-  numpy (Python)         BSD-3-Clause
+  numpy (Rust, Python)   BSD-2-Clause / BSD-3-Clause
+  opencl3 (Rust)         Apache-2.0
   scipy (Python)         BSD-3-Clause
-  pyvista (Python)       MIT
-
-The Gmsh additional permission in LICENSE authorises linking against Gmsh,
-Netgen, METIS, OpenCASCADE and ParaView under their own licences when
-distributing binaries containing rapidfem.
+  flask (Python, ui)     BSD-3-Clause
+  gdstk (Python, gds)    BSL-1.0
+  scikit-rf, pyvista, h5py (Python, io)   BSD-3-Clause / MIT / BSD-3-Clause

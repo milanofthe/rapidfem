@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! TD backend performance benchmark, production-plan WP6.3.
 //!
 //! Reports the three quantities the roadmap calls for: matrix-free `apply`
@@ -42,7 +46,7 @@ fn main() {
     );
     for &c in &[2usize, 3, 4, 5, 6, 8] {
         let mesh = structured_box(c, c, c, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, order, 1.0);
+        let op = MaxwellOperator::new(&mesh, order, 1.0, Default::default());
         let n = op.n_dof();
         let y: Vec<f64> = (0..n).map(|i| (i as f64 * 0.1).sin()).collect();
 
@@ -75,7 +79,7 @@ fn main() {
     // two scale differently, matvec linearly in `m`, orthogonalisation
     // quadratically, so the split, not the total, is what a tune targets.
     let mesh = structured_box(4, 4, 4, 1.0, 1.0, 1.0);
-    let op = MaxwellOperator::new(&mesh, order, 1.0);
+    let op = MaxwellOperator::new(&mesh, order, 1.0, Default::default());
     let n = op.n_dof();
     let y: Vec<f64> = (0..n).map(|i| (i as f64 * 0.07).cos()).collect();
 

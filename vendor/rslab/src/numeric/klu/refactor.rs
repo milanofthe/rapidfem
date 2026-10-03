@@ -31,7 +31,9 @@ impl<T: Scalar> KluSolver<T> {
         if a.nnz() != f.nnz_a {
             return Err(pattern_mismatch());
         }
-        let rs_inv = row_scale_inv(a, f.scaled);
+        // Into the kept buffer; it becomes `rs_inv` once the replay succeeds.
+        let mut rs_inv = std::mem::take(&mut f.rs_next);
+        row_scale_inv_into(a, f.scaled, &mut rs_inv);
 
         // Branch-free pattern verification against the recorded program: every
         // entry must map to the exact final position it had at factor time
@@ -59,33 +61,32 @@ impl<T: Scalar> KluSolver<T> {
             f_v: &'s mut [T],
         }
         let nblocks = f.block_ptr.len() - 1;
-        let mut jobs: Vec<RJob<'_, T>> = Vec::with_capacity(nblocks);
-        {
+        let mut x = std::mem::take(&mut f.replay_x);
+        // The jobs in block order, each split off the front of the rest.
+        let mut next_job = {
             let (mut lv, mut uv) = (f.l_val.as_mut_slice(), f.u_val.as_mut_slice());
             let (mut ud, mut fv) = (f.udiag.as_mut_slice(), f.f_val.as_mut_slice());
-            for b in 0..nblocks {
-                interrupt_check(int_flag)?;
-                let (bs, be) = (f.block_ptr[b], f.block_ptr[b + 1]);
-                let (a1, r1) =
-                    std::mem::take(&mut lv).split_at_mut(f.l_colptr[be] - f.l_colptr[bs]);
+            let (block_ptr, l_colptr) = (&f.block_ptr, &f.l_colptr);
+            let (u_colptr, f_colptr) = (&f.u_colptr, &f.f_colptr);
+            move |b: usize| {
+                let (bs, be) = (block_ptr[b], block_ptr[b + 1]);
+                let (a1, r1) = std::mem::take(&mut lv).split_at_mut(l_colptr[be] - l_colptr[bs]);
                 lv = r1;
-                let (a2, r2) =
-                    std::mem::take(&mut uv).split_at_mut(f.u_colptr[be] - f.u_colptr[bs]);
+                let (a2, r2) = std::mem::take(&mut uv).split_at_mut(u_colptr[be] - u_colptr[bs]);
                 uv = r2;
                 let (a3, r3) = std::mem::take(&mut ud).split_at_mut(be - bs);
                 ud = r3;
-                let (a4, r4) =
-                    std::mem::take(&mut fv).split_at_mut(f.f_colptr[be] - f.f_colptr[bs]);
+                let (a4, r4) = std::mem::take(&mut fv).split_at_mut(f_colptr[be] - f_colptr[bs]);
                 fv = r4;
-                jobs.push(RJob {
+                RJob {
                     b,
                     l_v: a1,
                     u_v: a2,
                     ud: a3,
                     f_v: a4,
-                });
+                }
             }
-        }
+        };
         let (block_ptr, col_perm) = (&f.block_ptr, &f.col_perm);
         let (l_colptr, l_rowidx) = (&f.l_colptr, &f.l_rowidx);
         let (u_colptr, u_rowidx) = (&f.u_colptr, &f.u_rowidx);
@@ -185,7 +186,7 @@ impl<T: Scalar> KluSolver<T> {
         };
 
         let pipelined = &f.pipelined;
-        let replay_block = |job: RJob<'_, T>| -> Result<(), RslabError> {
+        let replay_block = |job: RJob<'_, T>, x: &mut Vec<T>| -> Result<(), RslabError> {
             let b = job.b;
             let (bs, be) = (block_ptr[b], block_ptr[b + 1]);
             let bases = (l_colptr[bs], u_colptr[bs], f_colptr[bs]);
@@ -291,29 +292,39 @@ impl<T: Scalar> KluSolver<T> {
                 }
                 return Ok(());
             }
-            let mut x = vec![T::zero(); be - bs];
+            x.clear();
+            x.resize(be - bs, T::zero());
             for j in bs..be {
                 // SAFETY: this closure exclusively owns the whole block.
-                replay_col(j, bs, bases, ptrs, &mut x, None)?;
+                replay_col(j, bs, bases, ptrs, x, None)?;
             }
             Ok(())
         };
         if f.par_refactor && nblocks > 1 {
             use rayon::prelude::*;
-            let results: Vec<Result<(), RslabError>> =
-                jobs.into_par_iter().map(replay_block).collect();
+            let mut jobs = Vec::with_capacity(nblocks);
+            for b in 0..nblocks {
+                interrupt_check(int_flag)?;
+                jobs.push(next_job(b));
+            }
+            let results: Vec<Result<(), RslabError>> = jobs
+                .into_par_iter()
+                .map(|job| replay_block(job, &mut Vec::new()))
+                .collect();
             for r in results {
                 r?;
             }
         } else {
-            for job in jobs {
-                replay_block(job)?;
+            for b in 0..nblocks {
+                interrupt_check(int_flag)?;
+                replay_block(next_job(b), &mut x)?;
             }
         }
-        f.rs_inv = rs_inv;
+        f.rs_next = std::mem::replace(&mut f.rs_inv, rs_inv);
+        f.replay_x = x;
         let entry = (std::mem::size_of::<T>() + std::mem::size_of::<Ki>()) as u64;
         let nnz = self.diagnostics.factor_nnz;
-        self.diagnostics.push(
+        self.diagnostics.set_latest(
             "klu-refactor",
             t.elapsed().as_secs_f64() * 1e3,
             diagnostics_flops(&self.diagnostics),

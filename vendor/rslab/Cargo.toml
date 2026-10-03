@@ -1,5 +1,5 @@
 # Vendored copy of rslab (https://github.com/milanofthe/rslab) at commit
-# 2a22923, written by rslab's tools/vendor.py (see VENDOR.md). The upstream
+# 09d1775, written by rslab's tools/vendor.py (see VENDOR.md). The upstream
 # manifest trimmed to the library: its features and dependencies, no
 # benches, tests, examples or dev-dependencies. The own [workspace] keeps
 # the vendored tree out of the consuming workspace.
@@ -15,7 +15,7 @@ resolver = "2"
 
 [package]
 name = "rslab"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "RSLAB - pure-Rust sparse complex/real direct solver (symmetric LDL^T + unsymmetric LU) and preconditioner, a PARDISO-style embeddable replacement."

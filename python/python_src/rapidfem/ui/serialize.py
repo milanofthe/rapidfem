@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Serialize rapidfem objects into JSON payloads the viewer can consume.
 
 The bundled canvas3d viewer expects per-entity buffers in the form
@@ -11,32 +15,8 @@ import hashlib
 import math
 from typing import Any
 
-import gmsh
-
 
 # ── Geometry → triangle payload ───────────────────────────────────────────────
-
-
-def _material_label(material) -> str | None:
-    """Render a tracked entity's ``.material`` into a JSON-safe display string.
-
-    Accepts a legacy string (``"fr4"``), a :class:`rapidfem.Material`
-    instance, or ``None``. For Material instances we return a short label
-    like ``"Dielectric (εr=4.4)"`` so the UI legend shows something
-    meaningful without dragging the whole object into the JSON payload.
-    """
-    if material is None:
-        return None
-    if isinstance(material, str):
-        return material
-    cls = type(material).__name__
-    er = getattr(material, "er", None)
-    er_diag = getattr(material, "er_diag", None)
-    if er_diag is not None:
-        return f"{cls} (εr=[{er_diag[0]:.2g},{er_diag[1]:.2g},{er_diag[2]:.2g}])"
-    if er is not None and abs(er - 1.0) > 1e-9:
-        return f"{cls} (εr={er:.3g})"
-    return cls
 
 
 # Signature palette mirrored from `lib/theme.ts`. Kept here as floats so the
@@ -68,10 +48,6 @@ def _material_color(material) -> list[float]:
     """Signature-palette color for a Material instance."""
     if material is None:
         return _COL_NEUTRAL
-    if isinstance(material, str):
-        # Legacy string, keep the old hash-color so existing rfic.Stack flows
-        # don't suddenly recolor on import.
-        return _color_from_name(material)
     cls = type(material).__name__
     if cls == "Air":
         return _COL_AIR
@@ -128,7 +104,7 @@ def _entity_resolution(g, ent):
             key = "port" if cls in _PORT_CLASSES else cls.lower()
             key_count[key] = key_count.get(key, 0) + 1
             for pe in getattr(phys, "_entities", ()):
-                if id(pe) == id(ent):
+                if pe == ent:
                     return f"{key}_{key_count[key]}", _physics_color(phys)
         if ent.name:
             return ent.name, _color_from_name(ent.name)
@@ -136,18 +112,15 @@ def _entity_resolution(g, ent):
     # Volumes: material-typed, indexed per material class (matches the mesh).
     if ent.dim == 3:
         mat = ent.material
-        if mat is not None and not isinstance(mat, str):
+        if mat is not None:
             cls = type(mat).__name__.lower()
             order: list[int] = []
-            for e in getattr(g, "_entities", []):
+            for e in g.objects:
                 m = e.material
-                if (m is not None and not isinstance(m, str)
-                        and type(m).__name__.lower() == cls and id(m) not in order):
+                if m is not None and type(m).__name__.lower() == cls and id(m) not in order:
                     order.append(id(m))
             idx = (order.index(id(mat)) + 1) if id(mat) in order else 1
             return f"{cls}_{idx}", _material_color(mat)
-        if isinstance(mat, str):
-            return mat, _color_from_name(mat)
         if ent.name:
             return ent.name, _color_from_name(ent.name)
         return None, _COL_NEUTRAL
@@ -177,404 +150,206 @@ def _color_from_name(name: str) -> list[float]:
     return list(table[i % 6])
 
 
-def _surface_triangulation(dim_tag: tuple[int, int]) -> tuple[list[float], list[float]]:
-    """Extract a triangulated surface for one 2D entity.
-
-    Returns (positions, normals) as flat python lists in METERS.
-    Each triangle contributes 3 × 3 floats; normals are flat-shaded.
-    """
-    dim, tag = dim_tag
-    if dim != 2:
-        return [], []
-    # Gmsh mesh element type 2 == 3-node triangle.
-    types, _elem_tags, node_tags = gmsh.model.mesh.getElements(dim=2, tag=tag)
-    positions: list[float] = []
-    normals: list[float] = []
-    for et, nodes in zip(types, node_tags):
-        if et != 2:
-            continue
-        # nodes is a flat list, 3 node ids per triangle
-        for i in range(0, len(nodes), 3):
-            a_id, b_id, c_id = nodes[i], nodes[i + 1], nodes[i + 2]
-            ax, ay, az = gmsh.model.mesh.getNode(a_id)[0]
-            bx, by, bz = gmsh.model.mesh.getNode(b_id)[0]
-            cx, cy, cz = gmsh.model.mesh.getNode(c_id)[0]
-            # flat normal = (b-a) x (c-a) normalized
-            ux, uy, uz = bx - ax, by - ay, bz - az
-            vx, vy, vz = cx - ax, cy - ay, cz - az
-            nx = uy * vz - uz * vy
-            ny = uz * vx - ux * vz
-            nz = ux * vy - uy * vx
-            nl = math.sqrt(nx * nx + ny * ny + nz * nz)
-            if nl > 0:
-                nx, ny, nz = nx / nl, ny / nl, nz / nl
-            positions.extend((ax, ay, az, bx, by, bz, cx, cy, cz))
-            normals.extend((nx, ny, nz) * 3)
-    return positions, normals
+_DEFAULT_BBOX = {"min": [-1.0, -1.0, -1.0], "max": [1.0, 1.0, 1.0]}
 
 
-def _ensure_surface_mesh(maxh: float) -> None:
-    """Generate a coarse surface mesh suitable for visualization."""
-    gmsh.model.occ.synchronize()
-    gmsh.option.setNumber("Mesh.MeshSizeMax", maxh)
-    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.0)
-    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.SaveAll", 1)
-    gmsh.model.mesh.generate(2)
-
-
-def _global_bbox() -> dict[str, list[float]]:
-    xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
-    if not all(math.isfinite(v) for v in (xmin, ymin, zmin, xmax, ymax, zmax)):
-        return {"min": [-1.0, -1.0, -1.0], "max": [1.0, 1.0, 1.0]}
-    return {"min": [xmin, ymin, zmin], "max": [xmax, ymax, zmax]}
-
-
-def _bbox_diag() -> float:
-    bb = _global_bbox()
-    dx = bb["max"][0] - bb["min"][0]
-    dy = bb["max"][1] - bb["min"][1]
-    dz = bb["max"][2] - bb["min"][2]
-    return max(math.sqrt(dx * dx + dy * dy + dz * dz), 1e-9)
+def _bbox(b) -> dict[str, list[float]]:
+    """``{min, max}`` of an ``(xmin, ymin, zmin, xmax, ymax, zmax)`` box."""
+    b = [float(v) for v in b]
+    if len(b) != 6 or not all(math.isfinite(v) for v in b):
+        return dict(_DEFAULT_BBOX)
+    return {"min": b[:3], "max": b[3:]}
 
 
 def geometry_to_payload(g: Any, *, target_tris: int = 4000) -> dict:
-    """Tessellate a Geometry's OCC entities and produce a viewer payload.
+    """Viewer payload of a Geometry: its solver mesh once ``g.mesh()`` ran,
+    else a coarse triangulation of its faces.
 
-    Uses gmsh's 2D mesher with a coarse size to keep this responsive on
-    every save (``rapidfem serve`` calls this on Ctrl+S). ``target_tris``
-    nudges the mesh size to land near a desired triangle budget.
+    ``rapidfem serve`` calls this on every save; the preview surface mesh is
+    separate from the solver mesh and never touches it. ``target_tris`` is
+    the preview's triangle budget.
     """
-    gmsh.model.occ.synchronize()
-    # Use a Python-side flag on the Geometry to discriminate: if the user
-    # has explicitly called g.mesh(), render the FEM tet mesh; otherwise
-    # render filled OCC surfaces (coarse preview, isolated from FEM mesh
-    # because g.mesh() will mesh.clear() before its own generate(3) call).
-    if getattr(g, "_last_mesh", None) is not None:
+    if getattr(g, "_fem_mesh", None) is not None:
         try:
             return mesh_to_payload(g, maxh=0.0)
         except Exception:
             pass
-    return _surface_preview(g)
+    return _surface_preview(g, target_tris)
 
 
-def _surface_preview(g: Any) -> dict:
-    """Coarse OCC-surface tessellation for the Geometry cell, filled, colored
-    per named face. Quick (~50ms) and gets wiped by `g.mesh()` before any FEM
-    mesh is generated, so it never pollutes the user's discretization."""
-    gmsh.model.occ.synchronize()
-    diag = _bbox_diag()
-    maxh = max(diag / 10.0, 1e-6)
-    try:
-        gmsh.model.mesh.clear()
-    except Exception:
-        pass
-    gmsh.option.setNumber("Mesh.MeshSizeMax", maxh)
-    gmsh.option.setNumber("Mesh.MeshSizeMin", 0.0)
-    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
-    gmsh.option.setNumber("Mesh.SaveAll", 1)
-    try:
-        gmsh.model.mesh.generate(2)
-    except Exception:
-        # Preview meshing failed, fall back to wireframe.
-        return _wireframe_payload(g)
-
-    # Two passes so volumes can color their own boundary. First the physics-
-    # targeted faces (ports, PEC, ABC, ...) claim their surfaces; then each
-    # volume picks up whatever boundary faces remain and tints them with its
-    # material, so a substrate reads as one dielectric body instead of a litter
-    # of gray faces. A final pass mops up any orphan surface as neutral.
-    all_ents = list(getattr(g, "_entities", []))
+def _surface_preview(g: Any, target_tris: int) -> dict:
+    """Coarse face triangulation, filled, colored per physics and material."""
     entities: list[dict] = []
-    seen_surface_tags: set[int] = set()
+    empty = {"kind": "geometry", "bbox": dict(_DEFAULT_BBOX), "entities": entities,
+             "stats": {"n_entities": 0, "n_triangles": 0, "maxh": 0.0}}
+    if g._native.mesh_mode:
+        return empty  # a loaded mesh shows once g.mesh() bakes it
+    native = g._native
+    try:
+        faces = {fid: (p, n) for fid, p, n in native.preview(target_tris)}
+        bbox = native.bbox()
+    except Exception as e:  # noqa: BLE001
+        return {**empty, "error": str(e)}
+    diag = math.dist(bbox[:3], bbox[3:])
 
-    def _emit(name, tag, dim, color, dim_tags, material):
+    # Three passes. Physics-targeted faces (ports, PEC, ABC, ...) claim their
+    # faces first; then each volume picks up whatever of its boundary remains
+    # and tints it with its material, so a substrate reads as one dielectric
+    # body instead of a litter of gray faces; the rest is neutral.
+    claimed: set[int] = set()
+
+    def emit(name, tag, dim, color, ids):
         pos: list[float] = []
         nor: list[float] = []
-        for dt in dim_tags:
-            p, n = _surface_triangulation(dt)
-            pos.extend(p); nor.extend(n)
-        if not pos:
-            return
-        entities.append({
-            "name": name, "tag": int(tag), "dim": int(dim),
-            "color": color, "positions": pos, "normals": nor,
-            "material": material,
-        })
+        for i in ids:
+            if i in claimed or i not in faces:
+                continue
+            claimed.add(i)
+            pos.extend(faces[i][0])
+            nor.extend(faces[i][1])
+        if pos:
+            entities.append({
+                "name": name, "tag": int(tag), "dim": int(dim),
+                "color": color, "positions": pos, "normals": nor,
+            })
 
-    # Pass 1: physics-targeted (or legacy string-named) faces.
-    for ent in all_ents:
-        if ent.dim != 2 or ent.tag in seen_surface_tags:
+    objects = [o._entity for o in g.objects]
+    for ent in objects + [e for p in g._physics for e in p._entities]:
+        if ent.dim != 2:
             continue
         label, color = _entity_resolution(g, ent)
         if label is None:
-            continue   # untracked, a volume claims it in pass 2
-        seen_surface_tags.add(ent.tag)
-        _emit(label, ent.tag, 2, color, [(2, ent.tag)], _material_label(ent.material))
-
-    # Pass 2: volumes claim their remaining boundary faces under the material.
-    for ent in all_ents:
+            continue  # untracked, a volume claims it next
+        emit(label, ent.key[0], 2, color, native.face_ids([ent.key]))
+    # later volumes first: an inner body added after its surrounding
+    # volume takes the interface between them
+    for ent in reversed(objects):
         if ent.dim != 3:
             continue
         label, color = _entity_resolution(g, ent)
-        name = label or ent.name or f"_volume_{ent.tag}"
-        dim_tags: list[tuple[int, int]] = []
-        for d, t in gmsh.model.getBoundary([(3, ent.tag)], oriented=False):
-            if d == 2 and t not in seen_surface_tags:
-                dim_tags.append((2, t))
-                seen_surface_tags.add(t)
-        _emit(name, ent.tag, 3, color, dim_tags, _material_label(ent.material))
-
-    # Pass 3: any still-unclaimed surface (orphan fragment), neutral.
-    for ent in all_ents:
-        if ent.dim != 2 or ent.tag in seen_surface_tags:
-            continue
-        seen_surface_tags.add(ent.tag)
-        _emit(ent.name or f"_face_{ent.tag}", ent.tag, 2, _COL_NEUTRAL,
-              [(2, ent.tag)], _material_label(ent.material))
+        emit(label or ent.name or f"_volume_{ent.key}", ent.key, 3, color,
+             native.face_ids(native.faces_of(ent.key)))
+    for fid in sorted(faces):
+        emit(f"_face_{fid}", fid, 2, _COL_NEUTRAL, [fid])
 
     return {
         "kind": "geometry",
-        "bbox": _global_bbox(),
+        "bbox": _bbox(bbox),
         "entities": entities,
         "stats": {
             "n_entities": len(entities),
             "n_triangles": sum(len(e["positions"]) // 9 for e in entities),
-            "maxh": maxh,
+            "maxh": diag / 10.0,
         },
     }
 
 
-def _wireframe_payload(g: Any) -> dict:
-    """OCC wireframe, no meshing. Samples each boundary curve in parametric
-    space and emits the resulting polylines per named entity. Renders the
-    geometric outlines (filling will appear once the user runs g.mesh())."""
-    gmsh.model.occ.synchronize()
-    SAMPLES = 24  # points per curve
-
-    def sample_curve(tag: int) -> list[float]:
-        """Return flat xyz pairs for a curve, as line segments (2 verts each)."""
-        try:
-            u0, u1 = gmsh.model.getParametrizationBounds(1, tag)
-        except Exception:
-            return []
-        u0 = float(u0[0] if hasattr(u0, "__len__") else u0)
-        u1 = float(u1[0] if hasattr(u1, "__len__") else u1)
-        if u0 == u1:
-            return []
-        params = [u0 + (u1 - u0) * (i / (SAMPLES - 1)) for i in range(SAMPLES)]
-        try:
-            xyz = gmsh.model.getValue(1, tag, params)
-        except Exception:
-            return []
-        # xyz is a flat list [x0,y0,z0, x1,y1,z1, ...] of SAMPLES points.
-        out: list[float] = []
-        for i in range(SAMPLES - 1):
-            out.extend([xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2],
-                        xyz[3 * (i + 1)], xyz[3 * (i + 1) + 1], xyz[3 * (i + 1) + 2]])
-        return out
-
-    def curves_of(dim: int, tag: int) -> list[int]:
-        if dim == 1:
-            return [tag]
-        try:
-            bnd = gmsh.model.getBoundary([(dim, tag)], oriented=False, recursive=False)
-        except Exception:
-            return []
-        out: list[int] = []
-        if dim == 2:
-            for d, t in bnd:
-                if d == 1:
-                    out.append(abs(int(t)))
-        elif dim == 3:
-            for d, t in bnd:
-                if d == 2:
-                    sub = gmsh.model.getBoundary([(2, abs(int(t)))], oriented=False, recursive=False)
-                    for dd, tt in sub:
-                        if dd == 1:
-                            out.append(abs(int(tt)))
-        # Deduplicate while preserving order
-        seen: set[int] = set()
-        dedup: list[int] = []
-        for t in out:
-            if t in seen:
-                continue
-            seen.add(t)
-            dedup.append(t)
-        return dedup
-
-    raw_ents = list(getattr(g, "_entities", []))
-    def _key(e):
-        return (0 if e.dim == 2 else 1, 0 if e.name else 1)
-    raw_ents.sort(key=_key)
-
-    # Cache sampled curves so we don't re-tessellate shared edges, but
-    # emit them under EACH entity that owns them, otherwise the first
-    # face claims everything and the rest of the legend is empty.
-    curve_cache: dict[int, list[float]] = {}
-    def sample_cached(tag: int) -> list[float]:
-        v = curve_cache.get(tag)
-        if v is None:
-            v = sample_curve(tag)
-            curve_cache[tag] = v
-        return v
-
-    entities: list[dict] = []
-    seen_ents: set[tuple[int, int]] = set()
-    for ent in raw_ents:
-        if ent.dim not in (2, 3):
-            continue
-        key = (ent.dim, ent.tag)
-        if key in seen_ents:
-            continue
-        seen_ents.add(key)
-        resolved_label, resolved_color = _entity_resolution(g, ent)
-        name = resolved_label or ent.name or f"_{ 'face' if ent.dim == 2 else 'volume' }_{ent.tag}"
-        lines: list[float] = []
-        for ctag in curves_of(ent.dim, ent.tag):
-            lines.extend(sample_cached(ctag))
-        if not lines:
-            continue
-        entities.append({
-            "name": name,
-            "tag": int(ent.tag),
-            "dim": int(ent.dim),
-            "color": resolved_color,
-            "lines": lines,
-            "material": _material_label(ent.material),
-        })
-
-    return {
-        "kind": "geometry",
-        "wireframe": True,
-        "bbox": _global_bbox(),
-        "entities": entities,
-        "stats": {
-            "n_entities": len(entities),
-            "n_segments": sum(len(e["lines"]) // 6 for e in entities),
-            "maxh": 0.0,
-        },
-    }
-
-
-# ── Full 3D mesh → viewer payload ─────────────────────────────────────────────
+# ── Solver mesh → viewer payload ──────────────────────────────────────────────
 
 
 def mesh_to_payload(g: Any, *, maxh: float) -> dict:
-    """Generate the full 3D mesh on the Geometry and extract a viewer payload.
+    """The Geometry's solver mesh as a viewer payload: nodes, tets and the
+    boundary and group triangles, each tagged with its group.
 
-    Calls ``g.mesh(maxh=maxh)`` which leaves the gmsh model populated with a
-    tet mesh + named physical groups; we then read nodes, tets, and surface
-    triangles back out and ship them to the canvas3d viewer in its expected
-    MeshData layout.
+    Meshes first (with ``maxh``, 0 for the geometry's own size) unless
+    ``g.mesh()`` already ran.
     """
     import time
     t0 = time.perf_counter()
-    # If the user already triggered meshing (e.g. via builder.from_geometry()
-    # in the same script), gmsh holds the mesh + physical groups, calling
-    # g.mesh() again collides on duplicate physical tags. Skip the re-mesh in
-    # that case; otherwise generate now.
-    name_to_tag: dict[str, int] = {}
-    msh_bytes_len = 0
-    existing_node_tags, _, _ = gmsh.model.mesh.getNodes()
-    if len(existing_node_tags) == 0:
-        mesh_bytes_local, name_to_tag = g.mesh(maxh=maxh)
-        msh_bytes_len = len(mesh_bytes_local)
-    else:
-        # Recover name_to_tag from gmsh's physical groups (drop "_mat_" prefix).
-        for dim, ptag in gmsh.model.getPhysicalGroups():
-            n = gmsh.model.getPhysicalName(dim, ptag) or ""
-            if n.startswith("_mat_"):
-                n = n[len("_mat_"):]
-            if n:
-                name_to_tag[n] = ptag
+    if getattr(g, "_fem_mesh", None) is None:
+        g.mesh(maxh=maxh or None)
     t_mesh = time.perf_counter() - t0
+    nodes, tris, tri_tags, tets, tet_tags = g._fem_mesh.viewer()
 
-    # ── Nodes ────────────────────────────────────────────────────────────
-    node_tags, coords, _ = gmsh.model.mesh.getNodes()
-    # node_tags is 1-based and may not be contiguous after fragment ops.
-    # Build a dense index map: gmsh_tag -> dense_idx
-    max_tag = int(node_tags.max()) if len(node_tags) else 0
-    idx_map = [0] * (max_tag + 1)
-    for i, t in enumerate(node_tags):
-        idx_map[int(t)] = i
-    nodes_flat = list(coords)  # already flat xyz
-
-    # ── Physical groups ──────────────────────────────────────────────────
-    phys_names: dict[int, str] = {}
-    phys_dim: dict[int, int] = {}
-    phys_to_entities: dict[int, list[int]] = {}
-    for dim, ptag in gmsh.model.getPhysicalGroups():
-        name = gmsh.model.getPhysicalName(dim, ptag) or f"_phys_{dim}_{ptag}"
-        if name.startswith("_mat_"):
-            name = name[len("_mat_"):]
-        phys_names[ptag] = name
-        phys_dim[ptag] = dim
-        phys_to_entities[ptag] = list(gmsh.model.getEntitiesForPhysicalGroup(dim, ptag))
-
-    # Map each entity (dim, tag) → its physical-group tag (if any). Entities
-    # may belong to multiple physical groups; we take the first hit.
-    entity_to_phys: dict[tuple[int, int], int] = {}
-    for ptag, ents in phys_to_entities.items():
-        d = phys_dim[ptag]
-        for e in ents:
-            entity_to_phys.setdefault((d, int(e)), ptag)
-
-    # ── Tets (3D elements) ───────────────────────────────────────────────
-    tets_flat: list[int] = []
-    tet_phys: list[int] = []
-    for dim, etag in gmsh.model.getEntities(3):
-        etypes, eelem_tags, enode_tags = gmsh.model.mesh.getElements(dim=3, tag=etag)
-        ptag = entity_to_phys.get((3, etag), 0)
-        for et, _tags, nodes_arr in zip(etypes, eelem_tags, enode_tags):
-            if et != 4:  # 4-node tet
-                continue
-            n = len(nodes_arr) // 4
-            for k in range(n):
-                a = idx_map[int(nodes_arr[4 * k + 0])]
-                b = idx_map[int(nodes_arr[4 * k + 1])]
-                c = idx_map[int(nodes_arr[4 * k + 2])]
-                d_ = idx_map[int(nodes_arr[4 * k + 3])]
-                tets_flat.extend((a, b, c, d_))
-                tet_phys.append(ptag)
-
-    # ── Surface tris ─────────────────────────────────────────────────────
-    tris_flat: list[int] = []
-    tri_phys: list[int] = []
-    for dim, etag in gmsh.model.getEntities(2):
-        etypes, _eelem_tags, enode_tags = gmsh.model.mesh.getElements(dim=2, tag=etag)
-        ptag = entity_to_phys.get((2, etag), 0)
-        for et, nodes_arr in zip(etypes, enode_tags):
-            if et != 2:  # 3-node triangle
-                continue
-            n = len(nodes_arr) // 3
-            for k in range(n):
-                a = idx_map[int(nodes_arr[3 * k + 0])]
-                b = idx_map[int(nodes_arr[3 * k + 1])]
-                c = idx_map[int(nodes_arr[3 * k + 2])]
-                tris_flat.extend((a, b, c))
-                tri_phys.append(ptag)
-
+    groups = g._native.group_names()
+    phys_dim = {t: dim for t, _, dim in groups}
+    phys_names = {t: name for t, name, _ in groups}
+    xyz = [nodes[k::3] for k in range(3)]
+    bbox = ([min(c) for c in xyz] + [max(c) for c in xyz]) if nodes else []
     return {
         "kind": "mesh",
-        "bbox": _global_bbox(),
-        "nodes": nodes_flat,
-        "tris": tris_flat,
-        "tri_phys": tri_phys,
-        "tets": tets_flat,
-        "tet_phys": tet_phys,
+        "bbox": _bbox(bbox),
+        "nodes": nodes,
+        "tris": tris,
+        "tri_phys": tri_tags,
+        "tets": tets,
+        "tet_phys": tet_tags,
         "phys_names": phys_names,
         "phys_dim": phys_dim,
-        "name_to_tag": name_to_tag,
         "stats": {
-            "n_nodes": len(nodes_flat) // 3,
-            "n_tets": len(tet_phys),
-            "n_tris": len(tri_phys),
+            "n_nodes": len(nodes) // 3,
+            "n_tets": len(tet_tags),
+            "n_tris": len(tri_tags),
             "mesh_time_s": t_mesh,
-            "msh_bytes": msh_bytes_len,
         },
     }
+
+
+def td_timeseries_payload(obj) -> dict[str, Any]:
+    """``TdResponse`` / ``TdTransfer`` → a line-plot payload.
+
+    A response carries real probe samples on a time axis; a transfer
+    function carries a complex ``H`` on a frequency axis. ``domain``
+    tells the frontend which it is.
+    """
+    import numpy as np
+
+    cls = type(obj).__name__
+    if cls == "TdResponse":
+        x = np.asarray(obj.times, dtype=float).ravel()
+        resp = np.asarray(obj.responses, dtype=float)
+        labels = list(obj.probe_labels) or [
+            f"probe {k}" for k in range(resp.shape[0])
+        ]
+        series = [
+            {"label": labels[k], "y": resp[k].astype(float).tolist()}
+            for k in range(resp.shape[0])
+        ]
+        return {
+            "domain": "time",
+            "x_label": "Time",
+            "x": x.tolist(),
+            "series": series,
+            "source_label": obj.source_label,
+        }
+    # TdTransfer, complex frequency response
+    x = np.asarray(obj.frequencies, dtype=float).ravel()
+    H = np.asarray(obj.H)
+    return {
+        "domain": "freq",
+        "x_label": "Frequency (Hz)",
+        "x": x.tolist(),
+        "series": [{
+            "label": f"H · {obj.probe_label}",
+            "y_re": np.real(H).astype(float).tolist(),
+            "y_im": np.imag(H).astype(float).tolist(),
+        }],
+        "source_label": obj.source_label,
+    }
+
+
+def td_trajectory_payload(traj, *, max_frames: int = 180) -> dict[str, Any]:
+    """``TdTrajectory`` -> the DG-corner mesh with per-node |E|, |H| frames.
+
+    The element corners merge into a continuous node set with tet
+    connectivity; per kept frame (at most ``max_frames``) every node carries
+    |E| and |H|, averaged over its corners and quantised to integers
+    0..1000 of the per-channel maximum ``field_max``, which the viewer holds
+    fixed across the animation. The frontend samples its point cloud from
+    this mesh at runtime (see ``TdSession.viewer_trajectory``).
+    """
+    import numpy as np
+
+    p = getattr(traj, "_problem", None)
+    if p is None:
+        raise RuntimeError(
+            "trajectory carries no ProblemTD reference, it must come "
+            "straight from ProblemTD.transient()"
+        )
+    states = np.atleast_2d(np.ascontiguousarray(traj, dtype=np.float64))
+    out = p._op.viewer_trajectory(states, max_frames)
+    frames = out.pop("frames")
+    dt = getattr(traj, "_dt", None)
+    out["times"] = [f * dt if dt else float(f) for f in frames]
+    out["n_snapshots"] = len(frames)
+    return out

@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 #########################################################################################
 ##
 ##                            PORTS AND BOUNDARY CONDITIONS
@@ -8,8 +12,6 @@
 # IMPORTS ===============================================================================
 
 from __future__ import annotations
-
-import warnings
 
 from typing import Sequence
 
@@ -24,8 +26,7 @@ def _normalize(targets, *, expected_dim: int, cls_name: str):
 
     Accepts :class:`GeoObject`, :class:`EntityCollection`, individual
     ``_Entity``, and any combination of those. All resolved entities
-    must belong to the same :class:`Geometry` and (if ``expected_dim``
-    is set) carry that dim.
+    must belong to the same :class:`Geometry` and carry ``expected_dim``.
 
     Parameters
     ----------
@@ -44,39 +45,21 @@ def _normalize(targets, *, expected_dim: int, cls_name: str):
         the geometry instance every target belongs to
     """
     entities: list[_Entity] = []
-    geom = None
     for t in targets:
         if isinstance(t, GeoObject):
             entities.append(t._entity)
-            geom = t._geometry if geom is None else geom
-            if geom is not t._geometry:
-                raise ValueError(
-                    f"{cls_name}: targets span multiple Geometry instances")
         elif isinstance(t, EntityCollection):
             entities.extend(t._entities)
-            if geom is None:
-                geom = t._geometry
-            elif geom is not t._geometry:
-                raise ValueError(
-                    f"{cls_name}: targets span multiple Geometry instances")
         elif isinstance(t, _Entity):
             entities.append(t)
-            if t._geometry is None:
-                raise ValueError(
-                    f"{cls_name}: bare _Entity without Geometry back-ref")
-            if geom is None:
-                geom = t._geometry
-            elif geom is not t._geometry:
-                raise ValueError(
-                    f"{cls_name}: targets span multiple Geometry instances")
         else:
             raise TypeError(
                 f"{cls_name}: cannot use {type(t).__name__} as a target")
-
     if not entities:
         raise ValueError(f"{cls_name}: no targets")
-    if geom is None:
-        raise ValueError(f"{cls_name}: could not resolve target Geometry")
+    geom = entities[0]._geometry
+    if any(e._geometry is not geom for e in entities):
+        raise ValueError(f"{cls_name}: targets span multiple Geometry instances")
     for e in entities:
         if e.dim != expected_dim:
             kind = {2: "face", 3: "volume"}.get(expected_dim, f"dim={expected_dim}")
@@ -91,8 +74,8 @@ class _Physics:
     """Common base for every driven port and boundary condition.
 
     Subclasses set ``_expected_dim`` (2 for face physics, 3 for volume
-    physics) and implement :meth:`_add_to`, which places the object on the
-    native :class:`rapidfem._native.Model` under its mesh tag.
+    physics) and implement :meth:`_add_to`, which places the object on its
+    targets in the geometry's native setup.
 
 
     Note
@@ -103,29 +86,38 @@ class _Physics:
     ``__init__``; no further wiring step is required.
 
     The physics object is purely declarative, it holds no state about
-    the mesh. The geometry's :meth:`Geometry.mesh` step turns it into a
-    gmsh physical group, and :class:`rapidfem.Problem` reads that group
-    tag back when it builds the model.
+    the mesh. The native setup gives it a mesh tag (:attr:`_tag`), the
+    group of mesh faces or tets :meth:`Geometry.mesh` builds for it, and
+    places it on the model of both backends under that tag.
     """
     _expected_dim: int = 2
 
     def __init__(self, *targets):
-        ents, geom = _normalize(targets,
-                                expected_dim=self._expected_dim,
-                                cls_name=type(self).__name__)
-        self._entities = ents
-        self._geometry = geom
-        geom._physics.append(self)
+        self._entities, self._geometry = _normalize(
+            targets, expected_dim=self._expected_dim, cls_name=type(self).__name__)
+        self._index = self._add_to(self._geometry._native, [e.key for e in self._entities])
+        self._geometry._physics.append(self)
 
-    def _add_to(self, model, tag) -> None:
-        """place this object on the native model under its mesh tag
+    @property
+    def _tag(self) -> int:
+        """the mesh tag of this object (a periodic pair: of side a, side b
+        has the next one)"""
+        return self._geometry._native.physics_tag(self._index)
+
+    def _add_to(self, native, targets) -> int:
+        """place this object on ``targets`` of the native geometry
 
         Parameters
         ----------
-        model : rapidfem._native.Model
-            the model being built
-        tag : int
-            physical-group tag assigned by ``Geometry.mesh()``
+        native : rapidfem._native.Geometry
+            the geometry's native scene
+        targets : list
+            keys of the target entities
+
+        Returns
+        -------
+        int
+            the object's index in the native setup
         """
         raise NotImplementedError
 
@@ -185,16 +177,18 @@ class RectWaveguidePort(_Physics):
                  power: float = 1.0,
                  width: float = 0.0,
                  height: float = 0.0):
-        super().__init__(*targets)
         self.mode = (int(mode[0]), int(mode[1]))
         self.er = float(er)
         self.power = float(power)
         self.width = float(width)
         self.height = float(height)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_rect_port(tag, width=self.width, height=self.height,
-                            mode=list(self.mode), er=self.er, power=self.power)
+    def _add_to(self, native, targets) -> int:
+        return native.add_rect_port(targets, width=self.width, height=self.height,
+                                    mode=self.mode, er=self.er, power=self.power)
+
+
 class LumpedPort(_Physics):
     """Lumped voltage-source driven port between two PEC conductors.
 
@@ -206,7 +200,7 @@ class LumpedPort(_Physics):
     .. math::
 
         V = \\frac{1}{w} \\int_{\\text{port}}
-            \\mathbf{E} \\cdot \\hat{\\ell}\\; dS ,
+            \\mathbf{E} \\cdot \\hat{\\ell}\\; dS,
 
     (with :math:`w = A/\\ell` the port width), which stays well defined for
     tall / non-TEM ports where a single line integral would degenerate.
@@ -261,7 +255,6 @@ class LumpedPort(_Physics):
                  power: float = 1.0,
                  width: float = 0.0,
                  height: float = 0.0):
-        super().__init__(*targets)
         self.direction = tuple(float(v) for v in direction)
         self.z0 = float(z0)
         self.l = float(l)
@@ -269,11 +262,14 @@ class LumpedPort(_Physics):
         self.power = float(power)
         self.width = float(width)
         self.height = float(height)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_lumped_port(tag, z0=self.z0, l=self.l, c=self.c,
-                              direction=list(self.direction), width=self.width,
-                              height=self.height, power=self.power)
+    def _add_to(self, native, targets) -> int:
+        return native.add_lumped_port(targets, z0=self.z0, l=self.l, c=self.c,
+                                      direction=self.direction, width=self.width,
+                                      height=self.height, power=self.power)
+
+
 class CoaxPort(_Physics):
     """TEM-mode driven port on a coaxial annular face.
 
@@ -329,19 +325,19 @@ class CoaxPort(_Physics):
                  z_axis: Sequence[float] | None = None,
                  er: float = 1.0,
                  power: float = 1.0):
-        super().__init__(*targets)
         self.ri = float(ri)
         self.ro = float(ro)
         self.origin = tuple(float(v) for v in origin) if origin is not None else None
         self.z_axis = tuple(float(v) for v in z_axis) if z_axis is not None else None
         self.er = float(er)
         self.power = float(power)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_coax_port(
-            tag, ri=self.ri, ro=self.ro, er=self.er, power=self.power,
-            origin=None if self.origin is None else list(self.origin),
-            z_axis=None if self.z_axis is None else list(self.z_axis))
+    def _add_to(self, native, targets) -> int:
+        return native.add_coax_port(targets, ri=self.ri, ro=self.ro, er=self.er,
+                                    power=self.power, origin=self.origin, z_axis=self.z_axis)
+
+
 class WavePort(_Physics):
     """Numerically-solved wave port, 2-D mode eigensolve on the port face.
 
@@ -357,14 +353,15 @@ class WavePort(_Physics):
 
     Two solver paths, selected via ``mode_kind``:
 
-    - ``"auto"`` / ``"vector"`` / ``"hybrid"`` (default), **full-vector
+    - ``"auto"`` (default), **full-vector
       hybrid** eigenproblem (mixed Nédélec-edge :math:`E_t` + Lagrange-
       nodal :math:`E_z`). Honours per-element :math:`\\varepsilon_r` so
       the inhomogeneous quasi-TEM mode of a microstrip-class line is
       captured directly. Pair with ``pec=`` to mark any internal PEC
       conductor (the trace) that bisects the cross-section. Dispersion
       uses :math:`\\beta(k_0) = n_{\\mathrm{eff}}(f_0) \\cdot k_0`
-      throughout the sweep, set ``f0`` near band centre.
+      throughout the sweep, set ``f0`` near band centre. Without ``f0``
+      (the time-domain backend) ``"auto"`` takes the scalar TE path.
     - ``"te"`` / ``"tm"``, **scalar Helmholtz** TE / TM modes on the
       homogeneously filled hollow cross-section. Cutoff and dispersion
       come from the scalar :math:`k_c`; weak frequency dependence so
@@ -404,9 +401,8 @@ class WavePort(_Physics):
     targets : GeoObject or EntityCollection
         port face(s), multiple faces are merged into one cross-section
     mode_kind : str, optional
-        ``"auto"`` / ``"vector"`` / ``"hybrid"`` (default) for the
-        full-vector hybrid solve, ``"te"`` / ``"tm"`` for the scalar
-        Helmholtz path.
+        ``"auto"`` (default) for the full-vector hybrid solve,
+        ``"te"`` / ``"tm"`` for the scalar Helmholtz path.
     mode_index : int
         which mode to use, ordered by descending :math:`n_{\\mathrm{eff}}`
         (vector path) or ascending cutoff (scalar path). ``0`` = dominant.
@@ -421,45 +417,29 @@ class WavePort(_Physics):
         this is only for *internal* PEC.
     power : float
         incident power in watts (default ``1.0``)
-    te : bool, optional
-        legacy backwards-compat flag, superseded by ``mode_kind``.
     """
 
     def __init__(self, *targets,
-                 te: bool = True,
                  mode_index: int = 0,
                  f0: float | None = None,
                  power: float = 1.0,
-                 mode_kind: str | None = None,
+                 mode_kind: str = "auto",
                  pec: "Iterable | None" = None):
-        super().__init__(*targets)
-        self.te = bool(te)
         self.mode_index = int(mode_index)
         self.f0 = None if f0 is None else float(f0)
         self.power = float(power)
-        if mode_kind is not None:
-            self.mode_kind = str(mode_kind).lower()
-        else:
-            self.mode_kind = "auto"
+        self.mode_kind = mode_kind
         self.pec = list(pec) if pec is not None else []
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        # The cross-section solve: an explicit te / tm, otherwise the vector
-        # solve at f0, or without f0 the scalar solve picked by ``te``.
-        if self.mode_kind in ("te", "tm"):
-            kind = self.mode_kind
-        elif self.f0 is None:
-            kind = "te" if self.te else "tm"
-        else:
-            kind = "vector"
-        # Attached PEC objects resolve to their physical-group tags so the
-        # cross-section eigensolve can mark those nodes as internal
-        # conductors; Geometry.mesh() populates `_physics_tags`.
-        geom = self._geometry
-        pec_tags = [geom._physics_tags[id(p)] for p in self.pec
-                    if isinstance(geom._physics_tags.get(id(p)), int)]
-        model.add_wave_port(tag, kind=kind, mode_index=self.mode_index,
-                            power=self.power, f0=self.f0, pec_tags=pec_tags)
+    def _add_to(self, native, targets) -> int:
+        # the attached PEC objects mark internal conductors of the cross-section
+        pec = [p._index for p in self.pec if getattr(p, "_geometry", None) is self._geometry]
+        return native.add_wave_port(targets, mode_kind=self.mode_kind,
+                                    mode_index=self.mode_index, power=self.power,
+                                    f0=self.f0, pec=pec)
+
+
 class UserDefinedPort(_Physics):
     """Driven port with a user-supplied uniform E-field on the face.
 
@@ -492,17 +472,21 @@ class UserDefinedPort(_Physics):
     def __init__(self, *targets,
                  e_field: Sequence[float],
                  power: float = 1.0):
-        super().__init__(*targets)
         self.e_field = tuple(float(v) for v in e_field)
         self.power = float(power)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_user_port(tag, e_field=list(self.e_field), power=self.power)
+    def _add_to(self, native, targets) -> int:
+        return native.add_user_port(targets, e_field=self.e_field, power=self.power)
+
+
 class FloquetPort(_Physics):
     """Floquet plane-wave port for periodic unit cells.
 
-    Drives a periodic structure with an oblique plane wave at scan
-    angles :math:`(\\theta, \\phi)`. The Floquet mode has the form
+    Drives a periodic structure with a plane wave at scan angles
+    :math:`(\\theta, \\phi)`. The frequency-domain solver takes normal
+    incidence only (:math:`\\theta = 0`); oblique scan needs periodic side
+    walls with a phase shift (issue #14). The Floquet mode has the form
 
     .. math::
 
@@ -536,9 +520,7 @@ class FloquetPort(_Physics):
     scan_phi_deg : float
         azimuth scan angle :math:`\\phi` in degrees
     mode_nr : int
-        Floquet mode index (1 = fundamental)
-    er : float
-        relative permittivity of the port medium
+        polarisation of the plane wave: 1 = TE (s-pol), 2 = TM (p-pol)
     power : float
         incident power in watts
     """
@@ -547,19 +529,17 @@ class FloquetPort(_Physics):
                  scan_theta_deg: float = 0.0,
                  scan_phi_deg: float = 0.0,
                  mode_nr: int = 1,
-                 er: float = 1.0,
                  power: float = 1.0):
-        super().__init__(*targets)
         self.scan_theta_deg = float(scan_theta_deg)
         self.scan_phi_deg = float(scan_phi_deg)
         self.mode_nr = int(mode_nr)
-        self.er = float(er)
         self.power = float(power)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_floquet_port(tag, scan_theta_deg=self.scan_theta_deg,
-                               scan_phi_deg=self.scan_phi_deg,
-                               mode_nr=self.mode_nr, er=self.er, power=self.power)
+    def _add_to(self, native, targets) -> int:
+        return native.add_floquet_port(targets, scan_theta_deg=self.scan_theta_deg,
+                                       scan_phi_deg=self.scan_phi_deg,
+                                       mode_nr=self.mode_nr, power=self.power)
 
 
 # BOUNDARY CONDITIONS ===================================================================
@@ -575,15 +555,13 @@ class PEC(_Physics):
 
     on every targeted face. Variadic constructor: pass any mix of
     :class:`GeoObject`, :class:`EntityCollection`, or single faces;
-    they all share one :class:`Problem`-level ``[pec]`` block.
+    they all become one PEC group of the solver mesh.
 
 
     Note
     ----
-    Multiple ``rf.PEC(...)`` calls in the same problem are aggregated
-    into one TOML ``[pec]`` block when :class:`Problem` assembles the
-    config, so you can spread declarations across several lines for
-    readability without worrying about runtime overhead.
+    Every ``rf.PEC(...)`` call becomes its own face group, so
+    declarations can be spread over several lines without cost.
 
 
     Example
@@ -601,8 +579,10 @@ class PEC(_Physics):
         face(s) to mark as PEC, variadic
     """
 
-    def _add_to(self, model, tag) -> None:
-        model.add_pec(tag)
+    def _add_to(self, native, targets) -> int:
+        return native.add_pec(targets)
+
+
 class PMC(_Physics):
     """Perfect magnetic conductor, symmetry boundary.
 
@@ -630,8 +610,10 @@ class PMC(_Physics):
         face(s) to mark as PMC, variadic
     """
 
-    def _add_to(self, model, tag) -> None:
-        model.add_pmc(tag)
+    def _add_to(self, native, targets) -> int:
+        return native.add_pmc(targets)
+
+
 class ABC(_Physics):
     """First-order absorbing boundary condition.
 
@@ -675,11 +657,10 @@ class ABC(_Physics):
         face(s) to terminate
     """
 
-    def __init__(self, *targets):
-        super().__init__(*targets)
+    def _add_to(self, native, targets) -> int:
+        return native.add_abc(targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_abc(tag)
+
 class FarFieldSurface(_Physics):
     """Near-field-to-far-field (Huygens) integration surface.
 
@@ -687,15 +668,21 @@ class FarFieldSurface(_Physics):
     equivalent electric and magnetic currents
     :math:`\\mathbf{J}_s = \\hat{\\mathbf{n}} \\times \\mathbf{H}`,
     :math:`\\mathbf{M}_s = -\\hat{\\mathbf{n}} \\times \\mathbf{E}` are
-    sampled. :meth:`rapidfem.Problem.farfield` propagates those currents
+    sampled. :meth:`rapidfem.ProblemFD.farfield` propagates those currents
     to the far zone via the Stratton-Chu integral.
 
-    When the domain is truncated by an :class:`ABC`, the ABC face is
-    already a closed Huygens surface and the solver auto-detects it, so
-    no ``FarFieldSurface`` is needed. With a :class:`PML` there is no such
+    When the domain is truncated by an :class:`ABC`, its outer boundary
+    is the Huygens surface and the solver takes it by itself, so no
+    ``FarFieldSurface`` is needed. With a :class:`PML` there is no such
     surface (the outer hull is PEC-backed absorber, not free space), so
     you must mark one explicitly: the bulk-air / PML interface is the
     natural choice, a closed box sitting just inside the absorber.
+
+    A ground or symmetry plane on the domain boundary (the PEC floor an
+    antenna rests on, a PMC half-model plane) is taken as infinite: the
+    parts of the surface lying on it are replaced by the images of the
+    rest, and the pattern fills the half-space of the domain. This holds
+    when every conducting piece of the surface lies in one plane.
 
 
     Note
@@ -726,11 +713,10 @@ class FarFieldSurface(_Physics):
         face(s) forming the closed integration surface, variadic
     """
 
-    def __init__(self, *targets):
-        super().__init__(*targets)
+    def _add_to(self, native, targets) -> int:
+        return native.add_far_field(targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.set_far_field(tag)
+
 class SurfaceImpedance(_Physics):
     """Surface impedance boundary for thin lossy conductors.
 
@@ -756,11 +742,11 @@ class SurfaceImpedance(_Physics):
 
     The finite-thickness correction depends on where the face sits:
 
-    * ``two_sided=False`` (default) — a **boundary** face with fields on one
+    * ``two_sided=False`` (default): a **boundary** face with fields on one
       side only (a ground plane on the domain boundary). The face owns the
       full metal, :math:`Z = Z_{s,\\infty} \\coth(\\gamma_m t)`,
       :math:`1/(\\sigma t)` at DC.
-    * ``two_sided=True`` — a **wall** of a conductor that carries the BC on
+    * ``two_sided=True``: a **wall** of a conductor that carries the BC on
       opposing faces (the walls of a conductor cut out of the mesh). Each
       face owns half the metal, :math:`Z = Z_{s,\\infty}
       \\coth(\\gamma_m t/2)`; opposing faces in parallel recover
@@ -768,7 +754,7 @@ class SurfaceImpedance(_Physics):
       volume-to-surface thickness :math:`t_\\mathrm{eff} = w t/(w + t)`
       (``2V/S``), not the layer thickness, or the sidewalls add conductance
       and the DC resistance comes out a factor :math:`w/(w+t)` low.
-    * ``sheet=True`` — a zero-thickness **sheet** embedded in the volume
+    * ``sheet=True``: a zero-thickness **sheet** embedded in the volume
       with fields on both sides, standing in for a strip of thickness
       :math:`t`: :math:`Z = Z_{s,\\infty} \\coth(\\gamma_m t/2)/2`, the
       even mode of the slab (the two faces in parallel), :math:`1/(\\sigma t)`
@@ -781,9 +767,14 @@ class SurfaceImpedance(_Physics):
     Note
     ----
     A surface impedance on the walls of a finite-thickness strip is accurate
-    where the metal is thinner than about 1.5 or thicker than about 10 skin
-    depths. In between it underestimates the strip resistance by up to about
-    20 % (measured against a 2D quasi-static reference, issue #48); mesh the
+    where the metal is thinner than about 1.5 or thicker than about 4 skin
+    depths: on the walls of a conductor hollowed out of the mesh the
+    impedance of the current along a convex edge rises within a few skin
+    depths of it, the current crowding a per-face impedance misses, and the
+    solver adds that from a universal profile (within 3 % of a 2D
+    quasi-static reference from 4 skin depths up, issues #48 and #56). In
+    between, and across conductors narrower than 4 skin depths, it
+    underestimates the strip resistance by up to about 25 %; mesh the
     conductor as a volume there. :func:`rapidfem.rfic.build` makes this
     choice per layer from its ``band``. Never apply the BC to the faces of a
     conductor whose interior is still meshed: on internal faces it acts as a
@@ -822,16 +813,20 @@ class SurfaceImpedance(_Physics):
     two_sided : bool, optional
         the BC sits on opposing faces of the same metal volume (shell of an
         extruded conductor): each face owns half the thickness in the coth
-        term. Keep ``False`` for one-sided boundary sheets (ground planes).
-        Defaults to ``False``; if left unspecified while ``thickness`` is set
-        and the targets cover the complete shell of a solid, a
-        :class:`UserWarning` suggests the physically correct choice.
+        term. Keep ``False`` (the default) for one-sided boundary sheets
+        (ground planes).
     sheet : bool, optional
         the target is a zero-thickness sheet with fields on both sides that
         stands in for a strip of ``thickness`` (see above)
     zs : tuple[float, float], optional
         explicit ``(Re, Im)`` surface impedance in :math:`\\Omega/\\square`,
         overrides the analytic value
+
+    Raises
+    ------
+    ValueError
+        if ``sheet`` and ``two_sided`` are both set, or the targets cover the
+        complete shell of a solid that is still meshed (cut it out first)
     """
 
     def __init__(self, *targets,
@@ -839,49 +834,25 @@ class SurfaceImpedance(_Physics):
                  mur: float = 1.0,
                  er: float = 1.0,
                  thickness: float | None = None,
-                 two_sided: bool | None = None,
+                 two_sided: bool = False,
                  sheet: bool = False,
                  zs: tuple[float, float] | None = None):
-        super().__init__(*targets)
         self.conductivity = float(conductivity)
         self.mur = float(mur)
         self.er = float(er)
         self.thickness = float(thickness) if thickness is not None else None
-        self.two_sided = bool(two_sided) if two_sided is not None else False
+        self.two_sided = bool(two_sided)
         self.sheet = bool(sheet)
-        if self.sheet and self.two_sided:
-            raise ValueError("SurfaceImpedance: sheet and two_sided exclude each other")
         self.zs = (float(zs[0]), float(zs[1])) if zs is not None else None
-        if self._covers_solid_shell():
-            warnings.warn(
-                "SurfaceImpedance: the targets cover the complete shell of a "
-                "solid that is still meshed. On internal faces the BC is a "
-                "transition sheet and the field enters the conductor core, so "
-                "the loss comes out wrong. Cut the conductor out of the mesh "
-                "and put the BC on the walls (two_sided=True with "
-                "thickness=2V/S), or mesh it as a volume conductor.",
-                UserWarning, stacklevel=2)
+        super().__init__(*targets)
 
-    def _covers_solid_shell(self) -> bool:
-        """True if the target faces include the complete shell of at least
-        one 3-D object of the geometry that is still part of the mesh."""
-        ids = {id(e) for e in self._entities}
-        try:
-            for obj in getattr(self._geometry, "_objects", []):
-                if getattr(obj, "dim", None) != 3:
-                    continue
-                shell = obj.faces._entities
-                if shell and all(id(e) in ids for e in shell):
-                    return True
-        except Exception:
-            return False
-        return False
+    def _add_to(self, native, targets) -> int:
+        return native.add_surface_impedance(
+            targets, conductivity=self.conductivity, mur=self.mur, er=self.er,
+            thickness=self.thickness, two_sided=self.two_sided, sheet=self.sheet,
+            zs=self.zs)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_surface_impedance(
-            tag, conductivity=self.conductivity, mur=self.mur, er=self.er,
-            thickness=self.thickness, two_sided=self.two_sided,
-            sheet=self.sheet, zs=None if self.zs is None else list(self.zs))
+
 class LumpedElement(_Physics):
     """Series chip R-L-C element on a 2-D footprint.
 
@@ -931,18 +902,20 @@ class LumpedElement(_Physics):
                  direction: Sequence[float] = (0.0, 0.0, 1.0),
                  width: float = 0.0,
                  height: float = 0.0):
-        super().__init__(*targets)
         self.r = float(r)
         self.l = float(l)
         self.c = float(c) if c is not None else None
         self.direction = tuple(float(v) for v in direction)
         self.width = float(width)
         self.height = float(height)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_lumped_element(tag, r=self.r, l=self.l, c=self.c,
-                                 direction=list(self.direction),
-                                 width=self.width, height=self.height)
+    def _add_to(self, native, targets) -> int:
+        return native.add_lumped_element(targets, r=self.r, l=self.l, c=self.c,
+                                         direction=self.direction,
+                                         width=self.width, height=self.height)
+
+
 class PML(_Physics):
     """Coordinate-stretched anisotropic Perfectly Matched Layer.
 
@@ -964,10 +937,9 @@ class PML(_Physics):
     Note
     ----
     PML lives on a *volume* (dim=3), not a surface. Build it as an
-    extra cuboid attached to the air region; assign a placeholder
-    material (e.g. :class:`Air`) so the volume gets meshed, then
-    declare the PML BC on the volume, the BC's stretch overrides the
-    bulk permittivity for the absorption profile.
+    extra cuboid attached to the air region and declare the PML on it;
+    ``er_base`` / ``ur_base`` and the stretch set the slab's permittivity
+    and permeability, whatever material fills the box.
 
     For a closed enclosure around an antenna use one PML slab per
     outer face; the slabs must not overlap (each volume can only carry
@@ -1022,7 +994,6 @@ class PML(_Physics):
                  ur_base: float = 1.0,
                  exponent: float = 1.5,
                  delta_max: float = 8.0):
-        super().__init__(*targets)
         self.direction = tuple(float(v) for v in direction)
         self.inner_face = float(inner_face)
         self.thickness = float(thickness)
@@ -1030,12 +1001,15 @@ class PML(_Physics):
         self.ur_base = float(ur_base)
         self.exponent = float(exponent)
         self.delta_max = float(delta_max)
+        super().__init__(*targets)
 
-    def _add_to(self, model, tag) -> None:
-        model.add_pml(tag, direction=list(self.direction),
-                      inner_face=self.inner_face, thickness=self.thickness,
-                      er_base=self.er_base, ur_base=self.ur_base,
-                      exponent=self.exponent, delta_max=self.delta_max)
+    def _add_to(self, native, targets) -> int:
+        return native.add_pml(targets, direction=self.direction,
+                              inner_face=self.inner_face, thickness=self.thickness,
+                              er_base=self.er_base, ur_base=self.ur_base,
+                              exponent=self.exponent, delta_max=self.delta_max)
+
+
 class PeriodicBoundary(_Physics):
     """Normal-incidence periodic boundary pair (time-domain backend).
 
@@ -1077,37 +1051,19 @@ class PeriodicBoundary(_Physics):
     """
 
     def __init__(self, face_a, face_b):
-        # Run the parent's _normalize on each side so the pair check is
-        # symmetric and a face-pair object stays a single physics object
-        # in the geometry's _physics list, rather than registering twice.
-        ents_a, geom_a = _normalize([face_a],
-                                    expected_dim=2,
-                                    cls_name=type(self).__name__)
-        ents_b, geom_b = _normalize([face_b],
-                                    expected_dim=2,
-                                    cls_name=type(self).__name__)
-        if geom_a is not geom_b:
-            raise ValueError(
-                f"{type(self).__name__}: face_a and face_b must belong "
-                f"to the same Geometry"
-            )
-        # The base class tagging machinery assumes one tag per
-        # _Physics, but we need two (one per face) for a periodic pair.
-        # Store the two entity lists separately and overload the geometry
-        # registration: a single PeriodicBoundary registers as two
-        # physical-group tags, one per face.
-        self._entities_a = ents_a
-        self._entities_b = ents_b
-        # _entities is kept (the union) so downstream tag walkers still see
-        # something sensible.
-        self._entities = list(ents_a) + list(ents_b)
-        self._geometry = geom_a
-        geom_a._physics.append(self)
+        # one physics object on two face groups: the native setup tags side
+        # a and side b (the next tag) apart
+        ents_a, geom = _normalize([face_a], expected_dim=2, cls_name=type(self).__name__)
+        ents_b, geom_b = _normalize([face_b], expected_dim=2, cls_name=type(self).__name__)
+        if geom is not geom_b:
+            raise ValueError(f"{type(self).__name__}: face_a and face_b must belong "
+                             f"to the same Geometry")
+        self._entities = ents_a + ents_b
+        self._geometry = geom
+        self._index = geom._native.add_periodic([e.key for e in ents_a],
+                                                [e.key for e in ents_b])
+        geom._physics.append(self)
 
-
-    def _add_to(self, model, tag) -> None:
-        tag_a, tag_b = tag
-        model.add_periodic(tag_a, tag_b)
 
 __all__ = [
     "RectWaveguidePort", "LumpedPort", "CoaxPort", "WavePort",

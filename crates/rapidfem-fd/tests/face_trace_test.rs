@@ -1,10 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
-//
+
 // The surface element IS the tangential trace of the volume element.
 //
 // The Robin/port boundary term is assembled with `tri_stiff` on a boundary
@@ -111,7 +108,7 @@ fn volume_basis(mesh: &Mesh) -> (Vec<BasisFn>, [V3; 4]) {
 
 /// The trace-carrying volume DOFs of face `f`, in the surface element's DOF order:
 /// the local volume index whose GLOBAL DOF is the surface element's local DOF `s`.
-/// This is the correspondence the assembler relies on — a shared global index —
+/// This is the correspondence the assembler relies on, a shared global index, 
 /// not one re-derived here.
 fn trace_dofs(basis: &NedelecBasis, tri: usize) -> [usize; 8] {
     let tet_dofs = basis.tet_dofs(0);

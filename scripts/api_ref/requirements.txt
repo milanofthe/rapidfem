@@ -1,4 +1,4 @@
 # Build-time dependencies for the RapidFEM docs API extraction.
-# Static analysis only — RapidFEM itself is not imported.
+# Static analysis only, RapidFEM itself is not imported.
 griffe>=1.0
 docutils>=0.20,<0.22

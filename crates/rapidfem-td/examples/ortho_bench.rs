@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Arnoldi orthogonalisation benchmark, MGS vs CGS2, on realistic meshes.
 //!
 //! The production Krylov stepper (`propagator::expmv_into`) orthogonalises
@@ -171,7 +175,7 @@ fn main() {
     );
     for &c in &[4usize, 6, 8, 10, 12] {
         let mesh = structured_box(c, c, c, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, order, 1.0);
+        let op = MaxwellOperator::new(&mesh, order, 1.0, Default::default());
         let n = op.n_dof();
         let v: Vec<f64> = (0..n).map(|i| (0.3 + i as f64 * 0.011).sin()).collect();
 

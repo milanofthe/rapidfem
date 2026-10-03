@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Adaptive embedded low-storage Runge-Kutta time integration.
 //!
@@ -24,6 +21,7 @@
 use rayon::prelude::*;
 
 use crate::constants::{Field, KCL_A, KCL_B, KCL_BHAT, KCL_STAGES};
+use crate::explicit::Source;
 
 /// Reusable workspace for the KCL RK4(3)5[2R+]C embedded adaptive stepper,
 /// owns the stage register, the embedded-error accumulator, and the matvec
@@ -73,9 +71,11 @@ impl KclWorkspace {
         }
     }
 
-    /// One KCL RK4(3)5[2R+]C step of `dy/dt = A·y`, advancing `y` in place
-    /// by `dt` and writing the embedded-error vector into `err`.
-    /// `matvec(x, ax)` writes `A·x` into `ax`.
+    /// One KCL RK4(3)5[2R+]C step of `dy/dt = A·y + b`, advancing `y` in
+    /// place by `dt` and writing the embedded-error vector into `err`;
+    /// `source` is `b` held across the step (zeroth-order hold, like the
+    /// LSERK4 stepper), `None` for the free system. `matvec(x, ax)` writes
+    /// `A·x` into `ax`.
     ///
     /// `err` is the per-DOF difference between the fourth-order main
     /// solution and the third-order embedded one, a controller takes its
@@ -87,6 +87,7 @@ impl KclWorkspace {
         y: &mut [Field],
         err: &mut [Field],
         dt: Field,
+        source: Option<Source<'_>>,
     ) where
         F: Fn(&[Field], &mut [Field]),
     {
@@ -94,9 +95,13 @@ impl KclWorkspace {
         assert_eq!(err.len(), n, "err length must equal state length");
         self.ensure(n);
 
-        // Stage 0, matvec at y_n, accumulate b₀ into y (which becomes the
-        // running S2), seed e with (b̂₀-b₀)·dt·F₀.
+        // Stage 0, matvec at y_n (plus the held source), accumulate b₀
+        // into y (which becomes the running S2), seed e with
+        // (b̂₀-b₀)·dt·F₀.
         matvec(&y[..n], &mut self.k[..n]);
+        if let Some(s) = source {
+            s.add_to(&mut self.k[..n]);
+        }
         let b0 = KCL_B[0];
         let e0 = KCL_BHAT[0] - b0;
         y[..n]
@@ -125,6 +130,9 @@ impl KclWorkspace {
                     *si = *yi + amb * *ki;
                 });
             matvec(&self.stage[..n], &mut self.k[..n]);
+            if let Some(s) = source {
+                s.add_to(&mut self.k[..n]);
+            }
             let b = KCL_B[stage];
             let eweight = KCL_BHAT[stage] - b;
             // Scale to dt·F_i in place, accumulate into S2 and e.
@@ -134,147 +142,6 @@ impl KclWorkspace {
                 .zip(self.e[..n].par_iter_mut())
                 .for_each(|((ki, yi), ei)| {
                     let f = dt * *ki;
-                    *ki = f;
-                    *yi += b * f;
-                    *ei += eweight * f;
-                });
-        }
-
-        err[..n].copy_from_slice(&self.e[..n]);
-    }
-
-    /// One KCL step of the driven system `dy/dt = A·y + b`, with the soft
-    /// point source `b = e_{source_dof}·source_value` held constant across
-    /// the step. Advances `y` in place by `dt` and writes the embedded-error
-    /// vector into `err`.
-    ///
-    /// The zeroth-order source hold mirrors [`crate::explicit::LserkWorkspace::step_driven_into`]
-    /// and the exponential `step_driven`, so the integrators drive a port
-    /// transient identically bar their own truncation error.
-    pub fn step_driven_into<F>(
-        &mut self,
-        matvec: F,
-        y: &mut [Field],
-        err: &mut [Field],
-        dt: Field,
-        source_dof: usize,
-        source_value: Field,
-    ) where
-        F: Fn(&[Field], &mut [Field]),
-    {
-        let n = y.len();
-        assert_eq!(err.len(), n, "err length must equal state length");
-        self.ensure(n);
-
-        // Stage 0, RHS is A·y_n + b·g (zeroth-order hold across the step,
-        // same convention as the LSERK4 driven path).
-        matvec(&y[..n], &mut self.k[..n]);
-        if source_dof < n {
-            self.k[source_dof] += source_value;
-        }
-        let b0 = KCL_B[0];
-        let e0 = KCL_BHAT[0] - b0;
-        y[..n]
-            .par_iter_mut()
-            .zip(self.k[..n].par_iter_mut())
-            .zip(self.e[..n].par_iter_mut())
-            .for_each(|((yi, ki), ei)| {
-                let f = dt * *ki;
-                *ki = f;
-                *yi += b0 * f;
-                *ei = e0 * f;
-            });
-
-        for stage in 1..KCL_STAGES {
-            let amb = KCL_A[stage - 1] - KCL_B[stage - 1];
-            y[..n]
-                .par_iter()
-                .zip(self.k[..n].par_iter())
-                .zip(self.stage[..n].par_iter_mut())
-                .for_each(|((yi, ki), si)| {
-                    *si = *yi + amb * *ki;
-                });
-            matvec(&self.stage[..n], &mut self.k[..n]);
-            if source_dof < n {
-                self.k[source_dof] += source_value;
-            }
-            let b = KCL_B[stage];
-            let eweight = KCL_BHAT[stage] - b;
-            self.k[..n]
-                .par_iter_mut()
-                .zip(y[..n].par_iter_mut())
-                .zip(self.e[..n].par_iter_mut())
-                .for_each(|((ki, yi), ei)| {
-                    let f = dt * *ki;
-                    *ki = f;
-                    *yi += b * f;
-                    *ei += eweight * f;
-                });
-        }
-
-        err[..n].copy_from_slice(&self.e[..n]);
-    }
-
-    /// One KCL step of the driven system `dy/dt = A·y + b`, with the
-    /// **full source vector** `b = source` held constant across the step.
-    /// Advances `y` in place by `dt` and writes the embedded-error vector
-    /// into `err`.
-    ///
-    /// The vector-source generalisation of [`step_driven_into`](Self::step_driven_into),
-    /// the modal-port injection path, where the source spreads over every
-    /// port-face DOF. Zeroth-order hold over the step, like the explicit
-    /// and exponential counterparts.
-    pub fn step_with_source_into<F>(
-        &mut self,
-        matvec: F,
-        y: &mut [Field],
-        err: &mut [Field],
-        dt: Field,
-        source: &[Field],
-    ) where
-        F: Fn(&[Field], &mut [Field]),
-    {
-        let n = y.len();
-        assert_eq!(err.len(), n, "err length must equal state length");
-        assert_eq!(source.len(), n, "source length must equal state length");
-        self.ensure(n);
-
-        // Stage 0, RHS is A·y_n + b (full source vector, zeroth-order
-        // hold), the modal-port injection path.
-        matvec(&y[..n], &mut self.k[..n]);
-        let b0 = KCL_B[0];
-        let e0 = KCL_BHAT[0] - b0;
-        y[..n]
-            .par_iter_mut()
-            .zip(self.k[..n].par_iter_mut())
-            .zip(self.e[..n].par_iter_mut())
-            .zip(&source[..n])
-            .for_each(|(((yi, ki), ei), si)| {
-                let f = dt * (*ki + *si);
-                *ki = f;
-                *yi += b0 * f;
-                *ei = e0 * f;
-            });
-
-        for stage in 1..KCL_STAGES {
-            let amb = KCL_A[stage - 1] - KCL_B[stage - 1];
-            y[..n]
-                .par_iter()
-                .zip(self.k[..n].par_iter())
-                .zip(self.stage[..n].par_iter_mut())
-                .for_each(|((yi, ki), si)| {
-                    *si = *yi + amb * *ki;
-                });
-            matvec(&self.stage[..n], &mut self.k[..n]);
-            let b = KCL_B[stage];
-            let eweight = KCL_BHAT[stage] - b;
-            self.k[..n]
-                .par_iter_mut()
-                .zip(y[..n].par_iter_mut())
-                .zip(self.e[..n].par_iter_mut())
-                .zip(&source[..n])
-                .for_each(|(((ki, yi), ei), si)| {
-                    let f = dt * (*ki + *si);
                     *ki = f;
                     *yi += b * f;
                     *ei += eweight * f;
@@ -307,7 +174,7 @@ mod tests {
             let mut err = [0.0_f64, 0.0_f64];
             let mut ws = KclWorkspace::new();
             for _ in 0..nsteps {
-                ws.step_into(&matvec, &mut y, &mut err, dt);
+                ws.step_into(matvec, &mut y, &mut err, dt, None);
             }
             y
         };
@@ -337,7 +204,7 @@ mod tests {
             let mut y = [1.0_f64, 0.4_f64];
             let mut err = [0.0_f64, 0.0_f64];
             let mut ws = KclWorkspace::new();
-            ws.step_into(&matvec, &mut y, &mut err, dt);
+            ws.step_into(matvec, &mut y, &mut err, dt, None);
             (err[0] * err[0] + err[1] * err[1]).sqrt()
         };
         let e1 = probe(0.05);
@@ -359,7 +226,7 @@ mod tests {
         use crate::rhs::MaxwellOperator;
 
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let y0: Vec<Field> =
             (0..n).map(|i| (0.3 + i as Field * 0.017).sin()).collect();
@@ -368,7 +235,7 @@ mod tests {
         let mut y_rk = y0.clone();
         let mut err = vec![0.0; n];
         let mut ws = KclWorkspace::new();
-        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_rk, &mut err, dt);
+        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_rk, &mut err, dt, None);
 
         let y_exp = expmv(|x| op.apply(x), &y0, dt, 40);
 
@@ -388,89 +255,53 @@ mod tests {
 
     #[test]
     fn kcl_driven_matches_etd_below_cfl() {
-        // The driven KCL step against the exponential ETD step (single-DOF
-        // source held constant across the step): one driven KCL step well
-        // inside the CFL limit agrees with `etd_step` to O(dt^5). The
-        // zeroth-order hold convention is shared.
+        // The driven KCL step against the exponential ETD step with the
+        // same held source `b`: one driven KCL step well inside the CFL
+        // limit agrees with `etd_step` to O(dt^5). The zeroth-order hold
+        // convention is shared. Both source kinds: a single-DOF point
+        // source and a vector spread over many DOFs (the modal-port
+        // injection path).
         use crate::mesh_gen::structured_box;
         use crate::propagator::etd_step;
         use crate::rhs::MaxwellOperator;
 
         let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
+        let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default());
         let n = op.n_dof();
         let y0: Vec<Field> =
             (0..n).map(|i| (0.2 + i as Field * 0.019).sin()).collect();
+        let dt = 1e-3;
 
         let sdof = n / 3;
-        let src = 0.7;
-        let dt = 1e-3;
-
-        let mut y_rk = y0.clone();
-        let mut err = vec![0.0; n];
-        let mut ws = KclWorkspace::new();
-        ws.step_driven_into(
-            |x, ax| op.apply_into(x, ax), &mut y_rk, &mut err, dt, sdof, src,
-        );
-
-        let mut b = vec![0.0; n];
-        b[sdof] = src;
-        let y_etd = etd_step(|x| op.apply(x), &y0, &b, dt, 40);
-
-        let e: f64 = y_rk
-            .iter()
-            .zip(&y_etd)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let scale: f64 = y_etd.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(
-            e < 1e-9 * scale,
-            "driven KCL vs ETD step: rel.err {}",
-            e / scale,
-        );
-    }
-
-    #[test]
-    fn kcl_vector_source_matches_etd_below_cfl() {
-        // The vector-source KCL step against the exponential ETD step with
-        // the same full source vector `b`: a single driven KCL step well
-        // inside the CFL limit agrees with `etd_step` to O(dt^5). This is
-        // the modal-port injection path (b spread over many DOFs).
-        use crate::mesh_gen::structured_box;
-        use crate::propagator::etd_step;
-        use crate::rhs::MaxwellOperator;
-
-        let mesh = structured_box(2, 2, 2, 1.0, 1.0, 1.0);
-        let op = MaxwellOperator::new(&mesh, 2, 1.0);
-        let n = op.n_dof();
-        let y0: Vec<Field> =
-            (0..n).map(|i| (0.2 + i as Field * 0.019).sin()).collect();
-
-        let b: Vec<Field> =
+        let mut point = vec![0.0; n];
+        point[sdof] = 0.7;
+        let spread: Vec<Field> =
             (0..n).map(|i| 0.4 * (0.11 * i as Field).cos()).collect();
-        let dt = 1e-3;
+        let cases = [
+            ("point", Source::Point { dof: sdof, value: 0.7 }, &point),
+            ("vector", Source::Vector(&spread), &spread),
+        ];
 
-        let mut y_rk = y0.clone();
-        let mut err = vec![0.0; n];
-        let mut ws = KclWorkspace::new();
-        ws.step_with_source_into(
-            |x, ax| op.apply_into(x, ax), &mut y_rk, &mut err, dt, &b,
-        );
+        for (label, source, b) in cases {
+            let mut y_rk = y0.clone();
+            let mut err = vec![0.0; n];
+            let mut ws = KclWorkspace::new();
+            ws.step_into(|x, ax| op.apply_into(x, ax), &mut y_rk, &mut err, dt, Some(source));
 
-        let y_etd = etd_step(|x| op.apply(x), &y0, &b, dt, 40);
+            let y_etd = etd_step(|x| op.apply(x), &y0, b, dt, 40);
 
-        let e: f64 = y_rk
-            .iter()
-            .zip(&y_etd)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let scale: f64 = y_etd.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(
-            e < 1e-9 * scale,
-            "vector-source KCL vs ETD step: rel.err {}",
-            e / scale,
-        );
+            let e: f64 = y_rk
+                .iter()
+                .zip(&y_etd)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let scale: f64 = y_etd.iter().map(|x| x * x).sum::<f64>().sqrt();
+            assert!(
+                e < 1e-9 * scale,
+                "{label} driven KCL vs ETD step: rel.err {}",
+                e / scale,
+            );
+        }
     }
 }

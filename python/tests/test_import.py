@@ -1,245 +1,210 @@
-"""External CAD / mesh import via ``Geometry.load``.
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+"""External geometry import via ``Geometry.load``.
 
-Covers the three substrates the dispatcher handles: OCC BREP formats
-(STEP/BREP) that come back as composable ``GeoObject``s, STL surfaces healed
-into meshable solids, and pre-built ``.msh`` meshes loaded as a ``MeshScene``
-whose named physical groups carry materials and physics into a real solve.
-
-Fixtures are generated with gmsh into a tmp dir, each in its own model, so they
-don't collide with the global gmsh model rapidfem drives.
+STEP files load one solid per body in metres (the fixture is a three-part
+millimetre assembly). STL (and OBJ) surfaces load as meshable solids, placed
+by unit, scale, rotation and position. A ``.msh`` volume mesh loads in mesh
+mode (its groups the handles for materials and physics, no remeshing); the
+fixture is written by ``save_mesh``, so the round trip is tested too. IGES
+and BREP are not supported.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-import gmsh
 import rapidfem as rf
 
 MM = 1e-3
+ASSEMBLY = Path(__file__).parent / "data" / "assembly.step"
+
+
+def _box(obj) -> np.ndarray:
+    b = np.array([f.bbox for f in obj.faces])
+    return np.concatenate([b[:, :3].min(axis=0), b[:, 3:].max(axis=0)])
+
+
+def test_step_assembly_loads_in_metres():
+    g = rf.Geometry(maxh=4 * MM)
+    air = g.box(40 * MM, 40 * MM, 40 * MM, position=(-10 * MM, -10 * MM, -15 * MM),
+                material=rf.Air())
+    base, post, plate = g.load(str(ASSEMBLY), material=rf.Dielectric(er=3.0))
+    assert all(p.dim == 3 for p in (base, post, plate))
+    np.testing.assert_allclose(_box(base), np.array([0, 0, 0, 20, 20, 5]) * MM, atol=1e-9)
+    np.testing.assert_allclose(_box(plate), np.array([0, 0, -4, 20, 20, 0]) * MM, atol=1e-9)
+    assert _box(post)[5] == pytest.approx(17 * MM)
+    g.mesh()
+    assert g.mesh_stats.n_tets > 0 and g.mesh_stats.quality_min > 10
+    assert len(air.faces.outer) == 6
+
+
+def test_step_units_and_placement():
+    g = rf.Geometry()
+    parts = g.load(str(ASSEMBLY), unit="UM", position=(1 * MM, 0, 0))
+    np.testing.assert_allclose(_box(parts[0]), [1e-3, 0, 0, 1e-3 + 20e-6, 20e-6, 5e-6], atol=1e-12)
+
+
+def _icosphere_stl(path, radius: float) -> None:
+    """A closed, outward-oriented icosahedron as an ASCII STL."""
+    t = (1.0 + 5 ** 0.5) / 2.0
+    v = np.array([(-1, t, 0), (1, t, 0), (-1, -t, 0), (1, -t, 0),
+                  (0, -1, t), (0, 1, t), (0, -1, -t), (0, 1, -t),
+                  (t, 0, -1), (t, 0, 1), (-t, 0, -1), (-t, 0, 1)], dtype=float)
+    v *= radius / np.linalg.norm(v[0])
+    f = [(0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
+         (1, 5, 9), (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
+         (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
+         (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)]
+    lines = ["solid ico"]
+    for a, b, c in f:
+        n = np.cross(v[b] - v[a], v[c] - v[a])
+        n /= np.linalg.norm(n)
+        lines.append(f"facet normal {n[0]:e} {n[1]:e} {n[2]:e}")
+        lines.append("outer loop")
+        for i in (a, b, c):
+            lines.append(f"vertex {v[i][0]:e} {v[i][1]:e} {v[i][2]:e}")
+        lines.append("endloop")
+        lines.append("endfacet")
+    lines.append("endsolid ico")
+    path.write_text("\n".join(lines))
 
 
 @pytest.fixture(scope="module")
-def fixtures(tmp_path_factory):
-    """Write box.step, box.brep, sphere.stl and wg.msh; return their paths."""
-    d = tmp_path_factory.mktemp("import_fixtures")
-    if not gmsh.isInitialized():
-        gmsh.initialize()
-
-    # STEP + BREP: a 10x5x3 (mm) box. gmsh writes STEP with a millimetre unit,
-    # so importing with the default unit="M" yields a 0.01x0.005x0.003 m solid.
-    gmsh.model.add("fix_step")
-    gmsh.model.occ.addBox(0, 0, 0, 10, 5, 3)
-    gmsh.model.occ.synchronize()
-    gmsh.write(str(d / "box.step"))
-    gmsh.write(str(d / "box.brep"))
-    gmsh.model.remove()
-
-    # STL: a unit-radius sphere surface mesh (unit-less).
-    gmsh.model.add("fix_stl")
-    gmsh.model.occ.addSphere(0, 0, 0, 1.0)
-    gmsh.model.occ.synchronize()
-    gmsh.option.setNumber("Mesh.MeshSizeMax", 0.3)
-    gmsh.model.mesh.generate(2)
-    gmsh.write(str(d / "sphere.stl"))
-    gmsh.model.mesh.clear()
-    gmsh.model.remove()
-
-    # MSH: a rectangular-waveguide air box with named groups (metres).
-    gmsh.model.add("fix_msh")
-    vtag = gmsh.model.occ.addBox(0, 0, 0, 20 * MM, 10 * MM, 30 * MM)
-    gmsh.model.occ.synchronize()
-    faces = gmsh.model.getBoundary([(3, vtag)], oriented=False)
-    zmin = min(faces, key=lambda dt: gmsh.model.occ.getCenterOfMass(2, dt[1])[2])
-    zmax = max(faces, key=lambda dt: gmsh.model.occ.getCenterOfMass(2, dt[1])[2])
-    walls = [t for d_, t in faces if t not in (zmin[1], zmax[1])]
-    gmsh.model.addPhysicalGroup(3, [vtag], name="air")
-    gmsh.model.addPhysicalGroup(2, [zmin[1]], name="port_in")
-    gmsh.model.addPhysicalGroup(2, [zmax[1]], name="port_out")
-    gmsh.model.addPhysicalGroup(2, walls, name="walls")
-    gmsh.option.setNumber("Mesh.MeshSizeMax", 4 * MM)
-    gmsh.model.mesh.generate(3)
-    gmsh.write(str(d / "wg.msh"))
-    gmsh.model.mesh.clear()
-    gmsh.model.remove()
-
-    return {
-        "step": str(d / "box.step"),
-        "brep": str(d / "box.brep"),
-        "stl": str(d / "sphere.stl"),
-        "msh": str(d / "wg.msh"),
-    }
+def stl(tmp_path_factory):
+    path = tmp_path_factory.mktemp("import_fixtures") / "ico.stl"
+    _icosphere_stl(path, 5 * MM)
+    return path
 
 
-# ── CAD: STEP / BREP as composable primitives ───────────────────────────────
-
-def test_step_imports_as_geoobject_with_metre_units(fixtures):
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["step"])
-    assert isinstance(part, rf.GeoObject)
+def test_stl_loads_as_meshable_solid(stl):
+    g = rf.Geometry(maxh=2 * MM)
+    air = g.box(30 * MM, 30 * MM, 30 * MM, position=(-15 * MM,) * 3,
+                material=rf.Air())
+    part = g.load(str(stl), material=rf.Dielectric(er=4.0))
     assert part.dim == 3
-    xmin, ymin, zmin, xmax, ymax, zmax = part._entity.bbox
-    # 10x5x3 mm STEP -> metres
-    assert (xmax - xmin) == pytest.approx(10 * MM, rel=1e-3)
-    assert (ymax - ymin) == pytest.approx(5 * MM, rel=1e-3)
-    assert (zmax - zmin) == pytest.approx(3 * MM, rel=1e-3)
-    assert len(part.faces) == 6
+    assert len(part.faces) > 0
+    g.mesh()
+    assert g.mesh_stats.n_tets > 0
+    assert len(air.faces.outer) == 6
 
 
-def test_step_scale_override(fixtures):
-    # scale = metres per file unit; treat the mm box as if authored in metres.
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["step"], unit="MM", scale=1.0)
-    dx = part._entity.bbox[3] - part._entity.bbox[0]
-    assert dx == pytest.approx(10.0, rel=1e-3)
+def test_stl_placement(stl):
+    # the file in millimetres, turned about z and moved
+    path = stl.parent / "ico_mm.stl"
+    lines = []
+    for line in stl.read_text().splitlines():
+        if line.startswith("vertex"):
+            x, y, z = (float(v) / MM for v in line.split()[1:])
+            line = f"vertex {x:e} {y:e} {z:e}"
+        lines.append(line)
+    path.write_text("\n".join(lines))
+    g = rf.Geometry(maxh=2 * MM)
+    g.box(40 * MM, 40 * MM, 40 * MM, position=(-20 * MM,) * 3, material=rf.Air())
+    part = g.load(str(path), unit="MM", rotation=(np.pi / 2, (0, 0, 1)),
+                  position=(3 * MM, 0, 0))
+    b = np.array([f.bbox for f in part.faces])
+    lo, hi = b[:, :3].min(axis=0), b[:, 3:].max(axis=0)
+    np.testing.assert_allclose((lo + hi) / 2, [3 * MM, 0, 0], atol=1e-9)
+    assert hi[2] - lo[2] == pytest.approx(10 * MM * 0.85065, rel=1e-3)
 
 
-def test_step_composes_with_boolean_and_meshes(fixtures):
-    g = rf.Geometry(maxh=3 * MM)
-    part = g.load(fixtures["step"], material=rf.Air())
-    # face selectors work on the imported solid -> composable physics
-    rf.PEC(*part.faces.unassigned)
-    mb, _ = g.mesh()
-    assert isinstance(mb, (bytes, bytearray)) and len(mb) > 0
-    assert len(g._material_tags) == 1
-    assert len(g._physics_tags) == 1
+def test_unsupported_extension(tmp_path):
+    p = tmp_path / "part.xyz"
+    p.write_text("")
+    with pytest.raises(ValueError, match="unsupported extension"):
+        rf.Geometry().load(str(p))
 
 
-def test_brep_imports(fixtures):
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["brep"])
-    assert isinstance(part, rf.GeoObject) and part.dim == 3
+def test_missing_file(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        rf.Geometry().load(str(tmp_path / "missing.stl"))
 
 
-def test_step_placement_position(fixtures):
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["step"], position=(0.1, 0.0, 0.0))
-    assert part._entity.bbox[0] == pytest.approx(0.1, abs=1e-6)       # xmin
-    assert part._entity.bbox[3] == pytest.approx(0.1 + 10 * MM, abs=1e-6)
-
-
-def test_step_placement_rotation(fixtures):
-    import math
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["step"], rotation=(math.pi / 2, (0, 0, 1)))
-    # 90 deg about z swaps the x (10mm) and y (5mm) extents
-    dx = part._entity.bbox[3] - part._entity.bbox[0]
-    dy = part._entity.bbox[4] - part._entity.bbox[1]
-    assert dx == pytest.approx(5 * MM, rel=1e-3)
-    assert dy == pytest.approx(10 * MM, rel=1e-3)
-
-
-def test_step_posthoc_transforms_work(fixtures):
-    g = rf.Geometry(maxh=2.0)
-    part = g.load(fixtures["step"])
-    x0 = part._entity.cog[0]
-    g.translate(part, dx=0.05)
-    assert part._entity.cog[0] - x0 == pytest.approx(0.05, abs=1e-6)
-
-
-# ── STL: healed solid ───────────────────────────────────────────────────────
-
-def test_stl_heals_into_meshable_solid(fixtures):
-    g = rf.Geometry(maxh=0.3)
-    solid = g.load(fixtures["stl"], material=rf.Air())
-    assert isinstance(solid, rf.GeoObject) and solid.dim == 3
-    r = solid._entity.bbox
-    assert (r[3] - r[0]) == pytest.approx(2.0, rel=0.05)  # diameter ~2
-    mb, _ = g.mesh()
-    assert len(mb) > 0
-
-
-def test_stl_placement_shifts_and_meshes(fixtures):
-    g = rf.Geometry(maxh=0.3)
-    solid = g.load(fixtures["stl"], material=rf.Air(), position=(5.0, 0.0, 0.0))
-    assert solid._entity.cog[0] == pytest.approx(5.0, abs=0.05)
-    mb, _ = g.mesh()
-    assert len(mb) > 0
-
-
-def test_stl_rejects_posthoc_transforms(fixtures):
-    g = rf.Geometry(maxh=0.3)
-    solid = g.load(fixtures["stl"])
-    with pytest.raises(RuntimeError, match="discrete mesh"):
-        g.translate(solid, dx=1.0)
-    with pytest.raises(RuntimeError, match="discrete mesh"):
-        g.rotate(solid, angle=0.3)
-
-
-def test_stl_cannot_mix_with_primitives(fixtures):
-    # primitive after STL
-    g = rf.Geometry(maxh=0.3)
-    g.load(fixtures["stl"])
-    with pytest.raises(RuntimeError, match="discrete"):
-        g.box(1.0, 1.0, 1.0)
-    # STL after primitive
-    g2 = rf.Geometry(maxh=0.3)
-    g2.box(1.0, 1.0, 1.0)
-    with pytest.raises(RuntimeError, match="discrete"):
-        g2.load(fixtures["stl"])
+@pytest.mark.parametrize("ext", [".iges", ".igs", ".brep"])
+def test_unsupported_cad_formats(tmp_path, ext):
+    p = tmp_path / f"part{ext}"
+    p.write_text("")
+    with pytest.raises(NotImplementedError, match="STEP"):
+        rf.Geometry().load(str(p))
 
 
 # ── MSH: mesh mode ──────────────────────────────────────────────────────────
 
-def test_msh_exposes_named_groups(fixtures):
-    g = rf.Geometry()
-    scene = g.load(fixtures["msh"])
-    assert g._mode == "mesh"
-    assert set(scene.groups) == {"air", "port_in", "port_out", "walls"}
-    assert scene.group("air").material is None  # not yet bound
+A, B, L = 22.86 * MM, 10.16 * MM, 30 * MM  # WR-90
 
 
-def test_msh_mode_blocks_primitives(fixtures):
+def _waveguide(g):
+    air = g.box(A, B, L, material=rf.Air())
+    rf.RectWaveguidePort(air.faces.min(axis="z"))
+    rf.RectWaveguidePort(air.faces.max(axis="z"))
+    rf.PEC(*air.faces.unassigned)
+    return air
+
+
+@pytest.fixture(scope="module")
+def wg_msh(tmp_path_factory):
+    g = rf.Geometry(maxh=4 * MM)
+    _waveguide(g)
+    g.mesh()
+    path = tmp_path_factory.mktemp("import_fixtures") / "wg.msh"
+    assert g.save_mesh(str(path)) == str(path)
+    return path, g.mesh_stats.n_tets
+
+
+def test_msh_exposes_named_groups(wg_msh):
+    path, n_tets = wg_msh
     g = rf.Geometry()
-    g.load(fixtures["msh"])
+    scene = g.load(str(path))
+    assert {"air_1", "port_1", "port_2", "pec_1"} <= set(scene.groups)
+    assert scene.group("air_1").material is None  # not yet bound
+    np.testing.assert_allclose(scene.group("port_2")[0].bbox, [0, 0, L, A, B, L], atol=1e-12)
+    with pytest.raises(KeyError, match="available"):
+        scene.group("nope")
+
+
+def test_msh_mode_blocks_primitives(wg_msh):
+    g = rf.Geometry()
+    g.load(str(wg_msh[0]))
     with pytest.raises(RuntimeError, match="mesh mode"):
         g.box(1 * MM, 1 * MM, 1 * MM)
 
 
-def test_msh_bake_and_solve(fixtures):
+def test_msh_mode_requires_bindings(wg_msh):
     g = rf.Geometry()
-    scene = g.load(fixtures["msh"])
-    scene.group("air").material = rf.Air()
-    rf.RectWaveguidePort(scene.group("port_in"))
-    rf.RectWaveguidePort(scene.group("port_out"))
-    rf.PEC(scene.group("walls"))
-    mb, _ = g.mesh()
-    assert len(mb) > 0
-    assert len(g._material_tags) == 1
-    assert len(g._physics_tags) == 3  # two ports + the PEC walls
-
-    prob = rf.Problem(g)
-    res = prob.sweep(np.linspace(8e9, 12e9, 3))
-    assert res.frequencies.shape == (3,)
-    assert res.sparams.shape == (3, 2, 2)
-    # matched air-filled WR-90-ish guide: low reflection in band
-    assert 20 * np.log10(abs(res.sparams[1, 0, 0])) < -20
-
-
-def test_msh_mode_requires_bindings(fixtures):
-    g = rf.Geometry()
-    g.load(fixtures["msh"])
+    g.load(str(wg_msh[0]))
     with pytest.raises(RuntimeError, match="no materials or physics"):
         g.mesh()
 
 
-# ── Dispatcher errors ───────────────────────────────────────────────────────
-
-def test_unsupported_extension(tmp_path):
-    p = tmp_path / "thing.xyz"
-    p.write_text("nope")
-    g = rf.Geometry(maxh=1.0)
-    with pytest.raises(ValueError, match="unsupported extension"):
-        g.load(str(p))
-
-
-def test_missing_file():
-    g = rf.Geometry(maxh=1.0)
-    with pytest.raises(FileNotFoundError):
-        g.load("does_not_exist.step")
-
-
-def test_msh_placement_rejected(fixtures):
-    g = rf.Geometry()
+def test_msh_placement_rejected(wg_msh):
     with pytest.raises(ValueError, match="position/rotation"):
-        g.load(fixtures["msh"], position=(1.0, 0.0, 0.0))
+        rf.Geometry().load(str(wg_msh[0]), position=(1.0, 0.0, 0.0))
+
+
+def test_msh_bake_and_solve(wg_msh):
+    """The loaded mesh solves like the one it was saved from."""
+    path, n_tets = wg_msh
+    f = np.linspace(8e9, 12e9, 3)
+    g = rf.Geometry()
+    scene = g.load(str(path))
+    scene.group("air_1").material = rf.Air()
+    rf.RectWaveguidePort(scene.group("port_1"))
+    rf.RectWaveguidePort(scene.group("port_2"))
+    rf.PEC(scene.group("pec_1"))
+    stats = g.mesh()
+    assert stats.n_tets == n_tets
+    assert sorted(stats.groups) == ["air_1", "pec_1", "port_1", "port_2"]
+    res = rf.ProblemFD(g).sweep(f)
+    assert res.sparams.shape == (3, 2, 2)
+
+    ref = rf.Geometry(maxh=4 * MM)
+    _waveguide(ref)
+    ref.mesh()
+    res_ref = rf.ProblemFD(ref).sweep(f)
+    np.testing.assert_allclose(res.sparams, res_ref.sparams, atol=1e-9)
+    # matched air-filled guide: low reflection in band
+    assert np.all(20 * np.log10(np.abs(res.sparams[:, 0, 0])) < -20)

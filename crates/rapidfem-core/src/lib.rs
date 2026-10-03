@@ -1,21 +1,17 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! rapidfem-core, solver-agnostic substrate shared by the frequency-domain
 //! and time-domain backends: mesh, quadrature, the material data model and
 //! the sparse symmetric solver.
 
 pub mod constants;
+pub mod geom;
 pub mod linalg;
 pub mod model;
 pub mod quadrature;
 pub mod mesh;
-pub mod quality;
-pub mod mesh_io;
 pub mod materials;
 pub mod port_eigen;
 pub mod topology;

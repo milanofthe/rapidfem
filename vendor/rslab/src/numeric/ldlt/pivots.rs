@@ -22,3 +22,15 @@ pub(crate) struct LdltPivots<T> {
     /// Inertia of the factored matrix (advisory for complex symmetric).
     pub inertia: crate::inertia::Inertia,
 }
+
+impl<T> LdltPivots<T> {
+    /// Heap bytes held: `D`, the permutation and the supernode tree.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        use crate::memory::vec_bytes;
+        vec_bytes(&self.d_diag)
+            + vec_bytes(&self.d_subdiag)
+            + vec_bytes(&self.two_by_two)
+            + vec_bytes(&self.perm)
+            + vec_bytes(&self.supernode_parent)
+    }
+}

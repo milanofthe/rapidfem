@@ -1,8 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """
 Configuration for the RapidFEM docs build system.
 
 Single package. API documentation is extracted statically (griffe,
-allow_inspection=False) from the RapidFEM Python source — RapidFEM itself
+allow_inspection=False) from the RapidFEM Python source, RapidFEM itself
 does not need to be installed.
 """
 
@@ -32,8 +36,6 @@ MIN_SUPPORTED_VERSION = (0, 5, 0)
 # Substring patterns; a module is skipped if any pattern occurs in its name.
 # Excludes the CLI, native extension glue, the local UI, and example scripts.
 SKIP_PATTERNS = [
-    "_cli",
-    "_show",
     "_native",
     "_version",
     "bridge",

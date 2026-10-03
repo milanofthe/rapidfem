@@ -4,7 +4,7 @@
 use crate::error::RslabError;
 use crate::numeric::ldlt::LdltSolver;
 use crate::numeric::settings::{SolverSettings, Threads};
-use crate::scalar::Scalar;
+use crate::scalar::{Demote, Scalar};
 use crate::sparse::csc::CscMatrix;
 use crate::sparse::general::GeneralCsc;
 use num_complex::Complex;
@@ -138,114 +138,154 @@ impl<T: Scalar> Preconditioner<T> for NoPreconditioner {
     }
 }
 
-/// A memory-halved preconditioner: factor `A` (supplied in `Complex<f64>`) in
-/// `Complex<f32>` and apply it inside an `f64` Krylov iteration. The stored
-/// factor occupies **half the bytes** and its triangular solves run in single
-/// precision (gemm `c32` during the factor); because the outer COCG/COCR still
-/// iterates in `f64`, the *solution* keeps full `f64` accuracy. This is the
-/// standard mixed-precision setup for large 3D EM FEM / MOM preconditioning.
-pub struct LowPrecisionPreconditioner {
-    inner: LdltSolver<Complex<f32>>,
+/// A factor computed in a lower-precision field, applied inside an iteration
+/// in the higher one: `F` factors `A` demoted to `H::Low` (see [`Demote`])
+/// and every solve demotes its right-hand side, solves and promotes the
+/// result. The factor takes half the memory and its kernels run in single
+/// precision; the Krylov method (or [`solve_refined`](Factorization::solve_refined)
+/// against the full-precision matrix) recovers the accuracy of `H`, the
+/// standard mixed-precision preconditioner for large MoM and FEM systems.
+///
+/// Build it from any factor of the demoted matrix, the analysis reused:
+///
+/// ```
+/// # fn main() -> Result<(), rslab::RslabError> {
+/// use rslab::prelude::*;
+/// use num_complex::Complex64;
+/// let a = GeneralCsc::<Complex64>::from_triplets(
+///     2, &[0, 1, 0], &[0, 1, 1],
+///     &[Complex64::new(4.0, 1.0), Complex64::new(3.0, 0.0), Complex64::new(1.0, 0.0)],
+/// )?;
+/// let sym = LuSymbolic::analyze(&a, &SolverSettings::default())?;
+/// let m = MixedPrecision::new(sym.factor(&a.demoted(), &SolverSettings::default())?);
+/// let z = Factorization::<Complex64>::solve(&m, &[Complex64::new(1.0, 0.0); 2])?;
+/// # let _ = z; Ok(()) }
+/// ```
+pub struct MixedPrecision<F> {
+    factor: F,
 }
 
-impl LowPrecisionPreconditioner {
-    /// Down-cast `A` to `Complex<f32>` and factor it (static-pivoting honoured
-    /// via `opts`, e.g. `ZeroPivotAction::PerturbToEps`).
-    pub fn factor(a: &CscMatrix<Complex<f64>>, opts: &SolverSettings) -> Result<Self, RslabError> {
-        let a32 = CscMatrix::<Complex<f32>> {
-            n: a.n,
-            col_ptr: a.col_ptr.clone(),
-            row_idx: a.row_idx.clone(),
-            values: a
-                .values
-                .iter()
-                .map(|v| Complex::new(v.re as f32, v.im as f32))
-                .collect(),
-        };
-        Ok(Self {
-            inner: LdltSolver::factor(&a32, opts)?,
-        })
+impl<F> MixedPrecision<F> {
+    /// Wrap a factor of the demoted matrix.
+    pub fn new(factor: F) -> Self {
+        Self { factor }
     }
 
-    /// Stored factor fill (nnz of `L`); each entry is a single-precision
-    /// `Complex<f32>` (8 bytes vs 16 for `Complex<f64>`).
+    /// The low-precision factor.
+    pub fn inner(&self) -> &F {
+        &self.factor
+    }
+
+    /// Unwrap the low-precision factor.
+    pub fn into_inner(self) -> F {
+        self.factor
+    }
+}
+
+/// Run `solve` on `b` demoted to `H::Low` and promote its result.
+fn through_low<H: Demote>(
+    b: &[H],
+    solve: impl FnOnce(&[H::Low]) -> Result<Vec<H::Low>, RslabError>,
+) -> Result<Vec<H>, RslabError> {
+    let low: Vec<H::Low> = b.iter().map(|&v| v.demote()).collect();
+    Ok(solve(&low)?.into_iter().map(H::promote).collect())
+}
+
+impl<H: Demote, F: Factorization<H::Low>> Preconditioner<H> for MixedPrecision<F> {
+    fn apply(&self, r: &[H], z: &mut [H]) -> Result<(), RslabError> {
+        z.copy_from_slice(&through_low(r, |r| self.factor.solve(r))?);
+        Ok(())
+    }
+    fn apply_block(&self, r: &[H], z: &mut [H], s: usize, n: usize) -> Result<(), RslabError> {
+        z[..n * s].copy_from_slice(&through_low(&r[..n * s], |r| self.factor.solve_many(r, s))?);
+        Ok(())
+    }
+    fn solve_threads(&self) -> Threads {
+        self.factor.solve_threads()
+    }
+}
+
+impl<H: Demote, F: Factorization<H::Low>> Factorization<H> for MixedPrecision<F> {
+    fn n(&self) -> usize {
+        self.factor.n()
+    }
+    /// One solve with the low-precision factor: accurate to its precision.
+    fn solve(&self, b: &[H]) -> Result<Vec<H>, RslabError> {
+        through_low(b, |b| self.factor.solve(b))
+    }
+    fn solve_many(&self, b: &[H], nrhs: usize) -> Result<Vec<H>, RslabError> {
+        through_low(b, |b| self.factor.solve_many(b, nrhs))
+    }
+    fn solve_transpose(&self, b: &[H]) -> Result<Vec<H>, RslabError> {
+        through_low(b, |b| self.factor.solve_transpose(b))
+    }
+    /// Mixed-precision iterative refinement: residuals against `a` in `H`,
+    /// corrections from the low-precision factor.
+    fn solve_refined(
+        &self,
+        a: &dyn crate::refine::RefineOperator<H>,
+        b: &[H],
+        policy: &crate::refine::RefinePolicy,
+    ) -> Result<(Vec<H>, crate::refine::RefineOutcome), RslabError> {
+        let mut x = Factorization::solve(self, b)?;
+        let outcome = crate::refine::refine_in_place(a, b, &mut x, policy, |r| {
+            Factorization::solve(self, r)
+        })?;
+        Ok((x, outcome))
+    }
+    fn factor_nnz(&self) -> usize {
+        self.factor.factor_nnz()
+    }
+    fn n_perturbed(&self) -> usize {
+        self.factor.n_perturbed()
+    }
+    fn diagnostics(&self) -> crate::diagnostics::Diagnostics {
+        self.factor.diagnostics()
+    }
+}
+
+/// A `Complex<f32>` LDL^T factor preconditioning a `Complex<f64>` iteration.
+pub type LowPrecisionPreconditioner = MixedPrecision<LdltSolver<Complex<f32>>>;
+
+/// A `Complex<f32>` LU factor preconditioning a `Complex<f64>` iteration.
+pub type LowPrecisionLu = MixedPrecision<crate::numeric::lu::LuSolver<Complex<f32>>>;
+
+impl LowPrecisionPreconditioner {
+    /// Demote `A` to `Complex<f32>` and factor it (static pivoting honoured
+    /// via `opts`, e.g. `ZeroPivotAction::PerturbToEps`).
+    pub fn factor(a: &CscMatrix<Complex<f64>>, opts: &SolverSettings) -> Result<Self, RslabError> {
+        Ok(Self::new(LdltSolver::factor(&a.demoted(), opts)?))
+    }
+
+    /// Stored factor fill (nnz of `L`), in single-precision entries.
     pub fn factor_nnz(&self) -> usize {
-        self.inner.factor_nnz()
+        self.factor.factor_nnz()
     }
 
     /// Number of statically perturbed pivots (see [`LdltSolver::n_perturbed`]).
     pub fn n_perturbed(&self) -> usize {
-        self.inner.n_perturbed()
+        self.factor.n_perturbed()
     }
-}
-
-impl Preconditioner<Complex<f64>> for LowPrecisionPreconditioner {
-    fn apply(&self, r: &[Complex<f64>], z: &mut [Complex<f64>]) -> Result<(), RslabError> {
-        let r32: Vec<Complex<f32>> = r
-            .iter()
-            .map(|v| Complex::new(v.re as f32, v.im as f32))
-            .collect();
-        let z32 = self.inner.solve(&r32)?;
-        for (zi, v) in z.iter_mut().zip(z32) {
-            *zi = Complex::new(v.re as f64, v.im as f64);
-        }
-        Ok(())
-    }
-}
-
-/// Memory-halved **unsymmetric** preconditioner: factor the general matrix `A`
-/// (given in `Complex<f64>`) in `Complex<f32>` LU and apply it inside an `f64`
-/// GMRES iteration. The `Complex<f32>` factor uses half the bytes (and gemm
-/// `c32`); the outer GMRES keeps full `f64` accuracy. The unsymmetric analogue
-/// of [`LowPrecisionPreconditioner`], for MoM/FEM general systems.
-pub struct LowPrecisionLu {
-    inner: crate::numeric::lu::LuSolver<Complex<f32>>,
 }
 
 impl LowPrecisionLu {
-    /// Down-cast `A` to `Complex<f32>` and LU-factor it (options honoured -
-    /// static pivoting and/or incomplete dropping for a preconditioner).
+    /// Demote `A` to `Complex<f32>` and LU-factor it (options honoured:
+    /// static pivoting and drop tolerance for a preconditioner).
     pub fn factor(a: &GeneralCsc<Complex<f64>>, opts: &SolverSettings) -> Result<Self, RslabError> {
-        let a32 = GeneralCsc::<Complex<f32>> {
-            n: a.n,
-            col_ptr: a.col_ptr.clone(),
-            row_idx: a.row_idx.clone(),
-            values: a
-                .values
-                .iter()
-                .map(|v| Complex::new(v.re as f32, v.im as f32))
-                .collect(),
-        };
-        Ok(Self {
-            inner: crate::numeric::lu::LuSolver::factor(&a32, opts)?,
-        })
+        Ok(Self::new(crate::numeric::lu::LuSolver::factor(
+            &a.demoted(),
+            opts,
+        )?))
     }
 
     /// Stored fill `nnz(L)+nnz(U)`, in single-precision entries.
     pub fn factor_nnz(&self) -> usize {
-        self.inner.factor_nnz()
+        self.factor.factor_nnz()
     }
 
     /// Number of statically perturbed pivots.
     pub fn n_perturbed(&self) -> usize {
-        self.inner.n_perturbed()
-    }
-}
-
-impl Preconditioner<Complex<f64>> for LowPrecisionLu {
-    fn apply(&self, r: &[Complex<f64>], z: &mut [Complex<f64>]) -> Result<(), RslabError> {
-        let r32: Vec<Complex<f32>> = r
-            .iter()
-            .map(|v| Complex::new(v.re as f32, v.im as f32))
-            .collect();
-        let z32 = self.inner.solve(&r32)?;
-        for (zi, v) in z.iter_mut().zip(z32) {
-            *zi = Complex::new(v.re as f64, v.im as f64);
-        }
-        Ok(())
-    }
-    fn solve_threads(&self) -> Threads {
-        Preconditioner::solve_threads(&self.inner)
+        self.factor.n_perturbed()
     }
 }
 

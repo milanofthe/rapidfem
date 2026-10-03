@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Full residual-based a posteriori error estimator.
 //!
@@ -14,7 +11,8 @@
 use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
-use crate::interp;
+use crate::interp::{self, eval_curl_in_tet};
+use rapidfem_core::geom::{cross, dot, norm, scale, sub, tri_area_vector};
 use crate::quadrature::{gaus_quad_tet, gaus_quad_tri};
 
 pub struct ErrorEstimate {
@@ -29,12 +27,6 @@ pub struct ErrorEstimate {
     pub total_error: f64,
     pub marked_elements: Vec<usize>,
 }
-
-
-
-// `eval_curl_in_tet` lives in `crate::interp`, same analytic Nédélec-2
-// curl, used by both the error estimator and the H-field visualisation.
-pub use crate::interp::eval_curl_in_tet;
 
 /// Compute the full residual error estimate for each element.
 pub fn estimate_error(
@@ -70,12 +62,7 @@ pub fn estimate_error(
         let v2 = mesh.nodes[tet[2]];
         let v3 = mesh.nodes[tet[3]];
 
-        // Tet volume
-        let e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
-        let e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
-        let e3 = [v3[0]-v0[0], v3[1]-v0[1], v3[2]-v0[2]];
-        let vol = (e1[0]*(e2[1]*e3[2]-e2[2]*e3[1]) - e1[1]*(e2[0]*e3[2]-e2[2]*e3[0])
-                  + e1[2]*(e2[0]*e3[1]-e2[1]*e3[0])).abs() / 6.0;
+        let vol = dot(sub(v1, v0), cross(sub(v2, v0), sub(v3, v0))).abs() / 6.0;
 
         let mut res_sq = 0.0;
 
@@ -122,13 +109,9 @@ pub fn estimate_error(
         let fv1 = mesh.nodes[tri[1]];
         let fv2 = mesh.nodes[tri[2]];
 
-        // Face area
-        let fe1 = [fv1[0]-fv0[0], fv1[1]-fv0[1], fv1[2]-fv0[2]];
-        let fe2 = [fv2[0]-fv0[0], fv2[1]-fv0[1], fv2[2]-fv0[2]];
-        let normal = [fe1[1]*fe2[2]-fe1[2]*fe2[1], fe1[2]*fe2[0]-fe1[0]*fe2[2], fe1[0]*fe2[1]-fe1[1]*fe2[0]];
-        let area = 0.5 * (normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt();
-        let nn = (normal[0]*normal[0]+normal[1]*normal[1]+normal[2]*normal[2]).sqrt();
-        let n_hat = if nn > 1e-30 { [normal[0]/nn, normal[1]/nn, normal[2]/nn] } else { [0.0; 3] };
+        let normal = tri_area_vector(fv0, fv1, fv2);
+        let area = norm(normal);
+        let n_hat = if area > 1e-30 { scale(normal, 1.0 / area) } else { [0.0; 3] };
 
         let mut jump_sq = 0.0;
 

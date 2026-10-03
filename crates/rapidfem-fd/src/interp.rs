@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Field reconstruction: evaluate the FEM E-field and its curl at a point.
 //!
@@ -23,17 +20,13 @@ use num_complex::Complex64 as C64;
 use crate::mesh::Mesh;
 use crate::basis::NedelecBasis;
 use crate::tet_assembly::{barycentric_grads, build_basis, BasisFn};
+use rapidfem_core::geom::cross;
 
 type V3 = [f64; 3];
 
 /// Global sign matching the reconstruction to the `sparam`/excitation
 /// convention (see module docs). Physically immaterial; pinned here.
 const RECON_SIGN: f64 = -1.0;
-
-#[inline]
-fn cross3(a: &V3, b: &V3) -> V3 {
-    [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]
-}
 
 /// Barycentric L_i of local node i at point `p`: L_i = δ_{i0} + ∇L_i·(p − v0).
 #[inline]
@@ -201,19 +194,9 @@ fn point_in_tet(mesh: &Mesh, itet: usize, x: f64, y: f64, z: f64) -> bool {
     u >= -eps && v >= -eps && w >= -eps && u + v + w <= 1.0 + eps
 }
 
-/// Brute-force fallback for find_containing_tet.
+/// Brute-force fallback of the grid search: every tet in turn.
 fn find_containing_tet_brute(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize> {
-    for itet in 0..mesh.n_tets() {
-        if point_in_tet(mesh, itet, x, y, z) {
-            return Some(itet);
-        }
-    }
-    None
-}
-
-/// Find the tet containing a point (brute force, for backward compatibility).
-pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize> {
-    find_containing_tet_brute(mesh, x, y, z)
+    (0..mesh.n_tets()).find(|&itet| point_in_tet(mesh, itet, x, y, z))
 }
 
 /// Analytic curl of the FEM E-field inside a known tet at point `(x, y, z)`.
@@ -224,7 +207,7 @@ pub fn find_containing_tet(mesh: &Mesh, x: f64, y: f64, z: f64) -> Option<usize>
 ///   ∇×φ = scale·coeff·[ L_q·(∇L_p×∇L_g) + L_p·(∇L_q×∇L_g) ]
 ///
 /// linear in position via the L's (no constant-per-tet approximation). Used by
-/// the error estimator, far-field integration, and H = ∇×E / (jωμ).
+/// the error estimator, far-field integration, and H = ∇×E / (-jωμ).
 pub fn eval_curl_in_tet(
     mesh: &Mesh,
     basis: &NedelecBasis,
@@ -249,7 +232,7 @@ pub fn eval_curl_in_tet(
                 }
                 let mut e_less = t.exps;
                 e_less[m] -= 1;
-                let c = cross3(&grads[m], &grads[t.grad as usize]);
+                let c = cross(grads[m], grads[t.grad as usize]);
                 let s = w * em as f64 * monomial(&lam, &e_less);
                 for k in 0..3 {
                     curl[k] += dof * C64::from(s * c[k]);

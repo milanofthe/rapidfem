@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Geometric factors, the affine map from the reference tetrahedron to each
 //! physical element.
@@ -15,6 +12,7 @@
 //! `∂u/∂x_i = Σ_k (J⁻¹)[k,i] · ∂u/∂ξ_k`.
 
 use crate::constants::Field;
+use rapidfem_core::geom::{cross, dot, sub};
 use rapidfem_core::mesh::Mesh;
 
 /// Per-element geometric factors of the reference→physical affine map.
@@ -26,17 +24,14 @@ pub struct GeometricFactors {
     pub jacobian: [[Field; 3]; 3],
     /// Inverse Jacobian `J⁻¹`, the metric terms `∂ξ_k/∂x_i`.
     pub jacobian_inv: [[Field; 3]; 3],
-    /// Signed determinant of `J`.
+    /// Signed determinant of `J`, six times the signed element volume.
     pub det: Field,
-    /// Element volume, `|det J| / 6`.
-    pub volume: Field,
 }
 
 impl GeometricFactors {
     /// Build the geometric factors for a tet given its four vertices.
     pub fn for_tet(v: &[[Field; 3]; 4]) -> Self {
-        let col = |a: [Field; 3]| [a[0] - v[0][0], a[1] - v[0][1], a[2] - v[0][2]];
-        let (c0, c1, c2) = (col(v[1]), col(v[2]), col(v[3]));
+        let (c0, c1, c2) = (sub(v[1], v[0]), sub(v[2], v[0]), sub(v[3], v[0]));
         // J[i][k], row i, column k.
         let jacobian = [
             [c0[0], c1[0], c2[0]],
@@ -49,7 +44,6 @@ impl GeometricFactors {
             jacobian,
             jacobian_inv,
             det,
-            volume: det.abs() / 6.0,
         }
     }
 
@@ -62,16 +56,6 @@ impl GeometricFactors {
             }
         }
         x
-    }
-
-    /// Coefficients combining the reference derivatives `(Dr, Ds, Dt)` into the
-    /// physical derivative `∂/∂x_axis`: `D_{x_axis} = Σ_k coeff[k] · D_ref[k]`.
-    pub fn phys_deriv_coeffs(&self, axis: usize) -> [Field; 3] {
-        [
-            self.jacobian_inv[0][axis],
-            self.jacobian_inv[1][axis],
-            self.jacobian_inv[2][axis],
-        ]
     }
 }
 
@@ -92,29 +76,14 @@ pub fn all_geometric_factors(mesh: &Mesh) -> Vec<GeometricFactors> {
         .collect()
 }
 
-/// Closed-form inverse and determinant of a 3×3 matrix.
+/// Closed-form inverse and determinant of a 3x3 matrix: the columns of the
+/// adjugate are the cross products of the row pairs.
 fn inv3(m: [[Field; 3]; 3]) -> ([[Field; 3]; 3], Field) {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let adj_cols = [cross(m[1], m[2]), cross(m[2], m[0]), cross(m[0], m[1])];
+    let det = dot(m[0], adj_cols[0]);
     let id = 1.0 / det;
-    let inv = [
-        [
-            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * id,
-            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * id,
-            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * id,
-        ],
-        [
-            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * id,
-            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * id,
-            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * id,
-        ],
-        [
-            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * id,
-            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * id,
-            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * id,
-        ],
-    ];
+    let inv: [[Field; 3]; 3] =
+        std::array::from_fn(|i| std::array::from_fn(|j| adj_cols[j][i] * id));
     (inv, det)
 }
 
@@ -130,7 +99,6 @@ mod tests {
     fn reference_tet_is_identity() {
         let g = GeometricFactors::for_tet(&REF_TET);
         assert!((g.det - 1.0).abs() < 1e-14);
-        assert!((g.volume - 1.0 / 6.0).abs() < 1e-14);
         for i in 0..3 {
             for k in 0..3 {
                 let want = if i == k { 1.0 } else { 0.0 };
@@ -164,7 +132,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_matches_direct_formula() {
+    fn det_matches_triple_product() {
         let v = [
             [1.0, 2.0, -1.0],
             [3.0, 2.5, -1.0],
@@ -172,26 +140,20 @@ mod tests {
             [2.0, 2.0, 4.0],
         ];
         let g = GeometricFactors::for_tet(&v);
-        // Volume = |(v1-v0)·((v2-v0)×(v3-v0))| / 6.
-        let e = |a: [f64; 3]| [a[0] - v[0][0], a[1] - v[0][1], a[2] - v[0][2]];
-        let (a, b, c) = (e(v[1]), e(v[2]), e(v[3]));
-        let cross = [
-            b[1] * c[2] - b[2] * c[1],
-            b[2] * c[0] - b[0] * c[2],
-            b[0] * c[1] - b[1] * c[0],
-        ];
-        let triple = (a[0] * cross[0] + a[1] * cross[1] + a[2] * cross[2]).abs();
-        assert!((g.volume - triple / 6.0).abs() < 1e-12);
-        assert!(g.volume > 0.0);
+        // det J = (v1-v0) . ((v2-v0) x (v3-v0)), six times the volume.
+        let (a, b, c) = (sub(v[1], v[0]), sub(v[2], v[0]), sub(v[3], v[0]));
+        let triple = dot(a, cross(b, c));
+        assert!((g.det - triple).abs() < 1e-12);
+        assert!(g.det > 0.0);
     }
 
     #[test]
-    fn volume_is_positive_for_either_orientation() {
-        // Swapping two vertices flips det(J) but the volume stays positive.
+    fn det_flips_with_orientation() {
+        // Swapping two vertices flips the sign of det(J), not its magnitude.
         let v = [REF_TET[0], REF_TET[2], REF_TET[1], REF_TET[3]];
         let g = GeometricFactors::for_tet(&v);
         assert!(g.det < 0.0, "swapped tet should have negative det");
-        assert!((g.volume - 1.0 / 6.0).abs() < 1e-14);
+        assert!((g.det + 1.0).abs() < 1e-14);
     }
 
     #[test]
@@ -220,16 +182,15 @@ mod tests {
 
         let dref = [&re.diff_r, &re.diff_s, &re.diff_t];
         for axis in 0..3 {
-            let c = g.phys_deriv_coeffs(axis);
             for i in 0..n {
-                // (D_x u)_i = Σ_k c[k] Σ_j D_ref[k][i,j] u_j
+                // (D_x u)_i = sum_k Jinv[k][axis] sum_j D_ref[k][i,j] u_j
                 let mut got = 0.0;
                 for k in 0..3 {
                     let mut row = 0.0;
                     for j in 0..n {
                         row += dref[k][i * n + j] * un[j];
                     }
-                    got += c[k] * row;
+                    got += g.jacobian_inv[k][axis] * row;
                 }
                 let want = exacts[axis](pn[i]);
                 assert!(

@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Per-tet material tensors for the frequency-domain assembly.
 //!
@@ -79,34 +76,38 @@ pub struct Material {
     pub dispersion: Dispersion,
 }
 
-/// Build per-tet εr and μr tensors from material definitions.
-/// Accumulates each region's diagonal εr/μr/tanδ/σ onto its tets, then applies
-/// the complex-permittivity relation εr* = εr(1 − j·tanδ) − j·σ/(ω·ε₀).
-///
-/// Returns (er_tensors, ur_tensors) where each is Vec of 3x3 complex tensors.
-pub fn build_material_tensors(
-    n_tets: usize,
-    materials: &[Material],
-    frequency: f64,
-) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
-    build_material_tensors_impl(n_tets, materials, frequency, true)
-}
+/// The 3×3 identity tensor (vacuum εr, μr).
+pub const IDENTITY: [[C64; 3]; 3] = {
+    let (one, zero) = (C64::new(1.0, 0.0), C64::new(0.0, 0.0));
+    [[one, zero, zero], [zero, one, zero], [zero, zero, one]]
+};
 
-/// Like [`build_material_tensors`], but WITHOUT the −j·σ/(ω·ε₀) conductivity
-/// term: εr* = εr·(1 − j·tanδ) only. This is the frequency-independent part of
-/// a non-dispersive material; the σ part varies as 1/ω across a sweep and is
-/// carried separately via [`build_sigma_tensors`] (see the frequency sweep).
-pub fn build_material_tensors_wo_sigma(
+/// Per-tet complex εr and μr tensors: each material's diagonal εr / μr /
+/// tanδ / σ accumulated onto its tets (`None`: vacuum everywhere), then
+/// `εr* = εr(1 − j·tanδ) − j·σ/(ω·ε₀)`, the σ term only with `sigma` (a
+/// sweep carries it separately, see [`build_sigma_tensors`]). PML tets are
+/// then overwritten with their coordinate-stretched tensors at the tet
+/// centroid; σ-bearing materials must not overlap them.
+pub fn material_tensors(
     n_tets: usize,
-    materials: &[Material],
+    materials: Option<&[Material]>,
     frequency: f64,
+    sigma: bool,
+    pml: Option<(&[PmlRegion], &crate::mesh::Mesh)>,
 ) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
-    build_material_tensors_impl(n_tets, materials, frequency, false)
+    let (mut er, mut ur) = match materials {
+        Some(m) => build_material_tensors_impl(n_tets, m, frequency, sigma),
+        None => (vec![IDENTITY; n_tets], vec![IDENTITY; n_tets]),
+    };
+    if let Some((regions, mesh)) = pml {
+        apply_pml_overrides(&mut er, &mut ur, regions, mesh);
+    }
+    (er, ur)
 }
 
 /// Per-tet bulk-conductivity tensors σ (S/m, real values on the diagonal).
 /// Assembled as a mass matrix this yields B_σ; the sweep adds it per
-/// frequency as +j·k₀²/(ω·ε₀)·B_σ — algebraically identical to rebuilding
+/// frequency as +j·k₀²/(ω·ε₀)·B_σ, algebraically identical to rebuilding
 /// εr*(ω) = … − j·σ/(ω·ε₀) at every frequency.
 pub fn build_sigma_tensors(n_tets: usize, materials: &[Material]) -> Vec<[[C64; 3]; 3]> {
     let zero3x3 = [[C64::new(0.0, 0.0); 3]; 3];
@@ -240,38 +241,6 @@ impl PmlRegion {
         }
         (er_t, ur_t)
     }
-}
-
-/// Build per-tet εr and μr tensors with PML overrides.
-///
-/// First runs `build_material_tensors` on regular materials, then for every tet in any PML
-/// region OVERWRITES the tensor with the coordinate-stretched anisotropic value evaluated at
-/// the tet centroid. (PML regions take precedence over isotropic materials.)
-pub fn build_material_tensors_with_pml(
-    n_tets: usize,
-    materials: &[Material],
-    pml_regions: &[PmlRegion],
-    mesh: &crate::mesh::Mesh,
-    frequency: f64,
-) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
-    let (mut er, mut ur) = build_material_tensors(n_tets, materials, frequency);
-    apply_pml_overrides(&mut er, &mut ur, pml_regions, mesh);
-    (er, ur)
-}
-
-/// [`build_material_tensors_with_pml`] on top of the σ-free εr* (see
-/// [`build_material_tensors_wo_sigma`]). PML tets are overwritten with their
-/// stretched tensors either way; σ-bearing materials must not overlap them.
-pub fn build_material_tensors_with_pml_wo_sigma(
-    n_tets: usize,
-    materials: &[Material],
-    pml_regions: &[PmlRegion],
-    mesh: &crate::mesh::Mesh,
-    frequency: f64,
-) -> (Vec<[[C64; 3]; 3]>, Vec<[[C64; 3]; 3]>) {
-    let (mut er, mut ur) = build_material_tensors_wo_sigma(n_tets, materials, frequency);
-    apply_pml_overrides(&mut er, &mut ur, pml_regions, mesh);
-    (er, ur)
 }
 
 fn apply_pml_overrides(

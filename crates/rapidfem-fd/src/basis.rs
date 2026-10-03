@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! The degree-of-freedom layout of the volume and surface elements.
 //!
@@ -28,7 +25,7 @@
 //! mode-major order the goldens are pinned to:
 //!
 //!   tet:  [0..6] edges m0, [6..10] faces m0, [10..16] edges m1, [16..20] faces m1
-//!   tri:  [0..3] edges m0, [3] face m0,      [4..7] edges m1,   [7] face m1
+//!   tri:  `[0..3]` edges m0, `[3]` face m0,  `[4..7]` edges m1, `[7]` face m1
 //!
 //! Under the minimum rule an entity that did not reach a given mode is simply
 //! skipped, and both counts shrink. Nothing outside this module may assume 20 or 8.
@@ -41,13 +38,13 @@ use crate::order::{self, OrderMap};
 ///
 /// **This list IS the element definition.** `tet_assembly::build_basis` builds
 /// one basis function per entry, by asking the entity's generator for its `k`-th
-/// function — it does not enumerate anything itself. So the basis and the DOF map
+/// function, it does not enumerate anything itself. So the basis and the DOF map
 /// cannot disagree about how many DOFs there are, which ones they are, or what
 /// order they come in. With a variable order that is not a nicety; it is the only
 /// way to keep the two in step.
 ///
-/// The order within the list is mode-major — all entities' function 0, then all
-/// entities' function 1 — because that is the order the uniform order-2 element
+/// The order within the list is mode-major, all entities' function 0, then all
+/// entities' function 1, because that is the order the uniform order-2 element
 /// has always used and the goldens are pinned to. Entities whose order does not
 /// reach a given mode are simply skipped.
 ///
@@ -259,6 +256,20 @@ impl NedelecBasis {
         self.edge.get(i)
     }
 
+    /// The DOFs left free by PEC on triangles `pec_tris` (every DOF on such a
+    /// triangle and its edges is constrained), in order, and the renumbering
+    /// `dof -> free index`, `usize::MAX` for a constrained DOF.
+    pub fn free_dofs(&self, mesh: &Mesh, pec_tris: &[usize]) -> (Vec<usize>, Vec<usize>) {
+        let mut pec = vec![false; self.n_field];
+        for &t in pec_tris {
+            for &e in &mesh.tri_to_edge[t] {
+                self.edge_dofs(e).iter().for_each(|&d| pec[d] = true);
+            }
+            self.tri_dofs(t).iter().for_each(|&d| pec[d] = true);
+        }
+        rapidfem_core::linalg::free_index(self.n_field, |d| pec[d])
+    }
+
     /// Offsets into the volume COO arrays: tet `i` owns `[tet_nnz[i], tet_nnz[i+1])`.
     #[inline]
     pub fn tet_nnz_offsets(&self) -> &[usize] {
@@ -286,7 +297,7 @@ impl NedelecBasis {
 
 /// Convert global node indices in edge/tri arrays to local tet indices (0-3).
 ///
-/// Given tet vertex IDs [v0,v1,v2,v3] and a set of global node IDs,
+/// Given tet vertex IDs `[v0, v1, v2, v3]` and a set of global node IDs,
 /// returns the local index (0-3) of each node within the tet.
 pub fn local_mapping(tet_verts: &[usize; 4], global_ids: &[[usize; 2]; 6]) -> [[usize; 2]; 6] {
     let mut out = [[0usize; 2]; 6];

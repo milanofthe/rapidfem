@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Driven RLC lumped port — the reactive port termination reflects on cue.
+
+"""Driven RLC lumped port, the reactive port termination reflects on cue.
 
 A short 50 Ω stripline is driven by ``rf.LumpedPort(z0=50)`` at one end and
 terminated by a SECOND lumped port carrying a series reactance,
@@ -51,7 +52,7 @@ def _build(g):
     term = g.xz_plate(LINE_W, hb, position=(-LINE_W / 2, LINE_L - GAP_IN, 0.0))
     g.fragment(lower, upper, trace, feed, term)
     rf.PEC(trace)
-    rf.LumpedPort(feed, direction=(0, 0, 1), z0=ZREF)               # driven
+    rf.LumpedPort(feed, direction=(0, 0, 1))               # driven
     rf.LumpedPort(term, direction=(0, 0, 1), z0=ZREF, l=L_TERM)     # reactive termination
     return feed, term
 
@@ -65,7 +66,7 @@ def test_inductive_port_termination_reflection():
     """Port 2 = 50 Ω + 2 nH terminates the line; |S11| follows jωL/(2R+jωL)."""
     g = case.geometry(maxh=rf.lambda_maxh(f_max=float(np.max(FREQS)), er_max=ER))
     _build(g)
-    prob, res = case.sweep(g, FREQS, z0=ZREF)
+    prob, res = case.sweep(g, FREQS)
     s11 = np.abs(res.sparams[:, 0, 0])
     analytic = np.abs([_gamma_rlc(f) for f in FREQS])
 

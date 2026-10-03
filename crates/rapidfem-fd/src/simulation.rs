@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! High-level Simulation API: owns a mesh, the model placed on it and the
 //! analysis settings, and exposes sweep, eigenmode and far-field. The entry
@@ -30,9 +27,8 @@ use crate::waveguide::{
     FloquetPort, LumpedElement, LumpedPort, NumericalWavePort, RectWaveguide, SurfaceImpedance,
     UserDefinedPort,
 };
-use rapidfem_core::port_eigen::{
-    solve_modes, solve_vector_modes, ModeKind, NumericalMode, PortMesh2D,
-};
+use rapidfem_core::port_eigen::{solve_port_face, ModeKind, PortSolve};
+use rapidfem_core::geom::{dot, sub};
 
 /// Result of a frequency sweep.
 pub struct SweepResult {
@@ -41,6 +37,10 @@ pub struct SweepResult {
     pub sparams: Vec<Vec<Vec<C64>>>,
     /// FEM E-field solutions: `[freq_idx][port_exc][dof]`.
     pub solutions: Vec<Vec<Vec<C64>>>,
+    /// Reference impedance of each driven port, `[freq_idx][port]` (ohm):
+    /// the mode impedance of a modal port, the `z0` of a lumped one. The
+    /// S-parameters are referenced to these, see [`crate::network`].
+    pub port_impedances: Vec<Vec<f64>>,
     /// Number of driven ports (matches the inner dimension of `sparams`).
     pub n_driven: usize,
     /// Total wall-clock for the sweep (s).
@@ -84,12 +84,6 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// Build a `Simulation` from in-memory gmsh mesh bytes (no std::fs use).
-    pub fn from_mesh_bytes(mesh_bytes: &[u8], model: Model, settings: FdSettings) -> Result<Self, String> {
-        let mesh = crate::mesh_io::parse_mesh_bytes(mesh_bytes)?;
-        Self::new(mesh, model, settings)
-    }
-
     /// Build a `Simulation` from an owned mesh, its model and the settings.
     /// All BC objects (ports, PEC, materials, PML, lumped integration lines)
     /// are constructed up-front.
@@ -98,14 +92,14 @@ impl Simulation {
         // Lever ④: non-dimensionalize the geometry to O(1) coordinates so the
         // assembly and its absolute tolerances are unit-/scale-invariant. The
         // transform is reversed at the output boundary (field/coord rescaling).
-        // `RAPIDFEM_NO_NORMALIZE` keeps physical units (l0 = 1) — used to prove
+        // `RAPIDFEM_NO_NORMALIZE` keeps physical units (l0 = 1), used to prove
         // the normalized path is bit-identical on the solver's outputs.
         if std::env::var_os("RAPIDFEM_NO_NORMALIZE").is_none() {
             let l0 = mesh.normalize_characteristic_length();
             eprintln!("  Geometry normalized: L0 = {:.6e} m (mean edge length)", l0);
         }
         // Materials before ports so `wave_numerical` can consult per-tet ε_r
-        // when running the vector-hybrid mode solve on the port face — and before
+        // when running the vector-hybrid mode solve on the port face, and before
         // the basis, because the order policy reads them.
         let materials = build_materials(&mesh, &model);
 
@@ -118,11 +112,8 @@ impl Simulation {
                 // top of the band is adequate across it. (One map for the whole
                 // sweep is also what lets the symbolic factorisation be reused.)
                 let f_max = settings.frequencies.iter().copied().fold(0.0_f64, f64::max);
-                let (er, ur) = crate::materials::build_material_tensors(
-                    mesh.n_tets(),
-                    &materials,
-                    f_max,
-                );
+                let (er, ur) =
+                    crate::materials::material_tensors(mesh.n_tets(), Some(&materials), f_max, true, None);
                 let k = crate::order::cell_wavenumbers(&mesh, &er, &ur, f_max);
                 let om = crate::order::wavelength_policy(&mesh, &k, theta);
                 let n1 = om.cell.iter().filter(|&&p| p == 1).count();
@@ -152,7 +143,8 @@ impl Simulation {
                 String::new()
             }
         );
-        let (ports, port_tris) = build_ports(&mesh, &model, &materials)?;
+        let f_min = settings.frequencies.iter().cloned().fold(f64::INFINITY, f64::min);
+        let (ports, port_tris) = build_ports(&mesh, &model, &materials, f_min)?;
         let pec_tris = build_pec_tris(&mesh, &model);
         let pml_regions = build_pml_regions(&mesh, &model);
 
@@ -197,86 +189,6 @@ impl Simulation {
         }
     }
 
-    /// For a single frequency's solution vector, return |E| (V/m) averaged
-    /// at every mesh node by sampling the Nedelec-2 basis in each tet that
-    /// contains the node and averaging the resulting magnitudes.
-    /// Returned `Vec<f32>` has length `mesh.n_nodes()`.
-    pub fn nodal_field_magnitudes(&self, solution: &[C64]) -> Vec<f32> {
-        let n_nodes = self.mesh.n_nodes();
-        let mut sum = vec![0.0f64; n_nodes];
-        let mut count = vec![0u32; n_nodes];
-        // Sample at each tet's centroid; assign that magnitude to each of its
-        // 4 vertices. Cheap, gives a smooth nodal field via averaging.
-        for ti in 0..self.mesh.n_tets() {
-            let tet = &self.mesh.tets[ti];
-            let mut cx = 0.0; let mut cy = 0.0; let mut cz = 0.0;
-            for k in 0..4 {
-                let p = self.mesh.nodes[tet[k]];
-                cx += p[0]; cy += p[1]; cz += p[2];
-            }
-            cx /= 4.0; cy /= 4.0; cz /= 4.0;
-            let (ex, ey, ez) = crate::interp::eval_field_in_tet(
-                &self.mesh, &self.basis, solution, ti, cx, cy, cz,
-            );
-            // |E| on the normalized mesh is L₀·|E_phys| → divide by L₀.
-            let mag = (ex.norm_sqr() + ey.norm_sqr() + ez.norm_sqr()).sqrt() / self.mesh.l0;
-            for k in 0..4 {
-                sum[tet[k]] += mag;
-                count[tet[k]] += 1;
-            }
-        }
-        sum.into_iter()
-            .zip(count.into_iter())
-            .map(|(s, c)| if c == 0 { 0.0 } else { (s / c as f64) as f32 })
-            .collect()
-    }
-
-    /// Per-node phasor terms `(A, B, C)` for animated `|E(t)|²` rendering:
-    ///
-    ///   A = |Re(E)|² = Re_x² + Re_y² + Re_z²
-    ///   B = |Im(E)|² = Im_x² + Im_y² + Im_z²
-    ///   C = Re(E) · Im(E)   (real dot product)
-    ///
-    /// Then `|E(x,t)|² = A·cos²(ωt) + B·sin²(ωt) − 2·C·sin(ωt)·cos(ωt)`,
-    /// which lets the viewer's shader modulate one uniform (phase) and
-    /// render a propagating wave without any new field evaluations.
-    pub fn nodal_field_phasor_terms(&self, solution: &[C64]) -> Vec<[f32; 3]> {
-        let n_nodes = self.mesh.n_nodes();
-        let mut sum = vec![[0.0f64; 3]; n_nodes];
-        let mut count = vec![0u32; n_nodes];
-        for ti in 0..self.mesh.n_tets() {
-            let tet = &self.mesh.tets[ti];
-            let mut cx = 0.0; let mut cy = 0.0; let mut cz = 0.0;
-            for k in 0..4 {
-                let p = self.mesh.nodes[tet[k]];
-                cx += p[0]; cy += p[1]; cz += p[2];
-            }
-            cx /= 4.0; cy /= 4.0; cz /= 4.0;
-            let (ex, ey, ez) = crate::interp::eval_field_in_tet(
-                &self.mesh, &self.basis, solution, ti, cx, cy, cz,
-            );
-            // These are quadratic in E (|E|²), and E on the normalized mesh is
-            // L₀·E_phys, so divide by L₀² for physical |E|² units.
-            let inv_l02 = 1.0 / (self.mesh.l0 * self.mesh.l0);
-            let a = (ex.re * ex.re + ey.re * ey.re + ez.re * ez.re) * inv_l02;
-            let b = (ex.im * ex.im + ey.im * ey.im + ez.im * ez.im) * inv_l02;
-            let c = (ex.re * ex.im + ey.re * ey.im + ez.re * ez.im) * inv_l02;
-            for k in 0..4 {
-                sum[tet[k]][0] += a;
-                sum[tet[k]][1] += b;
-                sum[tet[k]][2] += c;
-                count[tet[k]] += 1;
-            }
-        }
-        sum.into_iter().zip(count.into_iter()).map(|(s, c)| {
-            if c == 0 { [0.0, 0.0, 0.0] }
-            else {
-                let inv = 1.0 / c as f64;
-                [(s[0] * inv) as f32, (s[1] * inv) as f32, (s[2] * inv) as f32]
-            }
-        }).collect()
-    }
-
     /// Run a frequency sweep and extract S-parameters.
     ///
     /// `on_freq`, if given, is invoked after each frequency's solve with
@@ -313,7 +225,7 @@ impl Simulation {
                 all_sparams.push(s);
                 keep_going
             };
-            results = crate::assembly::frequency_sweep_with_pml(
+            results = crate::assembly::frequency_sweep(
                 &self.mesh,
                 &self.basis,
                 &port_dyn,
@@ -335,11 +247,13 @@ impl Simulation {
             .into_iter()
             .map(|r| r.solutions.into_iter().collect())
             .collect();
+        let port_impedances = frequencies.iter().map(|&f| self.port_impedances(f)).collect();
 
         Ok(SweepResult {
             frequencies,
             sparams: all_sparams,
             solutions,
+            port_impedances,
             n_driven,
             solve_time_s,
         })
@@ -362,15 +276,8 @@ impl Simulation {
         // inhomogeneous quasi-TEM cross-section, where it is what keeps the
         // extraction unitary. Material scalars are frequency-flat here.
         let n_tets = self.mesh.n_tets();
-        let eps_tet = per_tet_eps_scalar(&self.materials, n_tets);
-        let mut mur_tet = vec![1.0_f64; n_tets];
-        for mat in &self.materials {
-            let ur = match mat.ur_diag {
-                Some([a, b, c]) => (a + b + c) / 3.0,
-                None => mat.ur,
-            };
-            for &ti in &mat.tet_indices { mur_tet[ti] = ur; }
-        }
+        let eps_tet = per_tet(&self.materials, n_tets, 1.0, er_scalar);
+        let mur_tet = per_tet(&self.materials, n_tets, 1.0, mur_scalar);
         SParamCtx { grid, eps_tet, mur_tet, driven_indices }
     }
 
@@ -405,25 +312,17 @@ impl Simulation {
             };
             for (obs_idx, &obs_pi) in ctx.driven_indices.iter().enumerate() {
                 let active = obs_idx == exc_idx;
-                let s = if let (true, Some((dir, _z0, v_inc)), Some(height)) = (
-                    port_dyn[obs_pi].is_lumped(),
-                    port_dyn[obs_pi].lumped_voltage_params(),
-                    port_dyn[obs_pi].port_height(),
-                ) {
-                    // Area-averaged mode projection V = (l/A)∫E·l̂ dS — robust
+                let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi]
+                    .iter()
+                    .map(|&ti| self.mesh.tris[ti])
+                    .collect();
+                let s = if let Some((dir, height, v_inc)) = port_dyn[obs_pi].lumped() {
+                    // Area-averaged mode projection V = (l/A)∫E·l̂ dS, robust
                     // for tall / non-TEM ports (derivations/lumped_port/).
-                    let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi]
-                        .iter()
-                        .map(|&ti| self.mesh.tris[ti])
-                        .collect();
                     sparam_voltage_surface(
                         &self.mesh.nodes, &obs_tris, dir, height, v_inc, active, &fieldf, 4,
                     )
                 } else {
-                    let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi]
-                        .iter()
-                        .map(|&ti| self.mesh.tris[ti])
-                        .collect();
                     sparam_waveport(&self.mesh.nodes, &obs_tris, port_dyn[obs_pi], &exc, active, &fieldf, &weight, 4)
                 };
                 freq_s[obs_idx][exc_idx] = s;
@@ -445,22 +344,48 @@ impl Simulation {
         )
     }
 
-    /// Radiation efficiency η = 1 − Σ |S_i1|² for the first driven port at the given freq.
-    /// Used as the gain-offset for far-field. Returns None if no driven ports / no S data.
-    pub fn radiation_efficiency(&self, result: &SweepResult, freq_idx: usize) -> Option<f64> {
+    /// The fraction of the incident power at port `port` the structure
+    /// accepts, 1 − Σ_i |S_i,port|² (what a lossless antenna radiates; the
+    /// realized-gain offset of the far field). `None` without S data.
+    pub fn accepted_fraction(&self, result: &SweepResult, freq_idx: usize, port: usize) -> Option<f64> {
         let s = result.sparams.get(freq_idx)?;
-        if s.is_empty() || s[0].is_empty() {
+        let column: Vec<f64> = s.iter().filter_map(|row| row.get(port)).map(|s| s.norm_sqr()).collect();
+        if column.is_empty() {
             return None;
         }
-        let s11_sum_sq: f64 = s.iter().filter_map(|row| row.first()).map(|s| s.norm_sqr()).sum();
-        Some((1.0 - s11_sum_sq).clamp(0.0, 1.0))
+        Some((1.0 - column.iter().sum::<f64>()).clamp(0.0, 1.0))
+    }
+
+    /// The reference impedance (ohm) of each driven port at `freq` Hz, in
+    /// S-matrix order: the mode impedance of a modal port, the `z0` of a
+    /// lumped one.
+    pub fn port_impedances(&self, freq: f64) -> Vec<f64> {
+        let exc = crate::excitation::Excitation::new(freq, self.mesh.l0);
+        self.ports.iter().filter(|p| p.is_driven()).map(|p| p.z_mode(&exc)).collect()
+    }
+
+    /// The centroid of every tet in physical coordinates (m).
+    pub fn tet_centroids(&self) -> Vec<[f64; 3]> {
+        let l0 = self.mesh.l0;
+        self.mesh
+            .tets
+            .iter()
+            .map(|tet| {
+                let mut c = [0.0; 3];
+                for &n in tet {
+                    for k in 0..3 {
+                        c[k] += self.mesh.nodes[n][k] * l0;
+                    }
+                }
+                c.map(|x| x / 4.0)
+            })
+            .collect()
     }
 
     /// Monk-style residual a-posteriori error indicator per tet for a given
     /// `(freq_idx, port_idx)` solution. Returns the full estimate (η per tet,
     /// volume and face contributions, total, marked subset from Dörfler at
-    /// `theta`). Intended for diagnostics, the same indicator drives the
-    /// adaptive loop in `--adaptive` sweeps.
+    /// `theta`). Diagnostic: it drives user-side refinement, nothing re-meshes.
     pub fn element_errors_at(
         &self,
         result: &SweepResult,
@@ -471,17 +396,7 @@ impl Simulation {
         let solution = result.solutions.get(freq_idx).and_then(|s| s.get(port_idx))?;
         let freq = *result.frequencies.get(freq_idx)?;
         let k0 = crate::excitation::Excitation::new(freq, self.mesh.l0).k0;
-        let n_tets = self.mesh.n_tets();
-        let (er_tensors, _) = if self.materials.is_empty() {
-            let id: [[C64; 3]; 3] = [
-                [C64::new(1.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0)],
-                [C64::new(0.0, 0.0), C64::new(1.0, 0.0), C64::new(0.0, 0.0)],
-                [C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(1.0, 0.0)],
-            ];
-            (vec![id; n_tets], vec![id; n_tets])
-        } else {
-            materials::build_material_tensors(n_tets, &self.materials, freq)
-        };
+        let (er_tensors, _) = materials::material_tensors(self.mesh.n_tets(), self.materials_opt(), freq, true, None);
         Some(crate::error_estimator::estimate_error(
             &self.mesh, &self.basis, solution, k0, &er_tensors, theta,
         ))
@@ -507,42 +422,17 @@ impl Simulation {
         Some(self.eval_dofs_at_nodes(&mode.field))
     }
 
-    /// Common interior, node → first-adjacent tet → barycentric eval.
-    /// Both ``field_at_nodes`` and ``eigenmode_field_at_nodes`` route here
-    /// so the per-node node→tet table is built the same way in both paths.
+    /// The physical E field (V/m) of the DOF vector `solution` at each node,
+    /// shared by `field_at_nodes` and `eigenmode_field_at_nodes`.
     fn eval_dofs_at_nodes(&self, solution: &[C64]) -> Vec<C64> {
-        let n_nodes = self.mesh.n_nodes();
-
-        // Node → adjacent tet (first one wins, matches vtk_export behaviour).
-        let mut node_to_tet = vec![usize::MAX; n_nodes];
-        for (itet, tet) in self.mesh.tets.iter().enumerate() {
-            for &ni in tet {
-                if node_to_tet[ni] == usize::MAX {
-                    node_to_tet[ni] = itet;
-                }
-            }
-        }
-
         // Lever ④: the field reconstructed on the L₀-normalized mesh is L₀·E_phys
         // (the Nédélec basis is scale-invariant), so divide by L₀ for physical
         // V/m. A no-op when l0 = 1.
         let inv_l0 = C64::from(1.0 / self.mesh.l0);
-        let mut out: Vec<C64> = Vec::with_capacity(3 * n_nodes);
-        for ni in 0..n_nodes {
-            let tet_idx = node_to_tet[ni];
-            if tet_idx == usize::MAX {
-                out.extend_from_slice(&[C64::new(0.0, 0.0); 3]);
-                continue;
-            }
-            let p = self.mesh.nodes[ni];
-            let (ex, ey, ez) = crate::interp::eval_field_in_tet(
-                &self.mesh, &self.basis, solution, tet_idx, p[0], p[1], p[2],
-            );
-            out.push(ex * inv_l0);
-            out.push(ey * inv_l0);
-            out.push(ez * inv_l0);
-        }
-        out
+        self.per_node(|t, p| {
+            let (ex, ey, ez) = crate::interp::eval_field_in_tet(&self.mesh, &self.basis, solution, t, p[0], p[1], p[2]);
+            [ex * inv_l0, ey * inv_l0, ez * inv_l0]
+        })
     }
 
     /// Per-tet loss-equivalent conductivity at angular frequency `omega`:
@@ -555,34 +445,15 @@ impl Simulation {
     /// term is the ordinary Ohmic conductivity. Together this matches the
     /// total imaginary permittivity the solver uses for power dissipation.
     fn per_tet_sigma_eff(&self, omega: f64) -> Vec<f64> {
-        let mut sigma = vec![0.0f64; self.mesh.n_tets()];
-        let w_eps0 = omega * EPS0;
-        for mat in &self.materials {
-            if mat.cond == 0.0 && mat.tand == 0.0 { continue; }
-            let s = w_eps0 * mat.er * mat.tand + mat.cond;
-            for &ti in &mat.tet_indices {
-                sigma[ti] = s;
-            }
-        }
-        sigma
+        per_tet(&self.materials, self.mesh.n_tets(), 0.0, |m| omega * EPS0 * m.er * m.tand + m.cond)
     }
 
-    /// Per-tet relative permeability μ_r, default 1.0 where no material applies.
-    fn per_tet_mur(&self) -> Vec<f64> {
-        let mut mur = vec![1.0f64; self.mesh.n_tets()];
-        for mat in &self.materials {
-            for &ti in &mat.tet_indices {
-                mur[ti] = mat.ur;
-            }
-        }
-        mur
-    }
-
-    /// Build the node → adjacent-tet map (first tet wins). Shared by all the
-    /// per-node samplers below so they pick the same tet at material interfaces.
-    fn node_to_tet_map(&self) -> Vec<usize> {
-        let n_nodes = self.mesh.n_nodes();
-        let mut node_to_tet = vec![usize::MAX; n_nodes];
+    /// `f(tet, node position)` at every mesh node, evaluated in the first tet
+    /// holding the node (the same tet for every sampler, so they agree at
+    /// material interfaces); zero for a node no tet holds. Flat `[x, y, z]`
+    /// per node.
+    fn per_node(&self, f: impl Fn(usize, [f64; 3]) -> [C64; 3]) -> Vec<C64> {
+        let mut node_to_tet = vec![usize::MAX; self.mesh.n_nodes()];
         for (itet, tet) in self.mesh.tets.iter().enumerate() {
             for &ni in tet {
                 if node_to_tet[ni] == usize::MAX {
@@ -591,6 +462,10 @@ impl Simulation {
             }
         }
         node_to_tet
+            .iter()
+            .zip(&self.mesh.nodes)
+            .flat_map(|(&t, &p)| if t == usize::MAX { [C64::new(0.0, 0.0); 3] } else { f(t, p) })
+            .collect()
     }
 
     /// Loss-equivalent current density J = σ_eff · E at each mesh node, in
@@ -603,63 +478,43 @@ impl Simulation {
         let freq = *result.frequencies.get(freq_idx)?;
         let omega = crate::excitation::Excitation::new(freq, self.mesh.l0).omega;
         let sigma = self.per_tet_sigma_eff(omega);
-        let n_nodes = self.mesh.n_nodes();
-        let node_to_tet = self.node_to_tet_map();
-        let mut out: Vec<C64> = Vec::with_capacity(3 * n_nodes);
-        for ni in 0..n_nodes {
-            let tet_idx = node_to_tet[ni];
-            if tet_idx == usize::MAX || sigma[tet_idx] == 0.0 {
-                out.extend_from_slice(&[C64::new(0.0, 0.0); 3]);
-                continue;
+        let zero = C64::new(0.0, 0.0);
+        Some(self.per_node(|t, p| {
+            if sigma[t] == 0.0 {
+                return [zero; 3];
             }
-            let p = self.mesh.nodes[ni];
-            let (ex, ey, ez) = crate::interp::eval_field_in_tet(
-                &self.mesh, &self.basis, solution, tet_idx, p[0], p[1], p[2],
-            );
+            let (ex, ey, ez) = crate::interp::eval_field_in_tet(&self.mesh, &self.basis, solution, t, p[0], p[1], p[2]);
             // J = σ·E_phys; E reconstructed on the normalized mesh is L₀·E_phys.
-            let s = C64::from(sigma[tet_idx] / self.mesh.l0);
-            out.push(ex * s);
-            out.push(ey * s);
-            out.push(ez * s);
-        }
-        Some(out)
+            let s = C64::from(sigma[t] / self.mesh.l0);
+            [ex * s, ey * s, ez * s]
+        }))
     }
 
-    /// Magnetic field H = ∇×E / (jωμ₀μ_r) at each mesh node, in (A/m).
+    /// Magnetic field H = ∇×E / (-jωμ₀μ_r) at each mesh node, in (A/m)
+    /// (time dependence e^{jωt}: ∇×E = -jωμH).
     /// Returns `Vec<C64>` of length `3 · n_nodes` (interleaved Hx, Hy, Hz).
     /// Uses the analytic Nédélec-2 curl evaluated at the node position.
     pub fn h_field_at_nodes(&self, result: &SweepResult, freq_idx: usize, port_idx: usize) -> Option<Vec<C64>> {
         let solution = result.solutions.get(freq_idx).and_then(|s| s.get(port_idx))?;
         let freq = *result.frequencies.get(freq_idx)?;
         let omega = crate::excitation::Excitation::new(freq, self.mesh.l0).omega;
-        let mur = self.per_tet_mur();
-        let n_nodes = self.mesh.n_nodes();
-        let node_to_tet = self.node_to_tet_map();
+        let mur = per_tet(&self.materials, self.mesh.n_tets(), 1.0, mur_scalar);
         let j = C64::new(0.0, 1.0);
-        let mut out: Vec<C64> = Vec::with_capacity(3 * n_nodes);
-        for ni in 0..n_nodes {
-            let tet_idx = node_to_tet[ni];
-            if tet_idx == usize::MAX {
-                out.extend_from_slice(&[C64::new(0.0, 0.0); 3]);
-                continue;
-            }
-            let p = self.mesh.nodes[ni];
-            let curl = crate::interp::eval_curl_in_tet(
-                &self.mesh, &self.basis, solution, tet_idx, p[0], p[1], p[2],
-            );
+        Some(self.per_node(|t, p| {
+            let curl = crate::interp::eval_curl_in_tet(&self.mesh, &self.basis, solution, t, p[0], p[1], p[2]);
             // ∇×E on the normalized mesh is L₀²·(∇×E)_phys (one L₀ from the basis
-            // field, one from the normalized ∇), so H = ∇×E/(jωμ) needs /L₀².
-            let denom = j * C64::from(omega * MU0 * mur[tet_idx] * self.mesh.l0 * self.mesh.l0);
-            out.push(curl[0] / denom);
-            out.push(curl[1] / denom);
-            out.push(curl[2] / denom);
-        }
-        Some(out)
+            // field, one from the normalized ∇), so H = ∇×E/(-jωμ) needs /L₀².
+            let denom = -j * C64::from(omega * MU0 * mur[t] * self.mesh.l0 * self.mesh.l0);
+            [curl[0] / denom, curl[1] / denom, curl[2] / denom]
+        }))
     }
 
-    /// Compute the far-field at a given (freq_idx, exc_port_idx). NFFT surface = `model.far_field_tag`
-    /// (the first ABC tag if not specified). PEC surfaces from `model.pec_tags` are included to close
-    /// the integration boundary.
+    /// The far-field pattern at `(freq_idx, exc_port_idx)`. The Huygens
+    /// surface is `model.far_field_tag` if one is marked, else the outer
+    /// boundary of the domain (open problems, with an ABC on it); `None`
+    /// without either. When every outer face but the ABC lies in one plane
+    /// (a ground or symmetry plane), that plane is infinite: the surface is
+    /// the ABC, closed by its image (see [`crate::farfield`]).
     pub fn compute_farfield(
         &self,
         result: &SweepResult,
@@ -669,48 +524,65 @@ impl Simulation {
         n_phi: usize,
     ) -> Option<RadiationPattern> {
         let solution = result.solutions.get(freq_idx).and_then(|s| s.get(exc_port_idx))?;
-        let nfft_tag = self.model.far_field_tag.or_else(|| {
-            self.model.faces.iter().find_map(|f| match f {
-                FaceSpec::Abc { tag } => Some(*tag),
-                _ => None,
-            })
-        })?;
-        let pec_nfft: Vec<usize> = self
-            .model
-            .pec_tags
-            .iter()
-            .flat_map(|&t| self.mesh.tris_for_tag(t).to_vec())
-            .collect();
-        // A face can carry both the NFFT tag and a PEC tag (e.g. a ground
-        // plane the user also marked as part of the Huygens surface). Drop
-        // those tris from the NFFT set so they aren't integrated twice; the
-        // PEC pass already covers them (with M_s = 0, the correct treatment
-        // of tangential E on a conductor).
-        let pec_set: std::collections::HashSet<usize> = pec_nfft.iter().copied().collect();
-        let nfft_tris: Vec<usize> = self
-            .mesh
-            .tris_for_tag(nfft_tag)
-            .iter()
-            .copied()
-            .filter(|t| !pec_set.contains(t))
-            .collect();
-        if nfft_tris.is_empty() {
+        let (surface, image) = self.huygens_surface()?;
+        if surface.is_empty() {
             return None;
         }
-        let efficiency = self.radiation_efficiency(result, freq_idx);
-
-        Some(crate::farfield::compute_farfield_full(
+        Some(crate::farfield::compute_farfield(
             &self.mesh,
             &self.basis,
             solution,
-            &nfft_tris,
-            &pec_nfft,
+            &surface,
+            image,
             result.frequencies[freq_idx],
             n_theta,
             n_phi,
             4,
-            efficiency,
+            self.accepted_fraction(result, freq_idx, exc_port_idx),
         ))
+    }
+
+    /// The triangles of the far-field surface and the image plane closing
+    /// it, see [`Self::compute_farfield`]. The candidate surface is the
+    /// marked one, else the outer boundary (with an ABC on it). Its pieces
+    /// on the domain's conducting boundary (outer faces that are no ABC:
+    /// PEC, PMC, the untagged PEC default) close it: in one plane they are
+    /// that plane's image, otherwise they stay on the surface (n̂ × E = 0
+    /// on PEC leaves only their electric currents).
+    fn huygens_surface(&self) -> Option<(Vec<usize>, Option<crate::farfield::ImagePlane>)> {
+        let tagged = |pick: fn(&FaceSpec) -> Option<i32>| -> std::collections::HashSet<usize> {
+            self.model.faces.iter().filter_map(pick).flat_map(|t| self.mesh.tris_for_tag(t).to_vec()).collect()
+        };
+        let abc = tagged(|f| if let FaceSpec::Abc { tag } = f { Some(*tag) } else { None });
+        let pmc = tagged(|f| if let FaceSpec::Pmc { tag } = f { Some(*tag) } else { None });
+        let outer = |t: usize| self.mesh.tri_to_tet[t][1] == usize::MAX;
+        let candidate: Vec<usize> = match self.model.far_field_tag {
+            Some(tag) => self.mesh.tris_for_tag(tag).to_vec(),
+            None if !abc.is_empty() => (0..self.mesh.n_tris()).filter(|&t| outer(t)).collect(),
+            None => return None,
+        };
+        let (closing, open): (Vec<usize>, Vec<usize>) =
+            candidate.iter().copied().partition(|&t| outer(t) && !abc.contains(&t));
+        match self.plane_of(&closing) {
+            Some((point, normal)) => {
+                let pec = !closing.iter().all(|t| pmc.contains(t));
+                Some((open, Some(crate::farfield::ImagePlane { point, normal, pec })))
+            }
+            None => Some((candidate, None)),
+        }
+    }
+
+    /// The plane all of `tris` (boundary triangles) lie in, with the normal
+    /// into the domain; `None` if they are empty or not coplanar.
+    fn plane_of(&self, tris: &[usize]) -> Option<([f64; 3], [f64; 3])> {
+        let m = &self.mesh;
+        let &first = tris.first()?;
+        let a = m.nodes[m.tris[first][0]];
+        // the inward normal; the nodes are O(1) (normalized mesh)
+        let n = m.tri_inward_normal(first)?;
+        let tol = 1e-9;
+        let on_plane = |p: [f64; 3]| dot(sub(p, a), n).abs() < tol;
+        tris.iter().all(|&t| m.tris[t].iter().all(|&i| on_plane(m.nodes[i]))).then_some((a, n))
     }
 }
 
@@ -718,56 +590,63 @@ impl Simulation {
 // Construction helpers, extracted from main.rs's prior orchestration
 // ============================================================================
 
+/// The Robin-type boundaries of the model. `f_min`, the lowest frequency of
+/// the sweep, bounds the reach of the surface impedances' edge correction.
 fn build_ports(
     mesh: &Mesh,
     model: &Model,
     materials: &[Material],
+    f_min: f64,
 ) -> Result<(Vec<Box<dyn Port>>, Vec<Vec<usize>>), String> {
     let mut ports: Vec<Box<dyn Port>> = Vec::new();
     let mut port_tris: Vec<Vec<usize>> = Vec::new();
+    // PMC walls a wave port meets (the symmetry plane of a half model) are
+    // natural on the port rim too.
+    let pmc_tags: Vec<i32> = model
+        .faces
+        .iter()
+        .filter_map(|f| if let FaceSpec::Pmc { tag } = f { Some(*tag) } else { None })
+        .collect();
 
     for pc in &model.faces {
-        match pc {
+        let tag = pc.tag();
+        if let FaceSpec::Pmc { .. } = pc {
+            eprintln!("  PMC: tag={}, {} triangles (natural BC)", tag, mesh.tris_for_tag(tag).len());
+            continue;
+        }
+        let tri_ids = mesh.tris_for_tag(tag).to_vec();
+        if tri_ids.is_empty() {
+            eprintln!("  WARNING: tag {} has no triangles, skipping {:?}", tag, std::mem::discriminant(pc));
+            continue;
+        }
+        let port_num = ports.len() + 1;
+        let port: Box<dyn Port> = match pc {
             FaceSpec::Rectangular { tag, width, height, mode, er, power } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping port", tag);
-                    continue;
-                }
                 let (cs, det_w, det_h) = detect_rect_port(mesh, &tri_ids);
-                // Config dims are physical lengths; the mesh (and det_*) are in
+                // The model's dims are physical lengths; the mesh (and det_*) are in
                 // L₀ units, so normalize config dims to match (lever ④).
                 let w = if *width > 0.0 { *width / mesh.l0 } else { det_w };
                 let h = if *height > 0.0 { *height / mesh.l0 } else { det_h };
-                let port_num = ports.len() + 1;
                 let port = RectWaveguide {
                     port_number: port_num,
                     power: *power,
                     mode: (mode[0], mode[1]),
                     er: *er,
-                    polarization: 1.0,
                     dims: (w, h),
                     cs,
                 };
                 eprintln!("  Port {}: rectangular, tag={}, TE{}{}, dims=({:.2}mm, {:.2}mm), er={:.1}",
                     port_num, tag, mode[0], mode[1], w * 1e3, h * 1e3, er);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(port));
+                Box::new(port)
             }
             FaceSpec::Coax { tag, ri, ro, origin, z_axis, er, power } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping CoaxPort", tag);
-                    continue;
-                }
                 let (cs_detected, _, _) = detect_rect_port(mesh, &tri_ids);
-                // Config origin is a physical coordinate; normalize to L₀ units.
+                // The model's origin is a physical coordinate; normalize to L₀ units.
                 let org = origin
                     .map(|o| [o[0] / mesh.l0, o[1] / mesh.l0, o[2] / mesh.l0])
                     .unwrap_or(cs_detected.origin);
                 let zax = z_axis.unwrap_or(cs_detected.zax);
                 let cs = cs_from_origin_zaxis(org, zax);
-                let port_num = ports.len() + 1;
                 let port = CoaxPort {
                     port_number: port_num,
                     power: *power, er: *er,
@@ -775,71 +654,46 @@ fn build_ports(
                 };
                 eprintln!("  Port {}: coax, tag={}, Ri={:.3}mm, Ro={:.3}mm, er={:.2}, Z0={:.2}Ohm",
                     port_num, tag, ri * 1e3, ro * 1e3, er, port.port_z());
-                port_tris.push(tri_ids);
-                ports.push(Box::new(port));
+                Box::new(port)
             }
             FaceSpec::Lumped { tag, z0, l, c, direction, width, height, power } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping port", tag);
-                    continue;
-                }
-                let port_num = ports.len() + 1;
                 let (det_w, det_h) = lumped_port_dims(mesh, &tri_ids, direction);
                 let w = if *width > 0.0 { *width / mesh.l0 } else { det_w };
                 let h = if *height > 0.0 { *height / mesh.l0 } else { det_h };
                 let port = LumpedPort {
                     port_number: port_num,
                     power: *power,
-                    z0: *z0,
-                    l: *l,
-                    c: *c,
-                    width: w,
-                    height: h,
+                    termination: LumpedElement { r: *z0, l: *l, c: *c, width: w, height: h },
                     direction: *direction,
                 };
                 eprintln!("  Port {}: lumped, tag={}, Z0={:.0}Ohm, dir=({:.1},{:.1},{:.1})",
                     port_num, tag, z0, direction[0], direction[1], direction[2]);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(port));
+                Box::new(port)
             }
             FaceSpec::UserDefined { tag, e_field, power } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping UserDefined", tag);
-                    continue;
-                }
-                let port_num = ports.len() + 1;
-                let port = UserDefinedPort::from_constant(port_num, *power, *e_field);
+                let port = UserDefinedPort { port_number: port_num, e_field: *e_field };
                 eprintln!("  Port {}: user_defined, tag={}, E=({:.3},{:.3},{:.3}), P={:.2}W",
                     port_num, tag, e_field[0], e_field[1], e_field[2], power);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(port));
+                Box::new(port)
             }
-            FaceSpec::Floquet { tag, scan_theta_deg, scan_phi_deg, mode_nr, er, power } => {
+            FaceSpec::Floquet { tag, scan_theta_deg, scan_phi_deg, mode_nr, power } => {
                 // Only normal incidence is supported in the FD solver: oblique
                 // scan needs periodic side-wall BCs and a complex mode field
                 // (issue #14). Reject θ≠0 rather than silently returning wrong
                 // S-parameters.
-                assert!(
-                    scan_theta_deg.abs() < 1e-9,
-                    "FloquetPort: oblique scan (θ={:.3}°) is not yet supported in \
-                     the frequency-domain solver — it requires periodic side-wall \
-                     boundary conditions and a complex mode field (see issue #14). \
-                     Only normal incidence (θ=0) is valid.",
-                    scan_theta_deg
-                );
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping FloquetPort", tag);
-                    continue;
+                if scan_theta_deg.abs() >= 1e-9 {
+                    return Err(format!(
+                        "FloquetPort: oblique scan (θ={scan_theta_deg:.3}°) is not supported in \
+                         the frequency-domain solver, it needs periodic side-wall boundary \
+                         conditions and a complex mode field (issue #14); only normal \
+                         incidence (θ=0) is valid"
+                    ));
                 }
                 let (cs_detected, det_w, det_h) = detect_rect_port(mesh, &tri_ids);
                 let area = det_w * det_h;
-                let port_num = ports.len() + 1;
                 let port = FloquetPort {
                     port_number: port_num,
-                    power: *power, er: *er, area,
+                    power: *power, area,
                     scan_theta: scan_theta_deg.to_radians(),
                     scan_phi: scan_phi_deg.to_radians(),
                     mode_nr: *mode_nr,
@@ -849,19 +703,10 @@ fn build_ports(
                     port_num, tag, mode_nr,
                     if *mode_nr == 1 { "TE/S" } else { "TM/P" },
                     scan_theta_deg, scan_phi_deg, area * 1e6);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(port));
+                Box::new(port)
             }
-            FaceSpec::Pmc { tag } => {
-                let tri_ids = mesh.tris_for_tag(*tag);
-                eprintln!("  PMC: tag={}, {} triangles (natural BC)", tag, tri_ids.len());
-            }
+            FaceSpec::Pmc { .. } => unreachable!("PMC faces are skipped above"),
             FaceSpec::LumpedElement { tag, r, l, c, width, height, direction } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping LumpedElement", tag);
-                    continue;
-                }
                 let (det_w, det_h) = lumped_port_dims(mesh, &tri_ids, direction);
                 // surf_z uses w/h as a ratio (scale-invariant); normalize both
                 // anyway so the values stay consistent with the L₀-unit mesh.
@@ -870,69 +715,48 @@ fn build_ports(
                 let bc = LumpedElement { r: *r, l: *l, c: *c, width: w, height: h };
                 eprintln!("  LumpedElement: tag={}, R={:.2}Ohm, L={:.2e}H, C={:?}F, w={:.2}mm, h={:.2}mm",
                     tag, r, l, c, w * 1e3, h * 1e3);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(bc));
+                Box::new(bc)
             }
             FaceSpec::SurfaceImpedance { tag, conductivity, mur, er, thickness, two_sided, sheet, zs } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping SurfaceImpedance", tag);
-                    continue;
-                }
-                let bc = if let Some(zs_arr) = zs {
-                    let mut s = SurfaceImpedance::from_zs(C64::new(zs_arr[0], zs_arr[1]));
-                    s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided; s.sheet = *sheet;
-                    s
-                } else {
-                    let mut s = SurfaceImpedance::from_conductivity(*conductivity);
-                    s.mur = *mur; s.er = *er; s.thickness = *thickness; s.two_sided = *two_sided; s.sheet = *sheet;
-                    s
+                let mut bc = match zs {
+                    Some(zs) => SurfaceImpedance::from_zs(C64::new(zs[0], zs[1])),
+                    None => SurfaceImpedance::from_conductivity(*conductivity),
                 };
+                bc.mur = *mur; bc.er = *er; bc.thickness = *thickness; bc.two_sided = *two_sided; bc.sheet = *sheet;
+                if zs.is_none() && !*sheet && f_min.is_finite() && f_min > 0.0 {
+                    let delta = bc.skin_depth(&crate::excitation::Excitation::new(f_min, mesh.l0));
+                    bc.edges = crate::sibc_edge::EdgeProfile::build(mesh, &tri_ids, crate::sibc_edge::REACH * delta / mesh.l0);
+                }
                 eprintln!("  SurfaceImpedance: tag={}, sigma={:.2e}S/m, ur={:.2}, er={:.2}, t={:?}, two_sided={}, sheet={}",
                     tag, conductivity, mur, er, thickness, two_sided, sheet);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(bc));
+                Box::new(bc)
             }
             FaceSpec::Abc { tag } => {
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping ABC", tag);
-                    continue;
-                }
-                let abc = AbsorbingBoundary::new();
+                let abc = AbsorbingBoundary;
                 eprintln!("  ABC: tag={}", tag);
-                port_tris.push(tri_ids);
-                ports.push(Box::new(abc));
+                Box::new(abc)
             }
             FaceSpec::WaveNumerical { tag, f0, mode_index, kind, pec_tags, power } => {
                 let f0 = f0.ok_or_else(|| format!(
                     "WavePort on tag {tag}: the frequency-domain backend needs f0 \
                      (the operating frequency of the 2D mode eigensolve)"))?;
-                let tri_ids = mesh.tris_for_tag(*tag).to_vec();
-                if tri_ids.is_empty() {
-                    eprintln!("  WARNING: tag {} has no triangles, skipping WaveNumerical", tag);
-                    continue;
-                }
-                let port_num = ports.len() + 1;
                 let pn = build_wave_numerical(
                     mesh, materials, &tri_ids, f0, *mode_index, *kind,
-                    pec_tags, *power, port_num,
+                    pec_tags, &pmc_tags, *power, port_num,
                 );
-                match pn {
-                    Some(port) => {
-                        eprintln!(
-                            "  Port {}: wave_numerical, tag={}, f0={:.3}GHz, kind={:?}, mode_idx={}, n_eff={:.3}",
-                            port_num, tag, f0 * 1e-9, kind, mode_index, port.n_eff,
-                        );
-                        port_tris.push(tri_ids);
-                        ports.push(Box::new(port));
-                    }
-                    None => {
-                        eprintln!("  WARNING: tag {}: wave_numerical eigensolve failed, skipping", tag);
-                    }
-                }
+                let Some(port) = pn else {
+                    eprintln!("  WARNING: tag {}: wave_numerical eigensolve failed, skipping", tag);
+                    continue;
+                };
+                eprintln!(
+                    "  Port {}: wave_numerical, tag={}, f0={:.3}GHz, kind={:?}, mode_idx={}, n_eff={:.3}",
+                    port_num, tag, f0 * 1e-9, kind, mode_index, port.n_eff,
+                );
+                Box::new(port)
             }
-        }
+        };
+        port_tris.push(tri_ids);
+        ports.push(port);
     }
 
     Ok((ports, port_tris))
@@ -947,7 +771,7 @@ fn build_pec_tris(mesh: &Mesh, model: &Model) -> Vec<usize> {
 
     // Default boundary condition: every EXTERIOR boundary face (one adjacent
     // tet) that carries no explicit port / BC becomes PEC (tangential E = 0).
-    // A magnetic wall — the bare natural BC of the curl-curl form — is opt-in
+    // A magnetic wall, the bare natural BC of the curl-curl form, is opt-in
     // via an explicit PMC. This makes a closed metal box the default and
     // removes the footgun where an untagged outer wall silently leaks (acts as
     // a magnetic wall). Interior faces (two adjacent tets) are never touched.
@@ -973,8 +797,7 @@ fn build_materials(mesh: &Mesh, model: &Model) -> Vec<Material> {
     model.materials.iter().map(|mc| {
         let tet_indices = mesh
             .vtag_to_tet
-            .get(&mc.volume_tag)
-            .map(|v| v.clone())
+            .get(&mc.volume_tag).cloned()
             .unwrap_or_default();
         if tet_indices.is_empty() {
             eprintln!("  WARNING: volume tag {} has no tets", mc.volume_tag);
@@ -1011,8 +834,7 @@ fn build_pml_regions(mesh: &Mesh, model: &Model) -> Vec<PmlRegion> {
     model.pml.iter().map(|pc| {
         let tet_indices = mesh
             .vtag_to_tet
-            .get(&pc.volume_tag)
-            .map(|v| v.clone())
+            .get(&pc.volume_tag).cloned()
             .unwrap_or_default();
         if tet_indices.is_empty() {
             eprintln!("  WARNING: PML volume tag {} has no tets", pc.volume_tag);
@@ -1039,71 +861,44 @@ fn build_pml_regions(mesh: &Mesh, model: &Model) -> Vec<PmlRegion> {
     }).collect()
 }
 
-/// Build a per-tet scalar relative permittivity from the materials list. Used
-/// by `build_wave_numerical` to feed the vector eigensolver. Anisotropic
-/// materials collapse to the mean of their diagonal, sufficient for the
-/// shift-invert pivot in `solve_vector_modes`.
-fn per_tet_eps_scalar(materials: &[Material], n_tets: usize) -> Vec<f64> {
-    let mut eps = vec![1.0_f64; n_tets];
+/// A nodal field (`[x, y, z]` per node) in the viewer's phasor form: per
+/// node `A = |Re E|²`, `B = |Im E|²`, `C = Re E · Im E`, so that
+/// `|E(t)|² = A cos²(ωt) + B sin²(ωt) - 2 C sin(ωt) cos(ωt)`, as f32.
+pub fn abc_phasor(field: &[C64]) -> Vec<f32> {
+    field
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|v| {
+            let (re, im) = (v.iter().map(|c| c.re), v.iter().map(|c| c.im));
+            let a: f64 = re.clone().map(|x| x * x).sum();
+            let b: f64 = im.clone().map(|y| y * y).sum();
+            let c: f64 = re.zip(im).map(|(x, y)| x * y).sum();
+            [a as f32, b as f32, c as f32]
+        })
+        .collect()
+}
+
+/// One scalar per tet from its material, `default` where none applies.
+fn per_tet(materials: &[Material], n_tets: usize, default: f64, f: impl Fn(&Material) -> f64) -> Vec<f64> {
+    let mut out = vec![default; n_tets];
     for mat in materials {
-        let er_scalar = match mat.er_diag {
-            Some([a, b, c]) => (a + b + c) / 3.0,
-            None => mat.er,
-        };
+        let v = f(mat);
         for &ti in &mat.tet_indices {
-            eps[ti] = er_scalar;
+            out[ti] = v;
         }
     }
-    eps
+    out
 }
 
-/// Inward face normal toward the adjacent tet centroid (same construction as
-/// CoaxPort / TD's wave_from_mesh_tag). Returns `None` if the face has no
-/// adjacent tet (which would mean a boundary tri with no interior side).
-fn face_inward_normal(mesh: &Mesh, t0: usize) -> Option<[f64; 3]> {
-    let [v0, v1, v2] = mesh.tris[t0];
-    let p0 = mesh.nodes[v0];
-    let p1 = mesh.nodes[v1];
-    let p2 = mesh.nodes[v2];
-    let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
-    let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
-    let mut nrm = [
-        e1[1] * e2[2] - e1[2] * e2[1],
-        e1[2] * e2[0] - e1[0] * e2[2],
-        e1[0] * e2[1] - e1[1] * e2[0],
-    ];
-    let len = (nrm[0].powi(2) + nrm[1].powi(2) + nrm[2].powi(2)).sqrt();
-    if len < 1e-30 {
-        return None;
-    }
-    for c in nrm.iter_mut() { *c /= len; }
-    let tet = mesh.tri_to_tet[t0].iter().copied().find(|&x| x != usize::MAX)?;
-    let mut centroid = [0.0_f64; 3];
-    for &nd in &mesh.tets[tet] {
-        for k in 0..3 { centroid[k] += mesh.nodes[nd][k] / 4.0; }
-    }
-    let inward = [centroid[0] - p0[0], centroid[1] - p0[1], centroid[2] - p0[2]];
-    let dot = nrm[0] * inward[0] + nrm[1] * inward[1] + nrm[2] * inward[2];
-    if dot < 0.0 {
-        for c in nrm.iter_mut() { *c = -*c; }
-    }
-    Some(nrm)
+/// A material's scalar εr: the mean of a diagonal tensor.
+fn er_scalar(m: &Material) -> f64 {
+    m.er_diag.map_or(m.er, |[a, b, c]| (a + b + c) / 3.0)
 }
 
-/// Build a per-global-node boolean mask: `true` for nodes that lie on any of
-/// the listed PEC physical groups. Used by `PortMesh2D::from_face` to mark
-/// internal-conductor (e.g. microstrip trace) nodes as PEC inside the
-/// cross-section eigensolve.
-fn build_internal_pec_mask(mesh: &Mesh, pec_tags: &[i32]) -> Vec<bool> {
-    let mut mask = vec![false; mesh.nodes.len()];
-    for &tag in pec_tags {
-        for &ti in mesh.tris_for_tag(tag) {
-            for &v in &mesh.tris[ti] {
-                mask[v] = true;
-            }
-        }
-    }
-    mask
+/// A material's scalar μr: the mean of a diagonal tensor.
+fn mur_scalar(m: &Material) -> f64 {
+    m.ur_diag.map_or(m.ur, |[a, b, c]| (a + b + c) / 3.0)
 }
 
 /// Run the 2D port-face eigensolve and wrap the dominant mode as a
@@ -1118,81 +913,24 @@ fn build_wave_numerical(
     mode_index: usize,
     kind: WaveKind,
     pec_tags: &[i32],
+    pmc_tags: &[i32],
     power: f64,
     port_num: usize,
 ) -> Option<NumericalWavePort> {
-    let t0 = *tri_ids.first()?;
-    let nrm = face_inward_normal(mesh, t0)?;
-    let pec_mask = build_internal_pec_mask(mesh, pec_tags);
-    let pec_opt = if pec_tags.is_empty() { None } else { Some(pec_mask.as_slice()) };
-
-    let face_tris: Vec<[usize; 3]> = tri_ids.iter().map(|&t| mesh.tris[t]).collect();
-    let pm = PortMesh2D::from_face(&mesh.nodes, &face_tris, nrm, pec_opt);
-
+    let pec = (!pec_tags.is_empty()).then(|| mesh.nodes_on_tags(pec_tags));
+    let pmc = (!pmc_tags.is_empty()).then(|| mesh.nodes_on_tags(pmc_tags));
     let k0 = crate::excitation::Excitation::new(f0, mesh.l0).k0;
-
-    // Per-face εr (size = face_tris.len()) is always needed: the vector
-    // path uses it as the eigensolve weight, and the unified amplitude
-    // normalisation in NumericalWavePort uses it for the Poynting-flux
-    // integral. Scalar paths get a uniform-1.0 vector, they sit on
-    // homogeneous-fill cross-sections by construction.
-    let eps_per_tet = per_tet_eps_scalar(materials, mesh.n_tets());
-    let eps_face: Vec<f64> = tri_ids
-        .iter()
-        .map(|&t| {
-            mesh.tri_to_tet[t]
-                .iter()
-                .copied()
-                .find(|&x| x != usize::MAX)
-                .map(|e| eps_per_tet[e])
-                .unwrap_or(1.0)
-        })
-        .collect();
-
-    let (nm, n_eff, is_vector): (NumericalMode, f64, bool) = match kind {
-        WaveKind::Te => {
-            let modes = solve_modes(&pm, ModeKind::Te, mode_index + 1);
-            let mode = modes.get(mode_index)?;
-            let kc = mode.k_c;
-            let beta = (k0 * k0 - kc * kc).max(0.0).sqrt();
-            let n_eff = if k0 > 0.0 { beta / k0 } else { 0.0 };
-            (NumericalMode::from_scalar(pm, mode, ModeKind::Te), n_eff, false)
-        }
-        WaveKind::Tm => {
-            let modes = solve_modes(&pm, ModeKind::Tm, mode_index + 1);
-            let mode = modes.get(mode_index)?;
-            let kc = mode.k_c;
-            let beta = (k0 * k0 - kc * kc).max(0.0).sqrt();
-            let n_eff = if k0 > 0.0 { beta / k0 } else { 0.0 };
-            (NumericalMode::from_scalar(pm, mode, ModeKind::Tm), n_eff, false)
-        }
-        WaveKind::Vector => {
-            let n_pec_nodes = pm.on_pec.iter().filter(|&&b| b).count();
-            let n_boundary_nodes = pm.on_boundary.iter().filter(|&&b| b).count();
-            eprintln!(
-                "  wave_numerical[vector] tag={}: {} face tris, {} nodes, \
-                 {} boundary + {} internal PEC, eps=[{:.2},{:.2}], k0={:.3}/m",
-                tri_ids.len(), pm.tris.len(), pm.nodes.len(),
-                n_boundary_nodes, n_pec_nodes,
-                eps_face.iter().cloned().fold(f64::INFINITY, f64::min),
-                eps_face.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                k0,
-            );
-            let modes = solve_vector_modes(&pm, &eps_face, k0, mode_index + 1);
-            if modes.is_empty() {
-                eprintln!("    -> solve_vector_modes returned 0 modes");
-                return None;
-            }
-            eprintln!("    -> got {} mode(s), n_eff = {:?}",
-                modes.len(),
-                modes.iter().map(|m| m.n_eff).collect::<Vec<_>>(),
-            );
-            let mode = modes.get(mode_index)?;
-            let n_eff = mode.n_eff;
-            (NumericalMode::from_vector(pm, mode), n_eff, true)
-        }
+    let solve = match kind {
+        WaveKind::Te => PortSolve::Scalar(ModeKind::Te),
+        WaveKind::Tm => PortSolve::Scalar(ModeKind::Tm),
+        WaveKind::Vector => PortSolve::Vector,
     };
-
+    let eps_per_tet = per_tet(materials, mesh.n_tets(), 1.0, er_scalar);
+    let (nm, n_eff) = solve_port_face(
+        mesh, tri_ids, solve, mode_index, &eps_per_tet, k0, pec.as_deref(), pmc.as_deref(),
+    )?;
+    let is_vector = solve == PortSolve::Vector;
+    let face_tris: Vec<[usize; 3]> = tri_ids.iter().map(|&t| mesh.tris[t]).collect();
     Some(NumericalWavePort::new(
         port_num,
         power,

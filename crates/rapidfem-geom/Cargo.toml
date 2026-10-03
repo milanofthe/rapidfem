@@ -1,0 +1,36 @@
+[package]
+name = "rapidfem-geom"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+# Geometry and meshing on the vendored rapidmesh: the rapidfem geometry
+# builder, and the mesh handed to the solvers straight from rapidmesh's
+# solver view (no mesh file in between).
+
+[lib]
+doctest = false
+
+[dependencies]
+rapidfem-core = { path = "../rapidfem-core" }
+rapidmesh = { path = "../../vendor/rapidmesh/crates/rapidmesh" }
+rapidmesh-step = { path = "../../vendor/rapidmesh/crates/rapidmesh-step" }
+rapidmesh-geom = { path = "../../vendor/rapidmesh/crates/rapidmesh-geom" }
+rapidmesh-tet = { path = "../../vendor/rapidmesh/crates/rapidmesh-tet" }
+rapidmesh-topo = { path = "../../vendor/rapidmesh/crates/rapidmesh-topo" }
+# Sheet booleans until rapidmesh has them (milanofthe/rapidmesh-dev#292).
+i_overlay = "1.9"
+hashbrown = "0.16.1"
+# GDSII reading (Layout21, BSD-3), pinned: a pre-release line.
+gds21 = "=3.0.0-pre.2"
+roxmltree = "0.20"
+# float_roundtrip: exact float parsing (the stack JSON round-trips)
+serde_json = { version = "1", features = ["float_roundtrip"] }
+pyo3 = { version = "0.29", optional = true }
+
+[features]
+# The stack types as Python classes, for the bindings.
+python = ["dep:pyo3"]
+
+[lints]
+workspace = true

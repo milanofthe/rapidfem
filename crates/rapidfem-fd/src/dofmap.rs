@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Global degree-of-freedom numbering, by geometric entity.
 //!
@@ -23,8 +20,6 @@
 //! `[all edges m1][all faces m1][all edges m2][all faces m2]`, which only works
 //! when every entity has the same count. The two differ by a permutation of the
 //! unknowns; the assembled system is the same up to that relabelling.)
-
-use crate::mesh::Mesh;
 
 /// Which geometric entity a local element DOF belongs to, and its index within
 /// that entity. An element reports this once per local DOF; the map turns it
@@ -89,19 +84,6 @@ impl DofMap {
             cell_base,
             n_field: cell_base + n_cell_dofs,
         }
-    }
-
-    /// The uniform Nédélec first-kind order-2 space: 2 DOFs on every edge, 2 on
-    /// every face, none in the interior.
-    pub fn uniform_r2(mesh: &Mesh) -> DofMap {
-        DofMap::new(
-            mesh.n_edges(),
-            mesh.n_tris(),
-            mesh.n_tets(),
-            |_| 2,
-            |_| 2,
-            |_| 0,
-        )
     }
 
     #[inline]
@@ -175,7 +157,7 @@ mod tests {
     fn variable_counts_are_contiguous_and_complete() {
         // 3 edges with 1, 2, 3 DOFs; 2 faces with 0 and 2; 1 cell with 3.
         let m = DofMap::new(3, 2, 1, |e| (e + 1) as u32, |f| (f * 2) as u32, |_| 3);
-        assert_eq!(m.n_field, (1 + 2 + 3) + (0 + 2) + 3);
+        assert_eq!(m.n_field, (1 + 2 + 3) + 2 + 3);
 
         let mut seen = vec![0u32; m.n_field];
         for e in 0..3 {
@@ -204,7 +186,7 @@ mod tests {
     #[test]
     fn empty_entities_take_no_space() {
         let m = DofMap::new(1, 3, 0, |_| 1, |f| if f == 1 { 0 } else { 2 }, |_| 0);
-        assert_eq!(m.n_field, 1 + 2 + 0 + 2);
+        assert_eq!(m.n_field, (1 + 2) + 2);
         assert_eq!(m.n_face_dofs(1), 0);
         // face 2 follows face 0 immediately, because face 1 is empty
         assert_eq!(m.face_dof(2, 0), m.face_dof(0, 1) + 1);

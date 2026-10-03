@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Port boundary conditions and their analytic modal fields.
 //!
@@ -19,45 +16,42 @@ use num_complex::Complex64 as C64;
 use rapidfem_core::port_eigen::NumericalMode;
 use crate::constants::*;
 use crate::excitation::Excitation;
+use crate::port::Port;
+use rapidfem_core::geom::{cross, dot, scale, sub, unit};
 
-/// Orthonormal port coordinate frame (origin + x̂,ŷ,ẑ rows).
-///
-/// Stores origin, xax (xhat), yax (yhat), zax (zhat), _basis, _basis_inv.
+/// Robin coefficient γ = j·k₀·Z₀/Zs of a sheet with impedance `zs` (Ω/sq).
+fn sheet_gamma(exc: &Excitation, zs: C64) -> C64 {
+    C64::new(0.0, exc.k0 * Z0) / zs
+}
+
+/// Series R-L-C impedance R + jωL + 1/(jωC); `c` None means no capacitor.
+fn series_rlc(r: f64, l: f64, c: Option<f64>, omega: f64) -> C64 {
+    let mut z = C64::new(r, omega * l);
+    if let Some(c) = c.filter(|&c| c > 0.0) {
+        z += C64::new(0.0, -1.0 / (omega * c));
+    }
+    z
+}
+
+/// Orthonormal port coordinate frame: origin and the local x̂, ŷ, ẑ axes.
 pub struct CoordinateSystem {
     pub origin: [f64; 3],
     pub xax: [f64; 3],
     pub yax: [f64; 3],
     pub zax: [f64; 3],
-    /// _basis: rows are xax, yax, zax
-    pub basis: [[f64; 3]; 3],
-    /// _basis_inv: inverse of basis (for global→local transform)
-    pub basis_inv: [[f64; 3]; 3],
 }
 
 impl CoordinateSystem {
     /// Build CS from origin and 3 orthonormal axes.
     pub fn new(origin: [f64; 3], xax: [f64; 3], yax: [f64; 3], zax: [f64; 3]) -> Self {
-        let basis = [xax, yax, zax];
-        // For orthonormal basis, inverse = transpose
-        let basis_inv = [
-            [xax[0], yax[0], zax[0]],
-            [xax[1], yax[1], zax[1]],
-            [xax[2], yax[2], zax[2]],
-        ];
-        CoordinateSystem { origin, xax, yax, zax, basis, basis_inv }
+        CoordinateSystem { origin, xax, yax, zax }
     }
 
-    /// Map a global point into the local frame.
+    /// Map a global point into the local frame (the axes are orthonormal, so
+    /// the local coordinates are projections onto them).
     pub fn in_local_cs(&self, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-        let b = &self.basis_inv;
-        let xg = x - self.origin[0];
-        let yg = y - self.origin[1];
-        let zg = z - self.origin[2];
-        (
-            b[0][0]*xg + b[0][1]*yg + b[0][2]*zg,
-            b[1][0]*xg + b[1][1]*yg + b[1][2]*zg,
-            b[2][0]*xg + b[2][1]*yg + b[2][2]*zg,
-        )
+        let d = [x - self.origin[0], y - self.origin[1], z - self.origin[2]];
+        (dot(self.xax, d), dot(self.yax, d), dot(self.zax, d))
     }
 
     /// Rotate local vector components back into the global frame.
@@ -76,7 +70,6 @@ pub struct RectWaveguide {
     pub power: f64,
     pub mode: (usize, usize),
     pub er: f64,
-    pub polarization: f64,
     pub dims: (f64, f64),  // (width, height)
     pub cs: CoordinateSystem,
 }
@@ -99,12 +92,6 @@ impl RectWaveguide {
             - (PI * n as f64 / height).powi(2)).sqrt()
     }
 
-    /// Robin γ-coefficient for the port boundary term.
-    /// gamma = 1j * beta
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, self.get_beta(exc))
-    }
-
     /// Mode wave impedance (TE: ωμ/β). Uses the length-coupled ω̃ = κ·c₀ so the
     /// impedance is invariant under the L₀ scaling (ω̃ and β both carry one L₀).
     /// Zmode = ω̃ * MU0 / beta
@@ -121,18 +108,18 @@ impl RectWaveguide {
     /// Transverse modal E-field at a local cross-section point.
     /// Returns (Ex, Ey, Ez) in LOCAL coordinates.
     ///
-    /// Ev = polarization * amplitude * cos(pi*m*x/width) * cos(pi*n*y/height)
-    /// Eh = polarization * amplitude * sin(pi*m*x/width) * sin(pi*n*y/height)
+    /// Ev = amplitude * cos(pi*m*x/width) * cos(pi*n*y/height)
+    /// Eh = amplitude * sin(pi*m*x/width) * sin(pi*n*y/height)
     /// Ex = Eh, Ey = Ev, Ez = 0
     /// Result scaled by qmode.
     pub fn port_mode_3d(&self, x_local: f64, y_local: f64, exc: &Excitation) -> (f64, f64, f64) {
         let (width, height) = self.dims;
         let (m, n) = self.mode;
         let a = self.get_amplitude(exc);
-        let ev = self.polarization * a
+        let ev = a
             * (PI * m as f64 * x_local / width).cos()
             * (PI * n as f64 * y_local / height).cos();
-        let eh = self.polarization * a
+        let eh = a
             * (PI * m as f64 * x_local / width).sin()
             * (PI * n as f64 * y_local / height).sin();
         let ex = eh;
@@ -149,37 +136,23 @@ impl RectWaveguide {
         let (ex, ey, ez) = self.port_mode_3d(xl, yl, exc);
         self.cs.in_global_basis(ex, ey, ez)
     }
-
-    /// Incident-wave source term for the port excitation vector.
-    /// Returns -2j * beta * port_mode_3d_global(...) as complex [3] vector.
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let (ex, ey, ez) = self.port_mode_3d_global(x, y, z, exc);
-        let factor = C64::new(0.0, -2.0 * self.get_beta(exc));
-        [factor * C64::from(ex), factor * C64::from(ey), factor * C64::from(ez)]
-    }
 }
 
-/// First-order Sommerfeld absorbing boundary: γ = j·k₀·neff (neff = 1 for air).
-/// A plain matched-impedance sheet, dissipative by construction.
-pub struct AbsorbingBoundary {
-    pub neff: f64,
+impl Port for RectWaveguide {
+    fn port_number(&self) -> usize { self.port_number }
+    fn beta(&self, exc: &Excitation) -> f64 { self.get_beta(exc) }
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some(self.port_mode_3d_global(x, y, z, exc))
+    }
+    fn z_mode(&self, exc: &Excitation) -> f64 { self.z_mode(exc) }
 }
 
-impl AbsorbingBoundary {
-    pub fn new() -> Self {
-        AbsorbingBoundary { neff: 1.0 }
-    }
+/// First-order Sommerfeld absorbing boundary in air: γ = j·k₀. A plain
+/// matched-impedance sheet, dissipative by construction.
+pub struct AbsorbingBoundary;
 
-    /// γ(k0) = j·k₀·neff.
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, exc.k0 * self.neff)
-    }
-}
-
-impl Default for AbsorbingBoundary {
-    fn default() -> Self {
-        Self::new()
-    }
+impl Port for AbsorbingBoundary {
+    fn beta(&self, exc: &Excitation) -> f64 { exc.k0 }
 }
 
 /// Floquet plane-wave port.
@@ -201,7 +174,6 @@ impl Default for AbsorbingBoundary {
 pub struct FloquetPort {
     pub port_number: usize,
     pub power: f64,
-    pub er: f64,
     /// Port-face area (m²), used for amplitude normalization.
     pub area: f64,
     /// Scan angle θ measured from port normal (radians). 0 = normal incidence.
@@ -215,12 +187,6 @@ pub struct FloquetPort {
 }
 
 impl FloquetPort {
-    pub fn beta(&self, exc: &Excitation) -> f64 { exc.k0 * self.scan_theta.cos() }
-
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, self.beta(exc))
-    }
-
     pub fn amplitude(&self, _exc: &Excitation) -> f64 {
         // E0 = sqrt(2·Z0·P / (A · cos θ)).
         (2.0 * Z0 * self.power / (self.area * self.scan_theta.cos())).sqrt()
@@ -239,63 +205,39 @@ impl FloquetPort {
 
         // Uniform transverse mode field, valid only at normal incidence (θ=0),
         // which `build_ports` enforces. Oblique scan additionally needs the
-        // transverse Bloch phase exp(-j·k_t·r) and periodic side-wall BCs — see
+        // transverse Bloch phase exp(-j·k_t·r) and periodic side-wall BCs, see
         // issue #14.
         let ex_l = e0 * (-s * sin_p - p * cos_t * cos_p);
         let ey_l = e0 * (s * cos_p - p * cos_t * sin_p);
         let ez_l = e0 * (-p * sin_t);
         self.cs.in_global_basis(ex_l, ey_l, ez_l)
     }
-
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let (mx, my, mz) = self.port_mode_3d_global(x, y, z, exc);
-        let factor = C64::new(0.0, -2.0 * self.beta(exc));
-        [factor * C64::from(mx), factor * C64::from(my), factor * C64::from(mz)]
-    }
 }
 
-/// User-defined port: a caller-supplied uniform transverse field.
-///
-/// The user supplies the port's E-field mode as a closure. A common case (constant E
-/// uniform across the face, e.g. parallel-plate TEM) is exposed via `from_constant`.
-/// gamma = j·β, get_uinc = -2j·β·mode_field. β defaults to k₀ but can be overridden.
+impl Port for FloquetPort {
+    fn port_number(&self) -> usize { self.port_number }
+    fn beta(&self, exc: &Excitation) -> f64 { exc.k0 * self.scan_theta.cos() }
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some(self.port_mode_3d_global(x, y, z, exc))
+    }
+    fn z_mode(&self, _exc: &Excitation) -> f64 { Z0 }
+}
+
+/// User-defined port: a uniform constant transverse field `e_field` across
+/// the face (e.g. a parallel-plate TEM mode), β = k₀. The mode impedance is a
+/// dummy 1 Ω; the user scales the drive via the incident power.
 pub struct UserDefinedPort {
     pub port_number: usize,
-    pub power: f64,
-    /// Mode field function: (k0, x, y, z) -> (Ex, Ey, Ez). Stored as a boxed closure.
-    pub mode_fn: Box<dyn Fn(f64, f64, f64, f64) -> (f64, f64, f64) + Send + Sync>,
-    /// Optional kz(k0) override; defaults to k0 (TEM-like)
-    pub beta_fn: Option<Box<dyn Fn(f64) -> f64 + Send + Sync>>,
+    pub e_field: [f64; 3],
 }
 
-impl UserDefinedPort {
-    /// Construct a port with a uniform constant E vector across the face.
-    pub fn from_constant(port_number: usize, power: f64, e_vec: [f64; 3]) -> Self {
-        let mode_fn: Box<dyn Fn(f64, f64, f64, f64) -> (f64, f64, f64) + Send + Sync> =
-            Box::new(move |_k0, _x, _y, _z| (e_vec[0], e_vec[1], e_vec[2]));
-        UserDefinedPort { port_number, power, mode_fn, beta_fn: None }
+impl Port for UserDefinedPort {
+    fn port_number(&self) -> usize { self.port_number }
+    fn beta(&self, exc: &Excitation) -> f64 { exc.k0 }
+    fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some((self.e_field[0], self.e_field[1], self.e_field[2]))
     }
-
-    pub fn beta(&self, exc: &Excitation) -> f64 {
-        match &self.beta_fn {
-            Some(f) => f(exc.k0),
-            None => exc.k0,
-        }
-    }
-
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, self.beta(exc))
-    }
-
-    pub fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> (f64, f64, f64) {
-        (self.mode_fn)(exc.k0, x, y, z)
-    }
-
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let (mx, my, mz) = self.port_mode_3d_global(x, y, z, exc);
-        let factor = C64::new(0.0, -2.0 * self.beta(exc));
-        [factor * C64::from(mx), factor * C64::from(my), factor * C64::from(mz)]
-    }
+    fn z_mode(&self, _exc: &Excitation) -> f64 { 1.0 }
 }
 
 /// Coaxial port (TEM mode): radial E ∝ 1/ρ between inner and outer conductors.
@@ -316,12 +258,6 @@ pub struct CoaxPort {
 }
 
 impl CoaxPort {
-    pub fn beta(&self, exc: &Excitation) -> f64 { exc.k0 * self.er.sqrt() }
-
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, self.beta(exc))
-    }
-
     /// Characteristic impedance of the coaxial line (Ω).
     pub fn port_z(&self) -> f64 {
         let eta = Z0 / self.er.sqrt();
@@ -335,7 +271,7 @@ impl CoaxPort {
 
     pub fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, _exc: &Excitation) -> (f64, f64, f64) {
         // Local cylindrical: rho = sqrt(xl² + yl²), phi = atan2(yl, xl).
-        // The mode formula is mathematically valid for any ρ>0; the gmsh-meshed annulus
+        // The mode formula is mathematically valid for any ρ>0; the meshed annulus
         // confines us to ρ ∈ [Ri, Ro], so we don't gate on the radii (mesh-imperfect quadrature
         // points slightly outside the geometric bounds would otherwise be cut, costing power).
         let (xl, yl, _) = self.cs.in_local_cs(x, y, z);
@@ -349,35 +285,29 @@ impl CoaxPort {
         let ey_l = e_rho * phi.sin();
         self.cs.in_global_basis(ex_l, ey_l, 0.0)
     }
+}
 
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let (mx, my, mz) = self.port_mode_3d_global(x, y, z, exc);
-        let factor = C64::new(0.0, -2.0 * self.beta(exc));
-        [factor * C64::from(mx), factor * C64::from(my), factor * C64::from(mz)]
+impl Port for CoaxPort {
+    fn port_number(&self) -> usize { self.port_number }
+    fn beta(&self, exc: &Excitation) -> f64 { exc.k0 * self.er.sqrt() }
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some(self.port_mode_3d_global(x, y, z, exc))
     }
+    fn z_mode(&self, _exc: &Excitation) -> f64 { self.port_z() }
 }
 
 /// Construct an orthonormal coordinate system from origin + z-axis. The x and y axes
 /// are chosen via Gram-Schmidt against an arbitrary reference (avoiding parallel cases).
 pub fn cs_from_origin_zaxis(origin: [f64; 3], z_axis: [f64; 3]) -> CoordinateSystem {
-    let zn = (z_axis[0].powi(2) + z_axis[1].powi(2) + z_axis[2].powi(2)).sqrt();
-    let zhat = [z_axis[0] / zn, z_axis[1] / zn, z_axis[2] / zn];
+    let zhat = unit(z_axis);
     // Choose an x-axis reference that's not parallel to z
     let xref = if zhat[0].abs() < AXIS_REF_PARALLEL_MAX {
         [1.0, 0.0, 0.0]
     } else {
         [0.0, 1.0, 0.0]
     };
-    let dot = xref[0] * zhat[0] + xref[1] * zhat[1] + xref[2] * zhat[2];
-    let xraw = [xref[0] - dot * zhat[0], xref[1] - dot * zhat[1], xref[2] - dot * zhat[2]];
-    let xn = (xraw[0].powi(2) + xraw[1].powi(2) + xraw[2].powi(2)).sqrt();
-    let xhat = [xraw[0] / xn, xraw[1] / xn, xraw[2] / xn];
-    let yhat = [
-        zhat[1] * xhat[2] - zhat[2] * xhat[1],
-        zhat[2] * xhat[0] - zhat[0] * xhat[2],
-        zhat[0] * xhat[1] - zhat[1] * xhat[0],
-    ];
-    CoordinateSystem::new(origin, xhat, yhat, zhat)
+    let xhat = unit(sub(xref, scale(zhat, dot(xref, zhat))));
+    CoordinateSystem::new(origin, xhat, cross(zhat, xhat), zhat)
 }
 
 /// Surface impedance boundary condition (lossy conductor wall).
@@ -388,17 +318,17 @@ pub fn cs_from_origin_zaxis(origin: [f64; 3], z_axis: [f64; 3]) -> CoordinateSys
 ///
 /// The finite-thickness correction Zs = Zs,∞·coth(γₘ·t_eff) has two regimes:
 ///
-/// * `two_sided = false` — the sheet is exposed to fields on one side only
+/// * `two_sided = false`: the sheet is exposed to fields on one side only
 ///   (e.g. a ground plane on the domain boundary). The face owns the full
 ///   metal cross-section: t_eff = t, and Zs → 1/(σt) at DC.
-/// * `two_sided = true` — the face is one side of a conductor carrying SIBC
+/// * `two_sided = true`: the face is one side of a conductor carrying SIBC
 ///   on opposing faces (a shell around an extruded trace). Each face owns
 ///   half the metal: t_eff = t/2, so per-face Zs → 2/(σt) at DC and the two
 ///   opposing faces in parallel recover the physical 1/(σt). This is
 ///   algebraically identical to Palace's (sinh ν ± sin ν)/(cosh ν − cos ν)
 ///   thin-sheet correction with ν = t/δ.
 ///
-/// * `sheet = true` — a zero-thickness sheet embedded in the volume with
+/// * `sheet = true`: a zero-thickness sheet embedded in the volume with
 ///   fields on both sides, standing in for a strip of thickness t. The two
 ///   faces of the strip carry the current in parallel:
 ///   Z = Zs,∞·coth(γₘ·t/2)/2 (the even mode of the slab two-port), 1/(σt) at
@@ -424,22 +354,29 @@ pub struct SurfaceImpedance {
     pub sheet: bool,
     /// Optional explicit surface impedance Zs (Ω/sq); overrides σ-based calc when Some
     pub zs: Option<C64>,
+    /// The conductor's convex edges near the faces, for the edge correction
+    /// of a σ-based impedance (see [`crate::sibc_edge`]).
+    pub edges: Option<crate::sibc_edge::EdgeProfile>,
 }
 
 impl SurfaceImpedance {
     pub fn from_conductivity(sigma: f64) -> Self {
-        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: None }
+        SurfaceImpedance { sigma, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: None, edges: None }
     }
 
     pub fn from_zs(zs: C64) -> Self {
-        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: Some(zs) }
+        SurfaceImpedance { sigma: 0.0, mur: 1.0, er: 1.0, thickness: None, two_sided: false, sheet: false, zs: Some(zs), edges: None }
     }
 
-    /// Robin γ-coefficient from the surface impedance Zs: γ = j·k₀·Z₀/Zs.
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        let r = self.surface_impedance(exc);
-        // γ = j*k0*Z0 / R
-        C64::new(0.0, exc.k0 * Z0) / r
+    /// Skin depth (m) at the excitation's frequency:
+    /// δ = sqrt( 2ρ/(ωμ) * (sqrt(1 + (ωερ)²) + ρωε) ).
+    pub fn skin_depth(&self, exc: &Excitation) -> f64 {
+        let eps = crate::constants::EPS0 * self.er;
+        let mu = crate::constants::MU0 * self.mur;
+        let rho = 1.0 / self.sigma;
+        let we = exc.omega * eps;
+        let inner = (1.0 + (we * rho).powi(2)).sqrt() + rho * we;
+        (2.0 * rho / (exc.omega * mu) * inner).sqrt()
     }
 
     fn surface_impedance(&self, exc: &Excitation) -> C64 {
@@ -450,10 +387,7 @@ impl SurfaceImpedance {
         let eps = crate::constants::EPS0 * self.er;
         let mu = crate::constants::MU0 * self.mur;
         let rho = 1.0 / self.sigma;
-        // Skin depth: δ = sqrt( 2ρ/(ωμ) * (sqrt(1 + (ωερ)²) + ρωε) )
-        let we = w0 * eps;
-        let inner = (1.0 + (we * rho).powi(2)).sqrt() + rho * we;
-        let d_skin = (2.0 * rho / (w0 * mu) * inner).sqrt();
+        let d_skin = self.skin_depth(exc);
         // R = (1 + j) ρ / δ
         let mut r = C64::new(1.0, 1.0) * C64::from(rho / d_skin);
         if let Some(t) = self.thickness {
@@ -463,12 +397,29 @@ impl SurfaceImpedance {
             let eps_c = C64::new(eps, -self.sigma / w0);
             let mu_c = C64::new(mu, 0.0);
             let gamma_m = C64::new(0.0, w0) * (mu_c * eps_c).sqrt();
-            r = r / (gamma_m * C64::from(t_eff)).tanh();
+            r /= (gamma_m * C64::from(t_eff)).tanh();
         }
         if self.sheet {
             r *= 0.5;
         }
         r
+    }
+}
+
+impl Port for SurfaceImpedance {
+    /// γ = j·k₀·Z₀/Zs.
+    fn get_gamma(&self, exc: &Excitation) -> C64 { sheet_gamma(exc, self.surface_impedance(exc)) }
+
+    /// The edge-corrected admittance tensor of the `k`-th face triangle
+    /// (see [`crate::sibc_edge`]); `None` where the scalar γ holds: an
+    /// explicit Zs, a sheet, a conductor under 3 δ across, a triangle away
+    /// from the edges.
+    fn tri_tensor(&self, exc: &Excitation, k: usize) -> Option<[[C64; 3]; 3]> {
+        let edges = self.edges.as_ref()?;
+        if self.zs.is_some() || self.sheet {
+            return None;
+        }
+        edges.tensor(k, self.get_gamma(exc), self.skin_depth(exc) / exc.l0)
     }
 }
 
@@ -490,93 +441,64 @@ pub struct LumpedElement {
 }
 
 impl LumpedElement {
-    pub fn impedance(&self, exc: &Excitation) -> C64 {
-        let omega = exc.omega;
-        let mut z = C64::new(self.r, omega * self.l);
-        if let Some(c) = self.c {
-            if c > 0.0 {
-                z += C64::new(0.0, -1.0 / (omega * c));
-            }
-        }
-        z
-    }
-
+    /// Sheet impedance Z(ω)·width/height of the element.
     pub fn surf_z(&self, exc: &Excitation) -> C64 {
-        self.impedance(exc) * C64::from(self.width / self.height)
+        series_rlc(self.r, self.l, self.c, exc.omega) * C64::from(self.width / self.height)
     }
+}
 
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, exc.k0 * Z0) / self.surf_z(exc)
-    }
+impl Port for LumpedElement {
+    fn get_gamma(&self, exc: &Excitation) -> C64 { sheet_gamma(exc, self.surf_z(exc)) }
 }
 
 /// Lumped port: a uniform-field gap source terminated in a series R-L-C.
 ///
-/// Termination impedance Z(ω) = R + jωL + 1/(jωC) (R = `z0`); the Robin BC uses
-/// the full RLC sheet impedance, while the incident-wave source and the
-/// S-parameter reference use the resistive part R (the standard real reference
-/// impedance). With L = 0 and no C this is the pure-R reference port.
-/// Derivation: derivations/lumped_port/.
+/// Termination impedance Z(ω) = R + jωL + 1/(jωC) (R = `termination.r`); the
+/// Robin BC uses the full RLC sheet impedance, while the incident-wave source
+/// and the S-parameter reference use the resistive part R (the standard real
+/// reference impedance). With L = 0 and no C this is the pure-R reference
+/// port. Derivation: derivations/lumped_port/.
 pub struct LumpedPort {
     pub port_number: usize,
     pub power: f64,
-    /// Reference resistance R (Ω) — S-parameters and incident power normalise to this.
-    pub z0: f64,
-    /// Series inductance L (H); 0 ⇒ no inductor.
-    pub l: f64,
-    /// Series capacitance C (F); None ⇒ no capacitor.
-    pub c: Option<f64>,
-    pub width: f64,
-    pub height: f64,
+    /// The R-L-C termination and the gap's width and height; R is the
+    /// reference resistance S-parameters and incident power normalise to.
+    pub termination: LumpedElement,
     /// E-field direction unit vector in global coordinates
     pub direction: [f64; 3],
 }
 
 impl LumpedPort {
-    /// Series RLC termination impedance Z(ω) = R + jωL + 1/(jωC), R = z0.
-    pub fn impedance(&self, exc: &Excitation) -> C64 {
-        let omega = exc.omega;
-        let mut z = C64::new(self.z0, omega * self.l);
-        if let Some(c) = self.c {
-            if c > 0.0 {
-                z += C64::new(0.0, -1.0 / (omega * c));
-            }
-        }
-        z
-    }
-
-    /// Sheet impedance for the Robin BC (full RLC): Z(ω) · width/height.
-    pub fn surf_z(&self, exc: &Excitation) -> C64 {
-        self.impedance(exc) * C64::from(self.width / self.height)
-    }
-
-    /// Real reference sheet impedance for the matched source: R · width/height.
-    pub fn surf_z_ref(&self) -> f64 {
-        self.z0 * self.width / self.height
-    }
-
     /// Incident drive voltage referenced to R: sqrt(2 · power · R).
     pub fn voltage(&self) -> f64 {
-        (2.0 * self.power * self.z0).sqrt()
+        (2.0 * self.power * self.termination.r).sqrt()
     }
+}
 
-    /// Robin γ-coefficient for the port boundary term: j·k0·η0 / Zs(ω) (full RLC).
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, exc.k0 * Z0) / self.surf_z(exc)
-    }
+impl Port for LumpedPort {
+    fn port_number(&self) -> usize { self.port_number }
+
+    /// Robin γ-coefficient: j·k0·η0 / Zs(ω) (full RLC).
+    fn get_gamma(&self, exc: &Excitation) -> C64 { self.termination.get_gamma(exc) }
 
     /// Uniform modal field along the gap direction.
-    pub fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> (f64, f64, f64) {
-        (self.direction[0], self.direction[1], self.direction[2])
+    fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some((self.direction[0], self.direction[1], self.direction[2]))
     }
 
     /// Incident source term −2·γ_R·E_inc (matched feed referenced to R):
     /// −2j·k0 · (voltage/height) · (η0 / Zs_ref) · mode_field, Zs_ref = R·w/h.
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let emag = C64::new(0.0, -2.0 * exc.k0)
-            * C64::from(self.voltage() / self.height * (Z0 / self.surf_z_ref()));
-        let (ex, ey, ez) = self.port_mode_3d_global(x, y, z, exc);
-        [emag * C64::from(ex), emag * C64::from(ey), emag * C64::from(ez)]
+    fn get_uinc(&self, _x: f64, _y: f64, _z: f64, exc: &Excitation) -> Option<[C64; 3]> {
+        let t = &self.termination;
+        let zs_ref = t.r * t.width / t.height;
+        let e = C64::new(0.0, -2.0 * exc.k0) * (self.voltage() / t.height * (Z0 / zs_ref));
+        Some(self.direction.map(|d| e * d))
+    }
+
+    fn z_mode(&self, _exc: &Excitation) -> f64 { self.termination.r }
+
+    fn lumped(&self) -> Option<([f64; 3], f64, f64)> {
+        Some((self.direction, self.termination.height, self.voltage()))
     }
 }
 
@@ -610,29 +532,8 @@ pub fn detect_rect_port(
     }
     let center = [0.5 * (min_c[0] + max_c[0]), 0.5 * (min_c[1] + max_c[1]), 0.5 * (min_c[2] + max_c[2])];
 
-    // 2. Compute face normal from first triangle
-    let first_tri = tris[tri_ids[0]];
-    let v0 = nodes[first_tri[0]];
-    let v1 = nodes[first_tri[1]];
-    let v2 = nodes[first_tri[2]];
-    let e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
-    let e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
-    let cr = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
-    let nn = (cr[0]*cr[0]+cr[1]*cr[1]+cr[2]*cr[2]).sqrt();
-    let mut normal = [cr[0]/nn, cr[1]/nn, cr[2]/nn];
-
-    // 3. Orient outward using adjacent tet centroid
-    let adj_tet = mesh.tri_to_tet[tri_ids[0]][0];
-    let tet = &mesh.tets[adj_tet];
-    let tc = [
-        (nodes[tet[0]][0]+nodes[tet[1]][0]+nodes[tet[2]][0]+nodes[tet[3]][0])/4.0,
-        (nodes[tet[0]][1]+nodes[tet[1]][1]+nodes[tet[2]][1]+nodes[tet[3]][1])/4.0,
-        (nodes[tet[0]][2]+nodes[tet[1]][2]+nodes[tet[2]][2]+nodes[tet[3]][2])/4.0,
-    ];
-    let to_tet = [tc[0]-center[0], tc[1]-center[1], tc[2]-center[2]];
-    if normal[0]*to_tet[0]+normal[1]*to_tet[1]+normal[2]*to_tet[2] > 0.0 {
-        normal = [-normal[0], -normal[1], -normal[2]];
-    }
+    // 2. The face normal, pointing out of the domain
+    let normal = scale(mesh.tri_inward_normal(tri_ids[0]).expect("port face with a tet behind it"), -1.0);
 
     // 4. Face extents along each axis
     let ext = [max_c[0]-min_c[0], max_c[1]-min_c[1], max_c[2]-min_c[2]];
@@ -648,25 +549,16 @@ pub fn detect_rect_port(
     face_axes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
     let broad_axis = face_axes[0].0;
-    let narrow_axis = face_axes[1].0;
     let width = face_axes[0].1;
     let height = face_axes[1].1;
 
-    // 6. Build orthonormal CS
+    // 6. Build orthonormal CS: x̂ along the broad axis, orthogonalised
+    // against ẑ (Gram-Schmidt).
     let zhat = normal;
-    let mut xhat = [0.0; 3];
-    xhat[broad_axis] = 1.0;
-    // Orthogonalize xhat against zhat (Gram-Schmidt)
-    let dot_xz = xhat[0]*zhat[0]+xhat[1]*zhat[1]+xhat[2]*zhat[2];
-    let xraw = [xhat[0]-dot_xz*zhat[0], xhat[1]-dot_xz*zhat[1], xhat[2]-dot_xz*zhat[2]];
-    let xn = (xraw[0]*xraw[0]+xraw[1]*xraw[1]+xraw[2]*xraw[2]).sqrt();
-    let xhat_f = [xraw[0]/xn, xraw[1]/xn, xraw[2]/xn];
-    let yhat = [zhat[1]*xhat_f[2]-zhat[2]*xhat_f[1],
-                zhat[2]*xhat_f[0]-zhat[0]*xhat_f[2],
-                zhat[0]*xhat_f[1]-zhat[1]*xhat_f[0]];
-
-    let _ = narrow_axis;
-    (CoordinateSystem::new(center, xhat_f, yhat, zhat), width, height)
+    let mut xref = [0.0; 3];
+    xref[broad_axis] = 1.0;
+    let xhat = unit(sub(xref, scale(zhat, dot(xref, zhat))));
+    (CoordinateSystem::new(center, xhat, cross(zhat, xhat), zhat), width, height)
 }
 
 /// Return (width, height) for a lumped port:
@@ -731,44 +623,6 @@ pub fn lumped_port_dims(
 // with amplitude(k0) chosen so that 0.5/Z_mode * A^2 * norm^2 = power.
 // =============================================================================
 
-/// Single quadrature point on a triangle: (weight, L1, L2, L3) in barycentric.
-type Tri4Tuple = (f64, f64, f64, f64);
-
-/// Sum a function over the triangle surface mesh using gmsh-style P1 quadrature.
-/// Inline replica of `sparam::surface_integral` for real-valued scalars, we
-/// only need this at port construction to integrate |e_t^unit|^2, which is
-/// real, so importing the complex version would be churn.
-fn integrate_scalar_over_tris(
-    nodes: &[[f64; 3]],
-    triangles: &[[usize; 3]],
-    dpts: &[Tri4Tuple],
-    f: &dyn Fn(f64, f64, f64) -> f64,
-) -> f64 {
-    let mut total = 0.0;
-    for tri in triangles {
-        let v1 = nodes[tri[0]];
-        let v2 = nodes[tri[1]];
-        let v3 = nodes[tri[2]];
-        let e1 = [v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]];
-        let e2 = [v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]];
-        let cr = [
-            e1[1] * e2[2] - e1[2] * e2[1],
-            e1[2] * e2[0] - e1[0] * e2[2],
-            e1[0] * e2[1] - e1[1] * e2[0],
-        ];
-        let area = 0.5 * (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
-        let mut tri_sum = 0.0;
-        for &(w, l1, l2, l3) in dpts {
-            let x = v1[0] * l1 + v2[0] * l2 + v3[0] * l3;
-            let y = v1[1] * l1 + v2[1] * l2 + v3[1] * l3;
-            let z = v1[2] * l1 + v2[2] * l2 + v3[2] * l3;
-            tri_sum += w * f(x, y, z);
-        }
-        total += tri_sum * area;
-    }
-    total
-}
-
 /// FD-side wrapper of `NumericalMode` that satisfies the `Port` trait.
 ///
 /// One construction per port: the eigensolve runs at `f0` (the operating
@@ -804,16 +658,11 @@ impl NumericalWavePort {
         }
     }
 
-    pub fn get_gamma(&self, exc: &Excitation) -> C64 {
-        C64::new(0.0, self.get_beta(exc))
-    }
-
     /// Modal wave impedance in SI ohms, the field-ratio `|E_t|/|H_t|` of
     /// the propagating mode. Scalar TE: `Z_0/√(1−(k_c/ω)²)`; scalar TM:
-    /// `Z_0·√(1−(k_c/ω)²)`; vector hybrid (quasi-TEM): `Z_0/n_eff`. Used
-    /// only by power-flux-based S-param paths (`sparam_field_power`,
-    /// `sparam_mode_power`); the mode-projection path (`sparam_waveport`)
-    /// is amplitude-invariant.
+    /// `Z_0·√(1−(k_c/ω)²)`; vector hybrid (quasi-TEM): `Z_0/n_eff`. The
+    /// port impedance reported for renormalisation; the mode-projection
+    /// S-parameters (`sparam_waveport`) do not depend on it.
     pub fn z_mode(&self, exc: &Excitation) -> f64 {
         // Length-coupled ω̃ = κ·c₀ keeps the cutoff ratio ωc/ω̃ invariant under L₀.
         self.mode.te_impedance(exc.omega_scaled()) * Z0
@@ -855,14 +704,6 @@ impl NumericalWavePort {
         (a * e[0], a * e[1], a * e[2])
     }
 
-    /// Incident-wave RHS contribution, same convention as RectWaveguide:
-    /// uinc = −2j·β · port_mode_3d_global.
-    pub fn get_uinc(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> [C64; 3] {
-        let (ex, ey, ez) = self.port_mode_3d_global(x, y, z, exc);
-        let factor = C64::new(0.0, -2.0 * self.get_beta(exc));
-        [factor * C64::from(ex), factor * C64::from(ey), factor * C64::from(ez)]
-    }
-
     /// Construct from an already-solved `NumericalMode`.
     ///
     /// Pre-computes `mode_l2_norm = √(∫ |E_t^unit|² dA)` over the port
@@ -879,14 +720,10 @@ impl NumericalWavePort {
         face_nodes: &[[f64; 3]],
         face_tris: &[[usize; 3]],
     ) -> Self {
-        let dpts: Vec<Tri4Tuple> = crate::quadrature::gaus_quad_tri(4)
-            .into_iter()
-            .map(|q| (q[0], q[1], q[2], q[3]))
-            .collect();
-        let l2_sq = integrate_scalar_over_tris(face_nodes, face_tris, &dpts, &|x, y, z| {
+        let l2_sq = crate::sparam::surface_integral(face_nodes, face_tris, &|x, y, z| {
             let e = mode.e_profile([x, y, z]);
-            e[0] * e[0] + e[1] * e[1] + e[2] * e[2]
-        });
+            C64::from(dot(e, e))
+        }, 4).re;
         let mode_l2_norm = l2_sq.max(0.0).sqrt();
         NumericalWavePort {
             port_number,
@@ -897,6 +734,15 @@ impl NumericalWavePort {
             is_vector,
         }
     }
+}
+
+impl Port for NumericalWavePort {
+    fn port_number(&self) -> usize { self.port_number }
+    fn beta(&self, exc: &Excitation) -> f64 { self.get_beta(exc) }
+    fn port_mode_3d_global(&self, x: f64, y: f64, z: f64, exc: &Excitation) -> Option<(f64, f64, f64)> {
+        Some(self.port_mode_3d_global(x, y, z, exc))
+    }
+    fn z_mode(&self, exc: &Excitation) -> f64 { self.z_mode(exc) }
 }
 
 #[cfg(test)]

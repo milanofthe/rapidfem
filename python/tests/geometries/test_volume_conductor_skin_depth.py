@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Skin effect in a finite-conductivity VOLUME conductor — exponential decay.
+
+"""Skin effect in a finite-conductivity VOLUME conductor, exponential decay.
 
 A TE10 wave travelling down a rectangular guide is incident on a slab of good
 (but finite) bulk conductor that fills the cross-section. Inside a good
@@ -10,7 +11,7 @@ exponentially from the surface,
 
     |E(depth)| = |E(0)| * exp(-depth / delta),   delta = 1/sqrt(pi f mu sigma).
 
-The conductivity and frequency are chosen so the skin depth is ~0.8 mm — large
+The conductivity and frequency are chosen so the skin depth is ~0.8 mm, large
 enough that the conductor region can be meshed (sub-delta tets) and the
 exponential is actually resolved, rather than the tens-of-nanometre delta of
 real copper at GHz. This test drives the structure with a single waveguide
@@ -67,7 +68,7 @@ def test_volume_conductor_skin_depth():
 
     # Single drive port at the air inlet; everything else is metal. The shared
     # air/conductor interface stays untagged (field continuity); the conductor's
-    # far face is PEC (a thick conductor backstop — the field has decayed to
+    # far face is PEC (a thick conductor backstop, the field has decayed to
     # ~e^-4 there, so the reflection is negligible).
     rf.RectWaveguidePort(air.faces.min(axis="z"))
     rf.PEC(*air.faces.outer.unassigned, *cond.faces.outer.unassigned)

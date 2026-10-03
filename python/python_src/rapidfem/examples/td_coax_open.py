@@ -51,7 +51,7 @@ rf.show(g)
 
 # %% Build the time-domain problem
 ptd = rf.ProblemTD(g, order=2, flux="upwind")
-print(f"DGTD coax monopole - {ptd.n_dof // 60} tets, {ptd.n_dof} state DOFs, "
+print(f"DGTD coax monopole - {ptd.n_tets} tets, {ptd.n_dofs} state DOFs, "
       f"monopole {LPROT / mm:.0f} mm, TEM drive {F0 / 1e9:.1f} GHz")
 
 # %% Drive the TEM mode and watch the pulse radiate from the open tip

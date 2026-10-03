@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Drude (free-electron metal) slab in a waveguide — dispersive reflectivity.
+
+"""Drude (free-electron metal) slab in a waveguide, dispersive reflectivity.
 
 A Drude medium has a frequency-dependent permittivity
 
@@ -17,8 +18,8 @@ effective propagation constant
 
 so the slab is an EVANESCENT barrier wherever β_slab² < 0 (high |S11|, low |S21|)
 and turns PROPAGATING once β_slab² > 0 (transmission recovers). The sign change of
-β_slab² — driven by the Drude dispersion sweeping Re(ε_r) from negative to
-positive — predicts the reflective↔transmissive crossover. We pin the measured
+β_slab², driven by the Drude dispersion sweeping Re(ε_r) from negative to
+positive, predicts the reflective↔transmissive crossover. We pin the measured
 |S| spectrum to that crossover, computed independently from `ref.drude_eps`.
 
 Reference: Jackson, *Classical Electrodynamics*, §7.5 (plasma/Drude dispersion);
@@ -114,7 +115,7 @@ def test_drude_slab_reflective_below_plasma_transmissive_above():
 
     # Passivity: the lossy Drude slab can only absorb, so scattered power ≤ 1.
     # A few-% over-unity is the FEM unitarity error of the high-contrast lossy
-    # air/Drude interface at a laptop mesh density — it is numerical, not a leak.
+    # air/Drude interface at a laptop mesh density, it is numerical, not a leak.
     pmax = max(case.passivity(res.sparams[i]) for i in range(len(FREQS)))
     print(f"  max passivity = {pmax:.4f}")
     assert pmax < 1.08, f"passivity {pmax:.3f} too far over unity"
@@ -125,11 +126,11 @@ def test_drude_slab_reflective_below_plasma_transmissive_above():
     assert np.all(np.diff(s21) > 0.0), f"|S21| not monotone up: {s21}"
     assert np.all(np.diff(s11) < 0.0), f"|S11| not monotone down: {s11}"
 
-    # Deep evanescent end (Re(ε)≪0): a metal-like mirror — near-total reflection,
+    # Deep evanescent end (Re(ε)≪0): a metal-like mirror, near-total reflection,
     # almost nothing transmitted.
     assert s11[0] > 0.95 and s21[0] < 0.25, (
         f"bottom not reflective: |S11|={s11[0]:.3f} |S21|={s21[0]:.3f}")
-    # Deep propagating end (Re(ε)>0): the slab transmits — reflection collapses.
+    # Deep propagating end (Re(ε)>0): the slab transmits, reflection collapses.
     assert s21[-1] > 0.90 and s11[-1] < 0.35, (
         f"top not transmissive: |S21|={s21[-1]:.3f} |S11|={s11[-1]:.3f}")
 

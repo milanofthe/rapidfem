@@ -1,26 +1,23 @@
 """GPU vs CPU time-domain DGTD benchmark on real example geometries.
 
 Where ``td_benchmark.py`` profiles the DGTD hot path on a single
-geometry, this benchmark runs the *whole* time-domain solver on the
-three production example geometries, each at three mesh resolutions,
-and reports the GPU LSERK4 transient against the CPU LSERK4 transient.
+geometry, this benchmark runs the *whole* time-domain solver on three
+representative geometries, each at three mesh resolutions, and reports
+the GPU LSERK4 transient against the CPU LSERK4 transient:
 
-The three geometries and their excitations are lifted straight from the
-example scripts:
-
-1. Ring resonator (``td_ring_resonator.py``) - a high-permittivity
+1. Ring resonator - a high-permittivity
    ceramic torus in an air-filled PEC cavity, lit by a homogeneous
    transient: an impulse initial state evolves freely.
-2. Power divider (``td_power_divider.py``) - a waveguide T-junction
+2. Power divider - a waveguide T-junction
    with PML-terminated arms, lit by a driven transient: a Gaussian
    soft-pulse injected into the stem.
-3. Cavity (``td_transfer_function.py``) - a PEC air-cube cavity, lit by
+3. Cavity - a PEC air-cube cavity, lit by
    a driven broadband run through ``driven_transient`` with a probe.
 
 The GPU path is the explicit LSERK4 transient, state device-resident;
 for a fair comparison the CPU run uses the same explicit integrator
-(``method="explicit"``), which the GPU path mirrors. gmsh meshing is
-the practical limiter, so the resolutions are sized so the finest mesh
+(``method="explicit"``), which the GPU path mirrors. Meshing is the
+practical limiter, so the resolutions are sized so the finest mesh
 lands in the 1-4M state-DOF range, not beyond.
 
 Run after ``maturin develop --release``:
@@ -64,7 +61,7 @@ CAV_DT = 8e-12           # transient step of the transfer-function example
 
 
 # %% Ring resonator - geometry build and excitation
-# Lifted from examples/td_ring_resonator.py: a torus embedded in an
+# A torus embedded in an
 # air-filled PEC box, fragmented conformally; only the six axis-aligned
 # cavity walls are PEC, the air-ring interface is left un-walled.
 def build_ring(maxh_air, maxh_ring):
@@ -85,14 +82,14 @@ def build_ring(maxh_air, maxh_ring):
 
 def run_ring(ptd, device, steps):
     """Homogeneous transient: an impulse initial state evolves freely."""
-    y0 = np.zeros(ptd.n_dof)
+    y0 = np.zeros(ptd.n_dofs)
     y0[ptd.probe_dof((RING_R_MAJ, 0.0, 0.0), field="E", component="z")] = 1.0
     return ptd.transient(y0, dt=RING_DT, steps=steps, method="explicit",
                          device=device, verbose=False)
 
 
 # %% Power divider - geometry build and excitation
-# Lifted from examples/td_power_divider.py: a T-shaped air guide tiled by
+# A T-shaped air guide tiled by
 # face-adjacent boxes, three PML slabs terminating the arms; fragment
 # stitches it all conformally, PEC walls are the TD operator's default.
 def build_power_divider(maxh):
@@ -141,7 +138,7 @@ def run_power_divider(ptd, device, steps):
 
 
 # %% Cavity - geometry build and excitation
-# Lifted from examples/td_transfer_function.py: a closed PEC air-cube,
+# A closed PEC air-cube,
 # driven broadband through driven_transient with one field probe.
 def build_cavity(maxh):
     """A meshed ProblemTD for the PEC air-cube cavity at the resolution."""
@@ -166,7 +163,7 @@ def run_cavity(ptd, device, steps):
 
 # %% Resolution sweeps
 # Three maxh values per geometry, coarse to fine, sized so the finest
-# mesh lands in the 1-4M state-DOF range. gmsh meshing is the limiter, so
+# mesh lands in the 1-4M state-DOF range. Meshing is the limiter, so
 # these are deliberately short of the 10M-DOF regime where complex-
 # geometry meshing turns prohibitive. The actual n_dof reached is
 # printed in the table below.
@@ -207,7 +204,7 @@ def bench_one(name, build, run, label, kwargs):
     except Exception as exc:                 # noqa: BLE001 - report, continue
         return dict(name=name, label=label, error=f"mesh/build failed: {exc}")
 
-    n = ptd.n_dof
+    n = ptd.n_dofs
     try:
         # CPU explicit transient - the same LSERK4 integrator the GPU
         # path runs, so the timings compare like for like.

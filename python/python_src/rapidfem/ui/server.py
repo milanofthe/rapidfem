@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 """Flask server for `rapidfem serve`.
 
 Exposes the bundled SvelteKit frontend on `/` and a small JSON API on
@@ -9,8 +13,9 @@ Cell execution runs in a per-file subprocess worker (see
 Streaming events flow via HTTP long-polling on ``/api/cell/poll``.
 
 The actual endpoints are registered in:
-  - ``rapidfem.ui.runner``  → /api/cell/*, /api/kernel
-  - ``rapidfem.ui.api``     → /api/files/*, /api/examples/*, legacy ops
+  - ``rapidfem.ui.runner``  → /api/cell/*, /api/kernel, /api/field
+  - ``rapidfem.ui.api``     → /api/files/*, /api/examples/*
+  - this module             → /api/health and the static frontend
 """
 from __future__ import annotations
 
@@ -81,7 +86,7 @@ def create_app(workdir: Path, debug: bool = False) -> Flask:
     runner.register(app)
     atexit.register(runner.shutdown_all)
 
-    # File/example/legacy endpoints.
+    # File, example and field endpoints.
     try:
         from rapidfem.ui import api  # noqa: F401
         api.register(app)

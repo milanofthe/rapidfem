@@ -1,13 +1,14 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Proximity effect — opposing currents crowd onto the FACING surfaces.
+
+"""Proximity effect, opposing currents crowd onto the FACING surfaces.
 
 Two nearby conductors carrying *opposing* currents (the odd / differential mode
 of a coupled pair) push their current onto the surfaces that face each other.
 Between the conductors the magnetic fields of the two anti-parallel currents
-reinforce, so the tangential H at the surface — and hence the surface current
-density ``Js = n x H`` — is larger on the inner (facing) surfaces than on the
+reinforce, so the tangential H at the surface, and hence the surface current
+density ``Js = n x H``, is larger on the inner (facing) surfaces than on the
 outer surfaces. In the EVEN / common mode (same-direction currents) the gap
 fields instead cancel and the current is pushed onto the OUTER surfaces. That
 sign flip between the two modes is the proximity effect, the multi-conductor
@@ -16,7 +17,7 @@ companion of the skin effect.
 Geometry: two parallel rectangular PEC bars (a coupled pair) raised above the
 box floor, each grounded at its far end and fed at its near end by a vertical
 lumped delta-gap to the floor (a PEC ground plane). A 3-D PEC bar is built the
-way the iris-filter test builds its iris plates — an air box whose faces are
+way the iris-filter test builds its iris plates, an air box whose faces are
 all tagged PEC, so the field is excluded from its interior and it acts as a
 solid conductor obstacle with distinct inner/outer surfaces. Everything sits in
 an air-filled shielding box whose unassigned outer walls default to PEC.
@@ -28,7 +29,7 @@ single solve yields both modes by superposition of the per-port fields:
     H_even = H(driven A) + H(driven B)     (common: same-direction currents)
 
 Because both modes are sampled at the *same* mesh nodes, the inner/outer
-comparison carries no sampling-distance bias — only the excitation differs. We
+comparison carries no sampling-distance bias, only the excitation differs. We
 sample |H_tangential| in the gap (adjacent to both inner faces) and in thin
 shells outside the outer faces, and assert:
 

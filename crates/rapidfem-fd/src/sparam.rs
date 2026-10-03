@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! S-parameter extraction via port surface integrals.
 //!
@@ -21,6 +18,7 @@ use num_complex::Complex64 as C64;
 use crate::quadrature::gaus_quad_tri;
 use crate::port::Port;
 use crate::excitation::Excitation;
+use rapidfem_core::geom::{norm, tri_area_vector};
 
 /// Gauss-quadrature surface integral of a scalar function over a triangle set.
 pub fn surface_integral(
@@ -33,14 +31,8 @@ pub fn surface_integral(
     let mut total = C64::new(0.0, 0.0);
 
     for tri in triangles {
-        let v1 = nodes[tri[0]];
-        let v2 = nodes[tri[1]];
-        let v3 = nodes[tri[2]];
-
-        let e1 = [v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2]];
-        let e2 = [v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2]];
-        let cr = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
-        let area = 0.5 * (cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]).sqrt();
+        let [v1, v2, v3] = tri.map(|i| nodes[i]);
+        let area = norm(tri_area_vector(v1, v2, v3));
 
         let mut tri_sum = C64::new(0.0, 0.0);
         for qp in &dpts {
@@ -105,59 +97,6 @@ pub fn sparam_waveport(
     mode_dot_field / norm
 }
 
-/// Field power crossing the port: P = ∫ (E−Q·E_mode)·conj(E_mode)/(2·Z_mode) dS.
-///
-/// P_field = ∫ (E_field - Q·E_mode) · conj(E_mode) / (2·Z_mode) dS
-pub fn sparam_field_power(
-    nodes: &[[f64; 3]],
-    tri_verts: &[[usize; 3]],
-    port: &dyn Port,
-    exc: &Excitation,
-    active: bool,
-    fieldf: &dyn Fn(f64, f64, f64) -> (C64, C64, C64),
-    gq_order: usize,
-) -> C64 {
-    let q = if active { 1.0 } else { 0.0 };
-    let z_mode = port.z_mode(exc);
-
-    surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
-        let (fx, fy, fz) = fieldf(x, y, z);
-
-        let ex1 = fx - C64::from(q * mx);
-        let ey1 = fy - C64::from(q * my);
-        let ez1 = fz - C64::from(q * mz);
-
-        let ex2 = C64::from(mx).conj();
-        let ey2 = C64::from(my).conj();
-        let ez2 = C64::from(mz).conj();
-
-        (ex1*ex2 + ey1*ey2 + ez1*ez2) / C64::from(2.0 * z_mode)
-    }, gq_order)
-}
-
-/// Reference mode power: P = ∫ |E_mode|²/(2·Z_mode) dS.
-///
-/// P_mode = ∫ |E_mode|² / (2·Z_mode) dS
-pub fn sparam_mode_power(
-    nodes: &[[f64; 3]],
-    tri_verts: &[[usize; 3]],
-    port: &dyn Port,
-    exc: &Excitation,
-    gq_order: usize,
-) -> C64 {
-    let z_mode = port.z_mode(exc);
-
-    surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
-        let ex2 = C64::from(mx).conj();
-        let ey2 = C64::from(my).conj();
-        let ez2 = C64::from(mz).conj();
-
-        (C64::from(mx)*ex2 + C64::from(my)*ey2 + C64::from(mz)*ez2) / C64::from(2.0 * z_mode)
-    }, gq_order)
-}
-
 /// Voltage-based S-parameter extraction for lumped ports.
 ///
 /// Integrates E·dl along a line through the port to get the port voltage,
@@ -197,16 +136,7 @@ pub fn sparam_voltage_surface(
     gq_order: usize,
 ) -> C64 {
     // Port area A = Σ triangle areas.
-    let mut area = 0.0_f64;
-    for tri in tri_verts {
-        let v1 = nodes[tri[0]];
-        let v2 = nodes[tri[1]];
-        let v3 = nodes[tri[2]];
-        let e1 = [v2[0]-v1[0], v2[1]-v1[1], v2[2]-v1[2]];
-        let e2 = [v3[0]-v1[0], v3[1]-v1[1], v3[2]-v1[2]];
-        let cr = [e1[1]*e2[2]-e1[2]*e2[1], e1[2]*e2[0]-e1[0]*e2[2], e1[0]*e2[1]-e1[1]*e2[0]];
-        area += 0.5 * (cr[0]*cr[0] + cr[1]*cr[1] + cr[2]*cr[2]).sqrt();
-    }
+    let area: f64 = tri_verts.iter().map(|t| norm(tri_area_vector(nodes[t[0]], nodes[t[1]], nodes[t[2]]))).sum();
     if area < crate::constants::SINGULAR_EPS || v_inc == 0.0 {
         return C64::new(0.0, 0.0);
     }

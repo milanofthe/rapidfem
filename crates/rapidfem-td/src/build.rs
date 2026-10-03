@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! The time-domain operator of a [`Model`] on a mesh.
 //!
@@ -12,19 +9,25 @@
 //! - materials: diagonal `ε`, `μ` and conductivity per tet; a Debye material
 //!   runs at `ε∞` with its relaxation on the auxiliary-polarisation block;
 //! - PML regions: graded impedance-matched absorbing layers (the TD
-//!   equivalent of the frequency-domain coordinate stretch);
+//!   equivalent of the frequency-domain coordinate stretch, see
+//!   `absorber_rate`);
 //! - ports in the order rectangular, coax, Floquet, numerical wave, then the
-//!   absorbing (ABC) faces, so the modal-port indices stay contiguous;
+//!   absorbing (ABC) faces, so the modal-port indices stay contiguous; the
+//!   face tag of every port comes back with the operator, so a caller
+//!   addresses a port by its tag;
 //! - PEC faces (boundary PEC is the default anyway, internal plates are
 //!   retagged) and periodic pairs.
 //!
 //! Lumped ports have no time-domain counterpart (a uniform delta-gap only
 //! carries a clean mode on a genuine parallel-plate gap) and are rejected.
-//! Surface impedances, lumped elements, PMC and user-defined ports are
-//! frequency-domain only; they are skipped with a warning.
+//! Surface impedances, lumped elements, PMC, user-defined ports and the
+//! far-field surface are frequency-domain only; they are skipped with a
+//! warning.
 
 use crate::dispersive::DebyeMaterial;
-use crate::rhs::{ElemMaterial, MaxwellOperator, PecSpec, PeriodicSpec, PortSpec};
+use crate::rhs::{
+    ElemMaterial, MaxwellOperator, OperatorOptions, PecSpec, PeriodicSpec, PortSpec,
+};
 use crate::waveguide::FloquetPolarisation;
 use rapidfem_core::mesh::Mesh;
 use rapidfem_core::model::{FaceSpec, Model, WaveKind};
@@ -33,18 +36,48 @@ use rapidfem_core::model::{FaceSpec, Model, WaveKind};
 /// ramps quadratically with depth (`ν_max·frac²`), so a slab of thickness `t`
 /// attenuates a round trip by about `exp(−2·ν_max·t/3)`; 24 gives 1e-7 at any
 /// thickness.
-pub const ABSORBER_LOSS_BUDGET: f64 = 24.0;
+const ABSORBER_LOSS_BUDGET: f64 = 24.0;
+
+/// Loss rate `ν` of tet `t` in a graded matched absorbing layer that starts
+/// at the plane `x_axis = inner` and grows `thickness` deep towards
+/// decreasing `x_axis` (`low`) or increasing `x_axis`; `None` for a tet whose
+/// centroid lies in front of the layer.
+///
+/// The rate ramps quadratically from `0` at the entry to `nu_max` at full
+/// depth. With `σ = ν·ε` and `σ* = ν·μ` the layer stays impedance-matched
+/// (`σ/ε = σ*/μ`), so a normally incident outgoing wave enters without
+/// reflection and then decays; ramping from zero keeps the entry smooth.
+/// This is a matched-layer absorber, not a coordinate-stretched PML: it is
+/// reflectionless only near normal incidence.
+fn absorber_rate(
+    mesh: &Mesh,
+    t: usize,
+    axis: usize,
+    low: bool,
+    inner: f64,
+    thickness: f64,
+    nu_max: f64,
+) -> Option<f64> {
+    let centroid = mesh.tets[t].iter().map(|&n| mesh.nodes[n][axis]).sum::<f64>() / 4.0;
+    let depth = if low { inner - centroid } else { centroid - inner };
+    if depth <= 0.0 {
+        return None;
+    }
+    let frac = (depth / thickness).clamp(0.0, 1.0);
+    Some(nu_max * frac * frac)
+}
 
 /// Build the operator of `model` on `mesh`: DG order `order`, flux blend
 /// `flux_alpha` (1 upwind, 0 central), `c` the speed of light in the mesh's
-/// length unit (the operator runs with time in length units).
+/// length unit (the operator runs with time in length units). Returns the
+/// operator and the face tag of each of its ports, in operator port order.
 pub fn operator_from_model(
     mesh: &Mesh,
     model: &Model,
     order: usize,
     flux_alpha: f64,
     c: f64,
-) -> Result<MaxwellOperator, String> {
+) -> Result<(MaxwellOperator, Vec<i32>), String> {
     let tets_of = |tag: i32| mesh.vtag_to_tet.get(&tag).map(|v| v.as_slice()).unwrap_or(&[]);
 
     // Materials, then the dispersive tets at ε∞.
@@ -82,13 +115,8 @@ pub fn operator_from_model(
         let is_low = p.direction[axis] < 0.0;
         let nu_max = if p.thickness > 0.0 { ABSORBER_LOSS_BUDGET / p.thickness } else { 0.0 };
         for &t in tets_of(p.volume_tag) {
-            let centroid = mesh.tets[t].iter().map(|&n| mesh.nodes[n][axis]).sum::<f64>() / 4.0;
-            let depth = if is_low { p.inner_face - centroid } else { centroid - p.inner_face };
-            if depth <= 0.0 {
-                continue;
-            }
-            let frac = (depth / p.thickness).clamp(0.0, 1.0);
-            let nu = nu_max * frac * frac;
+            let rate = absorber_rate(mesh, t, axis, is_low, p.inner_face, p.thickness, nu_max);
+            let Some(nu) = rate else { continue };
             let m = &mut materials[t];
             m.sigma = nu * m.eps[0];
             m.sigma_m = nu * m.mu[0];
@@ -98,11 +126,19 @@ pub fn operator_from_model(
     // Ports, grouped by kind in the order the port indices assume.
     let missing = |what: &str, tag: i32| format!("{what} face tag {tag} has no triangles");
     let mut port_specs: Vec<PortSpec> = Vec::new();
+    let mut port_tags: Vec<i32> = Vec::new();
     for f in &model.faces {
         if let FaceSpec::Rectangular { tag, mode, .. } = f {
-            let spec = PortSpec::from_mesh_tag_with_z0(mesh, *tag, (mode[0], mode[1]), None, 1.0)
+            if *mode == [0, 0] {
+                return Err(format!(
+                    "rectangular port tag {tag}: mode (0, 0) carries no TE field, \
+                     use (m, n) with m or n nonzero"
+                ));
+            }
+            let spec = PortSpec::from_mesh_tag(mesh, *tag, (mode[0], mode[1]))
                 .ok_or_else(|| missing("rectangular port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -110,6 +146,7 @@ pub fn operator_from_model(
             let spec = PortSpec::coax_from_mesh_tag(mesh, *tag, *origin)
                 .ok_or_else(|| missing("coax port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -125,23 +162,16 @@ pub fn operator_from_model(
                 polarisation,
                 scan_theta_deg.to_radians(),
                 scan_phi_deg.to_radians(),
-                None,
             )
             .ok_or_else(|| missing("floquet port", *tag))?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     // Numerical wave ports read the per-tet ε and mark every node on a PEC
     // face as an internal conductor of the cross-section.
     let eps_per_tet: Vec<f64> = materials.iter().map(|m| m.eps[0]).collect();
-    let mut pec_nodes = vec![false; mesh.n_nodes()];
-    for &tag in &model.pec_tags {
-        for &t in mesh.ftag_to_tri.get(&tag).map(|v| v.as_slice()).unwrap_or(&[]) {
-            for &n in &mesh.tris[t] {
-                pec_nodes[n] = true;
-            }
-        }
-    }
+    let pec_nodes = mesh.nodes_on_tags(&model.pec_tags);
     for f in &model.faces {
         if let FaceSpec::WaveNumerical { tag, f0, mode_index, kind, .. } = f {
             // A vector solve at k0 = 2π f0 / c; without f0 the scalar TE/TM
@@ -167,6 +197,7 @@ pub fn operator_from_model(
                 )
             })?;
             port_specs.push(spec);
+            port_tags.push(*tag);
         }
     }
     for f in &model.faces {
@@ -175,6 +206,7 @@ pub fn operator_from_model(
                 let spec = PortSpec::absorbing_from_mesh_tag(mesh, *tag)
                     .ok_or_else(|| missing("ABC", *tag))?;
                 port_specs.push(spec);
+                port_tags.push(*tag);
             }
             FaceSpec::Lumped { .. } => {
                 return Err("LumpedPort is not supported by the time-domain backend. Use a \
@@ -193,6 +225,12 @@ pub fn operator_from_model(
             _ => {}
         }
     }
+    if let Some(tag) = model.far_field_tag {
+        eprintln!(
+            "  TD: far-field surface tag {tag} ignored, the near-to-far-field transform is \
+             frequency-domain only"
+        );
+    }
 
     let mut periodic_specs = Vec::new();
     for &(a, b) in &model.periodic {
@@ -205,14 +243,87 @@ pub fn operator_from_model(
         pec_specs.push(PecSpec::from_mesh_tag(mesh, tag).ok_or_else(|| missing("PEC", tag))?);
     }
 
-    Ok(MaxwellOperator::new_full(
+    let op = MaxwellOperator::new(
         mesh,
         order,
         flux_alpha,
-        &materials,
-        &port_specs,
-        &disp_elems,
-        &periodic_specs,
-        &pec_specs,
-    ))
+        OperatorOptions {
+            materials: &materials,
+            ports: &port_specs,
+            dispersive: &disp_elems,
+            periodic: &periodic_specs,
+            pec_plates: &pec_specs,
+        },
+    );
+    Ok((op, port_tags))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh_gen::structured_box;
+    use crate::propagator::expmv;
+
+    fn energy(y: &[f64], mm: &[f64], n: usize) -> f64 {
+        let mut e = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                e += y[i] * mm[i * n + j] * y[j];
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn absorbing_layer_drains_field_energy() {
+        // A field disturbance in a closed PEC channel: with a matched
+        // absorbing layer at one end the energy drains away; with vacuum the
+        // central-flux operator conserves it.
+        let lz = 5.0;
+        let mesh = structured_box(1, 1, 10, 0.5, 0.5, lz);
+
+        let run = |materials: &[ElemMaterial]| -> f64 {
+            // central flux ⇒ vacuum is exactly energy-conserving.
+            let opts = OperatorOptions { materials, ..Default::default() };
+            let op = MaxwellOperator::new(&mesh, 2, 0.0, opts);
+            let n = op.n_dof();
+            let mm = op.assemble_energy_mass();
+            let mut y = vec![0.0; n];
+            y[op.nearest_node_dof([0.25, 0.25, 0.6], 0, 0)] = 1.0;
+            let e0 = energy(&y, &mm, n);
+            for _ in 0..900 {
+                y = expmv(|x| op.apply(x), &y, 0.06, 24);
+            }
+            energy(&y, &mm, n) / e0
+        };
+
+        let vacuum = vec![ElemMaterial::VACUUM; mesh.n_tets()];
+        // absorber covers most of the channel, the small clean region holds
+        // the disturbance, everything propagating into the layer is absorbed.
+        let thickness = 3.5;
+        let absorber: Vec<ElemMaterial> = (0..mesh.n_tets())
+            .map(|t| match absorber_rate(&mesh, t, 2, false, lz - thickness, thickness, 6.0) {
+                Some(nu) => ElemMaterial::matched_absorber(1.0, 1.0, nu),
+                None => ElemMaterial::VACUUM,
+            })
+            .collect();
+        let frac_vac = run(&vacuum);
+        let frac_abs = run(&absorber);
+
+        assert!(
+            frac_vac > 0.9,
+            "vacuum must conserve energy, kept {frac_vac:.3}"
+        );
+        // The absorber drains the bulk of the energy; the residual is the
+        // slow-decaying mode tail (modes with a field node in the layer).
+        // What matters is the decisive contrast against the vacuum run.
+        assert!(
+            frac_abs < 0.4,
+            "absorbing layer must drain energy, kept {frac_abs:.3}"
+        );
+        assert!(
+            frac_vac / frac_abs > 2.5,
+            "absorber vs vacuum contrast too weak: {frac_vac:.3} / {frac_abs:.3}"
+        );
+    }
 }

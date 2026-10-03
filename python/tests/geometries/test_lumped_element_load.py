@@ -1,7 +1,8 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-"""Lumped R/L/C load termination — the textbook lumped-load reflection.
+
+"""Lumped R/L/C load termination, the textbook lumped-load reflection.
 
 A uniform line driven by a single ``rf.LumpedPort(z0=50)`` and terminated by an
 ``rf.LumpedElement`` (a concentrated series R-L-C across the far gap) reflects
@@ -72,7 +73,7 @@ def _build_line(g, attach_load):
     # dead end caps behind the recess) ride on the default-PEC exterior. The two
     # recess gaps are interior → they carry the driven port and the load.
     rf.PEC(trace)
-    rf.LumpedPort(feed, direction=(0, 0, 1), z0=ZREF)
+    rf.LumpedPort(feed, direction=(0, 0, 1))
     attach_load(load)
     return feed, load
 
@@ -81,7 +82,7 @@ def _solve_s11(attach_load, freqs):
     """Build → mesh → sweep a single-port line; return (|S11|(f), prob)."""
     g = case.geometry(maxh=rf.lambda_maxh(f_max=float(np.max(freqs)), er_max=ER))
     _build_line(g, attach_load)
-    prob, res = case.sweep(g, freqs, z0=ZREF)
+    prob, res = case.sweep(g, freqs)
     return np.abs(res.sparams[:, 0, 0]), prob
 
 

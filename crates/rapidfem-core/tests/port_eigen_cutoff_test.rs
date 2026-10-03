@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
 
 //! Analytic golden test for the 2-D port-mode eigensolver
 //! ([`rapidfem_core::port_eigen::solve_modes`]).
@@ -18,12 +15,12 @@
 //! with `m, n ≥ 1` for `TM` (Dirichlet, `E_z = 0` on the wall) and
 //! `m, n ≥ 0`, not both zero, for `TE` (Neumann, `∂H_z/∂n = 0`). These
 //! closed forms are the anchors here, so no codegen / derivation script is
-//! needed — the constants are written out directly.
+//! needed, the constants are written out directly.
 //!
 //! The P1-nodal scalar solver gives an *eigenvalue upper bound*, but the
 //! row-sum-lumped mass shifts it back down, so the two errors nearly
 //! cancel: on a structured `24×14` rectangle the lowest TE/TM cutoffs land
-//! within ~0.1–0.5 % of the closed form (measured: TM11 0.07 %, TM21 0.09 %
+//! within ~0.1-0.5 % of the closed form (measured: TM11 0.07 %, TM21 0.09 %
 //! on a finer `40×22` mesh). This is still a convergence-grade golden, not
 //! a `1e-10` pin, so we assert the lowest few *sorted* computed `k_c`
 //! against the analytic ladder within a sane 1 % relative FEM tolerance.

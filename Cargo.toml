@@ -4,6 +4,7 @@ members = [
     "crates/rapidfem-core",
     "crates/rapidfem-fd",
     "crates/rapidfem-td",
+    "crates/rapidfem-geom",
     "python",
 ]
 # Vendored dependencies carry their own workspace (vendor/rslab).
@@ -12,3 +13,11 @@ exclude = ["vendor"]
 [profile.release]
 opt-level = 3
 lto = true
+
+# Numerical kernels index matrices and element arrays by position and take
+# many scalar arguments; iterator rewrites of those loops and argument
+# structs would obscure the maths they transcribe.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"

@@ -1,0 +1,17 @@
+[package]
+name = "rapidmesh-brep"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+rapidmesh-exact.workspace = true
+rapidmesh-geom.workspace = true
+rapidmesh-csg.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+
+
+[lints]
+workspace = true

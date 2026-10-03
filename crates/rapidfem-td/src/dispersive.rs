@@ -1,9 +1,6 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
-// Copyright (C) 2024-2025 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
 //! Dispersive materials via auxiliary differential equations (ADE).
 //!
@@ -58,36 +55,39 @@ impl DebyeMaterial {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::propagator::etd_step2;
 
     #[test]
     fn debye_ade_reproduces_the_analytic_permittivity() {
-        // Integrate the relaxation ODE Ṗ = a·P + g·cos(ωt) with the ETD
-        // propagator; the steady-state polarisation phasor must reconstruct
-        // the analytic Debye ε(ω) across a frequency sweep.
+        // Integrate the relaxation ODE Ṗ = a·P + g·cos(ωt) with the exact
+        // scalar ETD2 step (source linear over the step); the steady-state
+        // polarisation phasor must reconstruct the analytic Debye ε(ω)
+        // across a frequency sweep.
         let mat = DebyeMaterial { eps_inf: 2.0, eps_static: 5.0, tau: 0.3 };
         let (a, g) = mat.relaxation_coeffs();
-        let matvec = |p: &[f64]| vec![a * p[0]];
 
         for &omega in &[0.5, 1.5, 4.0, 10.0] {
             let src = |t: f64| g * (omega * t).cos();
             let n_per = 200;
             let h = 2.0 * std::f64::consts::PI / omega / n_per as f64;
+            // p(t+h) = e^{ah}·p + h·φ1(ah)·b0 + h·φ2(ah)·(b1 - b0).
+            let z = a * h;
+            let (e, phi1, phi2) = (z.exp(), z.exp_m1() / z, (z.exp_m1() - z) / (z * z));
+            let etd2 = |p: f64, b0: f64, b1: f64| e * p + h * (phi1 * b0 + phi2 * (b1 - b0));
 
             // Settle into the periodic steady state.
-            let mut p = vec![0.0];
+            let mut p = 0.0;
             let mut t = 0.0;
             for _ in 0..40 * n_per {
-                p = etd_step2(matvec, &p, &[src(t)], &[src(t + h)], h, 4);
+                p = etd2(p, src(t), src(t + h));
                 t += h;
             }
             // Extract the polarisation phasor over one period.
             let (mut pc, mut ps) = (0.0, 0.0);
             for _ in 0..n_per {
-                p = etd_step2(matvec, &p, &[src(t)], &[src(t + h)], h, 4);
+                p = etd2(p, src(t), src(t + h));
                 t += h;
-                pc += p[0] * (omega * t).cos();
-                ps += p[0] * (omega * t).sin();
+                pc += p * (omega * t).cos();
+                ps += p * (omega * t).sin();
             }
             let norm = 2.0 / n_per as f64;
             // P(t) = Re[(pc·norm - i·ps·norm)·e^{iωt}];  E phasor = 1;

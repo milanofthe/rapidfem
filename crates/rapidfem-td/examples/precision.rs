@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
+
 //! Mixed-precision probe: how far the `Field`-precision build drifts from
 //! the f64 reference.
 //!
@@ -35,7 +39,7 @@ fn rel_l2(got: &[Field], reference: &[f64]) -> f64 {
     let err: f64 = got
         .iter()
         .zip(reference)
-        .map(|(&a, &b)| (a as f64 - b).powi(2))
+        .map(|(&a, &b)| (a - b).powi(2))
         .sum::<f64>()
         .sqrt();
     let scale: f64 = reference.iter().map(|b| b * b).sum::<f64>().sqrt();
@@ -44,7 +48,7 @@ fn rel_l2(got: &[Field], reference: &[f64]) -> f64 {
 
 fn main() {
     let mesh = structured_box(3, 3, 3, 1.0, 1.0, 1.0);
-    let op = MaxwellOperator::new(&mesh, 2, 1.0); // upwind, the common case
+    let op = MaxwellOperator::new(&mesh, 2, 1.0, Default::default()); // upwind, the common case
     let n = op.n_dof();
 
     // A deterministic initial state.
@@ -71,7 +75,7 @@ fn main() {
     let mut y = y0.clone();
     let mut ws = LserkWorkspace::new();
     for _ in 0..STEPS {
-        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt);
+        ws.step_into(|x, ax| op.apply_into(x, ax), &mut y, dt, None);
     }
 
     println!(
@@ -84,7 +88,7 @@ fn main() {
     if size_of::<Field>() == 8 {
         let mut bytes = Vec::with_capacity(2 * n * 8);
         for &v in dy.iter().chain(y.iter()) {
-            bytes.extend_from_slice(&(v as f64).to_le_bytes());
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
         std::fs::write(&path, bytes).expect("write reference");
         println!("  wrote f64 reference           {}", path.display());
@@ -92,8 +96,10 @@ fn main() {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let r: Vec<f64> = bytes
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| f64::from_le_bytes(*c))
                     .collect();
                 assert_eq!(r.len(), 2 * n, "reference dof count mismatch");
                 println!(

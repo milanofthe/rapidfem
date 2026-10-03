@@ -1,10 +1,7 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
-//
-// This file is part of rapidfem, distributed under GPL-3.0-or-later with
-// the Gmsh additional permission. See LICENSE for the full terms.
-//
+
 // The discrete spectrum of a PEC cavity, computed densely and exactly.
 //
 // The dense spectrum lives in `common`, and is deliberately built without
@@ -18,7 +15,7 @@
 //   1. The physics. The lowest nonzero eigenvalue is the cavity's fundamental,
 //      TE101, which has a closed form. That checks the element, the DOF map, the
 //      orientation convention and the PEC elimination together.
-//   2. The kernel. The curl operator's null space — the discrete gradients — sits at
+//   2. The kernel. The curl operator's null space, the discrete gradients, sits at
 //      λ = 0, and its dimension is exactly countable.
 //   3. Stage 3: an eigenvalue is a property of the SPACE, not of the basis chosen
 //      for it, so the interpolatory and hierarchical bases must give one spectrum.
@@ -31,7 +28,6 @@ mod common;
 use common::*;
 use num_complex::Complex64 as C64;
 use rapidfem_fd::basis::NedelecBasis;
-use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::order::{cell_diameter, cell_wavenumbers, wavelength_policy, OrderMap};
 use std::collections::HashSet;
 
@@ -286,8 +282,8 @@ fn mixed_order_is_bracketed_by_the_uniform_spaces() {
 /// cheaper) and not "mixed order is accurate" (keeping them always is). It is that
 /// the policy picks the RIGHT cells: the ones where the order-1 dispersion error
 /// (k·h)² is already far below the model's overall error, so that reducing them
-/// costs essentially nothing. If the policy chose badly — reducing cells where the
-/// mode has structure — the error would jump.
+/// costs essentially nothing. If the policy chose badly, reducing cells where the
+/// mode has structure, the error would jump.
 #[test]
 fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     let (a, b, d): (f64, f64, f64) = (0.02286, 0.01016, 0.030);
@@ -317,7 +313,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     eprintln!("  uniform p=2: {} DOFs, error {e_full:.3e}", full.n_field);
 
     // Sweep theta so the trade-off is a measurement, not an assertion at one point.
-    let mut any = false;
+    let mut tested = false;
     for theta in [0.5, 0.75, 1.0, 1.5] {
         let orders = wavelength_policy(&mesh, &k, theta);
         let n1 = orders.cell.iter().filter(|&&p| p == 1).count();
@@ -325,7 +321,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
             eprintln!("  theta = {theta:.2}: {n1} cells at p=1 (nothing to decide, skipped)");
             continue;
         }
-        any = true;
+        tested = true;
         let basis = NedelecBasis::with_orders(&mesh, orders);
         let (r, _) = resonances(&basis, &mesh, &pec);
         let err = (r[0] - lambda).abs() / lambda;
@@ -346,10 +342,11 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
         // the wrong cells (uniform p=1 on this mesh is ~100x worse).
         assert!(
             err < 10.0 * e_full,
-            "theta = {theta}: the policy reduced cells that mattered — the error went from \
+            "theta = {theta}: the policy reduced cells that mattered, the error went from \
              {e_full:.3e} to {err:.3e}"
         );
     }
+    assert!(tested, "no theta split the mesh between the orders; the sweep tested nothing");
 
     // The control. Reducing EVERYTHING is materially worse, so the free lunch above
     // is the policy's CHOICE of cells and not an artefact of a mesh on which order 2
@@ -357,7 +354,7 @@ fn the_order_policy_gives_back_dofs_without_giving_back_accuracy() {
     //
     // (This mesh is a poor one for this mode on purpose: grading toward a corner
     // starves the region the field actually lives in, so even uniform order 2 is
-    // only good to ~2%. That is what makes the comparison meaningful — the fine
+    // only good to ~2%. That is what makes the comparison meaningful, the fine
     // corner cells contribute nothing either way, which is exactly the situation the
     // policy is supposed to detect and exploit.)
     let all_p1 = NedelecBasis::with_orders(&mesh, OrderMap::uniform(&mesh, 1));

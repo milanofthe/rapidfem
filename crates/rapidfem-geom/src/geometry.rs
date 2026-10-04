@@ -301,6 +301,10 @@ pub struct Geometry {
     face_names: BTreeMap<FaceSel, String>,
     maxh: Option<f64>,
     size_points: Vec<([f64; 3], f64)>,
+    /// Factor on every target size (global, object, material, face and
+    /// size point) when the scene is realized: above 1 coarsens, below
+    /// refines, the size relations stay.
+    size_scale: f64,
     realized: OnceLock<Result<Realized, String>>,
 }
 
@@ -340,7 +344,22 @@ impl Geometry {
             face_names: BTreeMap::new(),
             maxh,
             size_points: Vec::new(),
+            size_scale: 1.0,
             realized: OnceLock::new(),
+        }
+    }
+
+    /// The factor on every target size, see [`Geometry::set_size_scale`].
+    pub fn size_scale(&self) -> f64 {
+        self.size_scale
+    }
+
+    /// Multiplies every target size (global, object, material, face and
+    /// size point, and the size a `mesh` call passes) by `scale`.
+    pub fn set_size_scale(&mut self, scale: f64) {
+        if scale != self.size_scale {
+            self.size_scale = scale;
+            self.changed();
         }
     }
 
@@ -671,7 +690,8 @@ impl Geometry {
     }
 
     fn realize(&self) -> Result<Realized, String> {
-        let mut g = rapidmesh::Geometry::new(self.maxh);
+        let scaled = |h: Option<f64>| h.map(|h| h * self.size_scale);
+        let mut g = rapidmesh::Geometry::new(scaled(self.maxh));
         let mut solids = vec![None; self.objects.len()];
         // the solids of each STEP file, imported all at once
         let mut steps: std::collections::HashMap<&std::path::Path, Vec<Solid>> = Default::default();
@@ -685,24 +705,24 @@ impl Geometry {
             let e = |e: rapidmesh::Error| e.to_string();
             let (placed, done): (Vec<RmObject>, usize) = match &o.item {
                 Item::Solid(shape) => {
-                    let s = g.add_solid(shape.clone(), o.size(), false).map_err(e)?;
+                    let s = g.add_solid(shape.clone(), scaled(o.size()), false).map_err(e)?;
                     solids[i] = Some(s);
                     (vec![s.into()], 0)
                 }
-                Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), o.size()).map_err(e)?.into()], 0),
+                Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?.into()], 0),
                 Item::Sheets(sheets) => (
                     sheets
                         .iter()
-                        .map(|s| g.add_sheet(s, sheet_tag(i), o.size()).map(Into::into).map_err(e))
+                        .map(|s| g.add_sheet(s, sheet_tag(i), scaled(o.size())).map(Into::into).map_err(e))
                         .collect::<Result<Vec<RmObject>, String>>()?,
                     0,
                 ),
                 Item::Extrusion { sheet, vector, placed } => {
-                    let r = g.add_sheet(sheet, sheet_tag(i), o.size()).map_err(e)?;
+                    let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
                     for &tr in &o.transforms[..*placed] {
                         g.transform(r, tr).map_err(e)?;
                     }
-                    let s = g.extrude(r, *vector, o.size()).map_err(e)?;
+                    let s = g.extrude(r, *vector, scaled(o.size())).map_err(e)?;
                     solids[i] = Some(s);
                     (vec![r.into(), s.into()], *placed)
                 }
@@ -719,7 +739,7 @@ impl Geometry {
                     let s = *steps[path.as_path()]
                         .get(*body)
                         .ok_or_else(|| format!("{}: no solid {body}", path.display()))?;
-                    if let Some(h) = o.size() {
+                    if let Some(h) = scaled(o.size()) {
                         g.set_maxh_on(&Scope::region(Some(s.region)), h).map_err(e)?;
                     }
                     solids[i] = Some(s);
@@ -762,7 +782,7 @@ impl Geometry {
             }
         }
         for &(p, h) in &self.size_points {
-            g.add_size_point(p, h);
+            g.add_size_point(p, h * self.size_scale);
         }
         let topology = g.topology().map_err(|e| e.to_string())?;
         // solid index (insertion order, voids included) -> object
@@ -809,7 +829,7 @@ impl Geometry {
                 .collect();
             for id in ids {
                 let filter = FaceFilter { id: Some(id), ..FaceFilter::default() };
-                realized.geometry.set_maxh_on(&Scope::surf(Some(filter)), *h).map_err(|e| e.to_string())?;
+                realized.geometry.set_maxh_on(&Scope::surf(Some(filter)), *h * self.size_scale).map_err(|e| e.to_string())?;
             }
         }
         Ok(realized)
@@ -1124,7 +1144,16 @@ impl Geometry {
 
     /// Meshes the realised scene.
     pub fn mesh(&self, opts: &MeshOptions) -> Result<rapidmesh::Mesh, String> {
-        self.realized()?.geometry.mesh(opts).map_err(|e| e.to_string())
+        let scaled = |h: Option<f64>| h.map(|h| h * self.size_scale);
+        let opts = MeshOptions {
+            maxh: scaled(opts.maxh),
+            maxh_edge: scaled(opts.maxh_edge),
+            maxh_surf: scaled(opts.maxh_surf),
+            maxh_vol: scaled(opts.maxh_vol),
+            min_h_surf: opts.min_h_surf * self.size_scale,
+            ..opts.clone()
+        };
+        self.realized()?.geometry.mesh(&opts).map_err(|e| e.to_string())
     }
 }
 

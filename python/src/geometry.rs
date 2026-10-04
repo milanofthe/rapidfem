@@ -865,6 +865,21 @@ impl PyGeometry {
         Ok(groups)
     }
 
+    /// The factor on every target size (see `Geometry::set_size_scale`).
+    #[getter]
+    fn size_scale(&self) -> f64 {
+        self.inner.size_scale()
+    }
+
+    #[setter]
+    fn set_size_scale(&mut self, scale: f64) -> PyResult<()> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(PyValueError::new_err(format!("size_scale must be a positive number, got {scale}")));
+        }
+        self.inner.set_size_scale(scale);
+        Ok(())
+    }
+
     #[getter]
     fn mesh_mode(&self) -> bool {
         self.scene.is_some()

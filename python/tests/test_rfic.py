@@ -255,9 +255,9 @@ def test_build_passivation_and_boundary_modes(mini_gds, passv, boundary):
     )
     g = model.geometry
     if passv == "conformal":
-        # sheet + sidewall ring + cap over the exposed TopMetal2
-        assert len(model.slabs["Passive"]) >= 3
-        assert len(model.slabs["AIR"]) >= 2      # polygon air prisms
+        # the sheet and the grown TopMetal2 footprint raised over it
+        assert len(model.slabs["Passive"]) >= 2
+        assert len(model.slabs["AIR"]) == 1
     elif passv == "none":
         assert "Passive" not in model.slabs
     if boundary == "pml":

@@ -2,8 +2,8 @@
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-//! Planar regions of a layout: polygon sets with holes, their union,
-//! difference and outward offset, by i_overlay. A region is a list of
+//! Planar regions of a layout: polygon sets with holes, their union and
+//! outward offset, by i_overlay. A region is a list of
 //! shapes, a shape its outer contour followed by its holes.
 
 use i_overlay::core::fill_rule::FillRule;
@@ -24,11 +24,6 @@ fn overlay(a: &Region, b: &Region, rule: OverlayRule) -> Region {
 /// The union of possibly overlapping polygons.
 pub fn union(r: &Region) -> Region {
     overlay(r, &Region::new(), OverlayRule::Union)
-}
-
-/// `a` without `b`.
-pub fn difference(a: &Region, b: &Region) -> Region {
-    overlay(a, b, OverlayRule::Difference)
 }
 
 /// Twice the signed area of a contour (positive counter-clockwise).

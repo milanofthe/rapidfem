@@ -2,10 +2,11 @@
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-//! Boolean operations on coplanar sheets: union, difference, intersection.
+//! Difference and intersection of coplanar sheets (a union needs none:
+//! rapidmesh merges overlapping sheets of one tag exactly).
 //!
-//! rapidmesh's CSG works on solids; sheets (traces, ground planes, slots)
-//! need the 2D booleans in their plane. Every operand becomes its outline in
+//! rapidmesh's CSG works on solids; cutting sheets (ground planes, slots)
+//! needs the 2D booleans in their plane. Every operand becomes its outline in
 //! 3D (its transforms applied), the outlines are checked to share one plane,
 //! projected into that plane's frame, combined by i_overlay and handed back
 //! as `Sheet::Polygon`s with holes plus the placement that puts the frame
@@ -21,6 +22,8 @@ use i_overlay::float::single::SingleFloatOverlay;
 use rapidmesh::shapes::Sheet;
 use rapidmesh::Transform;
 use rapidfem_core::geom::{add, cross, dot, norm, scale, sub, unit};
+
+use crate::geometry::Piece;
 
 type P2 = [f64; 2];
 type P3 = [f64; 3];
@@ -155,9 +158,6 @@ fn shapes_of(l: &Loops, origin: P3, u: P3, v: P3) -> Shapes {
     contours.simplify_shape(FillRule::EvenOdd, 0.0)
 }
 
-/// One operand of [`boolean`]: its pieces and the transforms they share.
-pub type Operand<'a> = (&'a [Sheet], &'a [Transform]);
-
 /// The union of an operand's pieces in the frame.
 fn operand_shapes<'a>(pieces: impl IntoIterator<Item = &'a Loops>, origin: P3, u: P3, v: P3) -> Shapes {
     pieces
@@ -167,17 +167,23 @@ fn operand_shapes<'a>(pieces: impl IntoIterator<Item = &'a Loops>, origin: P3, u
         .simplify_shape(FillRule::NonZero, 0.0)
 }
 
-/// `target` combined with `tools` by `op`: the resulting sheets, xy
-/// polygons with holes in the plane's frame, and the placement they need.
-/// Errors when the operands do not share a plane; an empty result is an
-/// error too (the target would vanish).
-pub fn boolean(op: SheetOp, target: Operand, tools: &[Operand]) -> Result<(Vec<Sheet>, Vec<Transform>), String> {
-    let loops = |(pieces, tr): Operand| pieces.iter().map(|s| loops_of(s, tr)).collect::<Result<Vec<_>, _>>();
+/// The pieces of `target` cut by (difference) or cut to (intersection)
+/// the pieces of `tools`: the resulting sheets, xy polygons with holes in
+/// the plane's frame, and the placement they need. Errors when the operands
+/// do not share a plane; an empty result is an error too (the target would
+/// vanish).
+pub fn boolean(op: SheetOp, target: &[Piece], tools: &[Piece]) -> Result<(Vec<Sheet>, Vec<Transform>), String> {
+    let rule = match op {
+        SheetOp::Union => return Err("a sheet union is no 2D boolean, rapidmesh merges the pieces".into()),
+        SheetOp::Difference => OverlayRule::Difference,
+        SheetOp::Intersection => OverlayRule::Intersect,
+    };
+    let loops = |pieces: &[Piece]| pieces.iter().map(|(s, tr)| loops_of(s, tr)).collect::<Result<Vec<_>, _>>();
     let t = loops(target)?;
-    let others = tools.iter().map(|&o| loops(o)).collect::<Result<Vec<_>, _>>()?;
+    let others = loops(tools)?;
     let first = t.first().ok_or("an empty sheet operand")?;
     let (point, n) = plane_of(&first.outer)?;
-    let all = || t.iter().chain(others.iter().flatten());
+    let all = || t.iter().chain(&others);
     let size = all()
         .flat_map(|l| l.outer.iter())
         .map(|p| norm(sub(*p, point)))
@@ -192,12 +198,7 @@ pub fn boolean(op: SheetOp, target: Operand, tools: &[Operand]) -> Result<(Vec<S
     }
     let (origin, u, v, placement) = frame(point, n);
     let subject = operand_shapes(&t, origin, u, v);
-    let clip = operand_shapes(others.iter().flatten(), origin, u, v);
-    let rule = match op {
-        SheetOp::Union => OverlayRule::Union,
-        SheetOp::Difference => OverlayRule::Difference,
-        SheetOp::Intersection => OverlayRule::Intersect,
-    };
+    let clip = operand_shapes(&others, origin, u, v);
     let result = subject.overlay(&clip, rule, FillRule::NonZero);
     if result.is_empty() {
         return Err("the sheet boolean leaves nothing".into());
@@ -247,7 +248,7 @@ mod tests {
     fn plate_minus_disc_has_a_hole_and_stays_at_its_height() {
         let plate = Sheet::xy(4.0, 4.0, [0.0, 0.0, 1.5]);
         let disc = Sheet::disc(1.0, [2.0, 2.0, 1.5], [0.0, 0.0, 1.0]);
-        let (out, placement) = boolean(SheetOp::Difference, (std::slice::from_ref(&plate), &[]), &[(std::slice::from_ref(&disc), &[])]).unwrap();
+        let (out, placement) = boolean(SheetOp::Difference, &[(plate, vec![])], &[(disc, vec![])]).unwrap();
         assert!(placement.is_empty());
         assert_eq!(out.len(), 1);
         let Sheet::Polygon { holes, position, .. } = &out[0] else { unreachable!() };
@@ -258,15 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn union_of_abutting_strips_is_one_piece_and_a_split_leaves_two() {
-        let a = Sheet::xy(2.0, 1.0, [0.0, 0.0, 0.0]);
-        let b = Sheet::xy(2.0, 1.0, [2.0, 0.0, 0.0]);
-        let (u, _) = boolean(SheetOp::Union, (std::slice::from_ref(&a), &[]), &[(std::slice::from_ref(&b), &[])]).unwrap();
-        assert_eq!(u.len(), 1);
-        assert!((total_area(&u) - 4.0).abs() < 1e-12);
+    fn a_split_leaves_two_pieces() {
         let wide = Sheet::xy(5.0, 1.0, [0.0, 0.0, 0.0]);
         let gap = Sheet::xy(1.0, 3.0, [2.0, -1.0, 0.0]);
-        let (d, _) = boolean(SheetOp::Difference, (std::slice::from_ref(&wide), &[]), &[(std::slice::from_ref(&gap), &[])]).unwrap();
+        let (d, _) = boolean(SheetOp::Difference, &[(wide, vec![])], &[(gap, vec![])]).unwrap();
         assert_eq!(d.len(), 2);
         assert!((total_area(&d) - 4.0).abs() < 1e-12);
     }
@@ -280,7 +276,7 @@ mod tests {
             Transform::Rotate { angle: -std::f64::consts::FRAC_PI_2, axis: [0.0, 1.0, 0.0], center: [0.0; 3] },
             Transform::Translate([1.0, 0.5, 0.5]),
         ];
-        let (out, placement) = boolean(SheetOp::Intersection, (std::slice::from_ref(&a), &[]), &[(std::slice::from_ref(&b), &to_plane)]).unwrap();
+        let (out, placement) = boolean(SheetOp::Intersection, &[(a, vec![])], &[(b, to_plane.to_vec())]).unwrap();
         assert_eq!(out.len(), 1);
         assert!((total_area(&out) - 1.0).abs() < 1e-9);
         let Sheet::Polygon { points, .. } = &out[0] else { unreachable!() };
@@ -295,6 +291,6 @@ mod tests {
     fn sheets_in_different_planes_are_refused() {
         let a = Sheet::xy(1.0, 1.0, [0.0, 0.0, 0.0]);
         let b = Sheet::xy(1.0, 1.0, [0.0, 0.0, 0.5]);
-        assert!(boolean(SheetOp::Union, (std::slice::from_ref(&a), &[]), &[(std::slice::from_ref(&b), &[])]).is_err());
+        assert!(boolean(SheetOp::Difference, &[(a, vec![])], &[(b, vec![])]).is_err());
     }
 }

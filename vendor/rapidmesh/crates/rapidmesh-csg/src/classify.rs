@@ -7,7 +7,7 @@
 //! is the segment from it to an explicit target far outside the solid.
 //! Degenerate configurations (segment through an edge/vertex, target on a
 //! plane) are detected exactly and resolved by retrying with a different
-//! target — the set of bad targets is measure-zero, so a deterministic
+//! target -- the set of bad targets is measure-zero, so a deterministic
 //! pseudo-random target sequence escapes after a try or two.
 
 use crate::tri::Tri;

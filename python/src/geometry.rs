@@ -865,6 +865,21 @@ impl PyGeometry {
         Ok(groups)
     }
 
+    /// The factor on every target size (see `Geometry::set_size_scale`).
+    #[getter]
+    fn size_scale(&self) -> f64 {
+        self.inner.size_scale()
+    }
+
+    #[setter]
+    fn set_size_scale(&mut self, scale: f64) -> PyResult<()> {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(PyValueError::new_err(format!("size_scale must be a positive number, got {scale}")));
+        }
+        self.inner.set_size_scale(scale);
+        Ok(())
+    }
+
     #[getter]
     fn mesh_mode(&self) -> bool {
         self.scene.is_some()
@@ -900,7 +915,7 @@ impl PyGeometry {
                         .collect()
                 };
                 let fm = scene.fem_mesh(&names(&tagging.faces), &names(&tagging.volumes)).map_err(PyValueError::new_err)?;
-                (fm, (scene.mesh.quality.min_dihedral_deg, scene.mesh.quality.n_slivers))
+                (fm, (scene.mesh.quality.min_dihedral_deg, scene.mesh.quality.slivers.len()))
             }
             None => {
                 let opts = MeshOptions {
@@ -914,7 +929,7 @@ impl PyGeometry {
                 let (faces, volumes) = self.brep_groups(&tagging)?;
                 let holes = self.inner.hole_regions().map_err(err)?;
                 let fm = fem_mesh(&m, &faces, &volumes, &holes);
-                let quality = (m.quality.min_dihedral_deg, m.quality.n_slivers);
+                let quality = (m.quality.min_dihedral_deg, m.quality.slivers.len());
                 self.mesh = Some(m);
                 (fm, quality)
             }

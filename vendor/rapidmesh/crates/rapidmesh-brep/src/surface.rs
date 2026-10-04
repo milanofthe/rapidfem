@@ -5,29 +5,27 @@
 //! including the frame a plane lacks in [`SurfaceKind`] -- with a single interface
 //! (`closest` / `principal_curvatures` / `curvature_radius`, and the parameter
 //! maps `eval_uv` / `project_uv` / `normal`). It is the one projection path:
-//! the builder, the mesher, the optimizer, sizing and the diagnostics all query
-//! it. Every analytic carrier has a closed-form footpoint and curvature; the
+//! the builder, the mesher, sizing and the diagnostics all query it. Every analytic carrier has a closed-form footpoint and curvature; the
 //! extruded profile and a NURBS surface project by safeguarded Newton on their
 //! own derivatives and take their curvature from them.
 
 use rapidmesh_geom::nurbs::NurbsCurve;
-use rapidmesh_geom::vec3::{add, cross, dot, normalize as norm, scale, sub, V3};
+use rapidmesh_geom::vec3::{add, cross, dist, dot, normalize as norm, ortho_unit, scale, sub, V3};
 use rapidmesh_geom::{NurbsSurface, SurfaceKind};
 use std::sync::Arc;
 
 type P2 = [f64; 2];
 
-fn add3(a: V3, b: V3) -> V3 {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-/// An arbitrary unit vector perpendicular to `a` (a reference for `theta = 0`).
-fn perp(a: V3) -> V3 {
-    let t = if a[0].abs() < 0.9 {
-        [1.0, 0.0, 0.0]
+/// The unit `x` made square to the unit axis `a` (it should be already;
+/// rounding and transforms leave it a hair off), or [`ortho_unit`] of `a`
+/// where `x` has no part off the axis.
+fn square_to(x: V3, a: V3) -> V3 {
+    let off = sub(x, scale(a, dot(x, a)));
+    if dot(off, off) > 1e-24 {
+        norm(off)
     } else {
-        [0.0, 1.0, 0.0]
-    };
-    norm(cross(a, t))
+        ortho_unit(a)
+    }
 }
 
 /// A trimmed surface's underlying geometry, with one parameter-map interface.
@@ -87,8 +85,8 @@ pub enum Surface {
     Discrete(Arc<rapidmesh_geom::DiscreteSurface>),
     /// Constant-radius tube about a polyline path (swept pipes, helix coils):
     /// `dist(p, path) = radius`. Queried by closest-point projection like
-    /// [`Surface::Discrete`], but the oracle is analytic per segment -- smooth
-    /// where it matters and with exact curvature `radius` for sizing.
+    /// [`Surface::Discrete`], but analytic per segment: smooth where it
+    /// matters and with exact curvature `radius` for sizing.
     Tube {
         path: Arc<rapidmesh_geom::TubePath>,
         radius: f64,
@@ -121,7 +119,7 @@ impl Surface {
                     .iter()
                     .map(|&p| sub(onto(p), o))
                     .find(|d| dot(*d, *d) > 1e-20)
-                    .map_or_else(|| perp(normal), norm);
+                    .map_or_else(|| ortho_unit(normal), norm);
                 Surface::Plane {
                     o,
                     u,
@@ -132,21 +130,27 @@ impl Surface {
             SurfaceKind::Cylinder {
                 center,
                 axis,
+                x,
                 radius,
             } => {
                 let a = norm(*axis);
                 Surface::Cylinder {
                     center: *center,
                     axis: a,
-                    x: perp(a),
+                    x: square_to(*x, a),
                     radius: *radius,
                 }
             }
-            SurfaceKind::Sphere { center, radius } => {
-                let z = [0.0, 0.0, 1.0];
+            SurfaceKind::Sphere {
+                center,
+                axis,
+                x,
+                radius,
+            } => {
+                let z = norm(*axis);
                 Surface::Sphere {
                     center: *center,
-                    x: perp(z),
+                    x: square_to(*x, z),
                     z,
                     radius: *radius,
                 }
@@ -154,19 +158,21 @@ impl Surface {
             SurfaceKind::Cone {
                 apex,
                 axis,
+                x,
                 tan_half_angle,
             } => {
                 let a = norm(*axis);
                 Surface::Cone {
                     apex: *apex,
                     axis: a,
-                    x: perp(a),
+                    x: square_to(*x, a),
                     half_angle: tan_half_angle.atan(),
                 }
             }
             SurfaceKind::Torus {
                 center,
                 axis,
+                x,
                 major_radius,
                 minor_radius,
             } => {
@@ -174,7 +180,7 @@ impl Surface {
                 Surface::Torus {
                     center: *center,
                     axis: a,
-                    x: perp(a),
+                    x: square_to(*x, a),
                     major: *major_radius,
                     minor: *minor_radius,
                 }
@@ -215,7 +221,7 @@ impl Surface {
     /// The plane through `o` with unit normal `normal`, framed by an arbitrary
     /// in-plane `u`.
     pub fn plane(o: V3, normal: V3) -> Surface {
-        let u = perp(normal);
+        let u = ortho_unit(normal);
         Surface::Plane {
             o,
             u,
@@ -230,9 +236,9 @@ impl Surface {
             .then(|| Surface::from_kind(kind, &[]))
     }
 
-    /// Closest point on the surface and the outward normal there -- the
-    /// canonical projection API of the meshing path (`signed_offset`, POCS,
-    /// crossing pulls, the optimizer, the diagnostics). Closed form and
+    /// Closest point on the surface and the outward normal there: the
+    /// projection of the meshing path, the improver and the diagnostics.
+    /// Closed form and
     /// without trigonometry for every analytic kind; the extruded profile goes
     /// through its parameter map, a discrete patch through its facets.
     pub fn closest(&self, p: V3) -> (V3, V3) {
@@ -318,10 +324,107 @@ impl Surface {
         }
     }
 
+    /// Whether the carrier is a spline (an extrusion, a revolution, a
+    /// B-spline surface), whose nearest point is a search: one from the
+    /// parameters of a point nearby is far cheaper than [`Surface::closest`].
+    pub fn searches(&self) -> bool {
+        matches!(
+            self,
+            Surface::Extruded { .. }
+                | Surface::Nurbs(_)
+                | Surface::Revolved { .. }
+                | Surface::Tube { .. }
+        )
+    }
+
+    /// Where a search for the nearest point to `p` starts later: its
+    /// parameters on a spline carrier, its path segment on a tube.
+    pub fn search_start(&self, p: V3) -> P2 {
+        match self {
+            Surface::Tube { path, .. } => [path.closest_segment(p) as f64, 0.0],
+            _ => self.project_uv(p),
+        }
+    }
+
+    /// [`Surface::closest`] searched from `uv0`, where the search for a
+    /// point near the answer started (see [`Surface::search_start`]), with
+    /// where the answer's starts (`uv0` again on a carrier that does not
+    /// search).
+    pub fn closest_near(&self, p: V3, uv0: P2) -> (V3, P2) {
+        if !self.searches() {
+            return (self.closest(p).0, uv0);
+        }
+        if let Surface::Tube { path, radius } = self {
+            // Walked from the segment before; a point farther from the path
+            // than the tube is wide may be nearer another turn of it.
+            let (mut q, mut s) = path.closest_near(p, uv0[0] as usize);
+            if dist(p, q) > 2.0 * radius {
+                q = path.closest(p);
+                s = path.closest_segment(p);
+            }
+            let d = sub(p, q);
+            let l = dot(d, d).sqrt();
+            let n = if l > 0.0 {
+                scale(d, 1.0 / l)
+            } else {
+                [0.0, 0.0, 1.0]
+            };
+            return (add(q, scale(n, *radius)), [s as f64, 0.0]);
+        }
+        let uv = match self {
+            Surface::Extruded {
+                base,
+                u,
+                v,
+                axis,
+                profile,
+            } => {
+                let rel = sub(p, *base);
+                [
+                    profile.closest_param_near([dot(rel, *u), dot(rel, *v)], uv0[0]),
+                    dot(rel, *axis),
+                ]
+            }
+            Surface::Nurbs(s) => s.closest_param_near(p, uv0),
+            Surface::Revolved {
+                origin,
+                axis,
+                x,
+                profile,
+            } => {
+                let y = cross(*axis, *x);
+                let d = sub(p, *origin);
+                let z = dot(d, *axis);
+                let rd = sub(d, scale(*axis, z));
+                let r = dot(rd, rd).sqrt();
+                [
+                    dot(rd, y).atan2(dot(rd, *x)),
+                    profile.closest_param_near([r, z], uv0[1]),
+                ]
+            }
+            _ => self.project_uv(p),
+        };
+        (self.eval_uv(uv), uv)
+    }
+
+    /// A point of the surface near `p`, cheaper than [`Surface::closest_near`]
+    /// where that searches a spline: one Gauss-Newton step from `uv0` on a
+    /// NURBS carrier (a point on it, not quite the nearest), the nearest
+    /// point elsewhere. For comparing candidate places close to `uv0`.
+    pub fn toward(&self, p: V3, uv0: P2) -> V3 {
+        match self {
+            Surface::Nurbs(s) => {
+                let uv = s.step_toward(p, uv0);
+                s.eval(uv[0], uv[1])
+            }
+            _ => self.closest_near(p, uv0).0,
+        }
+    }
+
     /// Parameter point `(u, v)` -> 3D.
     pub fn eval_uv(&self, p: P2) -> V3 {
         match self {
-            Surface::Plane { o, u, v, .. } => add3(*o, add3(scale(*u, p[0]), scale(*v, p[1]))),
+            Surface::Plane { o, u, v, .. } => add(*o, add(scale(*u, p[0]), scale(*v, p[1]))),
             Surface::Cylinder {
                 center,
                 axis,
@@ -329,8 +432,8 @@ impl Surface {
                 radius,
             } => {
                 let y = cross(*axis, *x);
-                let r = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
-                add3(add3(*center, scale(*axis, p[1])), scale(r, *radius))
+                let r = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                add(add(*center, scale(*axis, p[1])), scale(r, *radius))
             }
             Surface::Sphere {
                 center,
@@ -339,9 +442,9 @@ impl Surface {
                 radius,
             } => {
                 let y = cross(*z, *x);
-                let eq = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
-                let dir = add3(scale(eq, p[1].cos()), scale(*z, p[1].sin()));
-                add3(*center, scale(dir, *radius))
+                let eq = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                let dir = add(scale(eq, p[1].cos()), scale(*z, p[1].sin()));
+                add(*center, scale(dir, *radius))
             }
             Surface::Cone {
                 apex,
@@ -351,8 +454,8 @@ impl Surface {
             } => {
                 let y = cross(*axis, *x);
                 let rho = p[1] * half_angle.tan();
-                let r = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
-                add3(add3(*apex, scale(*axis, p[1])), scale(r, rho))
+                let r = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                add(add(*apex, scale(*axis, p[1])), scale(r, rho))
             }
             Surface::Torus {
                 center,
@@ -362,9 +465,9 @@ impl Surface {
                 minor,
             } => {
                 let y = cross(*axis, *x);
-                let dir = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                let dir = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
                 let ring = scale(dir, major + minor * p[1].cos());
-                add3(add3(*center, ring), scale(*axis, minor * p[1].sin()))
+                add(add(*center, ring), scale(*axis, minor * p[1].sin()))
             }
             Surface::Extruded {
                 base,
@@ -374,9 +477,9 @@ impl Surface {
                 profile,
             } => {
                 let c = profile.eval(p[0]);
-                add3(
-                    add3(*base, scale(*axis, p[1])),
-                    add3(scale(*u, c[0]), scale(*v, c[1])),
+                add(
+                    add(*base, scale(*axis, p[1])),
+                    add(scale(*u, c[0]), scale(*v, c[1])),
                 )
             }
             Surface::Nurbs(s) => s.eval(p[0], p[1]),
@@ -388,8 +491,8 @@ impl Surface {
             } => {
                 let c = profile.eval(p[1]);
                 let y = cross(*axis, *x);
-                let dir = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
-                add3(add3(*origin, scale(*axis, c[1])), scale(dir, c[0]))
+                let dir = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                add(add(*origin, scale(*axis, c[1])), scale(dir, c[0]))
             }
             // no parameter map: the (u,v) API is chart territory, and discrete
             // patches never chart -- callers on the meshing path use `closest`
@@ -491,7 +594,7 @@ impl Surface {
             Surface::Plane { normal, .. } => *normal,
             Surface::Cylinder { axis, x, .. } => {
                 let y = cross(*axis, *x);
-                add3(scale(*x, p[0].cos()), scale(y, p[0].sin()))
+                add(scale(*x, p[0].cos()), scale(y, p[0].sin()))
             }
             Surface::Sphere { center, .. } => norm(sub(self.eval_uv(p), *center)),
             Surface::Cone {
@@ -501,7 +604,7 @@ impl Surface {
                 ..
             } => {
                 let y = cross(*axis, *x);
-                let radial = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                let radial = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
                 norm(sub(
                     scale(radial, half_angle.cos()),
                     scale(*axis, half_angle.sin()),
@@ -515,8 +618,8 @@ impl Surface {
                 ..
             } => {
                 let y = cross(*axis, *x);
-                let dir = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
-                let tube_center = add3(*center, scale(dir, *major));
+                let dir = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                let tube_center = add(*center, scale(dir, *major));
                 norm(sub(self.eval_uv(p), tube_center))
             }
             Surface::Extruded {
@@ -527,7 +630,7 @@ impl Surface {
                 ..
             } => {
                 let (_, c1, _) = profile.ders2(p[0]);
-                let tangent = add3(scale(*u, c1[0]), scale(*v, c1[1]));
+                let tangent = add(scale(*u, c1[0]), scale(*v, c1[1]));
                 norm(cross(tangent, *axis))
             }
             Surface::Nurbs(s) => s.normal(p[0], p[1]),
@@ -537,7 +640,7 @@ impl Surface {
                 // (dz, -dr) in the meridian, the solid on the profile's left.
                 let (_, c1, _) = profile.ders2(p[1]);
                 let y = cross(*axis, *x);
-                let dir = add3(scale(*x, p[0].cos()), scale(y, p[0].sin()));
+                let dir = add(scale(*x, p[0].cos()), scale(y, p[0].sin()));
                 norm(sub(scale(dir, c1[1]), scale(*axis, c1[0])))
             }
             Surface::Discrete(_) => [0.0, 0.0, 1.0],
@@ -610,9 +713,8 @@ impl Surface {
 
     /// The surface's isolated SINGULAR point, if any (the cone apex): a point
     /// where the tangent plane is undefined. Such a point can sit in a face's
-    /// interior with NO incident B-rep edge, so topology alone never protects
-    /// it -- restricted sampling then only approaches the tip, never hits it,
-    /// and the tip erodes. The mesher pins it as an explicit corner site.
+    /// interior with no incident B-rep edge, so topology alone never has it.
+    /// The chart of the face takes it as a point of the face's own.
     pub fn singular_point(&self) -> Option<V3> {
         match self {
             Surface::Cone { apex, .. } => Some(*apex),
@@ -653,11 +755,7 @@ mod tests {
     #[test]
     fn cylinder_roundtrip_and_radius() {
         let s = Surface::from_kind(
-            &SurfaceKind::Cylinder {
-                center: [0.0, 0.0, 0.0],
-                axis: [0.0, 0.0, 1.0],
-                radius: 2.0,
-            },
+            &SurfaceKind::cylinder([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 2.0),
             &[],
         );
         // a point exactly on the barrel
@@ -670,13 +768,7 @@ mod tests {
 
     #[test]
     fn sphere_roundtrip() {
-        let s = Surface::from_kind(
-            &SurfaceKind::Sphere {
-                center: [1.0, 0.0, 0.0],
-                radius: 3.0,
-            },
-            &[],
-        );
+        let s = Surface::from_kind(&SurfaceKind::sphere([1.0, 0.0, 0.0], 3.0), &[]);
         for &(t, f) in &[(0.5, 0.4), (-1.2, -0.8), (PI * 0.5, 0.0)] {
             let p = s.eval_uv([t, f]);
             assert!(
@@ -713,11 +805,7 @@ mod tests {
     #[test]
     fn cone_footpoint_is_the_nearest_point() {
         let s = Surface::from_kind(
-            &SurfaceKind::Cone {
-                apex: [0.0, 0.0, 0.0],
-                axis: [0.0, 0.0, 1.0],
-                tan_half_angle: 0.6,
-            },
+            &SurfaceKind::cone([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 0.6),
             &[],
         );
         // Off the barrel, outside and inside, and behind the apex.
@@ -740,12 +828,7 @@ mod tests {
         // R < 2r: on the inner equator the parallel circle, 1 / (R - r),
         // bends more than the tube, 1 / r.
         let s = Surface::from_kind(
-            &SurfaceKind::Torus {
-                center: [0.0, 0.0, 0.0],
-                axis: [0.0, 0.0, 1.0],
-                major_radius: 1.5,
-                minor_radius: 1.0,
-            },
+            &SurfaceKind::torus([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.5, 1.0),
             &[],
         );
         let inner = [0.5, 0.0, 0.0];

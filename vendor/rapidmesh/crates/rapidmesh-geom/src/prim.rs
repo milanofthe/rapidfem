@@ -5,44 +5,18 @@
 //! back-references. Solid builders guarantee watertightness and outward
 //! orientation; sheet builders guarantee consistent winding.
 
-use crate::faceted::{Faceted, SurfaceKind};
+use crate::faceted::{CurveKind, EdgeCurve, Faceted, SurfaceKind};
 use crate::nurbs::NurbsCurve;
 use crate::nurbs_surface::NurbsSurface;
 use crate::polygon::{polygon_orientation, triangulate_polygon};
+use crate::vec3::{add, cross, dot, len, scale, sub};
 use rapidmesh_csg::{PlanarFacet, Tri};
 use rapidmesh_exact::Sign;
 use std::sync::Arc;
 
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn scale(a: [f64; 3], s: f64) -> [f64; 3] {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-
-fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn norm(a: [f64; 3]) -> f64 {
-    dot3(a, a).sqrt()
-}
-
 /// Two unit vectors orthogonal to `axis` (and to each other).
 fn orthonormal_basis(axis: [f64; 3]) -> ([f64; 3], [f64; 3]) {
-    let n = norm(axis);
+    let n = len(axis);
     assert!(n > 0.0, "axis must be nonzero");
     let a = scale(axis, 1.0 / n);
     // Pick the coordinate axis least aligned with `a`.
@@ -53,9 +27,9 @@ fn orthonormal_basis(axis: [f64; 3]) -> ([f64; 3], [f64; 3]) {
     } else {
         [0.0, 0.0, 1.0]
     };
-    let e1 = cross3(a, helper);
-    let e1 = scale(e1, 1.0 / norm(e1));
-    let e2 = cross3(a, e1);
+    let e1 = cross(a, helper);
+    let e1 = scale(e1, 1.0 / len(e1));
+    let e2 = cross(a, e1);
     (e1, e2)
 }
 
@@ -146,20 +120,16 @@ pub fn frustum(
 
     let mut f = Faceted::new();
     let barrel_kind = if r_top == r_base {
-        SurfaceKind::Cylinder {
-            center: base_center,
-            axis,
-            radius: r_base,
-        }
+        SurfaceKind::cylinder(base_center, axis, r_base)
     } else {
         // Apex where the barrel lines meet.
         let factor = r_base / (r_base - r_top);
         let apex = add(base_center, scale(axis, factor));
-        SurfaceKind::Cone {
+        SurfaceKind::cone(
             apex,
-            axis: scale(axis, -factor),
-            tan_half_angle: r_base / (norm(axis) * factor).abs(),
-        }
+            scale(axis, -factor),
+            r_base / (len(axis) * factor).abs(),
+        )
     };
     let barrel = f.add_surface(barrel_kind);
 
@@ -212,7 +182,7 @@ pub fn cylinder(base_center: [f64; 3], axis: [f64; 3], radius: f64, segments: us
 /// of intersection curves), so a fixed count too coarse for the requested `maxh`
 /// leaves the boundary off the true surface -- the straddler root cause. The CORE
 /// derives this so every embedder (not just the Python layer) gets it.
-pub fn facet_count(radius: f64, maxh: Option<f64>, tol: f64) -> usize {
+pub(crate) fn facet_count(radius: f64, maxh: Option<f64>, tol: f64) -> usize {
     use std::f64::consts::PI;
     let n_tol = (PI / (1.0 - tol.clamp(1e-9, 0.5)).acos()).ceil() as usize;
     let n_maxh = match maxh {
@@ -244,7 +214,7 @@ pub fn sphere(center: [f64; 3], radius: f64, segments: usize, rings: usize) -> F
     );
     assert!(radius > 0.0);
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Sphere { center, radius });
+    let s = f.add_surface(SurfaceKind::sphere(center, radius));
     let pt = |theta: f64, phi: f64| -> [f64; 3] {
         add(
             center,
@@ -300,7 +270,7 @@ pub fn extrude_polygon(
     h: [f64; 3],
 ) -> Faceted {
     assert!(
-        dot3(cross3(u, v), h) > 0.0,
+        dot(cross(u, v), h) > 0.0,
         "extrusion frame must be right-handed: (u x v) . h > 0"
     );
     // Normalize ring orientations: outer counterclockwise, holes clockwise
@@ -332,7 +302,7 @@ pub fn extrude_polygon(
     // fan triangles and the boundary loops).
     let bottom = f.add_surface(SurfaceKind::Plane {
         point: base,
-        normal: scale(cross3(u, v), -1.0),
+        normal: scale(cross(u, v), -1.0),
     });
     let bottom_tris: Vec<Tri> = cap
         .iter()
@@ -357,7 +327,7 @@ pub fn extrude_polygon(
 
     let top = f.add_surface(SurfaceKind::Plane {
         point: top_base,
-        normal: cross3(u, v),
+        normal: cross(u, v),
     });
     let top_tris: Vec<Tri> = cap
         .iter()
@@ -389,7 +359,7 @@ pub fn extrude_polygon(
             let (at, bt) = (add(a, h), add(b, h));
             let side = f.add_surface(SurfaceKind::Plane {
                 point: a,
-                normal: cross3(sub(b, a), h),
+                normal: cross(sub(b, a), h),
             });
             let tris = [Tri::new(a, b, bt), Tri::new(a, bt, at)];
             f.push_flat(PlanarFacet::new(vec![a, b, bt, at]), &tris, side);
@@ -414,7 +384,7 @@ pub fn extrude_spline_profile(
     h: [f64; 3],
 ) -> Faceted {
     assert!(
-        dot3(cross3(u, v), h) > 0.0,
+        dot(cross(u, v), h) > 0.0,
         "extrusion frame must be right-handed"
     );
     assert!(n_seg >= 2, "need at least 2 segments");
@@ -430,14 +400,14 @@ pub fn extrude_spline_profile(
     }
     let cap = triangulate_polygon(&pts2, &[]);
     let top_base = add(base, h);
-    let hl = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).sqrt();
+    let hl = len(h);
     let axis = [h[0] / hl, h[1] / hl, h[2] / hl];
 
     let mut f = Faceted::new();
     // Bottom cap: reverse winding for the outward -(uxv) normal.
     let bottom = f.add_surface(SurfaceKind::Plane {
         point: base,
-        normal: scale(cross3(u, v), -1.0),
+        normal: scale(cross(u, v), -1.0),
     });
     let bottom_tris: Vec<Tri> = cap
         .iter()
@@ -454,7 +424,7 @@ pub fn extrude_spline_profile(
 
     let top = f.add_surface(SurfaceKind::Plane {
         point: top_base,
-        normal: cross3(u, v),
+        normal: cross(u, v),
     });
     let top_tris: Vec<Tri> = cap
         .iter()
@@ -491,7 +461,7 @@ pub fn extrude_spline_profile(
         let b = embed(base, u, v, q0);
         let flat = f.add_surface(SurfaceKind::Plane {
             point: a,
-            normal: cross3(sub(b, a), h),
+            normal: cross(sub(b, a), h),
         });
         let (at, bt) = (add(a, h), add(b, h));
         let tris = [Tri::new(a, b, bt), Tri::new(a, bt, at)];
@@ -549,14 +519,9 @@ pub fn torus(
         "torus needs 0 < minor_radius < major_radius"
     );
     let (e1, e2) = orthonormal_basis(axis);
-    let a_hat = scale(axis, 1.0 / norm(axis));
+    let a_hat = scale(axis, 1.0 / len(axis));
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Torus {
-        center,
-        axis,
-        major_radius,
-        minor_radius,
-    });
+    let s = f.add_surface(SurfaceKind::torus(center, axis, major_radius, minor_radius));
     let pt = |i: usize, j: usize| -> [f64; 3] {
         let theta = 2.0 * std::f64::consts::PI * i as f64 / segments_major as f64;
         let phi = 2.0 * std::f64::consts::PI * j as f64 / segments_minor as f64;
@@ -613,7 +578,7 @@ fn signed_volume(f: &Faceted) -> f64 {
     let mut v6 = 0.0;
     for t in &f.tris {
         let (a, b, c) = (t.v[0], t.v[1], t.v[2]);
-        v6 += dot3(a, cross3(b, c));
+        v6 += dot(a, cross(b, c));
     }
     v6 / 6.0
 }
@@ -632,7 +597,7 @@ pub fn mesh_solid(verts: &[[f64; 3]], tris: &[[u32; 3]]) -> Faceted {
         .iter()
         .map(|t| {
             let [a, b, c] = t.map(|v| verts[v as usize]);
-            dot3(a, cross3(b, c))
+            dot(a, cross(b, c))
         })
         .sum();
     assert!(vol.abs() > 0.0, "degenerate mesh_solid (zero volume)");
@@ -647,14 +612,14 @@ pub fn mesh_solid(verts: &[[f64; 3]], tris: &[[u32; 3]]) -> Faceted {
             }
         })
         .collect();
-    crate::import::faceted_from_tris_creased(soup, crate::import::CREASE_DEG)
+    crate::import::faceted_from_tris(soup, crate::import::CREASE_DEG)
 }
 
 /// Cylinder with an isotropic barrel: instead of [`cylinder`]'s single ring of
 /// full-height quads, the side is a structured grid of `rows` height levels so
 /// the cells are roughly square (near-equilateral triangles), matching gmsh /
-/// tetgen's even surface-point distribution. Flat fan caps (the conformal
-/// mesher refines those isotropically anyway). Carries the analytic
+/// tetgen's even surface-point distribution. Flat fan caps (the mesher
+/// remeshes them anyway). Carries the analytic
 /// [`SurfaceKind::Cylinder`] for vertex snapping.
 pub fn cylinder_iso(
     base_center: [f64; 3],
@@ -686,11 +651,7 @@ pub fn cylinder_iso(
         .collect();
 
     let mut f = Faceted::new();
-    let barrel = f.add_surface(SurfaceKind::Cylinder {
-        center: base_center,
-        axis,
-        radius,
-    });
+    let barrel = f.add_surface(SurfaceKind::cylinder(base_center, axis, radius));
     for k in 0..rows {
         let (lo, hi) = (&levels[k], &levels[k + 1]);
         for i in 0..segments {
@@ -765,19 +726,15 @@ pub fn frustum_iso(
 
     let mut f = Faceted::new();
     let barrel_kind = if r_top == r_base {
-        SurfaceKind::Cylinder {
-            center: base_center,
-            axis,
-            radius: r_base,
-        }
+        SurfaceKind::cylinder(base_center, axis, r_base)
     } else {
         let factor = r_base / (r_base - r_top);
         let apex = add(base_center, scale(axis, factor));
-        SurfaceKind::Cone {
+        SurfaceKind::cone(
             apex,
-            axis: scale(axis, -factor),
-            tan_half_angle: r_base / (norm(axis) * factor).abs(),
-        }
+            scale(axis, -factor),
+            r_base / (len(axis) * factor).abs(),
+        )
     };
     let barrel = f.add_surface(barrel_kind);
     let top_center = add(base_center, axis);
@@ -906,11 +863,11 @@ pub fn icosphere(center: [f64; 3], radius: f64, subdivisions: usize) -> Faceted 
     }
     // Project every vertex onto the sphere and emit.
     let proj = |v: [f64; 3]| -> [f64; 3] {
-        let n = norm(v);
+        let n = len(v);
         add(center, scale(v, radius / n))
     };
     let mut f = Faceted::new();
-    let s = f.add_surface(SurfaceKind::Sphere { center, radius });
+    let s = f.add_surface(SurfaceKind::sphere(center, radius));
     for tri in &faces {
         f.push_tri(
             Tri::new(
@@ -944,7 +901,7 @@ pub fn pipe(path: &[[f64; 3]], radius: f64, segments: usize) -> Faceted {
     let n = path.len();
     let seg_dir = |i: usize| -> [f64; 3] {
         let d: [f64; 3] = std::array::from_fn(|k| path[i + 1][k] - path[i][k]);
-        let l = norm(d);
+        let l = len(d);
         assert!(l > 0.0, "pipe path points must be distinct");
         scale(d, 1.0 / l)
     };
@@ -956,7 +913,7 @@ pub fn pipe(path: &[[f64; 3]], radius: f64, segments: usize) -> Faceted {
             seg_dir(n - 2)
         } else {
             let s = add(seg_dir(i - 1), seg_dir(i));
-            let l = norm(s);
+            let l = len(s);
             assert!(l > 1e-9, "pipe path doubles back on itself");
             scale(s, 1.0 / l)
         };
@@ -970,9 +927,9 @@ pub fn pipe(path: &[[f64; 3]], radius: f64, segments: usize) -> Faceted {
     for i in 1..n {
         let (prev_n, cur_n) = (node_normal(i - 1), node_normal(i));
         let (u, v) = frames[i - 1];
-        let c = dot3(prev_n, cur_n).clamp(-1.0, 1.0);
-        let axis = cross3(prev_n, cur_n);
-        let s = norm(axis);
+        let c = dot(prev_n, cur_n).clamp(-1.0, 1.0);
+        let axis = cross(prev_n, cur_n);
+        let s = len(axis);
         if s < 1e-12 {
             frames.push((u, v));
             continue;
@@ -980,8 +937,8 @@ pub fn pipe(path: &[[f64; 3]], radius: f64, segments: usize) -> Faceted {
         let k = scale(axis, 1.0 / s);
         let rot = |p: [f64; 3]| -> [f64; 3] {
             // Rodrigues: p c + (k x p) s + k (k . p)(1 - c).
-            let kxp = cross3(k, p);
-            let kdp = dot3(k, p);
+            let kxp = cross(k, p);
+            let kdp = dot(k, p);
             std::array::from_fn(|m| p[m] * c + kxp[m] * s + k[m] * kdp * (1.0 - c))
         };
         frames.push((rot(u), rot(v)));
@@ -1122,7 +1079,7 @@ pub fn sheet_rect(corner: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Faceted {
     let mut f = Faceted::new();
     let s = f.add_surface(SurfaceKind::Plane {
         point: corner,
-        normal: cross3(u, v),
+        normal: cross(u, v),
     });
     let b = add(corner, u);
     let c = add(add(corner, u), v);
@@ -1135,7 +1092,7 @@ pub fn sheet_rect(corner: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Faceted {
 
 /// The least turn (degrees) at a vertex of a polygon sheet that makes it a
 /// corner of the sheet.
-pub const POLYGON_CORNER_DEG: f64 = 20.0;
+const POLYGON_CORNER_DEG: f64 = 20.0;
 
 /// Planar polygon sheet (with holes) in the (base, u, v) frame.
 pub fn sheet_polygon(
@@ -1148,7 +1105,7 @@ pub fn sheet_polygon(
     let mut f = Faceted::new();
     let s = f.add_surface(SurfaceKind::Plane {
         point: base,
-        normal: cross3(u, v),
+        normal: cross(u, v),
     });
     let tris: Vec<Tri> = triangulate_polygon(outer, holes)
         .iter()
@@ -1191,7 +1148,7 @@ pub fn sheet_disk(center: [f64; 3], e1: [f64; 3], e2: [f64; 3], segments: usize)
     let mut f = Faceted::new();
     let s = f.add_surface(SurfaceKind::Plane {
         point: center,
-        normal: cross3(e1, e2),
+        normal: cross(e1, e2),
     });
     let ring: Vec<[f64; 3]> = (0..segments)
         .map(|i| {
@@ -1202,6 +1159,37 @@ pub fn sheet_disk(center: [f64; 3], e1: [f64; 3], e2: [f64; 3], segments: usize)
     let tris: Vec<Tri> = (0..segments)
         .map(|i| Tri::new(center, ring[i], ring[(i + 1) % segments]))
         .collect();
+    // The rim is the exact circle (or ellipse) the ring samples, closed on
+    // its first point: the B-rep edge takes it as its carrier, so the mesh
+    // samples it by its curvature, not by the ring.
+    let (r1, r2) = (len(e1), len(e2));
+    let axis = scale(cross(e1, e2), 1.0 / (r1 * r2));
+    // (Radius vectors at an angle span an ellipse too, but not on these
+    // axes: that rim stays the ring.)
+    let square = dot(e1, e2).abs() <= 1e-12 * r1 * r2;
+    let kind = if square && (r1 - r2).abs() <= 1e-12 * r1.max(r2) {
+        Some(CurveKind::Circle {
+            center,
+            axis,
+            x: scale(e1, 1.0 / r1),
+            radius: r1,
+        })
+    } else if square {
+        Some(CurveKind::Ellipse {
+            center,
+            major: scale(e1, 1.0 / r1),
+            minor: scale(e2, 1.0 / r2),
+            a: r1,
+            b: r2,
+        })
+    } else {
+        None
+    };
+    if let Some(kind) = kind {
+        let mut points = ring.clone();
+        points.push(ring[0]);
+        f.curves.push(EdgeCurve { kind, points });
+    }
     f.push_flat(PlanarFacet::new(ring), &tris, s);
     f
 }
@@ -1221,8 +1209,8 @@ pub fn sheet_nurbs(surface: &NurbsSurface, segments: [usize; 2]) -> Faceted {
     let mut f = Faceted::new();
     let s = f.add_surface(SurfaceKind::Nurbs(Arc::new(surface.clone())));
     let area2 = |a: [f64; 3], b: [f64; 3], c: [f64; 3]| {
-        let n = cross3(crate::vec3::sub(b, a), crate::vec3::sub(c, a));
-        dot3(n, n)
+        let n = cross(crate::vec3::sub(b, a), crate::vec3::sub(c, a));
+        dot(n, n)
     };
     for i in 0..segments[0] {
         for j in 0..segments[1] {
@@ -1266,7 +1254,7 @@ pub fn extrude_sheet(
     {
         return Err("only a flat sheet extrudes".into());
     }
-    let wl = dot3(w, w).sqrt();
+    let wl = dot(w, w).sqrt();
     if !(wl > 0.0 && wl.is_finite()) {
         return Err("an extrusion needs a nonzero vector".into());
     }
@@ -1276,13 +1264,13 @@ pub fn extrude_sheet(
     let n0 = sheet.tris.iter().fold([0.0; 3], |acc, t| {
         add(
             acc,
-            cross3(
+            cross(
                 crate::vec3::sub(t.v[1], t.v[0]),
                 crate::vec3::sub(t.v[2], t.v[0]),
             ),
         )
     });
-    let sign = if dot3(n0, w) > 0.0 { 1.0 } else { -1.0 };
+    let sign = if dot(n0, w) > 0.0 { 1.0 } else { -1.0 };
     let p0 = sheet.tris[0].v[0];
     let bottom = f.add_surface(SurfaceKind::Plane {
         point: p0,
@@ -1299,14 +1287,14 @@ pub fn extrude_sheet(
         let n = tris.iter().fold([0.0; 3], |acc, t| {
             add(
                 acc,
-                cross3(
+                cross(
                     crate::vec3::sub(t.v[1], t.v[0]),
                     crate::vec3::sub(t.v[2], t.v[0]),
                 ),
             )
         });
-        let along = dot3(n, w);
-        if !(along.abs() > 1e-9 * dot3(n, n).sqrt() * wl) {
+        let along = dot(n, w);
+        if !(along.abs() > 1e-9 * dot(n, n).sqrt() * wl) {
             return Err("an extrusion vector must leave the sheet's plane".into());
         }
         // The loops wind about n; the sweep goes with n or against it.
@@ -1349,7 +1337,7 @@ pub fn extrude_sheet(
                     _ => f.add_surface(SurfaceKind::Plane {
                         point: a,
                         normal: scale(
-                            cross3(crate::vec3::sub(b, a), w),
+                            cross(crate::vec3::sub(b, a), w),
                             if with { 1.0 } else { -1.0 },
                         ),
                     }),
@@ -1495,11 +1483,11 @@ pub fn extrude_profile(
     if n < 2 || edges.len() != n {
         return Err("a profile needs at least 2 vertices, one edge each".into());
     }
-    let hl = dot3(h, h).sqrt();
-    let unit = |w: [f64; 3]| (dot3(w, w) - 1.0).abs() < 1e-12;
-    let square = |a: [f64; 3], b: [f64; 3]| dot3(a, b).abs() < 1e-12 * hl.max(1.0);
+    let hl = dot(h, h).sqrt();
+    let unit = |w: [f64; 3]| (dot(w, w) - 1.0).abs() < 1e-12;
+    let square = |a: [f64; 3], b: [f64; 3]| dot(a, b).abs() < 1e-12 * hl.max(1.0);
     if !(unit(u) && unit(v) && square(u, v) && square(u, h) && square(v, h) && hl > 0.0)
-        || dot3(cross3(u, v), h) <= 0.0
+        || dot(cross(u, v), h) <= 0.0
     {
         return Err("an extrusion needs an orthonormal frame and a sweep along u x v".into());
     }
@@ -1519,15 +1507,11 @@ pub fn extrude_profile(
             Piece::Line(p, q) => SurfaceKind::Plane {
                 point: at(p),
                 normal: scale(
-                    cross3(crate::vec3::sub(at(q), at(p)), h),
+                    cross(crate::vec3::sub(at(q), at(p)), h),
                     if ccw { 1.0 } else { -1.0 },
                 ),
             },
-            Piece::Arc(c, rho) => SurfaceKind::Cylinder {
-                center: at(c),
-                axis,
-                radius: rho,
-            },
+            Piece::Arc(c, rho) => SurfaceKind::cylinder(at(c), axis, rho),
             Piece::Spline(curve) => SurfaceKind::Extruded {
                 profile: curve,
                 base,
@@ -1559,7 +1543,7 @@ pub fn extrude_profile(
     for (shift, up) in [([0.0; 3], false), (h, true)] {
         let s = f.add_surface(SurfaceKind::Plane {
             point: add(at(loop2[0]), shift),
-            normal: scale(cross3(u, v), if up { 1.0 } else { -1.0 }),
+            normal: scale(cross(u, v), if up { 1.0 } else { -1.0 }),
         });
         let mut lp: Vec<[f64; 3]> = loop2.iter().map(|&p| add(at(p), shift)).collect();
         let ts: Vec<Tri> = tris
@@ -1612,7 +1596,7 @@ pub fn revolve(
     if !(angle > 0.0 && angle <= TAU) {
         return Err(format!("revolve angle {angle} is not in (0, 2 pi]"));
     }
-    let len = dot3(axis, axis).sqrt();
+    let len = dot(axis, axis).sqrt();
     if !(len > 0.0) {
         return Err("revolve axis must be nonzero".into());
     }
@@ -1623,8 +1607,8 @@ pub fn revolve(
         [0.0, 1.0, 0.0]
     };
     let x = {
-        let c = cross3(a, pick);
-        scale(c, 1.0 / dot3(c, c).sqrt())
+        let c = cross(a, pick);
+        scale(c, 1.0 / dot(c, c).sqrt())
     };
     // As many turns as the widest radius needs at the target size.
     let rmax = profile_pieces(verts, edges, maxh, tol)?
@@ -1666,7 +1650,7 @@ pub fn revolve_at(
     if angles.len() < if full { 3 } else { 2 } || angles.windows(2).any(|w| !(w[0] < w[1])) {
         return Err("revolve angles must ascend, at least 3 for a full turn".into());
     }
-    let y = cross3(a, x);
+    let y = cross(a, x);
     let size = verts
         .iter()
         .flat_map(|v| verts.iter().map(move |w| (v[0] - w[0]).hypot(v[1] - w[1])))
@@ -1689,36 +1673,24 @@ pub fn revolve_at(
                         normal: scale(a, p[0] - q[0]),
                     })
                 } else if p[0] == q[0] {
-                    Some(SurfaceKind::Cylinder {
-                        center: origin,
-                        axis: a,
-                        radius: p[0],
-                    })
+                    Some(SurfaceKind::cylinder(origin, a, p[0]))
                 } else {
                     // The apex where the line meets the axis; the cone
                     // opens the way r grows.
                     let slope = (q[0] - p[0]) / (q[1] - p[1]);
-                    Some(SurfaceKind::Cone {
-                        apex: on_axis(p[1] - p[0] / slope),
-                        axis: scale(a, slope.signum()),
-                        tan_half_angle: slope.abs(),
-                    })
+                    Some(SurfaceKind::cone(
+                        on_axis(p[1] - p[0] / slope),
+                        scale(a, slope.signum()),
+                        slope.abs(),
+                    ))
                 }
             }
             // A circle about a point of the axis turns into a sphere; off
             // the axis into a torus (the same about -r as about r).
             Piece::Arc(c, rho) => Some(if c[0].abs() <= 1e-12 * size {
-                SurfaceKind::Sphere {
-                    center: on_axis(c[1]),
-                    radius: rho,
-                }
+                SurfaceKind::sphere(on_axis(c[1]), rho)
             } else {
-                SurfaceKind::Torus {
-                    center: on_axis(c[1]),
-                    axis: a,
-                    major_radius: c[0].abs(),
-                    minor_radius: rho,
-                }
+                SurfaceKind::torus(on_axis(c[1]), a, c[0].abs(), rho)
             }),
             Piece::Spline(curve) => Some(SurfaceKind::Revolved {
                 profile: curve,
@@ -1752,8 +1724,8 @@ pub fn revolve_at(
         add(on_axis(v[1]), scale(dir, v[0]))
     };
     let area2 = |t: &[[f64; 3]; 3]| {
-        let c = cross3(crate::vec3::sub(t[1], t[0]), crate::vec3::sub(t[2], t[0]));
-        dot3(c, c)
+        let c = cross(crate::vec3::sub(t[1], t[0]), crate::vec3::sub(t[2], t[0]));
+        dot(c, c)
     };
     let mut f = Faceted::new();
     let push = |f: &mut Faceted, t: [[f64; 3]; 3], s: u32| {
@@ -1812,7 +1784,7 @@ pub fn revolve_at(
             let dir = add(scale(x, t.cos()), scale(y, t.sin()));
             let s = f.add_surface(SurfaceKind::Plane {
                 point: origin,
-                normal: scale(cross3(dir, a), if outward { 1.0 } else { -1.0 }),
+                normal: scale(cross(dir, a), if outward { 1.0 } else { -1.0 }),
             });
             let mut lp: Vec<[f64; 3]> = loop2.iter().map(|&v| point(v, k)).collect();
             let ts: Vec<Tri> = tris

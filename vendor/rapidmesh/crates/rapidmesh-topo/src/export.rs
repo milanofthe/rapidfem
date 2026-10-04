@@ -32,7 +32,7 @@ pub struct Names {
 
 /// The second-order nodes of a tet mesh: its points then the mid-edge
 /// nodes, ten nodes per tet (corners positive, then the mid-edge nodes of
-/// (0,1), (1,2), (2,0), (0,3), (1,3), (2,3)) and six per surface triangle
+/// [`crate::TET10_EDGES`]) and six per surface triangle
 /// (corners as the mesh's, then (0,1), (1,2), (2,0)), parallel to the
 /// mesh's tets and faces.
 pub struct Order2<'a> {
@@ -100,15 +100,28 @@ impl<'a> Parts<'a> {
     }
 }
 
+/// The MSH entity (dimension, tag) of a point class: tags count from 1, a
+/// B-rep id `i` is tag `i + 1`. None for the interior.
+pub fn msh_entity(class: PointClass) -> Option<(u8, u32)> {
+    match class.dim_id() {
+        (dim @ 0..=2, id) if id != u32::MAX => Some((dim, id + 1)),
+        _ => None,
+    }
+}
+
+/// The point class of an MSH entity (dimension, tag): the inverse of
+/// [`msh_entity`]; the interior for a volume entity or tag 0.
+pub fn msh_class(dim: u8, tag: u32) -> PointClass {
+    match (dim, tag) {
+        (0..=2, t) if t > 0 => PointClass::of_dim_id(dim, t - 1),
+        _ => PointClass::Interior,
+    }
+}
+
 /// The (dimension, tag) of the entity a point is classified on, given the
 /// entity of the cells at it.
 fn node_entity(class: Option<&PointClass>, home: (u8, u32)) -> (u8, u32) {
-    match class {
-        Some(PointClass::Vertex(i)) => (0, i + 1),
-        Some(PointClass::Edge(e)) if *e != u32::MAX => (1, e + 1),
-        Some(PointClass::Face(f)) if *f != u32::MAX => (2, f + 1),
-        _ => home,
-    }
+    class.and_then(|&c| msh_entity(c)).unwrap_or(home)
 }
 
 /// Writes a tet mesh as a gmsh MSH 4.1 ASCII file.
@@ -147,10 +160,7 @@ fn write_parts(mesh: &Parts<'_>, names: &Names, w: &mut impl Write) -> io::Resul
         home.resize(points.len(), None);
         class.resize(points.len(), PointClass::Interior);
         for (t, n) in o.tets.iter().enumerate() {
-            for (e, [i, j]) in [[0, 1], [1, 2], [2, 0], [0, 3], [1, 3], [2, 3]]
-                .iter()
-                .enumerate()
-            {
+            for (e, [i, j]) in crate::TET10_EDGES.iter().enumerate() {
                 let (a, b) = (n[*i] as usize, n[*j] as usize);
                 let m = n[4 + e] as usize;
                 mid.insert((a.min(b), a.max(b)), m);
@@ -391,6 +401,54 @@ pub fn write_surface_vtu(mesh: &SurfaceMesh, w: &mut impl Write) -> io::Result<(
 
 fn write_vtu_parts(mesh: &Parts<'_>, w: &mut impl Write) -> io::Result<()> {
     let (nt, nf) = (mesh.tets.len(), mesh.faces.len());
+    // VTK, like gmsh, wants the first three corners to turn toward the
+    // fourth: the mirror of the mesher's orientation.
+    let cells = mesh
+        .tets
+        .iter()
+        .map(|t| (vec![t[0], t[1], t[3], t[2]], VTK_TET))
+        .chain(mesh.faces.iter().map(|f| (f.tri.to_vec(), VTK_TRIANGLE)));
+    let neg = |n: usize| std::iter::repeat_n(-1i64, n);
+    let patch = |p: u32| if p == u32::MAX { -1 } else { p as i64 };
+    let region: Vec<i64> = mesh
+        .tet_regions
+        .iter()
+        .map(|r| r.0 as i64)
+        .chain(neg(nf))
+        .collect();
+    let patches: Vec<i64> = neg(nt)
+        .chain(mesh.faces.iter().map(|f| patch(f.patch)))
+        .collect();
+    let tags: Vec<i64> = neg(nt)
+        .chain(mesh.faces.iter().map(|f| f.face_tag.0 as i64))
+        .collect();
+    write_vtu_grid(
+        w,
+        mesh.points,
+        cells,
+        &[
+            ("region", &region),
+            ("patch", &patches),
+            ("face_tag", &tags),
+        ],
+    )
+}
+
+/// VTK cell types.
+pub const VTK_TRIANGLE: u8 = 5;
+pub const VTK_TET: u8 = 10;
+pub const VTK_QUADRATIC_TET: u8 = 24;
+
+/// Writes a VTK XML unstructured grid (ASCII): the `points`, the `cells`
+/// (node ids in VTK's order and VTK cell type each) and integer cell data
+/// by name (the first the active scalars).
+pub fn write_vtu_grid(
+    w: &mut impl Write,
+    points: &[[f64; 3]],
+    cells: impl Iterator<Item = (Vec<usize>, u8)>,
+    data: &[(&str, &[i64])],
+) -> io::Result<()> {
+    let cells: Vec<(Vec<usize>, u8)> = cells.collect();
     writeln!(w, "<?xml version=\"1.0\"?>")?;
     writeln!(
         w,
@@ -400,14 +458,14 @@ fn write_vtu_parts(mesh: &Parts<'_>, w: &mut impl Write) -> io::Result<()> {
     writeln!(
         w,
         "<Piece NumberOfPoints=\"{}\" NumberOfCells=\"{}\">",
-        mesh.points.len(),
-        nt + nf
+        points.len(),
+        cells.len()
     )?;
     writeln!(
         w,
         "<Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">"
     )?;
-    for p in mesh.points {
+    for p in points {
         writeln!(w, "{} {} {}", p[0], p[1], p[2])?;
     }
     writeln!(w, "</DataArray></Points>")?;
@@ -416,64 +474,44 @@ fn write_vtu_parts(mesh: &Parts<'_>, w: &mut impl Write) -> io::Result<()> {
         w,
         "<DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">"
     )?;
-    // VTK, like gmsh, wants the first three corners to turn toward the
-    // fourth: the mirror of the mesher's orientation.
-    for t in mesh.tets {
-        writeln!(w, "{} {} {} {}", t[0], t[1], t[3], t[2])?;
-    }
-    for f in mesh.faces {
-        writeln!(w, "{} {} {}", f.tri[0], f.tri[1], f.tri[2])?;
+    for (nodes, _) in &cells {
+        let ids: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
+        writeln!(w, "{}", ids.join(" "))?;
     }
     writeln!(w, "</DataArray>")?;
     writeln!(
         w,
         "<DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">"
     )?;
-    let offsets = (1..=nt)
-        .map(|i| 4 * i)
-        .chain((1..=nf).map(|i| 4 * nt + 3 * i));
-    for o in offsets {
-        writeln!(w, "{o}")?;
+    let mut offset = 0;
+    for (nodes, _) in &cells {
+        offset += nodes.len();
+        writeln!(w, "{offset}")?;
     }
     writeln!(w, "</DataArray>")?;
     writeln!(
         w,
         "<DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">"
     )?;
-    for i in 0..nt + nf {
-        writeln!(w, "{}", if i < nt { 10 } else { 5 })?;
+    for (_, ty) in &cells {
+        writeln!(w, "{ty}")?;
     }
     writeln!(w, "</DataArray>")?;
     writeln!(w, "</Cells>")?;
-    writeln!(w, "<CellData Scalars=\"region\">")?;
-    let array =
-        |w: &mut dyn Write, name: &str, vals: &mut dyn Iterator<Item = i64>| -> io::Result<()> {
-            writeln!(
-                w,
-                "<DataArray type=\"Int64\" Name=\"{name}\" format=\"ascii\">"
-            )?;
-            for v in vals {
-                writeln!(w, "{v}")?;
-            }
-            writeln!(w, "</DataArray>")
-        };
-    let neg = |n: usize| std::iter::repeat_n(-1i64, n);
-    array(
-        w,
-        "region",
-        &mut mesh.tet_regions.iter().map(|r| r.0 as i64).chain(neg(nf)),
-    )?;
-    let patch = |p: u32| if p == u32::MAX { -1 } else { p as i64 };
-    array(
-        w,
-        "patch",
-        &mut neg(nt).chain(mesh.faces.iter().map(|f| patch(f.patch))),
-    )?;
-    array(
-        w,
-        "face_tag",
-        &mut neg(nt).chain(mesh.faces.iter().map(|f| f.face_tag.0 as i64)),
-    )?;
+    match data.first() {
+        Some((name, _)) => writeln!(w, "<CellData Scalars=\"{name}\">")?,
+        None => writeln!(w, "<CellData>")?,
+    }
+    for (name, vals) in data {
+        writeln!(
+            w,
+            "<DataArray type=\"Int64\" Name=\"{name}\" format=\"ascii\">"
+        )?;
+        for v in *vals {
+            writeln!(w, "{v}")?;
+        }
+        writeln!(w, "</DataArray>")?;
+    }
     writeln!(w, "</CellData>")?;
     writeln!(w, "</Piece>\n</UnstructuredGrid>\n</VTKFile>")
 }

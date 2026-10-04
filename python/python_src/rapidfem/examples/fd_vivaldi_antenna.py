@@ -18,7 +18,7 @@ This is the rigorous reference setup (geometry ported from EMerge demo19):
   incidence and can sit close, so a modest air pad + a PML shell keeps the
   mesh small *and* the far field trustworthy. The Vivaldi radiates endfire and
   through the slot to both sides, so all six faces get a PML.
-* **Mesh budget.** The bulk air is meshed at λ/10 of the top frequency; the PML
+* **Mesh budget.** The bulk air is meshed at λ/5 of the top frequency; the PML
   is 2× coarser (its accuracy comes from the stretch profile, not cell count);
   only the feed / stub / port / taper get a fine local size. That keeps the
   tet count in check despite the padded, six-sided enclosure.
@@ -74,7 +74,7 @@ W0 = _ms_width_50(50.0, ER_SUB, TH)   # ≈ 0.95 mm
 N_FREQ = 6
 FREQUENCIES = np.linspace(3.0e9, 8.0e9, N_FREQ)
 F_FF = 6.0e9                          # far-field frequency
-PER_LAMBDA = 10                       # air cells per wavelength at f_max
+PER_LAMBDA = 5                        # air cells per wavelength at f_max
 MAXH = rf.lambda_maxh(f_max=8.0e9, per_lambda=PER_LAMBDA)
 TAPER_N = 48                          # parametric-curve sampling
 
@@ -97,9 +97,9 @@ def taper_points(x0=0.0):
 g = rf.Geometry(maxh=MAXH)
 
 # One material per region for size control: substrate (fine), bulk near-field
-# air (λ/10), and a 2× coarser air inside the PML (the stretch profile sets the
+# air (λ/5), and a 2× coarser air inside the PML (the stretch profile sets the
 # absorber's accuracy, so a fine PML mesh is wasted).
-fr4 = rf.Dielectric(er=ER_SUB, tand=0.02, maxh=2.0 * TH)
+fr4 = rf.Dielectric(er=ER_SUB, tand=0.02, maxh=4.0 * TH)
 bulk_air = rf.Air()
 pml_air = rf.Air(maxh=2.0 * MAXH)
 
@@ -132,7 +132,7 @@ sub = g.box(PCB_XMAX - PCB_XMIN, PCB_YMAX - PCB_YMIN, TH,
 # dropped here, the thin boolean slivers wreck tet quality.)
 ground = g.xy_plate(PCB_XMAX - PCB_XMIN, PCB_YMAX - PCB_YMIN,
                     position=(PCB_XMIN, PCB_YMIN, -TH))
-taper = g.polygon([(x, y, -TH) for (x, y) in taper_points()], maxh=2.0 * mm)
+taper = g.polygon([(x, y, -TH) for (x, y) in taper_points()], maxh=4.0 * mm)
 disc = g.disc(RADIUS / 2.0, position=(-RADIUS / 2.0 + 1.0 * mm, 0.0, -TH))
 g.cut(ground, taper, disc)
 
@@ -140,7 +140,7 @@ g.cut(ground, taper, disc)
 FEED_X, FEED_Y0 = 2.0 * mm, -10.0 * mm
 FEED_LEN = 10.5 * mm
 feed = g.xy_plate(W0, FEED_LEN, position=(FEED_X - W0 / 2.0, FEED_Y0, 0.0),
-                  maxh=0.5 * mm)
+                  maxh=1.0 * mm)
 
 # Radial (sector) stub at the line end for the slot-line transition.
 stub_cx, stub_cy = FEED_X, FEED_Y0 + FEED_LEN - 0.2 * mm
@@ -149,12 +149,12 @@ half = math.radians(STUB_ANG / 2.0)
 arc = [(stub_cx, stub_cy, 0.0)]
 for a in np.linspace(base - half, base + half, 24):
     arc.append((stub_cx + L_STUB * math.cos(a), stub_cy + L_STUB * math.sin(a), 0.0))
-stub = g.polygon(arc, maxh=0.6 * mm)
+stub = g.polygon(arc, maxh=1.2 * mm)
 
 # Lumped feed: a vertical sheet bridging the ground plane (z = -TH) to the
 # microstrip trace (z = 0) through the substrate.
 port = g.plate(p0=(FEED_X - W0 / 2.0, FEED_Y0, -TH),
-               width=(W0, 0.0, 0.0), height=(0.0, 0.0, TH), maxh=0.4 * mm)
+               width=(W0, 0.0, 0.0), height=(0.0, 0.0, TH), maxh=0.8 * mm)
 
 g.fragment(air, pml_zp, pml_zm, pml_xp, pml_xm, pml_yp, pml_ym,
            sub, ground, feed, stub, port)

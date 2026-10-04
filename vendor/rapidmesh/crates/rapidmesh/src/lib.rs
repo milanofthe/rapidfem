@@ -34,19 +34,17 @@ pub mod shapes;
 
 pub use features::{EdgeCut, EdgePick};
 pub use fem::{SecondOrder, TET10_EDGES};
-pub use geometry::{
-    Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions, DEFAULT_CELLS_ACROSS,
-};
+pub use geometry::{Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions};
 pub use geometry::{Object, SheetRef, Transform};
 pub use mesh::{Diagnostics, Labels, Mesh, Run, Sets, SolidInfo, SurfaceMesh, TetView, TriView};
 pub use msh::{load_msh, read_msh};
 pub use rapidmesh_brep::{EdgeFilter, EdgeKind, FaceFilter, Topology};
 pub use rapidmesh_exact::log::{Event, Level as LogLevel};
 pub use rapidmesh_geom::{polygon_union, TaggedPlc};
-pub use rapidmesh_tet::diagnostics::{Defect, DefectKind, MeshDiagnostics};
-pub use rapidmesh_tet::fidelity::Fidelity;
-pub use rapidmesh_tet::mesh3::PeriodicPair;
+pub use rapidmesh_tet::Fidelity;
+pub use rapidmesh_tet::PeriodicPair;
 pub use rapidmesh_tet::{dorfler_mark, Dorfler, PointClass, QualityStats, SurfaceFace, TetMesh};
+pub use rapidmesh_tet::{Defect, DefectKind, MeshDiagnostics};
 pub use rapidmesh_topo::{
     Classification, TetGeometry, TetTopology, TriClassification, TriGeometry, TriTopology,
     FACE_PERMS, NONE,
@@ -58,6 +56,8 @@ pub enum Error {
     /// A call that does not fit the geometry (a zero axis, a selection
     /// that matches nothing, a file that is no closed solid).
     Invalid(String),
+    /// A geometry the mesher cannot mesh, with where and what to repair.
+    Mesh(String),
     Io(std::io::Error),
 }
 
@@ -66,7 +66,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Error::Invalid(m) => f.write_str(m),
+            Error::Invalid(m) | Error::Mesh(m) => f.write_str(m),
             Error::Io(e) => e.fmt(f),
         }
     }
@@ -76,7 +76,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Io(e) => Some(e),
-            Error::Invalid(_) => None,
+            Error::Invalid(_) | Error::Mesh(_) => None,
         }
     }
 }

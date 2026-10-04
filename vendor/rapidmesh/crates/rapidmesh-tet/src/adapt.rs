@@ -4,7 +4,7 @@
 //! size sources, which the mesher's grading + Ruppert refinement realise
 //! sliver-free. SOLVE and ESTIMATE belong to the solver.
 
-use crate::conform::SurfaceMesh;
+use crate::mesh::SurfaceMesh;
 use rapidmesh_geom::vec3::{len, sub};
 
 /// The knobs of Dörfler marking and the refinement it asks for.
@@ -41,12 +41,7 @@ pub fn dorfler_mark(eta: &[f64], theta: f64) -> Vec<u32> {
     // Indices by descending indicator; ties keep descending index order to match
     // a `argsort(e2)[::-1]` (ascending-stable, then reversed) convention.
     let mut order: Vec<u32> = (0..eta.len() as u32).collect();
-    order.sort_by(|&a, &b| {
-        e2[b as usize]
-            .partial_cmp(&e2[a as usize])
-            .unwrap()
-            .then(b.cmp(&a))
-    });
+    order.sort_by(|&a, &b| e2[b as usize].total_cmp(&e2[a as usize]).then(b.cmp(&a)));
     // Smallest prefix whose cumulative squared indicator reaches `theta * total`.
     let target = theta * total;
     let mut cum = 0.0;
@@ -79,7 +74,8 @@ impl SurfaceMesh {
     /// Dörfler-mark by `eta` and turn the marked elements into point size sources:
     /// returns the marked indices and parallel `(centroid, h)` arrays, with
     /// `h = local_h / factor` (clamped to `h_min` when `h_min > 0`). Feed the
-    /// `(centroid, h)` pairs into a size field (`refine_near_points`) and remesh.
+    /// `(centroid, h)` pairs into a size field (`Geometry::add_size_points`)
+    /// and remesh.
     pub fn dorfler_size_points(
         &self,
         eta: &[f64],

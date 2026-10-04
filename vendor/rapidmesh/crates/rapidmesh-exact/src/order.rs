@@ -7,7 +7,7 @@ use crate::point::Point3;
 use crate::ring::Ring;
 use crate::{Axis, Sign};
 
-/// (q - p) · (b - a) over homogeneous coordinates, times the (separately
+/// (q - p) * (b - a) over homogeneous coordinates, times the (separately
 /// sign-corrected) product of the four w's.
 fn dot_diff<T: Ring>(ha: &[T; 4], hb: &[T; 4], hp: &[T; 4], hq: &[T; 4]) -> T {
     let mut acc: Option<T> = None;
@@ -23,8 +23,8 @@ fn dot_diff<T: Ring>(ha: &[T; 4], hb: &[T; 4], hp: &[T; 4], hq: &[T; 4]) -> T {
     acc.expect("three components")
 }
 
-/// Exact sign of (q - p) · (b - a): orders `p` vs `q` along the direction
-/// from `a` to `b`. Positive means `q` lies further along a→b than `p`.
+/// Exact sign of (q - p) * (b - a): orders `p` vs `q` along the direction
+/// from `a` to `b`. Positive means `q` lies further along a->b than `p`.
 ///
 /// All four points may be implicit. Returns `None` if any point is invalid.
 pub fn cmp_along(a: &Point3, b: &Point3, p: &Point3, q: &Point3) -> Option<Sign> {
@@ -92,7 +92,7 @@ pub fn collinear(a: &Point3, b: &Point3, c: &Point3) -> Option<bool> {
 }
 
 /// Exact closed betweenness on the segment [a, b]: true if the (collinear)
-/// point `p` satisfies a ≤ p ≤ b along the segment. The caller is responsible
+/// point `p` satisfies a <= p <= b along the segment. The caller is responsible
 /// for `p` being on the line through `a`, `b`.
 pub fn within_closed(a: &Point3, b: &Point3, p: &Point3) -> Option<bool> {
     Some(cmp_along(a, b, a, p)? != Sign::Negative && cmp_along(a, b, p, b)? != Sign::Negative)

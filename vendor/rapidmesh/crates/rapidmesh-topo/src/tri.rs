@@ -6,22 +6,22 @@ use crate::csr::Csr;
 use crate::source::TriSource;
 use std::collections::HashMap;
 
-/// Derived connectivity of a triangle mesh. Pure topology — no coordinates.
+/// Derived connectivity of a triangle mesh. Pure topology -- no coordinates.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TriTopology {
     pub n_verts: usize,
-    /// The triangle → vertex connectivity (the source elements, as `u32`), so the
+    /// The triangle -> vertex connectivity (the source elements, as `u32`), so the
     /// complex is self-contained and the geometry builders need only coordinates.
     pub tris: Vec<[u32; 3]>,
     /// Unique edges, canonical `(min, max)`.
     pub edges: Vec<[u32; 2]>,
     /// Global edge id per local edge of each triangle (`TRI_EDGE_LOCAL` order).
     pub tri_edges: Vec<[u32; 3]>,
-    /// `+1` if the local edge runs min→max (matches canonical), else `-1`.
+    /// `+1` if the local edge runs min->max (matches canonical), else `-1`.
     pub tri_edge_sign: Vec<[i8; 3]>,
     /// The tag of every triangle (see [`TriSource::tri_tag`]).
     pub tri_tags: Vec<i64>,
-    /// Edge → every incident triangle, ascending: two on a manifold edge,
+    /// Edge -> every incident triangle, ascending: two on a manifold edge,
     /// one on a free edge, three or more at a junction of sheets.
     pub edge_tris_all: Csr,
     /// The first two triangles incident to each edge; `NONE` fills a free
@@ -31,7 +31,7 @@ pub struct TriTopology {
     /// for a free slot. Lets a MoM build pick interior-same-tag (RWG) or
     /// boundary/tag-change edges without re-walking the mesh.
     pub edge_tags: Vec<[i64; 2]>,
-    /// Vertex → incident triangles.
+    /// Vertex -> incident triangles.
     pub vert_tris: Csr,
 }
 
@@ -178,10 +178,10 @@ pub struct TriGeometry {
     pub area: Vec<f64>,
     /// Triangle centroid (planar: `z = 0`).
     pub centroid: Vec<[f64; 3]>,
-    /// Unit face normal. Planar: `[0, 0, ±1]` (sign of the signed area). 3D: the
+    /// Unit face normal. Planar: `[0, 0, +-1]` (sign of the signed area). 3D: the
     /// unit normal of the stored winding.
     pub normal: Vec<[f64; 3]>,
-    /// Second area moment about the centroid `[∫dx², ∫dx·dy, ∫dy²]` (the multipole
+    /// Second area moment about the centroid `[int dx^2, int dx*dy, int dy^2]` (the multipole
     /// MoM moment). Populated by `build_2d` only; empty for 3D surfaces (the
     /// in-plane moment has no global frame there).
     pub inertia: Vec<[f64; 3]>,
@@ -198,7 +198,7 @@ pub struct TriGeometry {
 }
 
 /// Barycentric gradients of triangle `p` with unit normal `n` and area `a`:
-/// `∇λ_i = n × (p[i+2] - p[i+1]) / 2a`.
+/// `grad lambda_i = n x (p[i+2] - p[i+1]) / 2a`.
 fn bary_grad(p: [[f64; 3]; 3], n: [f64; 3], a: f64) -> [[f64; 3]; 3] {
     use crate::math::{cross, scale, sub};
     if !(a > 0.0) {
@@ -208,7 +208,7 @@ fn bary_grad(p: [[f64; 3]; 3], n: [f64; 3], a: f64) -> [[f64; 3]; 3] {
 }
 
 impl TriGeometry {
-    /// Planar (z = 0) geometry: area, centroid, ±z normal, second area moment,
+    /// Planar (z = 0) geometry: area, centroid, +-z normal, second area moment,
     /// edge lengths/midpoints.
     pub fn build_2d(topo: &TriTopology, coords: &[[f64; 2]]) -> Self {
         let nt = topo.tris.len();
@@ -325,6 +325,7 @@ fn tri_min_angle_deg(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::{dot, sub};
     use crate::source::Tris;
 
     #[test]
@@ -372,20 +373,18 @@ mod tests {
         assert!(
             (c[0] - 1.0 / 3.0).abs() < 1e-12 && (c[1] - 1.0 / 3.0).abs() < 1e-12 && c[2] == 0.0
         );
-        // symmetric triangle: ∫dx² == ∫dy², cross moment negative.
+        // symmetric triangle: int dx^2 == int dy^2, cross moment negative.
         assert!((g.inertia[0][0] - g.inertia[0][2]).abs() < 1e-12);
         assert!(g.inertia[0][1] < 0.0);
     }
 
     /// The gradients of a tilted triangle: tangent, summing to zero, and
-    /// `∇λ_i · (p_j - p_k)` the difference of the Kronecker deltas.
+    /// `grad lambda_i * (p_j - p_k)` the difference of the Kronecker deltas.
     #[test]
     fn barycentric_gradients() {
         let p = [[0.1, 0.2, 0.3], [1.7, 0.4, -0.2], [0.5, 1.3, 0.9]];
         let topo = TriTopology::build(&Tris::untagged(&[[0, 1, 2]], 3));
         let g = TriGeometry::build_3d(&topo, &p);
-        let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
         for i in 0..3 {
             assert!(dot(g.grad[0][i], g.normal[0]).abs() < 1e-12);
             for j in 0..3 {

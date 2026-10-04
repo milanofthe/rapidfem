@@ -5,7 +5,7 @@
 //! interval-arithmetic filtering, expansion-arithmetic fallback), CDT remeshing
 //! of intersected facets with symbolic perturbation, then inside/outside
 //! classification against the boolean expression. Boolean expressions are
-//! evaluated as one multi-operand arrangement — never as cascaded pairwise ops
+//! evaluated as one multi-operand arrangement -- never as cascaded pairwise ops
 //! with float snapping in between, which is the known failure mode.
 //!
 //! Blueprints: Lévy (ACM TOG 2024, exact mesh CSG / Weiler model) and

@@ -3,9 +3,8 @@
 //!
 //! Faces are TRIMMED analytic surfaces, edges are analytic CURVES (including the
 //! intersection curves a boolean creates), vertices are corner points. The mesher
-//! re-meshes from this geometry -- distribute on each edge curve, mesh each
-//! trimmed face in its (u,v) parameter space, fill the volume -- independent of
-//! any input tessellation.
+//! meshes from this geometry (samples on each edge curve, each face in its
+//! chart, then the volume), independent of any input tessellation.
 //!
 //! Topology is **non-manifold** (Weiler radial-edge): an edge radially links ALL
 //! faces meeting along it, and a face carries front/back material labels, so
@@ -14,18 +13,15 @@
 //!
 //! Deliberately MINIMAL: this layer carries only what the mesher consumes
 //! (vertices, edges with an analytic curve + radial face list, faces with
-//! oriented boundary loops + region/tag labels). Everything else the mesher
-//! already does -- parameter-space mapping (`surfchart`), point distribution
-//! (`curve`), region classification (`region_at`), volume filling -- so there is
-//! no half-edge/pcurve/shell/region machinery here (a face chart maps an
-//! edge chain into (u,v) on demand).
+//! oriented boundary loops + region/tag labels). Charts, edge sampling and
+//! the volume are the mesher's, so there is no half-edge/pcurve/shell/region
+//! machinery here.
 
 use rapidmesh_geom::vec3::V3;
 use rapidmesh_geom::{FaceTag, RegionTag, Scene, TaggedPlc};
 use std::sync::Arc;
 
 pub mod build;
-pub mod feature;
 pub mod index;
 pub mod surface;
 pub mod topology;
@@ -80,7 +76,7 @@ pub enum Curve {
         z: f64,
     },
     /// Ellipse: an oblique plane section of a cylinder. The point is `center`
-    /// plus `a·cos(t)·major` plus `b·sin(t)·minor`, with `axis = major x minor`
+    /// plus `a*cos(t)*major` plus `b*sin(t)*minor`, with `axis = major x minor`
     /// the section-plane normal. Exact closed form (curvature drives the sizing
     /// analytically, like `Circle`).
     Ellipse {
@@ -92,12 +88,18 @@ pub enum Curve {
     },
     /// Intersection of two surfaces, evaluated lazily by projecting the vertex
     /// chain onto both (the mesher reuses its surface projections). Covers every
-    /// analytic∩analytic curve with no closed form (cylinder∩cylinder, oblique
+    /// analytic-analytic curve with no closed form (cylinder-cylinder, oblique
     /// cone sections, torus intersections): the chain is densified and each
     /// sample pulled onto BOTH carriers by alternating projection, so the edge
     /// follows the true curve instead of the faceted arrangement chain (whose
     /// sagitta error is the straddler-sliver root cause).
     Intersection { a: SurfaceId, b: SurfaceId },
+    /// A B-spline edge a shape declared (a CAD file's), over the parameter
+    /// range `t` from the edge's first end to its last.
+    Nurbs {
+        curve: Arc<rapidmesh_geom::NurbsCurve<3>>,
+        t: [f64; 2],
+    },
     /// Faceted fallback: the edge IS its vertex chain (no analytic refinement).
     Polyline,
 }
@@ -217,7 +219,7 @@ pub struct Model {
     pub brep: Brep,
     /// The spatial index over the PLC facets (facet `i` = PLC triangle
     /// `i`), built on first use and shared by the sizing field, the region
-    /// query and the mesher's oracle.
+    /// query and the mesher.
     index: std::sync::OnceLock<Arc<index::FacetBvh>>,
 }
 
@@ -248,12 +250,8 @@ impl Model {
             .clone()
     }
 
-    /// Assembles `scene` and builds its model.
-    pub fn of_scene(scene: &Scene) -> Model {
-        Model::new(scene.assemble())
-    }
-
-    /// [`Model::of_scene`], or the input the scene could not assemble.
+    /// Assembles `scene` and builds its model, or names the input the scene
+    /// could not assemble.
     pub fn try_of_scene(scene: &Scene) -> Result<Model, rapidmesh_geom::AssembleError> {
         Ok(Model::new(scene.try_assemble()?))
     }

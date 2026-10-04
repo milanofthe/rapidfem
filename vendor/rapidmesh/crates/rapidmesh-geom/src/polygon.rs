@@ -71,7 +71,7 @@ fn point_in_edges_z0(p: &Point3, edges: &[([f64; 3], [f64; 3])], hi: [f64; 2]) -
 ///
 /// `outer` and each hole must be simple polygons (no self-crossings); holes
 /// must lie inside the outer boundary and not cross each other (touching at
-/// points/edges is fine — classification is by even-odd parity). Returns the
+/// points/edges is fine -- classification is by even-odd parity). Returns the
 /// input-coordinate triangles, counterclockwise.
 pub fn triangulate_polygon(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[[f64; 2]; 3]> {
     assert!(outer.len() >= 3, "polygon needs at least 3 vertices");

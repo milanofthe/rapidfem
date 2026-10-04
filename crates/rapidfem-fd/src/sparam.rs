@@ -7,9 +7,8 @@
 //! Standard modal post-processing (Pozar, *Microwave Engineering*, ch. 4;
 //! Jin, *FEM in Electromagnetics*): a port wave amplitude is the overlap of
 //! the simulated field with the port mode, weighted by the local wave
-//! admittance / Poynting factor. `sparam_waveport` returns the amplitude
-//! ratio S; the `*_power` helpers return the Poynting-normalised powers; and
-//! `sparam_voltage_surface` extracts a lumped port's S from the area-averaged
+//! admittance / Poynting factor. `ModalProjection` returns the amplitude
+//! ratio S; `sparam_voltage_surface` extracts a lumped port's S from the area-averaged
 //! mode-projected voltage `V = (1/w)∫E·l̂ dS` (derivations/lumped_port/).
 //! All accept `&dyn Port` and integrate over the port triangles by Gaussian
 //! quadrature (`surface_integral`).
@@ -19,6 +18,7 @@ use crate::quadrature::gaus_quad_tri;
 use crate::port::Port;
 use crate::excitation::Excitation;
 use rapidfem_core::geom::{norm, tri_area_vector};
+use rapidfem_core::mesh::Mesh;
 
 /// Gauss-quadrature surface integral of a scalar function over a triangle set.
 pub fn surface_integral(
@@ -53,48 +53,60 @@ pub fn surface_integral(
 ///
 /// S = ∫ (E_field − Q·E_mode)·conj(E_mode)·c dS / ∫ |E_mode|²·c dS
 ///
-/// where `c(x,y,z)` is the **local wave admittance weight**, `√(εᵣ/μᵣ)` for a
-/// TEM/quasi-TEM mode (`1/μᵣ` for TE, `1/εᵣ` for TM), supplied by `weight`.
-/// The weight turns the bare field overlap (`|E|²`) into the power / Poynting
-/// overlap: the power-wave amplitude is `b ∝ ∫E×H*·n̂`, and for a TEM mode
+/// where `c` is the **local wave admittance weight**, `√(εᵣ/μᵣ)` for a
+/// TEM/quasi-TEM mode (`1/μᵣ` for TE, `1/εᵣ` for TM), per tet. The weight
+/// turns the bare field overlap (`|E|²`) into the power / Poynting overlap:
+/// the power-wave amplitude is `b ∝ ∫E×H*·n̂`, and for a TEM mode
 /// `H_mode ∝ c·(n̂×E_mode)`, so `b ∝ ∫ c·E·conj(E_mode)`. Without it the
 /// overlap mis-weights an *inhomogeneous* quasi-TEM mode (the cross-section
 /// impedance varies), giving a passivity error `|S|² > 1` ∝ the inhomogeneity.
 /// The ratio stays amplitude-invariant, so the mode normalisation cancels.
-pub fn sparam_waveport(
-    nodes: &[[f64; 3]],
-    tri_verts: &[[usize; 3]],
-    port: &dyn Port,
-    exc: &Excitation,
-    active: bool,
-    fieldf: &dyn Fn(f64, f64, f64) -> (C64, C64, C64),
-    weight: &dyn Fn(f64, f64, f64) -> f64,
-    gq_order: usize,
-) -> C64 {
-    let q = if active { 1.0 } else { 0.0 };
+///
+/// Built once per port and frequency: every quadrature point of the port
+/// face with the tet behind it (the face is a face of that tet, so no point
+/// search), its weight times `c`, the mode field there and the norm; each
+/// excitation then only evaluates its field at those points.
+pub struct ModalProjection {
+    /// (tet, point, quadrature weight · area · c, mode field)
+    points: Vec<(usize, [f64; 3], f64, [f64; 3])>,
+    norm: f64,
+}
 
-    let mode_dot_field = surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
-        let (fx, fy, fz) = fieldf(x, y, z);
-        let c = C64::from(weight(x, y, z));
-
-        let ex1 = fx - C64::from(q * mx);
-        let ey1 = fy - C64::from(q * my);
-        let ez1 = fz - C64::from(q * mz);
-
-        c * (ex1 * C64::from(mx) + ey1 * C64::from(my) + ez1 * C64::from(mz))
-    }, gq_order);
-
-    let norm = surface_integral(nodes, tri_verts, &|x, y, z| {
-        let (mx, my, mz) = port.port_mode_3d_global(x, y, z, exc).unwrap_or((0.0, 0.0, 0.0));
-        C64::from(weight(x, y, z) * (mx*mx + my*my + mz*mz))
-    }, gq_order);
-
-    if norm.norm() < crate::constants::SINGULAR_EPS {
-        return C64::new(0.0, 0.0);
+impl ModalProjection {
+    pub fn new(mesh: &Mesh, tris: &[usize], port: &dyn Port, exc: &Excitation, c: &dyn Fn(usize) -> f64, gq_order: usize) -> Self {
+        let qp = gaus_quad_tri(gq_order);
+        let mut points = Vec::with_capacity(tris.len() * qp.len());
+        let mut norm_sq = 0.0;
+        for &ti in tris {
+            let [v1, v2, v3] = mesh.tris[ti].map(|i| mesh.nodes[i]);
+            let area = norm(tri_area_vector(v1, v2, v3));
+            let tet = mesh.tri_to_tet[ti][0];
+            let ct = c(tet);
+            for q in &qp {
+                let p = [0, 1, 2].map(|k| v1[k] * q[1] + v2[k] * q[2] + v3[k] * q[3]);
+                let (mx, my, mz) = port.port_mode_3d_global(p[0], p[1], p[2], exc).unwrap_or((0.0, 0.0, 0.0));
+                let wc = q[0] * area * ct;
+                norm_sq += wc * (mx * mx + my * my + mz * mz);
+                points.push((tet, p, wc, [mx, my, mz]));
+            }
+        }
+        ModalProjection { points, norm: norm_sq }
     }
 
-    mode_dot_field / norm
+    /// S of the field `field(tet, point)`; `active` subtracts the incident
+    /// mode (the driven port's own reflection).
+    pub fn s(&self, field: &dyn Fn(usize, [f64; 3]) -> [C64; 3], active: bool) -> C64 {
+        if self.norm.abs() < crate::constants::SINGULAR_EPS {
+            return C64::new(0.0, 0.0);
+        }
+        let q = if active { 1.0 } else { 0.0 };
+        let mut overlap = C64::new(0.0, 0.0);
+        for &(tet, p, wc, m) in &self.points {
+            let e = field(tet, p);
+            overlap += ((e[0] - q * m[0]) * m[0] + (e[1] - q * m[1]) * m[1] + (e[2] - q * m[2]) * m[2]) * wc;
+        }
+        overlap / self.norm
+    }
 }
 
 /// Voltage-based S-parameter extraction for lumped ports.

@@ -10,13 +10,11 @@ description = "Analysis-ready cell-complex view of a mesh (incidence + element g
 default = []
 # Source adapters for the rapidmesh mesher's own output types. Off by default so
 # the core (topology + geometry, std-only) builds standalone for external meshes.
-mesher = ["dep:rapidmesh-tet", "dep:rapidmesh-geom", "dep:rapidmesh-brep", "dep:rapidmesh-exact"]
+mesher = ["dep:rapidmesh-tet", "dep:rapidmesh-geom"]
 
 [dependencies]
 rapidmesh-tet = { workspace = true, optional = true }
-rapidmesh-exact = { workspace = true, optional = true }
 rapidmesh-geom = { workspace = true, optional = true }
-rapidmesh-brep = { workspace = true, optional = true }
 
 [lints]
 workspace = true

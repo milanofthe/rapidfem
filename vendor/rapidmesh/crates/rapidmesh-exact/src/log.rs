@@ -1,14 +1,14 @@
 //! Thread-local meshing log: stage timings, statistics, and leveled events.
 //!
-//! The meshing pipeline (scene assembly -> PLC -> tet mesh -> optimize) runs
-//! its stages sequentially on one thread (rayon fan-out happens inside a stage,
+//! The meshing pipeline (assembly, B-rep, faces, volume, finish) runs its
+//! stages sequentially on one thread (rayon fan-out happens inside a stage,
 //! whose total is recorded on the calling thread). Each stage records its
 //! wall-clock duration, key counts, and human-readable events here; the Python
 //! binding clears the collector before a mesh and takes the ordered records
 //! after, exposing them as `mesh.timings` / `mesh.stats` / `mesh.log`.
 //!
 //! Events are also printed live to stderr (with an elapsed-time prefix) when the
-//! log level is at or below their severity. The level is a fastsim-style
+//! log level is at or below their severity. The level is a
 //! threshold (`Debug < Info < Warn < Error`): set `RAPIDMESH_LOG` to
 //! `debug`/`info`/`warn`/`error` (or `1`/`true` = info, unset/`0`/`off` = silent),
 //! or call [`set_level`] from the host. So a user can watch the

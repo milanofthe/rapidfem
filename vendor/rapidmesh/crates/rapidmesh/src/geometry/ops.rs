@@ -5,6 +5,7 @@ use super::{Geometry, Solid};
 use crate::mesh::SolidInfo;
 use crate::shapes::Sheet;
 use crate::{Error, Result};
+use rapidmesh_geom::vec3::{add, cross, dot, len, sub};
 use rapidmesh_geom::{extrude_sheet, FaceTag, Faceted, SurfaceKind};
 
 type P3 = [f64; 3];
@@ -135,9 +136,6 @@ impl Transform {
 
     /// Where the point `p` goes.
     pub(crate) fn point(&self, p: P3) -> P3 {
-        let sub = |a: P3, b: P3| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        let add = |a: P3, b: P3| [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
-        let dot = |a: P3, b: P3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
         match *self {
             Transform::Translate(v) => add(p, v),
             Transform::Rotate {
@@ -150,11 +148,7 @@ impl Transform {
                 let d = sub(p, center);
                 let (s, c) = angle.sin_cos();
                 let along = dot(u, d);
-                let cr = [
-                    u[1] * d[2] - u[2] * d[1],
-                    u[2] * d[0] - u[0] * d[2],
-                    u[0] * d[1] - u[1] * d[0],
-                ];
+                let cr = cross(u, d);
                 let r: P3 =
                     std::array::from_fn(|k| d[k] * c + cr[k] * s + u[k] * along * (1.0 - c));
                 add(center, r)
@@ -355,7 +349,7 @@ fn disc_rim(
     vector: P3,
 ) -> Result<SurfaceKind> {
     let unit = |v: P3| {
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let l = len(v);
         v.map(|c| c / l)
     };
     let (mut c, mut a, mut r) = (center, unit(axis), radius);
@@ -376,19 +370,11 @@ fn disc_rim(
         }));
     }
     let v = unit(vector);
-    let cross = [
-        a[1] * v[2] - a[2] * v[1],
-        a[2] * v[0] - a[0] * v[2],
-        a[0] * v[1] - a[1] * v[0],
-    ];
+    let cross = cross(a, v);
     if cross.iter().map(|x| x * x).sum::<f64>().sqrt() > 1e-9 {
         return Err(Error::Invalid(
             "a disc extrudes along its axis only (an oblique sweep is an elliptic cylinder)".into(),
         ));
     }
-    Ok(SurfaceKind::Cylinder {
-        center: c,
-        axis: a,
-        radius: r,
-    })
+    Ok(SurfaceKind::cylinder(c, a, r))
 }

@@ -4,14 +4,14 @@
 //! normals turning by more than the crease threshold): each region becomes one
 //! [`SurfaceKind::Discrete`] carrier, so the mesher REMESHES the import against
 //! its own envelope -- creases survive as B-rep feature edges, smooth areas are
-//! free to resample. (One plane per facet, the old behaviour, froze the whole
-//! import: every input edge a protected feature, every input sliver permanent.)
+//! free to resample.
 //! Exactly degenerate (collinear) facets are dropped on import; duplicated
 //! facets are rejected. [`validate_closed`] checks the watertight,
 //! consistently-oriented 2-manifold invariant that [`crate::Scene`] solids
 //! require.
 
 use crate::faceted::{Faceted, SurfaceKind};
+use crate::vec3::{bbox, cross, len};
 use rapidmesh_csg::Tri;
 use rapidmesh_exact::collinear;
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ pub const CREASE_DEG: f64 = 40.0;
 /// gives every region ONE carrier: a plane where its facets lie in one (to
 /// the tolerance the B-rep checks planes with), else a
 /// [`SurfaceKind::Discrete`] patch.
-pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
+pub(crate) fn faceted_from_tris(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
     let tris: Vec<Tri> = tris
         .into_iter()
         .filter(|t| collinear(&t.point(0), &t.point(1), &t.point(2)) != Some(true))
@@ -89,12 +89,8 @@ pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Face
         );
         let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
         let w = [cc[0] - a[0], cc[1] - a[1], cc[2] - a[2]];
-        let mut nr = [
-            u[1] * w[2] - u[2] * w[1],
-            u[2] * w[0] - u[0] * w[2],
-            u[0] * w[1] - u[1] * w[0],
-        ];
-        let l = (nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2]).sqrt();
+        let mut nr = cross(u, w);
+        let l = len(nr);
         if l > 0.0 {
             for x in &mut nr {
                 *x /= l;
@@ -148,8 +144,8 @@ pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Face
     // connected component -- fandisk: 710 edges, 1 component), while scan
     // noise shatters into short OPEN fragments (cow: 94 of 137 components
     // have <= 3 edges; armadillo: 500 of 573). A raw dihedral threshold
-    // turns every fragment into a feature curve with protecting balls --
-    // measured at 4.8 HOURS on the 5.8k-facet cow. Open components shorter
+    // turns every fragment into a B-rep edge the mesher has to hold. Open
+    // components shorter
     // than `NOISE_CHAIN_MIN` edges are therefore treated as smooth; closed
     // loops of any size stay (a tiny loop can be a genuine small feature).
     const NOISE_CHAIN_MIN: usize = 8;
@@ -230,14 +226,7 @@ pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Face
         }
     }
     // The tolerance of a plane: as the B-rep's, relative to the extent.
-    let (lo, hi) = points
-        .iter()
-        .fold(([f64::MAX; 3], [f64::MIN; 3]), |(lo, hi), p| {
-            (
-                std::array::from_fn(|k| lo[k].min(p[k])),
-                std::array::from_fn(|k| hi[k].max(p[k])),
-            )
-        });
+    let (lo, hi) = bbox(&points);
     let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
     let flat_tol = 1e-9 * diag.max(1.0);
     for members in regions {
@@ -289,14 +278,10 @@ pub(crate) fn faceted_from_tris_creased(tris: Vec<Tri>, crease_deg: f64) -> Face
 
 /// Reads an STL file (binary or ASCII, auto-detected) into a [`Faceted`].
 /// Facet normals in the file are ignored; orientation comes from the vertex
-/// winding (the STL convention requires both to agree).
-pub fn import_stl(path: &Path) -> Result<Faceted, ImportError> {
-    import_stl_creased(path, CREASE_DEG)
-}
-
-/// [`import_stl`] with an explicit crease threshold (degrees) for the
-/// feature-edge detection that splits the soup into smooth Discrete regions.
-pub fn import_stl_creased(path: &Path, crease_deg: f64) -> Result<Faceted, ImportError> {
+/// winding (the STL convention requires both to agree). `crease_deg` is the
+/// threshold of the feature-edge detection that splits the soup into smooth
+/// Discrete regions ([`CREASE_DEG`] the default).
+pub fn import_stl(path: &Path, crease_deg: f64) -> Result<Faceted, ImportError> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?.read_to_end(&mut bytes)?;
     let tris = if stl_is_binary(&bytes) {
@@ -304,7 +289,7 @@ pub fn import_stl_creased(path: &Path, crease_deg: f64) -> Result<Faceted, Impor
     } else {
         parse_stl_ascii(&bytes)?
     };
-    Ok(faceted_from_tris_creased(tris, crease_deg))
+    Ok(faceted_from_tris(tris, crease_deg))
 }
 
 /// Binary detection: the 80-byte header is free-form (may even start with
@@ -385,14 +370,8 @@ fn parse_stl_ascii(bytes: &[u8]) -> Result<Vec<Tri>, ImportError> {
 /// Reads a Wavefront OBJ file into a [`Faceted`]. Only `v` and `f` records
 /// are interpreted; faces with more than three corners are fan-triangulated;
 /// `f` indices may be 1-based or negative (relative), with optional
-/// `/texture/normal` suffixes.
-pub fn import_obj(path: &Path) -> Result<Faceted, ImportError> {
-    import_obj_creased(path, CREASE_DEG)
-}
-
-/// [`import_obj`] with an explicit crease threshold (degrees), see
-/// [`import_stl_creased`].
-pub fn import_obj_creased(path: &Path, crease_deg: f64) -> Result<Faceted, ImportError> {
+/// `/texture/normal` suffixes. `crease_deg` as for [`import_stl`].
+pub fn import_obj(path: &Path, crease_deg: f64) -> Result<Faceted, ImportError> {
     let text = std::fs::read_to_string(path)?;
     let mut verts: Vec<[f64; 3]> = Vec::new();
     let mut tris: Vec<Tri> = Vec::new();
@@ -461,51 +440,10 @@ pub fn import_obj_creased(path: &Path, crease_deg: f64) -> Result<Faceted, Impor
     if tris.is_empty() {
         return Err(ImportError::Parse("no faces found".to_string()));
     }
-    Ok(faceted_from_tris_creased(tris, crease_deg))
+    Ok(faceted_from_tris(tris, crease_deg))
 }
 
 // ---------------------------------------------------------- validation
-
-/// Smallest triangle height (altitude) of the shape relative to its
-/// bounding-box diagonal. Near-degenerate facets put neighboring facet
-/// planes within float rounding of each other, which exact conforming
-/// meshing cannot tile; inputs below roughly `1e-3` need mesh repair and
-/// should be screened before meshing.
-pub fn min_height_ratio(f: &Faceted) -> f64 {
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    let mut min_h = f64::MAX;
-    for t in &f.tris {
-        for v in &t.v {
-            for k in 0..3 {
-                lo[k] = lo[k].min(v[k]);
-                hi[k] = hi[k].max(v[k]);
-            }
-        }
-        let [a, b, c] = t.v;
-        let u: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
-        let w: [f64; 3] = std::array::from_fn(|k| c[k] - a[k]);
-        let n = [
-            u[1] * w[2] - u[2] * w[1],
-            u[2] * w[0] - u[0] * w[2],
-            u[0] * w[1] - u[1] * w[0],
-        ];
-        let area2 = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-        let e = |p: [f64; 3], q: [f64; 3]| -> f64 {
-            (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f64>().sqrt()
-        };
-        let lmax = e(a, b).max(e(b, c)).max(e(c, a));
-        if lmax > 0.0 {
-            min_h = min_h.min(area2 / lmax);
-        }
-    }
-    let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
-    if diag > 0.0 {
-        min_h / diag
-    } else {
-        0.0
-    }
-}
 
 /// Checks the closed-solid invariant [`crate::Scene::add_solid`] requires:
 /// after welding bit-identical vertices, every undirected edge must be shared

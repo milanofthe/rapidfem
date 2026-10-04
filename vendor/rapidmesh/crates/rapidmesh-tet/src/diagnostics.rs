@@ -1,32 +1,30 @@
-//! Mesh diagnostics: quality metrics plus spatially-located defects.
-//!
-//! This is the instrument that turns the corpus run into a MAP rather than a
-//! pass/fail light, and -- crucially -- it locates WHERE the mesh is wrong, which
-//! is exactly the trigger the curved-surface refinement (straddler repair) needs:
-//! a straddler is a boundary face whose vertex is OFF its analytic surface (an
-//! interior point leaked into the boundary), and its position is where a surface
-//! point must be inserted. Quality (dihedral histogram, slivers, radius-edge) and
-//! conformity (non-manifold edges, surface deviation, region volumes) round out
-//! the picture so every later step is measurable and visible.
+//! Mesh diagnostics: quality metrics and located defects. Quality (dihedral
+//! histogram, slivers, radius-edge ratio), conformity (non-manifold edges per
+//! region, region volumes) and faithfulness to the surfaces (straddlers,
+//! bridges). Every defect carries its position, so a corpus run shows where a
+//! mesh is wrong, not only that it is.
 
-use crate::conform::TetMesh;
+use crate::constants::FIDELITY_REL;
+use crate::mesh::TetMesh;
+
+use crate::quality::{quality_stats, QualityStats};
+use crate::simplex::tet_min_dihedral;
 use rapidmesh_brep::Surface;
-use rapidmesh_geom::vec3::{dist, sub, V3};
+use rapidmesh_geom::vec3::{centroid, dist, V3};
 use rapidmesh_geom::SurfaceKind;
 use rayon::prelude::*;
 
 /// The kind of a located mesh defect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefectKind {
-    /// A tet whose smallest dihedral angle is below [`SLIVER_DEG`] (poorly
+    /// A tet whose smallest dihedral angle is below [`crate::SLIVER_DEG`] (poorly
     /// conditioned; `value` = the angle in degrees).
     Sliver,
     /// A surface edge not shared by exactly two faces (a boundary leak /
     /// non-manifold incidence; `value` = the incidence count).
     NonManifoldEdge,
     /// A boundary face with a vertex OFF its analytic surface: an interior point
-    /// leaked into the boundary (the restricted Delaunay under-sampled the
-    /// surface). `value` = the off-surface distance. The repair site for refinement.
+    /// leaked into the boundary. `value` = the off-surface distance.
     Straddler,
     /// A boundary face whose vertices all sit ON surfaces but whose INTERIOR
     /// spans far off every one of them: a lid/bridge over a cavity opening
@@ -35,7 +33,7 @@ pub enum DefectKind {
     /// centroid's off-surface distance.
     BridgeFace,
     /// A point of the input PLC far from every mesh interface: geometry the
-    /// mesh lost ([`crate::fidelity`]). `value` = the distance over the local
+    /// mesh lost ([`crate::measure`]). `value` = the distance over the local
     /// mesh size.
     Uncovered,
     /// A mesh interface face far from every PLC facet: geometry the mesh
@@ -48,6 +46,11 @@ pub enum DefectKind {
     /// tagged with the wrong surface. `value` = the centroid distance over
     /// the face's longest edge (infinite if the surface has no facet).
     Mislabeled,
+    /// A face with a region on a side that is no face of a tet of that
+    /// region: an interface or sheet the tets there do not have, so it is
+    /// not embedded in the volume mesh. `value` = the tets of its regions
+    /// that have it (it needs one per side, a sheet two).
+    LooseFace,
 }
 
 impl DefectKind {
@@ -62,6 +65,7 @@ impl DefectKind {
             DefectKind::Excess => "excess",
             DefectKind::FeatureMissed => "feature_missed",
             DefectKind::Mislabeled => "mislabeled",
+            DefectKind::LooseFace => "loose_face",
         }
     }
 }
@@ -77,19 +81,9 @@ pub struct Defect {
 /// Quality + conformity diagnostics of a tet mesh, with located defects.
 #[derive(Debug, Clone)]
 pub struct MeshDiagnostics {
-    pub n_tets: usize,
+    pub quality: QualityStats,
     pub n_points: usize,
     pub n_faces: usize,
-    /// Smallest dihedral angle over all tets (degrees).
-    pub min_dihedral_deg: f64,
-    /// Mean of the per-tet smallest dihedral angle (degrees).
-    pub mean_min_dihedral_deg: f64,
-    /// Count of per-tet min-dihedral in each 10-degree bin `[0,10),...,[170,180)`.
-    pub dihedral_histogram: [usize; 18],
-    /// Tets with min dihedral below [`SLIVER_DEG`].
-    pub n_slivers: usize,
-    /// Largest circumradius / shortest-edge ratio.
-    pub max_radius_edge: f64,
     /// Every surface edge is shared by exactly two faces.
     pub watertight: bool,
     pub n_nonmanifold_edges: usize,
@@ -97,164 +91,40 @@ pub struct MeshDiagnostics {
     /// Boundary faces bridging far off every analytic surface (see
     /// [`DefectKind::BridgeFace`]).
     pub n_bridge_faces: usize,
+    /// Faces the tets of their regions do not have (see
+    /// [`DefectKind::LooseFace`]).
+    pub n_loose_faces: usize,
     /// Largest distance of a curved boundary face's centroid from its analytic
     /// surface (the chord sagitta -- the realised geometric accuracy vs `tol`).
     pub max_surface_deviation: f64,
-    /// Total tet volume per region, ascending region tag.
-    pub region_volumes: Vec<(u32, f64)>,
     /// Located defects (slivers, non-manifold edges, straddlers).
     pub defects: Vec<Defect>,
-}
-
-/// Tets below this smallest-dihedral angle (degrees) are counted as slivers.
-pub use crate::constants::SLIVER_DEG;
-
-fn centroid(ps: &[V3]) -> V3 {
-    let n = ps.len() as f64;
-    std::array::from_fn(|k| ps.iter().map(|p| p[k]).sum::<f64>() / n)
-}
-
-/// Smallest dihedral angle of a tet, in degrees (0 for a flat or
-/// degenerate tet): at each edge the angle between the two faces through
-/// it, from their outward normals (four cross products for the six edges),
-/// the arccosine of the largest cosine, so one `acos` per tet. The one
-/// implementation the refinement, the improvement and the statistics share.
-pub fn tet_min_dihedral(p: [V3; 4]) -> f64 {
-    let cross = |a: V3, b: V3| -> V3 {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
-    let dot = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    // The normal of the face opposite each corner, turned away from it.
-    let mut n = [[0.0; 3]; 4];
-    let mut len2 = [0.0; 4];
-    for k in 0..4 {
-        let (a, b, c) = (p[(k + 1) % 4], p[(k + 2) % 4], p[(k + 3) % 4]);
-        let m = cross(sub(b, a), sub(c, a));
-        let s = dot(m, sub(p[k], a));
-        let l = dot(m, m);
-        if !(s != 0.0 && l > 0.0) {
-            return 0.0;
-        }
-        n[k] = if s > 0.0 { m.map(|x| -x) } else { m };
-        len2[k] = l;
-    }
-    // The edge off corners k and l lies on the faces opposite them.
-    let mut cos = -1.0f64;
-    for (k, l) in [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)] {
-        cos = cos.max(-dot(n[k], n[l]) / (len2[k] * len2[l]).sqrt());
-    }
-    cos.clamp(-1.0, 1.0).acos().to_degrees()
-}
-
-fn tet_volume(p: [V3; 4]) -> f64 {
-    let (a, b, c, d) = (p[0], p[1], p[2], p[3]);
-    let (ab, ac, ad) = (sub(b, a), sub(c, a), sub(d, a));
-    let cr = [
-        ac[1] * ad[2] - ac[2] * ad[1],
-        ac[2] * ad[0] - ac[0] * ad[2],
-        ac[0] * ad[1] - ac[1] * ad[0],
-    ];
-    (ab[0] * cr[0] + ab[1] * cr[1] + ab[2] * cr[2]).abs() / 6.0
-}
-
-/// Circumradius / shortest-edge of one tet (`None` if degenerate).
-fn radius_edge(p: [V3; 4]) -> Option<f64> {
-    // Circumcenter via the linear system on squared-distance differences.
-    let a = p[0];
-    let mut m = [[0.0f64; 3]; 3];
-    let mut rhs = [0.0f64; 3];
-    for i in 0..3 {
-        let q = p[i + 1];
-        for k in 0..3 {
-            m[i][k] = 2.0 * (q[k] - a[k]);
-        }
-        rhs[i] = (0..3).map(|k| q[k] * q[k] - a[k] * a[k]).sum();
-    }
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() < 1e-30 {
-        return None;
-    }
-    let mut cc = [0.0f64; 3];
-    for k in 0..3 {
-        let mut mk = m;
-        for r in 0..3 {
-            mk[r][k] = rhs[r];
-        }
-        let dk = mk[0][0] * (mk[1][1] * mk[2][2] - mk[1][2] * mk[2][1])
-            - mk[0][1] * (mk[1][0] * mk[2][2] - mk[1][2] * mk[2][0])
-            + mk[0][2] * (mk[1][0] * mk[2][1] - mk[1][1] * mk[2][0]);
-        cc[k] = dk / det;
-    }
-    let r = dist(cc, a);
-    let mut lmin = f64::MAX;
-    for i in 0..4 {
-        for j in i + 1..4 {
-            lmin = lmin.min(dist(p[i], p[j]));
-        }
-    }
-    (lmin > 0.0).then(|| r / lmin)
 }
 
 /// Computes quality + conformity diagnostics with located defects.
 pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     let pt = |i: usize| mesh.points[i];
 
-    // ---- quality: dihedral histogram, slivers, radius-edge ----------------
-    let mut hist = [0usize; 18];
-    let mut min_dih = f64::MAX;
-    let mut sum_dih = 0.0;
-    let mut max_re = 0.0f64;
-    let mut n_slivers = 0usize;
-    let mut defects: Vec<Defect> = Vec::new();
-    let mut region_vol: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
-    // Per tet: its smallest dihedral, radius-edge ratio and volume.
-    let per_tet: Vec<(f64, Option<f64>, f64)> = mesh
-        .tets
-        .par_iter()
-        .map(|t| {
-            let p = [pt(t[0]), pt(t[1]), pt(t[2]), pt(t[3])];
-            (tet_min_dihedral(p), radius_edge(p), tet_volume(p))
+    // ---- quality, and the slivers as defects ------------------------------
+    let quality = quality_stats(mesh);
+    let mut defects: Vec<Defect> = quality
+        .slivers
+        .iter()
+        .map(|&t| {
+            let p = mesh.tets[t].map(pt);
+            Defect {
+                kind: DefectKind::Sliver,
+                pos: centroid(&p),
+                value: tet_min_dihedral(p),
+            }
         })
         .collect();
-    for (ti, (t, &(md, re, vol))) in mesh.tets.iter().zip(&per_tet).enumerate() {
-        let p = [pt(t[0]), pt(t[1]), pt(t[2]), pt(t[3])];
-        if md.is_finite() {
-            min_dih = min_dih.min(md);
-            sum_dih += md;
-            let bin = ((md / 10.0).floor() as usize).min(17);
-            hist[bin] += 1;
-            if md < SLIVER_DEG {
-                n_slivers += 1;
-                defects.push(Defect {
-                    kind: DefectKind::Sliver,
-                    pos: centroid(&p),
-                    value: md,
-                });
-            }
-        }
-        if let Some(re) = re {
-            max_re = max_re.max(re);
-        }
-        *region_vol.entry(mesh.tet_regions[ti].0).or_insert(0.0) += vol;
-    }
-    let mean_dih = if mesh.tets.is_empty() {
-        0.0
-    } else {
-        sum_dih / mesh.tets.len() as f64
-    };
 
-    // ---- conformity: non-manifold surface edges, PER REGION (Diag5) -------
+    // ---- conformity: non-manifold surface edges, per region ---------------
     // Each region's boundary (the faces that touch it) must be a closed 2-manifold:
     // every edge shared by exactly TWO of that region's faces. A triple curve --
     // where an interface (region A|B) meets the outer boundary -- carries 3+ faces
-    // GLOBALLY but exactly 2 PER REGION, so it is NOT a defect (the old global count
-    // wrongly flagged it). A real non-manifold (a barrel-seam pinch, a crack) shows
+    // globally but exactly 2 per region, so it is not a defect. A real non-manifold (a barrel-seam pinch, a crack) shows
     // up within a single region and is still caught. An embedded sheet (the
     // same region on both sides) lies inside its region and bounds nothing,
     // so it is not part of this count.
@@ -274,9 +144,18 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             }
         }
     }
+    // Where two bodies touch along a curve, the region around them has four
+    // faces at it, two of each body: the geometry pinches there (a contact
+    // has no volume between), no leak. Odd counts are leaks, and four faces
+    // off every curve are a fold.
+    let on_curve: rustc_hash::FxHashSet<(usize, usize)> = mesh
+        .curve_edges
+        .iter()
+        .map(|c| (c.v[0].min(c.v[1]), c.v[0].max(c.v[1])))
+        .collect();
     let mut nm: rustc_hash::FxHashMap<(usize, usize), u32> = rustc_hash::FxHashMap::default();
     for (&(_, a, b), &cnt) in &region_edge {
-        if cnt != 2 {
+        if cnt != 2 && !(cnt == 4 && on_curve.contains(&(a, b))) {
             let e = nm.entry((a, b)).or_insert(0);
             *e = (*e).max(cnt);
         }
@@ -290,6 +169,70 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             pos: centroid(&[pt(a), pt(b)]),
             value: cnt as f64,
         });
+    }
+
+    // ---- conformity: every face is a face of the tets on its sides --------
+    // A face between regions a and b needs a tet of a and one of b on it; a
+    // sheet inside region r two tets of r; a face on the outside (region 0)
+    // one tet of the region on its other side. Only the faces are indexed,
+    // the tets looked up against them.
+    let key = |t: [usize; 3]| {
+        let mut k = t;
+        k.sort_unstable();
+        k
+    };
+    let face_of: rustc_hash::FxHashMap<[usize; 3], usize> = mesh
+        .faces
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (key(f.tri), i))
+        .collect();
+    // A triangle listed twice, with a region on both (a | b and b | c): b has
+    // no thickness there (one body cut down to a face of another), so it
+    // needs no tet on it.
+    let mut listed: rustc_hash::FxHashMap<[usize; 3], Vec<usize>> =
+        rustc_hash::FxHashMap::default();
+    for (i, f) in mesh.faces.iter().enumerate() {
+        listed.entry(key(f.tri)).or_default().push(i);
+    }
+    let flat = |i: usize, r: rapidmesh_geom::RegionTag| {
+        listed[&key(mesh.faces[i].tri)]
+            .iter()
+            .any(|&j| j != i && mesh.faces[j].regions.contains(&r))
+    };
+    // The tets of each side's region on each face (a sheet counts both on
+    // its first side).
+    let mut held: Vec<[u32; 2]> = vec![[0, 0]; mesh.faces.len()];
+    for (t, tv) in mesh.tets.iter().enumerate() {
+        for f in crate::simplex::TET_FACES {
+            if let Some(&i) = face_of.get(&key(f.map(|j| tv[j]))) {
+                let r = mesh.tet_regions[t];
+                let [a, b] = mesh.faces[i].regions;
+                if r == a {
+                    held[i][0] += 1;
+                } else if r == b {
+                    held[i][1] += 1;
+                }
+            }
+        }
+    }
+    let mut n_loose = 0usize;
+    for (i, f) in mesh.faces.iter().enumerate() {
+        let [a, b] = f.regions;
+        let [ha, hb] = held[i];
+        let loose = if a == b {
+            a.0 != 0 && ha < 2
+        } else {
+            (a.0 != 0 && ha == 0 && !flat(i, a)) || (b.0 != 0 && hb == 0 && !flat(i, b))
+        };
+        if loose {
+            n_loose += 1;
+            defects.push(Defect {
+                kind: DefectKind::LooseFace,
+                pos: centroid(&f.tri.map(pt)),
+                value: (ha + hb) as f64,
+            });
+        }
     }
 
     // ---- conformity: straddlers + surface deviation (curved faces) --------
@@ -312,19 +255,14 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             .map(|s| dist(q, s.closest(q).0))
             .fold(f64::INFINITY, f64::min)
     };
-    // A face closing a filled contact wedge spans the wedge by design.
-    let contact: rustc_hash::FxHashSet<usize> = mesh.contact_faces.iter().copied().collect();
     // Per curved face: its corners, longest edge, the largest distance of a
     // corner and of its centroid from the nearest surface.
     let offs: Vec<Option<([V3; 3], f64, f64, f64)>> = mesh
         .faces
         .par_iter()
-        .enumerate()
-        .map(|(fi, f)| {
+        .map(|f| {
             let kind = &mesh.surfaces[f.surface as usize];
-            if matches!(kind, SurfaceKind::Plane { .. } | SurfaceKind::Facets)
-                || curved.is_empty()
-                || contact.contains(&fi)
+            if matches!(kind, SurfaceKind::Plane { .. } | SurfaceKind::Facets) || curved.is_empty()
             {
                 return None; // planar faces are exact; deviation is 0
             }
@@ -339,7 +277,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         })
         .collect();
     for &(v, longest, vmax_off, c_off) in offs.iter().flatten() {
-        if longest > 0.0 && vmax_off > 0.25 * longest {
+        if longest > 0.0 && vmax_off > FIDELITY_REL * longest {
             n_straddlers += 1;
             defects.push(Defect {
                 kind: DefectKind::Straddler,
@@ -354,7 +292,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         // some surface), but the face INTERIOR spans far off everything --
         // the cavity-lid class (mold_block), topologically watertight yet
         // geometrically false. Same relative threshold as the straddler.
-        if longest > 0.0 && c_off > 0.25 * longest && vmax_off <= 0.25 * longest {
+        if longest > 0.0 && c_off > FIDELITY_REL * longest && vmax_off <= FIDELITY_REL * longest {
             n_bridge_faces += 1;
             defects.push(Defect {
                 kind: DefectKind::BridgeFace,
@@ -365,101 +303,21 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     }
 
     MeshDiagnostics {
-        n_tets: mesh.tets.len(),
+        quality,
         n_points: mesh.points.len(),
         n_faces: mesh.faces.len(),
-        min_dihedral_deg: if min_dih.is_finite() { min_dih } else { 0.0 },
-        mean_min_dihedral_deg: mean_dih,
-        dihedral_histogram: hist,
-        n_slivers,
-        max_radius_edge: max_re,
         watertight: n_nonmanifold == 0,
         n_nonmanifold_edges: n_nonmanifold,
         n_straddlers,
         n_bridge_faces,
+        n_loose_faces: n_loose,
         max_surface_deviation: max_dev,
-        region_volumes: region_vol.into_iter().collect(),
         defects,
     }
 }
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn dihedral_of_known_tets() {
-        let r = 1.0 / 3f64.sqrt();
-        let regular = [[r, r, r], [r, -r, -r], [-r, r, -r], [-r, -r, r]];
-        assert!((tet_min_dihedral(regular) - (1.0f64 / 3.0).acos().to_degrees()).abs() < 1e-9);
-        let corner = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ];
-        let want = (1.0 / 3f64.sqrt()).acos().to_degrees();
-        assert!((tet_min_dihedral(corner) - want).abs() < 1e-9);
-        let flipped = [corner[1], corner[0], corner[2], corner[3]];
-        assert!((tet_min_dihedral(flipped) - want).abs() < 1e-9);
-        let flat = [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [1.0, 1.0, 0.0],
-        ];
-        assert_eq!(tet_min_dihedral(flat), 0.0);
-    }
-
-    /// The face-normal form agrees with the angle between the half-planes
-    /// at each edge, on random and on flat tets.
-    #[test]
-    fn dihedral_matches_the_edge_form() {
-        fn by_edges(p: [V3; 4]) -> f64 {
-            let cross = |a: V3, b: V3| -> V3 {
-                [
-                    a[1] * b[2] - a[2] * b[1],
-                    a[2] * b[0] - a[0] * b[2],
-                    a[0] * b[1] - a[1] * b[0],
-                ]
-            };
-            let dot = |a: V3, b: V3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-            let mut cos = -1.0f64;
-            for (i, j, k, l) in [
-                (0, 1, 2, 3),
-                (0, 2, 1, 3),
-                (0, 3, 1, 2),
-                (1, 2, 0, 3),
-                (1, 3, 0, 2),
-                (2, 3, 0, 1),
-            ] {
-                let e = sub(p[j], p[i]);
-                let (n1, n2) = (cross(e, sub(p[k], p[i])), cross(e, sub(p[l], p[i])));
-                cos = cos.max(dot(n1, n2) / (dot(n1, n1) * dot(n2, n2)).sqrt());
-            }
-            cos.clamp(-1.0, 1.0).acos().to_degrees()
-        }
-        let mut s = 0x9e37_79b9_7f4a_7c15u64;
-        let mut r = || {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            (s >> 11) as f64 / (1u64 << 53) as f64 - 0.5
-        };
-        for i in 0..20_000 {
-            let mut p: [V3; 4] = std::array::from_fn(|_| [r(), r(), r()]);
-            if i % 4 == 0 {
-                // Nearly flat: the fourth corner close to the plane of the others.
-                let t = [r().abs(), r().abs()];
-                p[3] = std::array::from_fn(|k| {
-                    p[0][k] + t[0] * (p[1][k] - p[0][k]) + t[1] * (p[2][k] - p[0][k])
-                });
-                p[3][2] += 1e-3 * r();
-            }
-            let (a, b) = (tet_min_dihedral(p), by_edges(p));
-            assert!((a - b).abs() < 1e-6 * (1.0 + b), "{p:?}: {a} vs {b}");
-        }
-    }
-
     use super::*;
     use rapidmesh_geom::{solid_box, Scene};
 
@@ -467,14 +325,16 @@ mod tests {
     fn box_is_clean_and_watertight() {
         let mut scene = Scene::new();
         scene.add_solid(solid_box([0.0, 0.0, 0.0], [2.0, 3.0, 4.0]));
-        let plc = scene.assemble();
-        let m = crate::conform::mesh_plc_with(
-            &plc,
-            &crate::conform::MeshParams {
+        let model = rapidmesh_brep::Model::try_of_scene(&scene).expect("model");
+        let m = crate::mesher::mesh_scene(
+            &scene,
+            &model,
+            &crate::params::MeshParams {
                 maxh: 1.0,
                 ..Default::default()
             },
-        );
+        )
+        .expect("bottom-up mesh");
         let d = diagnose(&m);
         assert!(
             d.watertight,
@@ -486,8 +346,8 @@ mod tests {
             d.max_surface_deviation < 1e-9,
             "planar faces have zero deviation"
         );
-        assert!(d.min_dihedral_deg > 0.0, "well-defined dihedral");
-        let vol: f64 = d.region_volumes.iter().map(|&(_, v)| v).sum();
+        assert!(d.quality.min_dihedral_deg > 0.0, "well-defined dihedral");
+        let vol: f64 = d.quality.per_region.iter().map(|r| r.volume).sum();
         assert!((vol - 24.0).abs() < 1e-6, "box volume 24, got {vol}");
     }
 
@@ -496,15 +356,17 @@ mod tests {
         use rapidmesh_geom::sphere;
         let mut scene = Scene::new();
         scene.add_solid(sphere([0.0, 0.0, 0.0], 1.0, 24, 12));
-        let plc = scene.assemble();
-        let m = crate::conform::mesh_plc_with(
-            &plc,
-            &crate::conform::MeshParams {
+        let model = rapidmesh_brep::Model::try_of_scene(&scene).expect("model");
+        let m = crate::mesher::mesh_scene(
+            &scene,
+            &model,
+            &crate::params::MeshParams {
                 maxh: 0.4,
                 tol_surf: 1e-2,
                 ..Default::default()
             },
-        );
+        )
+        .expect("bottom-up mesh");
         let d = diagnose(&m);
         assert!(
             d.watertight,

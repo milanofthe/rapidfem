@@ -5,7 +5,7 @@
 //! here are exact (no rounding error in the represented value), which makes
 //! sign computation exact.
 //!
-//! Components live inline up to [`INLINE`] and spill to the heap beyond, so
+//! Components live inline up to `INLINE` and spill to the heap beyond, so
 //! the short expansions of a typical exact predicate never allocate while
 //! arbitrary-degree expressions (homogeneous TPI coordinates of degree 7
 //! inside a 4x4 determinant) still work.
@@ -193,7 +193,7 @@ fn scale_expansion_zeroelim(e: &[f64], b: f64, h: &mut Comps) {
 /// far below the subnormal range, where Shewchuk's two-product silently
 /// drops bits (#90). Every operation checks its operands' extreme
 /// components first (O(1), they are sorted by magnitude) and continues in
-/// [`Big`] when a product could leave the safe exponent range, so signs
+/// `Big` when a product could leave the safe exponent range, so signs
 /// stay exact for every finite input at the cost of big-integer arithmetic
 /// in those rare cases only.
 ///

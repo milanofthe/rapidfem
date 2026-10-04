@@ -54,8 +54,8 @@ impl Default for Options {
             via_mode: "merged".into(),
             footprint_margin: 0.3,
             air_height_um: 60.0,
-            conductor_maxh_um: 1.5,
-            port_maxh_um: 1.5,
+            conductor_maxh_um: 3.0,
+            port_maxh_um: 3.0,
             port_tab_um: 8.0,
             port_inset_um: None,
             port_z0: 50.0,
@@ -74,7 +74,7 @@ pub struct FemLayout {
     pub substrate: ObjId,
     pub oxide: ObjId,
     pub air: ObjId,
-    /// The global mesh size: a tenth of the smaller footprint side.
+    /// The global mesh size: a fifth of the smaller footprint side.
     pub maxh: f64,
 }
 
@@ -189,7 +189,9 @@ pub fn from_fem_json(scene: &mut Scene, doc: &Value, stack: Option<&Stack>, o: &
     let z_top_um = num(last, "z_um")? + num(last, "thickness_um")?;
     let z_top_m = z_top_um * UM;
 
-    let maxh = foot_w.min(foot_h) / 10.0;
+    // a mesh study on the bundled layouts: a fifth of the footprint and
+    // 3 um on the conductors stay within 0.01 of half these sizes in |S|
+    let maxh = foot_w.min(foot_h) / 5.0;
     scene.geo.set_maxh(Some(maxh));
     let corner = [cx - foot_w / 2.0, cy - foot_h / 2.0];
     let substrate = scene.geo.add_solid(
@@ -236,7 +238,8 @@ pub fn from_fem_json(scene: &mut Scene, doc: &Value, stack: Option<&Stack>, o: &
             }
             let mut contours = vec![piece.iter().map(|p| [p[0] * UM, p[1] * UM]).collect::<Vec<P2>>()];
             contours.extend(holes.iter().map(|h| h.iter().map(|p| [p[0] * UM, p[1] * UM]).collect()));
-            let v = scene.prism(&contours, z_lo, Some(thick), Some(sio2.clone()), Some(cond_maxh))?;
+            // no material: a hole below, its walls PEC
+            let v = scene.prism(&contours, z_lo, Some(thick), None, Some(cond_maxh))?;
             scene.geo.set_name(v, Some(id.to_string()));
             match out.conductors.iter_mut().find(|(n, _)| n == id) {
                 Some((_, vs)) => vs.push(v),

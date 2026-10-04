@@ -29,11 +29,11 @@ pub struct Solid {
 /// A regularized boolean operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoolOp {
-    /// A ∪ B.
+    /// A union B.
     Union,
-    /// A ∩ B.
+    /// A intersect B.
     Intersection,
-    /// A − B.
+    /// A minus B.
     Difference,
 }
 
@@ -45,7 +45,7 @@ pub struct BooleanResult {
     /// Output triangles (outward-oriented).
     pub triangles: Vec<[usize; 3]>,
     /// Per output triangle: index of the input facet it came from
-    /// (0..a.tris.len() for A, then B) — carries tags downstream.
+    /// (0..a.tris.len() for A, then B) -- carries tags downstream.
     pub source_facet: Vec<usize>,
 }
 

@@ -347,6 +347,34 @@ impl NurbsSurface {
         Some([k1.max(k2), k1.min(k2)])
     }
 
+    /// The parameters of a surface point near `q` by Newton from `start`,
+    /// the parameters of a point near it (a search where the answer lies
+    /// close, not over the whole surface).
+    pub fn closest_param_near(&self, q: V3, start: [f64; 2]) -> [f64; 2] {
+        let r = sub(self.eval(start[0], start[1]), q);
+        self.descend(start, dot(r, r), q).0
+    }
+
+    /// The parameters of a surface point near `q` by one Gauss-Newton step
+    /// from `start` (within the domain): for a candidate place a small
+    /// offset away, where a point on the surface matters and not that it is
+    /// the nearest to `q` ([`NurbsSurface::closest_param_near`] for that).
+    pub fn step_toward(&self, q: V3, start: [f64; 2]) -> [f64; 2] {
+        let [s, s_u, s_v, ..] = self.ders2(start[0], start[1]);
+        let r = sub(q, s);
+        let (a, b, c) = (dot(s_u, s_u), dot(s_u, s_v), dot(s_v, s_v));
+        let (g0, g1) = (dot(r, s_u), dot(r, s_v));
+        let det = a * c - b * b;
+        if !(det > 0.0) {
+            return start;
+        }
+        let (ud, vd) = self.domain();
+        [
+            (start[0] + (c * g0 - b * g1) / det).clamp(ud[0], ud[1]),
+            (start[1] + (a * g1 - b * g0) / det).clamp(vd[0], vd[1]),
+        ]
+    }
+
     /// The parameters of the point of the surface nearest `q`: a Newton
     /// descent from the nearest sample of each piece that can hold a
     /// nearer point than found, the nearest piece first.

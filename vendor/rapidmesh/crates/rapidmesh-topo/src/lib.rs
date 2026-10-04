@@ -1,7 +1,7 @@
 //! Analysis-ready cell-complex view of a mesh.
 //!
 //! The solver-agnostic, dimension-uniform derivation of a mesh's 0/1/2/3-cell
-//! incidence and per-element geometry — the connectivity downstream FEM/FVM
+//! incidence and per-element geometry -- the connectivity downstream FEM/FVM
 //! solvers otherwise rebuild from scratch. 2D and 3D run through the same code:
 //! a triangle mesh's *topology* is identical whether it is planar or
 //! embedded in 3D (a surface); only *geometry* is coordinate-aware.
@@ -32,8 +32,8 @@ pub mod export;
 pub mod mesher;
 
 pub use convention::{
-    canonical_edge, face_perm, sort3_sign, FACE_PERMS, NONE, TET_EDGE_LOCAL, TET_FACE_LOCAL,
-    TRI_EDGE_LOCAL,
+    canonical_edge, face_perm, sort3_sign, FACE_PERMS, NONE, TET10_EDGES, TET_EDGE_LOCAL,
+    TET_FACE_LOCAL, TRI_EDGE_LOCAL,
 };
 pub use csr::Csr;
 pub use source::{TetSource, Tets, TriSource, Tris};

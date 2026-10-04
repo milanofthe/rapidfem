@@ -9,12 +9,17 @@ pub const NONE: u32 = u32::MAX;
 /// Local edges of a triangle, as local-vertex index pairs.
 pub const TRI_EDGE_LOCAL: [[usize; 2]; 3] = [[0, 1], [1, 2], [2, 0]];
 
+/// The corner pairs of a second-order tet's mid-edge nodes, in node order
+/// (nodes 4 to 9): the order of gmsh's and VTK's quadratic tets up to the
+/// direction of an edge.
+pub const TET10_EDGES: [[usize; 2]; 6] = [[0, 1], [1, 2], [2, 0], [0, 3], [1, 3], [2, 3]];
+
 /// Local edges of a tetrahedron, as local-vertex index pairs.
 pub const TET_EDGE_LOCAL: [[usize; 2]; 6] = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
 
 /// Local faces of a tetrahedron, as local-vertex index triples. Face `i`
 /// excludes local vertex `i`, ordered so the triangle normal points **outward**
-/// of a positively oriented tet (verified by [`tests::tet_faces_point_outward`]).
+/// of a positively oriented tet (verified by the test `tet_faces_point_outward`).
 pub const TET_FACE_LOCAL: [[usize; 3]; 4] = [[1, 2, 3], [0, 3, 2], [0, 1, 3], [0, 2, 1]];
 
 /// The six orders of a triangle's vertices. A face seen by a tet in its
@@ -47,7 +52,7 @@ pub fn face_perm(local: [u32; 3]) -> u8 {
 }
 
 /// Canonical (min, max) form of an edge plus the sign of the supplied direction:
-/// `+1` if `(a, b)` already runs min→max, `-1` if it is reversed.
+/// `+1` if `(a, b)` already runs min->max, `-1` if it is reversed.
 #[inline]
 pub fn canonical_edge(a: u32, b: u32) -> ([u32; 2], i8) {
     if a <= b {

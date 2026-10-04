@@ -1155,6 +1155,7 @@ dependencies = [
  "num-complex",
  "rapidfem-core",
  "rayon",
+ "rslab",
  "web-time",
 ]
 
@@ -1205,7 +1206,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "rapidmesh-brep",
  "rapidmesh-exact",
@@ -1219,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-brep"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
@@ -1230,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-csg"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "geometry-predicates",
  "rapidmesh-exact",
@@ -1240,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-exact"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "geometry-predicates",
  "num-bigint",
@@ -1250,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-geom"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "i_overlay",
  "rapidmesh-csg",
@@ -1261,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-step"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
@@ -1272,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-tet"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
  "geometry-predicates",
  "rapidmesh-brep",
@@ -1286,10 +1287,8 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-topo"
-version = "1.0.0"
+version = "2.1.0"
 dependencies = [
- "rapidmesh-brep",
- "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-tet",
 ]

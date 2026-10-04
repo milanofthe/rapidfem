@@ -21,7 +21,7 @@ use crate::interp;
 use crate::materials::{self, Material, PmlRegion};
 use crate::mesh::Mesh;
 use crate::port::Port;
-use crate::sparam::{sparam_voltage_surface, sparam_waveport};
+use crate::sparam::{sparam_voltage_surface, ModalProjection};
 use crate::waveguide::{
     cs_from_origin_zaxis, detect_rect_port, lumped_port_dims, AbsorbingBoundary, CoaxPort,
     FloquetPort, LumpedElement, LumpedPort, NumericalWavePort, RectWaveguide, SurfaceImpedance,
@@ -88,6 +88,7 @@ impl Simulation {
     /// All BC objects (ports, PEC, materials, PML, lumped integration lines)
     /// are constructed up-front.
     pub fn new(mesh: Mesh, model: Model, settings: FdSettings) -> Result<Self, String> {
+        let t_setup = web_time::Instant::now();
         let mut mesh = mesh;
         // Lever ④: non-dimensionalize the geometry to O(1) coordinates so the
         // assembly and its absolute tolerances are unit-/scale-invariant. The
@@ -147,6 +148,7 @@ impl Simulation {
         let (ports, port_tris) = build_ports(&mesh, &model, &materials, f_min)?;
         let pec_tris = build_pec_tris(&mesh, &model);
         let pml_regions = build_pml_regions(&mesh, &model);
+        eprintln!("  Set up basis, materials and ports in {:.1}ms", t_setup.elapsed().as_secs_f64() * 1e3);
 
         Ok(Simulation {
             mesh,
@@ -206,7 +208,10 @@ impl Simulation {
         let port_tri_refs = self.port_tris_slices();
         let n_driven = port_dyn.iter().filter(|p| p.is_driven()).count();
         // Build the frequency-independent extraction context once.
+        let t_ctx = web_time::Instant::now();
         let ctx = self.sparam_ctx(&port_dyn);
+        let ctx_ms = t_ctx.elapsed().as_secs_f64() * 1e3;
+        let mut extract_ms = 0.0;
 
         // S-parameters are accumulated per frequency inside the solve callback
         // (so the streaming `on_freq` sees the same matrix that lands in the
@@ -217,7 +222,9 @@ impl Simulation {
         let results;
         {
             let mut on_solve = |fi: usize, freq: f64, sr: &crate::assembly::SolveResult| -> bool {
+                let t = web_time::Instant::now();
                 let s = self.extract_sparams_one(&ctx, &port_dyn, &port_tri_refs, freq, sr, n_driven);
+                extract_ms += t.elapsed().as_secs_f64() * 1e3;
                 let keep_going = match on_freq {
                     Some(cb) => cb(fi, freq, &s),
                     None => true,
@@ -238,6 +245,7 @@ impl Simulation {
             )?;
         }
         let solve_time_s = t0.elapsed().as_secs_f64();
+        eprintln!("  S-parameters extracted in {extract_ms:.1}ms (context {ctx_ms:.1}ms)");
 
         // An early interrupt leaves fewer solved frequencies than requested;
         // truncate so frequencies / sparams / solutions stay the same length.
@@ -293,15 +301,15 @@ impl Simulation {
         freq_result: &crate::assembly::SolveResult,
         n_driven: usize,
     ) -> Vec<Vec<C64>> {
-        let weight = |x: f64, y: f64, z: f64| -> f64 {
-            match ctx.grid.find_containing_tet(&self.mesh, x, y, z) {
-                Some(tet) => (ctx.eps_tet[tet] / ctx.mur_tet[tet]).sqrt(),
-                None => 1.0,
-            }
-        };
-
         let exc = crate::excitation::Excitation::new(freq, self.mesh.l0);
         let mut freq_s = vec![vec![C64::new(0.0, 0.0); n_driven]; n_driven];
+        // the mode projection of every modal port, once for all excitations
+        let c = |tet: usize| (ctx.eps_tet[tet] / ctx.mur_tet[tet]).sqrt();
+        let projections: Vec<Option<ModalProjection>> = ctx
+            .driven_indices
+            .iter()
+            .map(|&pi| port_dyn[pi].lumped().is_none().then(|| ModalProjection::new(&self.mesh, port_tri_refs[pi], port_dyn[pi], &exc, &c, 4)))
+            .collect();
 
         for (exc_idx, sol) in freq_result.solutions.iter().enumerate() {
             let fieldf = |x: f64, y: f64, z: f64| -> (C64, C64, C64) {
@@ -312,18 +320,18 @@ impl Simulation {
             };
             for (obs_idx, &obs_pi) in ctx.driven_indices.iter().enumerate() {
                 let active = obs_idx == exc_idx;
-                let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi]
-                    .iter()
-                    .map(|&ti| self.mesh.tris[ti])
-                    .collect();
-                let s = if let Some((dir, height, v_inc)) = port_dyn[obs_pi].lumped() {
+                let s = if let Some(projection) = &projections[obs_idx] {
+                    let field = |tet: usize, p: [f64; 3]| {
+                        let (ex, ey, ez) = interp::eval_field_in_tet(&self.mesh, &self.basis, sol, tet, p[0], p[1], p[2]);
+                        [ex, ey, ez]
+                    };
+                    projection.s(&field, active)
+                } else {
                     // Area-averaged mode projection V = (l/A)∫E·l̂ dS, robust
                     // for tall / non-TEM ports (derivations/lumped_port/).
-                    sparam_voltage_surface(
-                        &self.mesh.nodes, &obs_tris, dir, height, v_inc, active, &fieldf, 4,
-                    )
-                } else {
-                    sparam_waveport(&self.mesh.nodes, &obs_tris, port_dyn[obs_pi], &exc, active, &fieldf, &weight, 4)
+                    let (dir, height, v_inc) = port_dyn[obs_pi].lumped().expect("a driven port is lumped or modal");
+                    let obs_tris: Vec<[usize; 3]> = port_tri_refs[obs_pi].iter().map(|&ti| self.mesh.tris[ti]).collect();
+                    sparam_voltage_surface(&self.mesh.nodes, &obs_tris, dir, height, v_inc, active, &fieldf, 4)
                 };
                 freq_s[obs_idx][exc_idx] = s;
             }
@@ -740,17 +748,22 @@ fn build_ports(
                 let f0 = f0.ok_or_else(|| format!(
                     "WavePort on tag {tag}: the frequency-domain backend needs f0 \
                      (the operating frequency of the 2D mode eigensolve)"))?;
+                let t_mode = web_time::Instant::now();
                 let pn = build_wave_numerical(
                     mesh, materials, &tri_ids, f0, *mode_index, *kind,
                     pec_tags, &pmc_tags, *power, port_num,
                 );
                 let Some(port) = pn else {
-                    eprintln!("  WARNING: tag {}: wave_numerical eigensolve failed, skipping", tag);
-                    continue;
+                    return Err(format!(
+                        "WavePort on tag {tag}: the cross-section eigensolve at f0 = {:.4} GHz found no mode \
+                         {mode_index}; the port face may be meshed too coarsely to carry it (refine the port \
+                         faces) or the mode does not propagate at f0",
+                        f0 * 1e-9
+                    ));
                 };
                 eprintln!(
-                    "  Port {}: wave_numerical, tag={}, f0={:.3}GHz, kind={:?}, mode_idx={}, n_eff={:.3}",
-                    port_num, tag, f0 * 1e-9, kind, mode_index, port.n_eff,
+                    "  Port {}: wave_numerical, tag={}, f0={:.3}GHz, kind={:?}, mode_idx={}, n_eff={:.3} ({:.0}ms)",
+                    port_num, tag, f0 * 1e-9, kind, mode_index, port.n_eff, t_mode.elapsed().as_secs_f64() * 1e3,
                 );
                 Box::new(port)
             }

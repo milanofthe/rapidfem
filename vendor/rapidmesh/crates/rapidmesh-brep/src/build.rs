@@ -15,8 +15,8 @@ use crate::{
     Brep, CoEdge, CoEdgeId, Curve, Edge, EdgeId, Face, FaceId, Loop, Surface, SurfaceId, Vertex,
     VertexId,
 };
-use rapidmesh_geom::vec3::{add, cross, dist, dot, normalize as norm, scale, sub, V3};
-use rapidmesh_geom::{NurbsCurve, SurfaceKind, TaggedPlc};
+use rapidmesh_geom::vec3::{add, bbox, cross, dist, dot, normalize as norm, scale, sub, V3};
+use rapidmesh_geom::{CurveKind, NurbsCurve, SurfaceKind, TaggedPlc};
 use std::sync::Arc;
 // Deterministic (seedless) hashers: from_plc's map ITERATION order sets the
 // B-rep edge / face / vertex order, which flows into the surface point order and
@@ -62,13 +62,7 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
     let n_tri = plc.triangles.len();
     let mut diag = 0.0f64;
     {
-        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
-        for p in pos {
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
-        }
+        let (lo, hi) = bbox(pos);
         for k in 0..3 {
             diag = diag.max(hi[k] - lo[k]);
         }
@@ -306,6 +300,16 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
         })
     };
 
+    // The curves the shapes declare, each with the box of its points.
+    let declared: Vec<(&rapidmesh_geom::EdgeCurve, V3, V3)> = plc
+        .curves
+        .iter()
+        .map(|c| {
+            let (lo, hi) = bbox(&c.points);
+            (c, lo, hi)
+        })
+        .collect();
+
     // ---- B3 cont.: build Edge records (curve recovery), keep radial faces ----
     let mut edges: Vec<Edge> = Vec::new();
     let mut edge_faces: Vec<Vec<FaceId>> = Vec::new();
@@ -324,7 +328,8 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
             .map(|&f| FaceId(f as u32))
             .collect();
         rad.sort_unstable();
-        let curve = recover_curve(&chain_pts, &rad, &faces, plc, tol);
+        let curve = declared_curve(&chain_pts, &declared, tol)
+            .unwrap_or_else(|| recover_curve(&chain_pts, &rad, &faces, plc, tol));
         edges.push(Edge {
             ends: [va, vb],
             chain: chain_pts,
@@ -371,7 +376,7 @@ pub fn from_plc(plc: &TaggedPlc) -> Brep {
         let mut kind = plc.surfaces[faces[fid].surface.0 as usize].clone();
         // A face whose facets are its carrier (a loft mantle, a swept wall)
         // is a DISCRETE patch of its own facets, the same closest-point
-        // oracle that remeshes STL imports; one that happens to be flat is
+        // carrier an STL import gets; one that happens to be flat is
         // the plane of its facets. A plane whose facets leave it (which the
         // geometry should never produce) is carried by its facets too.
         let flat = match kind {
@@ -513,13 +518,7 @@ fn canonicalize(b: &mut Brep, plc: &TaggedPlc) {
     }
     // Where a point lies in the frame of solid `owner`, on a grid of a
     // billionth of the model, so rounding does not reorder.
-    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
-    for p in &plc.vertices {
-        for k in 0..3 {
-            lo[k] = lo[k].min(p[k]);
-            hi[k] = hi[k].max(p[k]);
-        }
-    }
+    let (lo, hi) = bbox(&plc.vertices);
     let grid = 1e-9
         * (0..3)
             .map(|k| hi[k] - lo[k])
@@ -762,6 +761,104 @@ fn arc_len(chain: &[V3]) -> f64 {
     chain.windows(2).map(|w| dist(w[0], w[1])).sum()
 }
 
+/// The declared curve the chain lies on (every point within `tol` of the
+/// curve's points' polyline), a B-spline over the parameters of the chain's
+/// ends; `None` where none holds it or a B-spline's parameters do not run
+/// monotonically along it (a piece across the seam of a closed curve).
+fn declared_curve(
+    chain: &[V3],
+    declared: &[(&rapidmesh_geom::EdgeCurve, V3, V3)],
+    tol: f64,
+) -> Option<Curve> {
+    if chain.len() < 2 {
+        return None;
+    }
+    let on_polyline = |pts: &[V3], q: V3| {
+        pts.windows(2).any(|w| {
+            let d = sub(w[1], w[0]);
+            let dd = dot(d, d);
+            let t = if dd > 0.0 {
+                (dot(sub(q, w[0]), d) / dd).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            dist(q, std::array::from_fn(|k| w[0][k] + t * d[k])) <= tol
+        })
+    };
+    let (c, _, _) = declared.iter().find(|(c, lo, hi)| {
+        chain
+            .iter()
+            .all(|q| (0..3).all(|k| q[k] >= lo[k] - tol && q[k] <= hi[k] + tol))
+            && chain.iter().all(|&q| on_polyline(&c.points, q))
+    })?;
+    // The conics and lines span what their chain spans; a B-spline is
+    // evaluated in its own parameter, over the range of the chain's ends.
+    let curve = match &c.kind {
+        CurveKind::Line { p0, dir } => return Some(Curve::Line { p0: *p0, dir: *dir }),
+        CurveKind::Circle {
+            center,
+            axis,
+            x,
+            radius,
+        } => {
+            return Some(Curve::Circle {
+                center: *center,
+                axis: *axis,
+                radius: *radius,
+                x: *x,
+            })
+        }
+        CurveKind::Ellipse {
+            center,
+            major,
+            minor,
+            a,
+            b,
+        } => {
+            return Some(Curve::Ellipse {
+                center: *center,
+                major: *major,
+                minor: *minor,
+                a: *a,
+                b: *b,
+            })
+        }
+        CurveKind::Nurbs(curve) => curve,
+    };
+    let param = |q: V3| curve.closest_param(q);
+    let (lo, hi) = curve.domain();
+    let n = chain.len() - 1;
+    let closed = dist(chain[0], chain[n]) <= tol;
+    let t: [f64; 2] = if closed {
+        // The whole curve, the way the chain runs.
+        let (t0, t1) = (param(chain[0]), param(chain[1]));
+        let at_lo = (t0 - lo).abs() <= (hi - t0).abs();
+        match (at_lo, t1 > t0) {
+            (true, true) | (false, true) => [lo, hi],
+            _ => [hi, lo],
+        }
+    } else {
+        [param(chain[0]), param(chain[n])]
+    };
+    if t[0] == t[1] {
+        return None;
+    }
+    // The inner points in order along the range.
+    let along = |q: V3| (param(q) - t[0]) / (t[1] - t[0]);
+    let mut last = 0.0;
+    for &q in &chain[1..n] {
+        let s = along(q);
+        if !(s > last && s < 1.0) {
+            return None;
+        }
+        last = s;
+    }
+    Some(Curve::Nurbs {
+        curve: curve.clone(),
+        t,
+    })
+}
+
 /// Recovers the analytic curve of an edge from its vertex chain and the surfaces
 /// of its radial faces. Handles the forms our scenes use; everything else falls
 /// back to the faceted polyline (`Curve::Polyline`).
@@ -817,6 +914,7 @@ fn recover_curve(chain: &[V3], rad: &[FaceId], faces: &[Face], plc: &TaggedPlc, 
             center,
             axis,
             radius,
+            ..
         } = kind
         {
             for &(po, pn) in &planes {
@@ -1243,14 +1341,17 @@ fn meridian(k: &SurfaceKind, o: V3, a: V3, size: f64) -> Option<Meridian> {
             p: [0.0, z(*point)],
             d: [1.0, 0.0],
         }),
-        SurfaceKind::Sphere { center, radius } => on_axis(*center).then_some(Meridian::Circle {
-            c: [0.0, z(*center)],
-            r: *radius,
-        }),
+        SurfaceKind::Sphere { center, radius, .. } => {
+            on_axis(*center).then_some(Meridian::Circle {
+                c: [0.0, z(*center)],
+                r: *radius,
+            })
+        }
         SurfaceKind::Cylinder {
             center,
             axis,
             radius,
+            ..
         } => (along(*axis) && on_axis(*center)).then_some(Meridian::Line {
             p: [*radius, 0.0],
             d: [0.0, 1.0],
@@ -1259,6 +1360,7 @@ fn meridian(k: &SurfaceKind, o: V3, a: V3, size: f64) -> Option<Meridian> {
             apex,
             axis,
             tan_half_angle,
+            ..
         } => (along(*axis) && on_axis(*apex)).then(|| {
             // The generator leaves the apex into the nappe, whichever way
             // the axis runs.
@@ -1274,6 +1376,7 @@ fn meridian(k: &SurfaceKind, o: V3, a: V3, size: f64) -> Option<Meridian> {
             axis,
             major_radius,
             minor_radius,
+            ..
         } => (along(*axis) && on_axis(*center)).then_some(Meridian::Circle {
             c: [*major_radius, z(*center)],
             r: *minor_radius,
@@ -1404,10 +1507,10 @@ fn revolution_circle(
     None
 }
 
-/// The exact ellipse of an oblique plane∩cylinder section. Plane `(po, pn)`,
+/// The exact ellipse of an oblique plane-cylinder section. Plane `(po, pn)`,
 /// cylinder `(center c, unit axis ca, radius r)`: the section is an ellipse
 /// with center on the cylinder axis, semi-minor `r` along `ca x pn`,
-/// semi-major `r/|ca·pn|` along the axis' in-plane projection. `None` when
+/// semi-major `r/|ca*pn|` along the axis' in-plane projection. `None` when
 /// near-perpendicular (a circle, handled elsewhere) or near-parallel (no
 /// bounded section).
 fn plane_cylinder_ellipse(

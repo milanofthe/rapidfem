@@ -3,7 +3,7 @@
 //! Rust offers no portable access to FPU rounding modes, so instead of
 //! directed rounding every inexact operation widens its result outward by one
 //! ulp via `f64::next_down`/`next_up`. Default rounding is to-nearest, so the
-//! true result lies within half an ulp of the computed bound — one ulp outward
+//! true result lies within half an ulp of the computed bound -- one ulp outward
 //! is strictly conservative. Intervals are therefore slightly wider than with
 //! directed rounding, costing only a few extra (correct) fallbacks to exact
 //! arithmetic.

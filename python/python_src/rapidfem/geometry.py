@@ -519,6 +519,21 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
         return Geometry._adopt(native, name=cell or "gds_import")
 
     @property
+    def size_scale(self) -> float:
+        """factor on every target size of the mesh
+
+        Multiplies the global ``maxh``, every object, material and face size
+        and the ``maxh`` a :meth:`mesh` call passes: above 1 coarsens the whole
+        mesh, below 1 refines it, the size relations of the model stay. The
+        knob for a quick preview mesh or a convergence study.
+        """
+        return self._native.size_scale
+
+    @size_scale.setter
+    def size_scale(self, value: float) -> None:
+        self._native.size_scale = float(value)
+
+    @property
     def objects(self) -> list[GeoObject]:
         """every object of the scene, in the order they were added"""
         return [GeoObject(self, i) for i in self._native.objects()]

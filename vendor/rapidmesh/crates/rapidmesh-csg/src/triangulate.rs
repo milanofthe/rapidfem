@@ -1,20 +1,18 @@
-//! Exact constrained triangulation of a single facet.
+//! Exact constrained Delaunay triangulation of a facet.
 //!
-//! Given a facet (input triangle), a set of points and a set of constraint
-//! segments on it (all exact, possibly implicit), produces a triangulation of
-//! the facet whose vertex set is the input set plus all constraint-constraint
-//! crossing points, and whose edge set contains every (sub-divided) constraint
-//! segment. Everything runs on exact predicates over the facet's 2D
-//! projection; no coordinate is ever rounded.
+//! Given a facet (an input triangle, or a planar polygon by a seed tiling),
+//! points and constraint segments on it (all exact, possibly implicit),
+//! produces a triangulation of the facet whose vertex set is the input set
+//! plus all constraint-constraint crossing points, and whose edge set contains
+//! every (sub-divided) constraint segment. Everything runs on exact
+//! predicates over the facet's 2D projection; no coordinate is ever rounded.
 //!
-//! Algorithm: classic incremental insertion (interior 1→3 split, on-edge
-//! 2→4 split) followed by flip-based constraint edge recovery. Constraints
-//! are pre-split at their mutual crossing points (constructed exactly from
-//! constraint provenance) and at every vertex lying on them, so recovery only
-//! ever handles segments with empty interiors — the regime where flip
-//! recovery provably terminates. The triangulation is constrained, not
-//! Delaunay; a CDT upgrade (indirect incircle) can be layered on later
-//! without changing this module's contract.
+//! Algorithm: incremental insertion (interior 1-3 split, on-edge 2-4 split),
+//! flip-based recovery of the constraint edges, then Lawson flips to the
+//! constrained Delaunay triangulation. Constraints are pre-split at their
+//! mutual crossing points (constructed exactly from constraint provenance)
+//! and at every vertex lying on them, so recovery only ever handles segments
+//! with empty interiors, the regime where flip recovery provably terminates.
 
 use crate::constraint::Constraint;
 use crate::tri::Tri;
@@ -33,18 +31,6 @@ pub struct FacetTriangulation {
     pub axis: Axis,
     /// The facet's 2D orientation in that projection.
     pub orientation: Sign,
-}
-
-impl FacetTriangulation {
-    /// True if the (undirected) edge {u, v} is present.
-    pub fn has_edge(&self, u: usize, v: usize) -> bool {
-        self.triangles.iter().any(|t| {
-            (0..3).any(|e| {
-                let (a, b) = (t[e], t[(e + 1) % 3]);
-                (a == u && b == v) || (a == v && b == u)
-            })
-        })
-    }
 }
 
 /// The vertex pool of a facet triangulation: every point also prepared for
@@ -164,7 +150,7 @@ pub fn triangulate_facet(
 /// single input triangle to an arbitrary planar polygon (with holes): the seed
 /// boundary edges (loops, including holes) have no opposite triangle and are
 /// preserved, while seed-internal edges are flipped toward the constrained
-/// Delaunay triangulation — so a fan/ear seed leaves no artificial interior
+/// Delaunay triangulation -- so a fan/ear seed leaves no artificial interior
 /// structure behind. `canonical` makes that the exact constrained Delaunay
 /// triangulation, a pure function of the geometry, which a facet with a
 /// coincident coplanar partner needs (the overlap must triangulate the same
@@ -533,8 +519,8 @@ impl Tris {
     }
 }
 
-/// Inserts pool vertex `k` into the triangulation (interior 1→3 split or
-/// on-edge 2→4 split), located by a walk. Panics if the vertex lies outside
+/// Inserts pool vertex `k` into the triangulation (interior 1->3 split or
+/// on-edge 2->4 split), located by a walk. Panics if the vertex lies outside
 /// the facet.
 fn insert_vertex(tris: &mut Tris, pool: &Pool, orientation: Sign, k: usize) -> Result<(), String> {
     let outside = orientation.flip();
@@ -600,7 +586,7 @@ fn locate(tris: &Tris, pool: &Pool, outside: Sign, k: usize) -> Option<(usize, [
 /// Flips non-constrained edges to the constrained Delaunay triangulation,
 /// with a deterministic geometric tie-break for cocircular quads (prefer the
 /// diagonal containing the lexicographically smallest of the four vertices).
-/// The result is unique given the vertex set and constraints — the property
+/// The result is unique given the vertex set and constraints -- the property
 /// that makes coincident facets of different inputs match exactly.
 fn delaunay_pass(
     tris: &mut Tris,
@@ -674,7 +660,7 @@ fn delaunay_pass(
 }
 
 /// Restores the edge {u, v} (whose open interior contains no vertices) by
-/// flipping edges that cross it — Sloan-style FIFO processing.
+/// flipping edges that cross it -- Sloan-style FIFO processing.
 ///
 /// The edges crossing the segment are collected once by walking along it
 /// from `u`; an edge whose surrounding quad is not strictly convex is

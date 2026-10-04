@@ -273,6 +273,7 @@ pub fn frequency_sweep(
             .map(|bvec| free_dofs.iter()
                 .map(|&d| bvec[d]).collect())
             .collect();
+        let asm_ms = t_freq.elapsed().as_secs_f64() * 1e3;
         if let Some(target) = &dump {
             crate::dump::write_system(target, fi, 2.0 * std::f64::consts::PI * freq / 299_792_458.0, n_free, &coo_rows, &coo_cols, &coo_vals, &b_frees)?;
         }
@@ -315,7 +316,7 @@ pub fn frequency_sweep(
         }
 
         eprintln!(
-            "  f={:>8.4e} Hz [{:>2}/{:>2}]  {:>6.1}ms  {}",
+            "  f={:>8.4e} Hz [{:>2}/{:>2}]  {:>6.1}ms  {} (assembly {asm_ms:.0}ms)",
             freq, fi + 1, frequencies.len(), t_freq.elapsed().as_secs_f64() * 1e3,
             how,
         );

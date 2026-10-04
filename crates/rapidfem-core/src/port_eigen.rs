@@ -534,6 +534,8 @@ fn krylov_lowest(
 #[derive(Clone, Debug)]
 pub struct NumericalMode {
     mesh: PortMesh2D,
+    /// Buckets of the triangles, for `locate`.
+    grid: TriGrid,
     /// The field representation `e_profile` evaluates.
     profile: Profile,
     /// Inverse peak `|E_t|` over the cross-section, the unit-peak
@@ -545,6 +547,63 @@ pub struct NumericalMode {
     cutoff: f64,
     /// Modal-impedance model for the forward/backward split.
     z_model: ImpedanceModel,
+}
+
+/// A uniform bucket grid over the triangles of a port mesh: each cell lists
+/// (in index order) the triangles whose slightly grown bounding box meets
+/// it, about one triangle per cell.
+#[derive(Clone, Debug)]
+struct TriGrid {
+    lo: [f64; 2],
+    cell: f64,
+    dims: [usize; 2],
+    cells: Vec<Vec<u32>>,
+}
+
+impl TriGrid {
+    fn new(mesh: &PortMesh2D) -> TriGrid {
+        let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for p in &mesh.nodes {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let span = [(hi[0] - lo[0]).max(0.0), (hi[1] - lo[1]).max(0.0)];
+        let n = mesh.tris.len().max(1) as f64;
+        let cell = ((span[0] * span[1]) / n).sqrt().max(span[0].max(span[1]) / 1024.0).max(f64::MIN_POSITIVE);
+        let dims = [0, 1].map(|k| (span[k] / cell).floor() as usize + 1);
+        let mut cells = vec![Vec::new(); dims[0] * dims[1]];
+        // grown by the barycentric slack `locate` accepts, relative to the span
+        let grow = 1e-6 * span[0].max(span[1]);
+        for (ti, t) in mesh.tris.iter().enumerate() {
+            let (mut a, mut b) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for &v in t {
+                for k in 0..2 {
+                    a[k] = a[k].min(mesh.nodes[v][k] - grow);
+                    b[k] = b[k].max(mesh.nodes[v][k] + grow);
+                }
+            }
+            let (i0, j0) = (Self::index(lo, cell, dims, a, 0), Self::index(lo, cell, dims, a, 1));
+            let (i1, j1) = (Self::index(lo, cell, dims, b, 0), Self::index(lo, cell, dims, b, 1));
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    cells[j * dims[0] + i].push(ti as u32);
+                }
+            }
+        }
+        TriGrid { lo, cell, dims, cells }
+    }
+
+    fn index(lo: [f64; 2], cell: f64, dims: [usize; 2], p: [f64; 2], k: usize) -> usize {
+        (((p[k] - lo[k]) / cell).floor().max(0.0) as usize).min(dims[k] - 1)
+    }
+
+    /// The triangles that can hold `uv`, in index order.
+    fn candidates(&self, uv: [f64; 2]) -> &[u32] {
+        let (i, j) = (Self::index(self.lo, self.cell, self.dims, uv, 0), Self::index(self.lo, self.cell, self.dims, uv, 1));
+        &self.cells[j * self.dims[0] + i]
+    }
 }
 
 /// A numerical mode's field representation.
@@ -646,6 +705,7 @@ impl NumericalMode {
             .fold(0.0_f64, f64::max);
         let inv_peak = if peak > 0.0 { 1.0 / peak } else { 0.0 };
         NumericalMode {
+            grid: TriGrid::new(&mesh),
             mesh,
             profile: Profile::Nodal(e_uv_node),
             inv_peak,
@@ -653,6 +713,7 @@ impl NumericalMode {
             cutoff: mode.k_c,
             z_model,
         }
+        .signed()
     }
 
     /// Build a numerical mode from a full-vector hybrid solve. Stores the
@@ -688,6 +749,7 @@ impl NumericalMode {
         let inv_peak = if peak > 0.0 { 1.0 / peak } else { 0.0 };
         let w_hat = cross(mesh.u_hat, mesh.v_hat);
         NumericalMode {
+            grid: TriGrid::new(&mesh),
             mesh,
             profile: Profile::Ned2(Ned2ModeData {
                 e_edge, e_face, tri_edges, e_z_node, e_z_edge,
@@ -697,6 +759,48 @@ impl NumericalMode {
             cutoff: 0.0,
             z_model: ImpedanceModel::Flat { z },
         }
+        .signed()
+    }
+
+    /// `E_t` at the centroid of triangle `ti`, in `(u, v)`, unnormalised.
+    fn centroid_et(&self, ti: usize) -> [f64; 2] {
+        let t = self.mesh.tris[ti];
+        match &self.profile {
+            Profile::Nodal(e) => [0, 1].map(|k| (e[t[0]][k] + e[t[1]][k] + e[t[2]][k]) / 3.0),
+            Profile::Ned2(nd) => {
+                let (_a, g) = self.mesh.tri_geom(t);
+                ned2_et_at(&nd.tri_edges[ti], &g, &nd.e_edge, &nd.e_face[ti], ti, [1.0 / 3.0; 3])
+            }
+        }
+    }
+
+    /// The mode with a fixed sign, so the S-parameters of a port do not
+    /// flip with the mesh (an eigenvector's sign is arbitrary): the largest
+    /// global component of `∫ E_t dA` is positive, or for a mode without a
+    /// net transverse field (`TE20`) the largest global component of `E_t`
+    /// where it peaks.
+    fn signed(mut self) -> NumericalMode {
+        let global = |e: [f64; 2]| [0, 1, 2].map(|k| e[0] * self.mesh.u_hat[k] + e[1] * self.mesh.v_hat[k]);
+        let dominant = |v: [f64; 3]| v.into_iter().fold(0.0f64, |m, x| if x.abs() > m.abs() { x } else { m });
+        let (mut net, mut total, mut peak) = ([0.0f64; 3], 0.0f64, [0.0f64; 3]);
+        for (ti, &t) in self.mesh.tris.iter().enumerate() {
+            let area = self.mesh.tri_geom(t).0.abs();
+            let e = global(self.centroid_et(ti));
+            let mag = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+            for k in 0..3 {
+                net[k] += area * e[k];
+            }
+            total += area * mag;
+            if mag > (peak[0] * peak[0] + peak[1] * peak[1] + peak[2] * peak[2]).sqrt() {
+                peak = e;
+            }
+        }
+        let net_len = (net[0] * net[0] + net[1] * net[1] + net[2] * net[2]).sqrt();
+        let reference = if net_len > 1e-3 * total { dominant(net) } else { dominant(peak) };
+        if reference < 0.0 {
+            self.inv_peak = -self.inv_peak;
+        }
+        self
     }
 
     /// Cutoff angular frequency (`= k_c`; `0` for a quasi-TEM mode).
@@ -722,34 +826,40 @@ impl NumericalMode {
     /// return its index plus the barycentric coordinates there. Falls back
     /// to the nearest triangle if the point sits just outside the mesh.
     fn locate(&self, uv: [f64; 2]) -> (usize, [f64; 3]) {
+        // the first triangle (by index) holding the point among those of its
+        // bucket, which are all that can hold it
+        for &ti in self.grid.candidates(uv) {
+            let (bary, slack) = self.barycentric(ti as usize, uv);
+            if slack >= -1e-9 {
+                return (ti as usize, bary);
+            }
+        }
+        // just outside the mesh: the nearest triangle
         let mut best = (0usize, [1.0, 0.0, 0.0]);
         let mut best_slack = f64::NEG_INFINITY;
-        for (ti, &t) in self.mesh.tris.iter().enumerate() {
-            let a = self.mesh.nodes[t[0]];
-            let b = self.mesh.nodes[t[1]];
-            let c = self.mesh.nodes[t[2]];
-            let d =
-                (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
-            if d.abs() < 1e-30 {
-                continue;
-            }
-            let l0 = ((b[1] - c[1]) * (uv[0] - c[0])
-                + (c[0] - b[0]) * (uv[1] - c[1]))
-                / d;
-            let l1 = ((c[1] - a[1]) * (uv[0] - c[0])
-                + (a[0] - c[0]) * (uv[1] - c[1]))
-                / d;
-            let l2 = 1.0 - l0 - l1;
-            let slack = l0.min(l1).min(l2);
-            if slack >= -1e-9 {
-                return (ti, [l0, l1, l2]);
-            }
+        for ti in 0..self.mesh.tris.len() {
+            let (bary, slack) = self.barycentric(ti, uv);
             if slack > best_slack {
                 best_slack = slack;
-                best = (ti, [l0, l1, l2]);
+                best = (ti, bary);
             }
         }
         best
+    }
+
+    /// The barycentric coordinates of `uv` in triangle `ti` and the smallest
+    /// of them (negative outside); `-inf` for a degenerate triangle.
+    fn barycentric(&self, ti: usize, uv: [f64; 2]) -> ([f64; 3], f64) {
+        let t = self.mesh.tris[ti];
+        let (a, b, c) = (self.mesh.nodes[t[0]], self.mesh.nodes[t[1]], self.mesh.nodes[t[2]]);
+        let d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+        if d.abs() < 1e-30 {
+            return ([1.0, 0.0, 0.0], f64::NEG_INFINITY);
+        }
+        let l0 = ((b[1] - c[1]) * (uv[0] - c[0]) + (c[0] - b[0]) * (uv[1] - c[1])) / d;
+        let l1 = ((c[1] - a[1]) * (uv[0] - c[0]) + (a[0] - c[0]) * (uv[1] - c[1])) / d;
+        let l2 = 1.0 - l0 - l1;
+        ([l0, l1, l2], l0.min(l1).min(l2))
     }
 
     /// In-plane `(u, v)` coordinates of a global point on the port face.
@@ -1689,6 +1799,14 @@ fn solve_vector_modes_core(
                 None => genuine.push((neff2, vec![x])),
             }
         }
+        // The shifts run down from the top of the band: once the wanted
+        // modes all lie above the shift just searched (so one search below
+        // them is done), the lower shifts only find lower modes.
+        let mut found: Vec<f64> = genuine.iter().map(|g| g.0).collect();
+        found.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        if found.len() >= n_modes && found[..n_modes].iter().all(|&nf| nf >= neff2_t) {
+            break;
+        }
     }
     genuine.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     // One vector per mode. A degenerate cluster spans a plane of equally
@@ -1900,6 +2018,40 @@ mod tests {
         let want = (1.0 - (PI / 4.0 / k0).powi(2)).sqrt();
         let got = modes[0].n_eff;
         assert!((got - want).abs() / want < 0.05, "n_eff = {got:.4}, want {want:.4}");
+    }
+
+    #[test]
+    fn bucketed_locate_matches_the_linear_scan() {
+        let (nodes, tris) = rect_mesh(2.0, 1.0, 17, 9);
+        let pm = PortMesh2D::from_face(&nodes, &tris, [0.0, 0.0, 1.0], None);
+        let modes = solve_vector_modes(&pm, &vec![1.0; pm.tris.len()], 3.0, 1);
+        let m = NumericalMode::from_vector(pm, &modes[0]);
+        let linear = |uv: [f64; 2]| -> (usize, [f64; 3]) {
+            let mut best = (0usize, [1.0, 0.0, 0.0]);
+            let mut best_slack = f64::NEG_INFINITY;
+            for ti in 0..m.mesh.tris.len() {
+                let (bary, slack) = m.barycentric(ti, uv);
+                if slack >= -1e-9 {
+                    return (ti, bary);
+                }
+                if slack > best_slack {
+                    best_slack = slack;
+                    best = (ti, bary);
+                }
+            }
+            best
+        };
+        // nodes, edge midpoints, interior points and points just outside
+        let mut points: Vec<[f64; 2]> = m.mesh.nodes.clone();
+        for t in &m.mesh.tris {
+            let p = t.map(|v| m.mesh.nodes[v]);
+            points.push([(p[0][0] + p[1][0]) / 2.0, (p[0][1] + p[1][1]) / 2.0]);
+            points.push([(p[0][0] + p[1][0] + p[2][0]) / 3.0, (p[0][1] + p[1][1] + p[2][1]) / 3.0]);
+        }
+        points.extend([[-1e-3, 0.5], [2.0 + 1e-3, 0.3], [1.0, -2e-3], [0.7, 1.0 + 1e-4]]);
+        for uv in points {
+            assert_eq!(m.locate(uv), linear(uv), "at {uv:?}");
+        }
     }
 
     #[test]

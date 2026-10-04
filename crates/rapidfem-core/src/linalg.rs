@@ -29,7 +29,7 @@
 //! the machine's RAM, so a factorisation too big for the machine fails fast
 //! with a clear message instead of driving it into swap mid-sweep.
 
-use rslab::{CscMatrix, Inertia, LdltSolver, LdltSymbolic, OrderingMethod, Scalar, SolverSettings};
+use rslab::{CscMatrix, Inertia, LdltSolver, LdltSymbolic, OrderingMethod, Scalar, SolverSettings, Threads};
 
 /// Refuse to factor when the estimated transient peak exceeds this fraction
 /// of TOTAL system RAM. Headroom for the OS, the assembly buffers and the
@@ -79,16 +79,24 @@ pub struct SymmetricSolver<T: Scalar> {
     estimate: Option<(u64, u64)>,
     /// Right-hand sides per solve, for the memory plan.
     nrhs: usize,
-    // Lower-triangle triplet buffers, reused across refactorizations.
-    lo_rows: Vec<usize>,
-    lo_cols: Vec<usize>,
-    lo_vals: Vec<T>,
+    /// The last triplet pattern, so a sweep's systems (one pattern, new
+    /// values) skip the sort of a fresh CSC build.
+    pattern: Option<Pattern<T>>,
+}
+
+/// A triplet pattern and its CSC matrix: per triplet the value slot it adds
+/// to (`u32::MAX` for an upper-triangle one, which the lower triangle mirrors).
+struct Pattern<T> {
+    n: usize,
+    rows: Vec<usize>,
+    cols: Vec<usize>,
+    slot: Vec<u32>,
+    a: CscMatrix<T>,
 }
 
 impl<T: Scalar> SymmetricSolver<T> {
     pub fn new() -> Self {
-        Self { n: 0, symbolic: None, solver: None, estimate: None, nrhs: 1,
-               lo_rows: Vec::new(), lo_cols: Vec::new(), lo_vals: Vec::new() }
+        Self { n: 0, symbolic: None, solver: None, estimate: None, nrhs: 1, pattern: None }
     }
 
     /// The number of right-hand sides solved at once (the driven ports),
@@ -97,8 +105,10 @@ impl<T: Scalar> SymmetricSolver<T> {
         self.nrhs = nrhs.max(1);
     }
 
-    /// Filter the full COO triplets to the lower triangle (row ≥ col) into the
-    /// reused buffers and build rslab's CSC (duplicates summed there).
+    /// rslab's CSC of the lower triangle (row ≥ col) of the full COO
+    /// triplets, duplicates summed. On the pattern of the last call (same
+    /// triplet rows and columns) the values are scattered into the cached
+    /// structure; a new pattern is sorted once and cached.
     fn build_matrix(
         &mut self,
         n: usize,
@@ -106,18 +116,40 @@ impl<T: Scalar> SymmetricSolver<T> {
         cols: &[usize],
         vals: &[T],
     ) -> Result<CscMatrix<T>, String> {
-        self.lo_rows.clear();
-        self.lo_cols.clear();
-        self.lo_vals.clear();
-        for i in 0..rows.len() {
-            if rows[i] >= cols[i] {
-                self.lo_rows.push(rows[i]);
-                self.lo_cols.push(cols[i]);
-                self.lo_vals.push(vals[i]);
+        if let Some(p) = self.pattern.as_mut()
+            && p.n == n
+            && p.rows == rows
+            && p.cols == cols
+        {
+            p.a.values.fill(T::zero());
+            for (&s, &v) in p.slot.iter().zip(vals) {
+                if s != u32::MAX {
+                    let s = s as usize;
+                    p.a.values[s] = p.a.values[s] + v;
+                }
             }
+            return Ok(p.a.clone());
         }
-        CscMatrix::from_triplets(n, &self.lo_rows, &self.lo_cols, &self.lo_vals)
-            .map_err(|e| format!("rslab matrix build: {e:?}"))
+        let lower = |i: &usize| rows[*i] >= cols[*i];
+        let keep: Vec<usize> = (0..rows.len()).filter(lower).collect();
+        let pick = |src: &[usize]| keep.iter().map(|&i| src[i]).collect::<Vec<usize>>();
+        let a = CscMatrix::from_triplets(n, &pick(rows), &pick(cols), &keep.iter().map(|&i| vals[i]).collect::<Vec<T>>())
+            .map_err(|e| format!("rslab matrix build: {e:?}"))?;
+        if a.nnz() < u32::MAX as usize {
+            let slot = rows
+                .iter()
+                .zip(cols)
+                .map(|(&r, &c)| {
+                    if r < c {
+                        return u32::MAX;
+                    }
+                    let (s, e) = (a.col_ptr[c], a.col_ptr[c + 1]);
+                    (s + a.row_idx[s..e].binary_search(&r).expect("a triplet of the matrix")) as u32
+                })
+                .collect();
+            self.pattern = Some(Pattern { n, rows: rows.to_vec(), cols: cols.to_vec(), slot, a: a.clone() });
+        }
+        Ok(a)
     }
 }
 
@@ -138,7 +170,11 @@ impl<T: Scalar> SymmetricSolver<T> {
         let a = self.build_matrix(n, rows, cols, vals)?;
         // The default is the ordering race; RAPIDFEM_RSLAB_ORDERING=
         // amd|amf|metis|rcm pins one, for experiments, not correctness.
-        let mut settings = SolverSettings::default();
+        // rapidfem factors one system at a time, so it takes every core
+        // rslab's per-matrix prediction finds useful instead of its cap of 4
+        // for concurrent solves (12 to 38 % faster factors on the example
+        // systems, examples/rslab_tune.rs).
+        let mut settings = SolverSettings { threads: Threads::Auto { max: 0 }, ..SolverSettings::default() };
         if let Ok(v) = std::env::var("RAPIDFEM_RSLAB_ORDERING") {
             match v.to_ascii_lowercase().as_str() {
                 "amd" => settings.ordering.method = OrderingMethod::Amd,

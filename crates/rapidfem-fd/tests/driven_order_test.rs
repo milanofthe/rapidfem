@@ -25,11 +25,11 @@ use num_complex::Complex64 as C64;
 use rapidfem_fd::assembly::frequency_sweep;
 use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::excitation::Excitation;
-use rapidfem_fd::interp::{eval_field_in_tet, TetGrid};
+use rapidfem_fd::interp::eval_field_in_tet;
 use rapidfem_fd::mesh::Mesh;
 use rapidfem_fd::order::OrderMap;
 use rapidfem_fd::port::Port;
-use rapidfem_fd::sparam::sparam_waveport;
+use rapidfem_fd::sparam::ModalProjection;
 use rapidfem_fd::waveguide::{CoordinateSystem, RectWaveguide};
 
 // WR-90, a short section.
@@ -93,22 +93,17 @@ fn solve_s(mesh: &Mesh, orders: OrderMap) -> [[C64; 2]; 2] {
     assert_eq!(res.solutions.len(), 2, "two driven ports -> two excitation solves");
 
     let exc = Excitation::new(FREQ, mesh.l0);
-    let grid = TetGrid::new(mesh);
-    let weight = |_x: f64, _y: f64, _z: f64| 1.0; // air
+    let air = |_tet: usize| 1.0;
+    let projections = [(&port1, &pt1), (&port2, &pt2)].map(|(port, tris)| ModalProjection::new(mesh, tris, port as &dyn Port, &exc, &air, 4));
 
     let mut s = [[C64::new(0.0, 0.0); 2]; 2];
     for (exc_idx, sol) in res.solutions.iter().enumerate() {
-        let fieldf = |x: f64, y: f64, z: f64| -> (C64, C64, C64) {
-            match grid.find_containing_tet(mesh, x, y, z) {
-                Some(tet) => eval_field_in_tet(mesh, &basis, sol, tet, x, y, z),
-                None => (C64::new(0.0, 0.0), C64::new(0.0, 0.0), C64::new(0.0, 0.0)),
-            }
+        let field = |tet: usize, p: [f64; 3]| {
+            let (ex, ey, ez) = eval_field_in_tet(mesh, &basis, sol, tet, p[0], p[1], p[2]);
+            [ex, ey, ez]
         };
-        for (obs_idx, (port, tris)) in [(&port1, &pt1), (&port2, &pt2)].iter().enumerate() {
-            let obs_tris: Vec<[usize; 3]> = tris.iter().map(|&ti| mesh.tris[ti]).collect();
-            let active = obs_idx == exc_idx;
-            s[obs_idx][exc_idx] =
-                sparam_waveport(&mesh.nodes, &obs_tris, *port as &dyn Port, &exc, active, &fieldf, &weight, 4);
+        for (obs_idx, projection) in projections.iter().enumerate() {
+            s[obs_idx][exc_idx] = projection.s(&field, obs_idx == exc_idx);
         }
     }
     s

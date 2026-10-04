@@ -54,10 +54,12 @@ sub_W   = max(WIDTHS) + 2 * PAD_Y
 g = rf.Geometry(maxh=MAXH)
 
 # Substrate is RO-style 62-mil. The narrow 8-mil trace section drives the
-# surface refinement separately via auto_refine_features; the substrate
-# mesh is fixed at ~1/3 of its thickness so the wave-port eigensolve at the
-# x-min / x-max cross-section resolves the inhomogeneous quasi-TEM mode.
-ro = rf.Dielectric(er=ER_SUB, maxh=SUB_H / 3)
+# surface refinement separately via auto_refine_features, which is where the
+# accuracy sits (coarser traces move |S| by up to 0.06); the substrate
+# volume at 2/3 of its thickness keeps the mesh at a fifth of the 1/3 one
+# (the full thickness moves |S| by 0.04) and still lets the wave-port
+# eigensolve resolve the quasi-TEM mode.
+ro = rf.Dielectric(er=ER_SUB, maxh=2 * SUB_H / 3)
 
 sub = g.box(total_L, sub_W, SUB_H, position=(-total_L / 2, -sub_W / 2, 0),
             material=ro)

@@ -238,7 +238,8 @@ pub fn from_fem_json(scene: &mut Scene, doc: &Value, stack: Option<&Stack>, o: &
             }
             let mut contours = vec![piece.iter().map(|p| [p[0] * UM, p[1] * UM]).collect::<Vec<P2>>()];
             contours.extend(holes.iter().map(|h| h.iter().map(|p| [p[0] * UM, p[1] * UM]).collect()));
-            let v = scene.prism(&contours, z_lo, Some(thick), Some(sio2.clone()), Some(cond_maxh))?;
+            // no material: a hole below, its walls PEC
+            let v = scene.prism(&contours, z_lo, Some(thick), None, Some(cond_maxh))?;
             scene.geo.set_name(v, Some(id.to_string()));
             match out.conductors.iter_mut().find(|(n, _)| n == id) {
                 Some((_, vs)) => vs.push(v),

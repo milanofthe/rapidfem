@@ -43,6 +43,9 @@ rf.show(layout.geometry)
 
 # %% Mesh (the bridge placed the physics: PEC conductor
 # walls, 50 Ohm lumped ports, ABC outside)
+# The ring spans 300 um: twice the default sizes keep it to ~130k tets, within
+# 0.004 in |S| of 1.5 times them (a mesh study).
+layout.geometry.size_scale = 2.0
 layout.geometry.mesh()
 rf.show(layout.geometry)
 

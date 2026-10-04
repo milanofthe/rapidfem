@@ -532,21 +532,18 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
             h = h.min(layer.thickness / 3.0).min(skin_depth(f_hi, layer.sigma));
         }
         for &id in ids {
+            // a PEC or SIBC conductor becomes a hole and takes no material
             let m = match t {
                 "volume" => {
                     let s = layer.sigma;
-                    super::Mat { cond_diag: Some([VIA_LATERAL_FACTOR * s, VIA_LATERAL_FACTOR * s, s]), ..super::Mat::dielectric(1.0) }
+                    Some(super::Mat { cond_diag: Some([VIA_LATERAL_FACTOR * s, VIA_LATERAL_FACTOR * s, s]), ..super::Mat::dielectric(1.0) })
                 }
-                "volume_iso" => super::Mat { conductivity: layer.sigma, ..super::Mat::dielectric(1.0) },
-                _ => {
-                    // a hole later: the background around the layer
-                    let bg = stack
-                        .dielectric_at(layer.z + layer.thickness / 2.0)
-                        .map_or_else(|| StackMaterial::new("air", "dielectric"), |d| stack.slab_material(d));
-                    super::Mat { tand: bg.tand, ..super::Mat::dielectric(bg.er) }
-                }
+                "volume_iso" => Some(super::Mat { conductivity: layer.sigma, ..super::Mat::dielectric(1.0) }),
+                _ => None,
             };
-            scene.fill(&[id], m);
+            if let Some(m) = m {
+                scene.fill(&[id], m);
+            }
             scene.geo.set_object_maxh(id, Some(h));
         }
     }

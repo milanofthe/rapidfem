@@ -30,7 +30,9 @@ F0 = 8.0e9
 Z0 = -BL / 2               # box -z face (the coax feed end / edge)
 Z1 = Z0 + LIN             # open end of the outer-conductor shield
 Z2 = Z1 + LPROT           # tip of the protruding inner-conductor monopole
-g = rf.Geometry(maxh=rf.lambda_maxh(f_max=10.0e9))
+# The free-space box at 6 cells per wavelength (order-2 DG carries the wave
+# fine at that, and it is the bulk of the mesh); the coax keeps RO / 3.
+g = rf.Geometry(maxh=rf.lambda_maxh(f_max=10.0e9, per_lambda=6))
 box = g.box(BW, BW, BL, position=(-BW / 2, -BW / 2, Z0), material=rf.Air())
 coax = g.cylinder(radius=RO, height=LIN, position=(0, 0, Z0), axis=(0, 0, 1),
                   material=rf.Air(), maxh=RO / 3)

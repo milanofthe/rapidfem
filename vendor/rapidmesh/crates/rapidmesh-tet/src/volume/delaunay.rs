@@ -9,7 +9,8 @@
 //! takes the tet behind it too, so the cavity stays star-shaped.
 
 use crate::predicates::{inside, orient, P3};
-use crate::volume::tets::{Tets, FACE, NONE};
+use crate::simplex::TET_FACES;
+use crate::volume::tets::{Tets, NONE};
 use rapidmesh_geom::vec3::bbox;
 
 /// Steps of a point location walk per tet before it gives up and scans
@@ -247,7 +248,7 @@ impl Delaunay {
             if !alive {
                 continue;
             }
-            for (i, f) in FACE.iter().enumerate() {
+            for (i, f) in TET_FACES.iter().enumerate() {
                 let tri = f.map(|k| t[k]);
                 if t[i] < 4 || tri.iter().any(|&v| v < 4) {
                     continue;
@@ -375,7 +376,7 @@ impl Delaunay {
 fn closes(fill: &[[u32; 4]], hole: &rustc_hash::FxHashMap<[u32; 3], u32>) -> bool {
     let mut count: rustc_hash::FxHashMap<[u32; 3], u32> = rustc_hash::FxHashMap::default();
     for t in fill {
-        for f in FACE {
+        for f in TET_FACES {
             let mut f = f.map(|k| t[k]);
             f.sort_unstable();
             *count.entry(f).or_default() += 1;

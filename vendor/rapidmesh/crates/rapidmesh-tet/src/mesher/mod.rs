@@ -325,13 +325,23 @@ fn mesh_in_blocks(
     );
     // Blocks are a matter of speed: where a block fails at a cut (one
     // through a fine feature), the model is meshed whole; a failure away
-    // from the cuts is the geometry's, and said at once.
+    // from the cuts is the geometry's, and said at once. A boundary that
+    // diverges is the cuts' only where every face it misses most on is a
+    // cut or a piece of a face one splits, near a cut.
+    let at_cut = |e: &MeshError| {
+        let Some((plan, blocks)) = cut.as_ref() else {
+            return false;
+        };
+        let near = |p: [f64; 3]| plan.near(p, AT_CUT * domain.h_at(p));
+        match e {
+            MeshError::Boundary(BoundaryError::Diverged { near: faces, .. }) => {
+                faces.iter().all(|n| near(n.at) && blocks.at_cut(n.face))
+            }
+            _ => e.at().is_none_or(near),
+        }
+    };
     match mesh_cut(source, cut.as_ref().map(|c| &c.1), &domain, params) {
-        Err(e)
-            if cut.as_ref().is_some_and(|(plan, _)| {
-                e.at().is_none_or(|p| plan.near(p, AT_CUT * domain.h_at(p)))
-            }) =>
-        {
+        Err(e) if at_cut(&e) => {
             rapidmesh_exact::log::info(
                 "mesher.blocks",
                 format!("in blocks: {e}; meshed whole instead"),

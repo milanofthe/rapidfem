@@ -4,13 +4,8 @@
 use crate::curve::{Curve, PolylineCurve};
 use rapidmesh_brep::{Brep, Curve as BCurve, Edge as BEdge, Surface};
 use rapidmesh_geom::nurbs::NurbsCurve;
-use rapidmesh_geom::vec3::{add, cross, dot, scale, sub, V3};
+use rapidmesh_geom::vec3::{add, cross, dist, dot, scale, sub, V3};
 use std::sync::Arc;
-
-fn dist3(a: V3, b: V3) -> f64 {
-    let d = sub(a, b);
-    dot(d, d).sqrt()
-}
 
 /// Arc length along a parametric curve and back: `ts` the parameters
 /// from the curve's first end to its last (rising or falling), `ss` the arc
@@ -280,7 +275,7 @@ impl EllipseCurve {
             let (st, ct) = t.sin_cos();
             std::array::from_fn(|k| center[k] + a * ct * major[k] + b * st * minor[k])
         };
-        let arc = ArcTable::new(t0, t0 + span, 512, |u, w| dist3(at(u), at(w)))?;
+        let arc = ArcTable::new(t0, t0 + span, 512, |u, w| dist(at(u), at(w)))?;
         Some(EllipseCurve {
             center,
             major,
@@ -343,7 +338,7 @@ fn pocs(sa: &Surface, sb: &Surface, mut p: V3, tol: f64) -> V3 {
         } else {
             sb.closest(fa).0
         };
-        let moved = dist3(p, q);
+        let moved = dist(p, q);
         p = q;
         if moved < tol {
             break;
@@ -375,7 +370,7 @@ impl Curve for IntersectionCurve {
         let p0 = self.poly.point_at(s);
         let p = pocs(&self.sa, &self.sb, p0, self.tol);
         // Divergence guard, as in the polyline construction.
-        if dist3(p, p0) <= 0.05 * self.poly.length() {
+        if dist(p, p0) <= 0.05 * self.poly.length() {
             p
         } else {
             p0
@@ -409,7 +404,7 @@ fn intersection_polyline(sa: &Surface, sb: &Surface, chain: &[V3]) -> Option<Pol
     if chain.len() < 2 {
         return None;
     }
-    let total: f64 = chain.windows(2).map(|w| dist3(w[0], w[1])).sum();
+    let total: f64 = chain.windows(2).map(|w| dist(w[0], w[1])).sum();
     if !(total > 0.0) {
         return None;
     }
@@ -417,7 +412,7 @@ fn intersection_polyline(sa: &Surface, sb: &Surface, chain: &[V3]) -> Option<Pol
     let target = total / 256.0; // dense enough for discrete curvature + sizing
     let mut out: Vec<V3> = Vec::with_capacity(512);
     for w in chain.windows(2) {
-        let seg = dist3(w[0], w[1]);
+        let seg = dist(w[0], w[1]);
         let n = (seg / target).ceil().max(1.0) as usize;
         for k in 0..n {
             let f = k as f64 / n as f64;
@@ -425,7 +420,7 @@ fn intersection_polyline(sa: &Surface, sb: &Surface, chain: &[V3]) -> Option<Pol
             let p = pocs(sa, sb, p0, tol);
             // Divergence guard: a projected point that left the segment's own
             // neighbourhood is a failed projection -- keep the chain point.
-            out.push(if dist3(p, p0) <= seg.max(0.05 * total) {
+            out.push(if dist(p, p0) <= seg.max(0.05 * total) {
                 p
             } else {
                 p0
@@ -609,7 +604,7 @@ mod curve_tests {
 
     fn scan(c: &dyn Curve, p: V3) -> f64 {
         (0..=200_000)
-            .map(|i| dist3(c.point_at(c.length() * i as f64 / 200_000.0), p))
+            .map(|i| dist(c.point_at(c.length() * i as f64 / 200_000.0), p))
             .fold(f64::INFINITY, f64::min)
     }
 
@@ -629,7 +624,7 @@ mod curve_tests {
                 let s = f * c.length();
                 let [p, t, k] = c.ders_at(s);
                 let numeric = Numeric(c).ders_at(s)[1];
-                assert!(dist3(p, c.point_at(s)) < 1e-12);
+                assert!(dist(p, c.point_at(s)) < 1e-12);
                 assert!((dot(t, t) - 1.0).abs() < 1e-12, "unit tangent");
                 let cos = dot(t, numeric) / dot(numeric, numeric).sqrt();
                 assert!(cos > 1.0 - 1e-9, "tangent along the curve at {f}: {cos}");
@@ -645,7 +640,7 @@ mod curve_tests {
         let s = 0.3 * circle.length();
         let (a, b) = (circle.ders_at(s), Numeric(&circle).ders_at(s));
         assert!(
-            dist3(a[1], b[1]) < 1e-6 && dist3(a[2], b[2]) < 1e-4,
+            dist(a[1], b[1]) < 1e-6 && dist(a[2], b[2]) < 1e-4,
             "{a:?} vs {b:?}"
         );
     }
@@ -662,7 +657,7 @@ mod curve_tests {
         let ellipse = EllipseCurve::new([0.0, 0.0, 0.5], x, y, 3.0, 1.2, &chain).unwrap();
         let smp = samples(&ellipse, 16);
         for p in [[2.5, 1.5, 0.9], [0.3, 0.2, 0.5], [-1.0, 2.0, 0.0]] {
-            let d = dist3(ellipse.point_at(closest_arc(&ellipse, &smp, p)), p);
+            let d = dist(ellipse.point_at(closest_arc(&ellipse, &smp, p)), p);
             let reference = scan(&ellipse, p);
             assert!(
                 d <= reference + 1e-9 && reference - d < 1e-6,
@@ -685,6 +680,6 @@ mod curve_tests {
             -2.0 * 0.05 / 3.0f64.hypot(0.05),
             0.0,
         ];
-        assert!(dist3(q, want) < 1e-9, "{q:?} vs {want:?}");
+        assert!(dist(q, want) < 1e-9, "{q:?} vs {want:?}");
     }
 }

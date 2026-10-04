@@ -128,6 +128,9 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32, prev: Option<Kept>) -> (
     segments.sort_unstable();
     let mut edges = Vec::new();
     for (fi, (f, tris)) in brep.faces.iter().zip(&b.faces).enumerate() {
+        if !f.regions.iter().any(|x| x.0 == r) {
+            continue;
+        }
         // A planar face is a facet of its own only where its points are
         // exactly in one plane (an axis-aligned one); a tilted plane's
         // points are off it by their rounding, and its triangles are
@@ -136,7 +139,7 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32, prev: Option<Kept>) -> (
             brep.surface(f.surface),
             rapidmesh_brep::Surface::Plane { .. }
         ) && exactly_planar(b, tris);
-        if planar || !f.regions.iter().any(|x| x.0 == r) {
+        if planar {
             continue;
         }
         // The third corner on either side of each edge of the face.

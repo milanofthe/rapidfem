@@ -103,7 +103,7 @@ impl Shape for BrepShape<'_> {
         let PointClass::Face(f) = kind else {
             return self.project(kind, p).map(|q| (q, uv));
         };
-        let (q, _, uv) = self
+        let (q, uv) = self
             .brep
             .surface(self.brep.faces.get(f as usize)?.surface)
             .closest_near(p, uv);

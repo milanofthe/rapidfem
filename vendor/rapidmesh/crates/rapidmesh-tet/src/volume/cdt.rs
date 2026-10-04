@@ -700,31 +700,15 @@ fn seg_meets_tri(pts: &[P3], e: [u32; 2], t: [u32; 3]) -> bool {
     if (s0 == 0 && shared.contains(&e[0])) || (s1 == 0 && shared.contains(&e[1])) {
         return false;
     }
-    if s0 != 0 && s1 != 0 && !shared.is_empty() {
-        // Strictly across the plane, the crossing is no triangle vertex
-        // unless the segment runs through one; a shared vertex is an end,
-        // which lies off the plane: impossible, so nothing shared counts.
-    }
     // The crossing lies in the closed triangle when the segment turns the
-    // same way (or not at all) around each of its edges.
+    // same way (or not at all) around each of its edges. (Strictly across
+    // the plane, a shared vertex is an end off it: nothing shared counts.)
     let o = [
         orient(e0, e1, t0, t1),
         orient(e0, e1, t1, t2),
         orient(e0, e1, t2, t0),
     ];
-    let (pos, neg) = (o.iter().any(|&x| x > 0), o.iter().any(|&x| x < 0));
-    if pos && neg {
-        return false;
-    }
-    if !pos && !neg {
-        // The segment lies in the plane of... impossible here: e0 or e1 is
-        // off the plane, so the orientations cannot all vanish.
-        return true;
-    }
-    // Inside or on the boundary. On the boundary through a shared vertex
-    // only is no meeting: that needs the crossing at the vertex, which an
-    // end off the plane cannot give (handled above for ends on it).
-    true
+    !(o.iter().any(|&x| x > 0) && o.iter().any(|&x| x < 0))
 }
 
 /// [`seg_meets_tri`] for a segment in the plane of the triangle.

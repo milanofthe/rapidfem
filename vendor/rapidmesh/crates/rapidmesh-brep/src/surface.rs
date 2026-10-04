@@ -350,10 +350,9 @@ impl Surface {
     /// point near the answer started (see [`Surface::search_start`]), with
     /// where the answer's starts (`uv0` again on a carrier that does not
     /// search).
-    pub fn closest_near(&self, p: V3, uv0: P2) -> (V3, V3, P2) {
+    pub fn closest_near(&self, p: V3, uv0: P2) -> (V3, P2) {
         if !self.searches() {
-            let (q, n) = self.closest(p);
-            return (q, n, uv0);
+            return (self.closest(p).0, uv0);
         }
         if let Surface::Tube { path, radius } = self {
             // Walked from the segment before; a point farther from the path
@@ -370,7 +369,7 @@ impl Surface {
             } else {
                 [0.0, 0.0, 1.0]
             };
-            return (add(q, scale(n, *radius)), n, [s as f64, 0.0]);
+            return (add(q, scale(n, *radius)), [s as f64, 0.0]);
         }
         let uv = match self {
             Surface::Extruded {
@@ -405,7 +404,7 @@ impl Surface {
             }
             _ => self.project_uv(p),
         };
-        (self.eval_uv(uv), self.normal(uv), uv)
+        (self.eval_uv(uv), uv)
     }
 
     /// A point of the surface near `p`, cheaper than [`Surface::closest_near`]

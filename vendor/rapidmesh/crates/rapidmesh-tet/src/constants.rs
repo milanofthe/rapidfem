@@ -1,14 +1,6 @@
-//! Central tuning constants for the tet mesher.
-//!
-//! Every numeric knob that shapes mesher BEHAVIOUR (sampling densities, relaxation
-//! iteration caps, quality thresholds, spatial-structure capacities, the sizing
-//! field's factors) lives here, grouped and documented, so the meshing recipe is
-//! tunable from one place rather than scattered across modules. Pure structural
-//! data shared by several modules (the tet face table) is here too, to remove
-//! duplication. Algorithm-internal sentinels (`NONE`, bit masks, the FP splitter)
-//! stay with their algorithms; constants of the lower crates (`rapidmesh-exact`,
-//! `-geom`, `-csg`) stay there -- the dependency direction forbids one file across
-//! crates, and they are not mesher tuning knobs.
+//! Tuning constants shared by several modules of the mesher, or that
+//! readers look for in one place (the sliver angle, the fidelity
+//! thresholds). A knob only one algorithm reads stays next to it.
 
 // ---- seeding / domain bounds ----------------------------------------------
 /// Fallback base subdivision of the bbox diagonal when no finite size cap exists.

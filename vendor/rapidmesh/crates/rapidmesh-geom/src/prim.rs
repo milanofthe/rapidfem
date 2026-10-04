@@ -182,7 +182,7 @@ pub fn cylinder(base_center: [f64; 3], axis: [f64; 3], radius: f64, segments: us
 /// of intersection curves), so a fixed count too coarse for the requested `maxh`
 /// leaves the boundary off the true surface -- the straddler root cause. The CORE
 /// derives this so every embedder (not just the Python layer) gets it.
-pub fn facet_count(radius: f64, maxh: Option<f64>, tol: f64) -> usize {
+pub(crate) fn facet_count(radius: f64, maxh: Option<f64>, tol: f64) -> usize {
     use std::f64::consts::PI;
     let n_tol = (PI / (1.0 - tol.clamp(1e-9, 0.5)).acos()).ceil() as usize;
     let n_maxh = match maxh {
@@ -1092,7 +1092,7 @@ pub fn sheet_rect(corner: [f64; 3], u: [f64; 3], v: [f64; 3]) -> Faceted {
 
 /// The least turn (degrees) at a vertex of a polygon sheet that makes it a
 /// corner of the sheet.
-pub const POLYGON_CORNER_DEG: f64 = 20.0;
+const POLYGON_CORNER_DEG: f64 = 20.0;
 
 /// Planar polygon sheet (with holes) in the (base, u, v) frame.
 pub fn sheet_polygon(

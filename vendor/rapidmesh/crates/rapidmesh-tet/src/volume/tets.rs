@@ -2,7 +2,7 @@
 //! tetrahedralization and the refinement insert into. A neighbour is kept as
 //! `tet << 2 | its face`; a dead tet's slot is reused by the next new one.
 
-pub(crate) use crate::simplex::TET_FACES as FACE;
+use crate::simplex::TET_FACES;
 use rustc_hash::FxHashMap;
 
 /// No neighbour (or no tet).
@@ -47,7 +47,7 @@ impl Tets {
     /// The vertices of face `i` of tet `t` (see [`TET_FACES`](crate::simplex::TET_FACES)).
     pub fn face(&self, t: u32, i: usize) -> [u32; 3] {
         let tv = self.tets[t as usize];
-        FACE[i].map(|k| tv[k])
+        TET_FACES[i].map(|k| tv[k])
     }
 
     /// A new epoch to mark tets in.

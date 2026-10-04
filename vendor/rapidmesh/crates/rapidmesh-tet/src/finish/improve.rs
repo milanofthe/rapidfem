@@ -685,21 +685,6 @@ impl Improver<'_> {
         None
     }
 
-    /// The repair of the bad tet `t`: a flip, else a peel, else the move of
-    /// one of its vertices that leaves the best star (see [`best_move`]).
-    fn plan(&self, t: u32, target_deg: f64) -> Plan {
-        if !self.alive[t as usize] || self.q[t as usize] >= target_deg {
-            return Plan::Skip;
-        }
-        if let Some(p) = self.plan_flip(t) {
-            return p;
-        }
-        if self.may_peel(t) {
-            return Plan::Peel;
-        }
-        best_move(self.c.tets[t as usize].map(|v| self.plan_move(v)))
-    }
-
     /// True when no vertex move of `v` helped at its last try and its star
     /// has not changed since: the try would fail the same way.
     fn failed_still(&self, v: u32) -> bool {
@@ -707,8 +692,10 @@ impl Improver<'_> {
         f != 0 && f >= self.star_event[v as usize]
     }
 
-    /// [`Improver::plan`] for every tet of `chunk` at once, in parallel, the
-    /// move of a vertex shared by several of them planned once.
+    /// The repair of each bad tet of `chunk` (a flip, else a peel, else the
+    /// move of one of its vertices that leaves the best star, see
+    /// [`best_move`]), planned at once in parallel, the move of a vertex
+    /// shared by several of them planned once.
     fn plan_batch(&self, chunk: &[u32], target_deg: f64) -> Vec<Plan> {
         use rayon::prelude::*;
         // Everything but the moves, which are `None` here.
@@ -1013,7 +1000,8 @@ impl Improver<'_> {
                 .fold(0.0, f64::max);
             off / longest.max(f64::MIN_POSITIVE)
         };
-        stray(new) > BRIDGE && stray(new) > stray(old)
+        let after = stray(new);
+        after > BRIDGE && after > stray(old)
     }
 
     fn smooth_vertex(&mut self, v: u32) -> bool {
@@ -1190,33 +1178,39 @@ impl<'a> Improver<'a> {
             }
             bad.sort_by(|&a, &b| self.q[a as usize].total_cmp(&self.q[b as usize]));
             let mut changed = false;
-            let mut at = 0;
-            while at < bad.len() {
-                let chunk = &bad[at..(at + self.batch_size).min(bad.len())];
-                at += chunk.len();
-                let plans = self.plan_batch(chunk, target_deg);
+            // Worst first; a plan made stale by a change before it in its
+            // batch goes to the head of the next batch, planned there in
+            // parallel again rather than here alone (the first plan of a
+            // batch is never stale, so every batch takes one).
+            let mut queue: std::collections::VecDeque<u32> = bad.into();
+            while !queue.is_empty() {
+                let n = self.batch_size.min(queue.len());
+                let chunk: Vec<u32> = queue
+                    .drain(..n)
+                    .filter(|&t| self.alive[t as usize] && self.q[t as usize] < target_deg)
+                    .collect();
+                let plans = self.plan_batch(&chunk, target_deg);
                 self.batch += 1;
-                // Plans made again because a change before them in the batch
-                // touched their neighbourhood.
-                let mut conflicts = 0;
+                let mut stale: Vec<u32> = Vec::new();
                 for (&t, plan) in chunk.iter().zip(plans) {
                     let fresh = self.c.tets[t as usize]
                         .iter()
                         .all(|&v| self.dirty[v as usize] != self.batch);
-                    let plan = if fresh {
-                        plan
+                    if fresh {
+                        changed |= self.apply(t, plan);
                     } else {
-                        conflicts += 1;
-                        self.plan(t, target_deg)
-                    };
-                    changed |= self.apply(t, plan);
+                        stale.push(t);
+                    }
                 }
                 // Clustered bad tets conflict: smaller batches then waste
                 // fewer plans, scattered ones afford larger batches.
-                if 4 * conflicts > chunk.len() {
+                if 4 * stale.len() > chunk.len() {
                     self.batch_size = (self.batch_size / 2).max(BATCH_MIN);
-                } else if 16 * conflicts < chunk.len() {
+                } else if 16 * stale.len() < chunk.len() {
                     self.batch_size = (2 * self.batch_size).min(BATCH_MAX);
+                }
+                for &t in stale.iter().rev() {
+                    queue.push_front(t);
                 }
             }
             if !changed {
@@ -1303,13 +1297,14 @@ impl<'a> Improver<'a> {
                 .fold(0.0, f64::max)
         };
         let before = angle(p0);
-        let stray0 = stray(p0);
+        // Projected only once a candidate raises the angle.
+        let stray0 = std::cell::OnceCell::new();
         let star: SmallVec<[u32; 32]> = self.live(v).collect();
         for frac in [1.0, 0.5, 0.25] {
             let x0: P3 = std::array::from_fn(|k| p0[k] + frac * (goal[k] - p0[k]));
             let x = self.project_from(kind, x0, v)?;
             if angle(x) > before + GAIN
-                && stray(x) <= stray0
+                && stray(x) <= *stray0.get_or_init(|| stray(p0))
                 && self.star_accepts(v, &star, x, target)
             {
                 return Some(x);
@@ -1333,8 +1328,12 @@ impl<'a> Improver<'a> {
         let mut moved = 0;
         let mut stamp = vec![0u32; self.c.points.len()];
         for sweep in 1..=sweeps as u32 {
+            // After the first sweep only vertices next to one it moved: a
+            // plan reads no more than the star, so the others would plan
+            // as before and fail again.
             let plans: Vec<(u32, Option<P3>)> = candidates
                 .par_iter()
+                .filter(|&&v| sweep == 1 || stamp[v as usize] == sweep - 1)
                 .map(|&v| (v, self.plan_relax(v, target)))
                 .collect();
             let mut any = false;

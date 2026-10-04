@@ -11,7 +11,7 @@
 //! importer's dihedral threshold, not here.
 
 use crate::bvh::Bvh;
-use crate::vec3::{bbox, cross, dot, normalize, sub, V3};
+use crate::vec3::{bbox, closest_on_tri, cross, dot, normalize, sub, V3};
 
 /// One smooth soup patch with a closest-point accelerator.
 #[derive(Debug)]
@@ -30,43 +30,6 @@ pub struct DiscreteSurface {
     curv_r: Vec<f64>,
     /// The tree over the triangles.
     bvh: Bvh,
-}
-
-/// Closest point on triangle `(a, b, c)` to `p`.
-fn closest_on_tri(p: V3, a: V3, b: V3, c: V3) -> V3 {
-    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
-    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return a;
-    }
-    let bp = sub(p, b);
-    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
-    if d3 >= 0.0 && d4 <= d3 {
-        return b;
-    }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        return std::array::from_fn(|k| a[k] + v * ab[k]);
-    }
-    let cp = sub(p, c);
-    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
-    if d6 >= 0.0 && d5 <= d6 {
-        return c;
-    }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        return std::array::from_fn(|k| a[k] + w * ac[k]);
-    }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return std::array::from_fn(|k| b[k] + w * (c[k] - b[k]));
-    }
-    let denom = 1.0 / (va + vb + vc);
-    let (v, w) = (vb * denom, vc * denom);
-    std::array::from_fn(|k| a[k] + ab[k] * v + ac[k] * w)
 }
 
 fn d2(a: V3, b: V3) -> f64 {

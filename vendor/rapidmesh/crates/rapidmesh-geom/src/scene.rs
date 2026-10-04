@@ -236,8 +236,15 @@ impl Scene {
             let name = |t: u32| {
                 let s = plc.surface_refs[t as usize].0 as usize;
                 let r = plc.region_tags[t as usize].map(|r| r.0);
+                let at: [f64; 3] = std::array::from_fn(|k| {
+                    plc.triangles[t as usize]
+                        .iter()
+                        .map(|&v| plc.vertices[v as usize][k])
+                        .sum::<f64>()
+                        / 3.0
+                });
                 format!(
-                    "triangle {t} (solid {}, role {}, regions {r:?})",
+                    "triangle {t} (solid {}, role {}, regions {r:?}, at {at:.4?})",
                     plc.surface_owners.get(s).copied().unwrap_or(u32::MAX),
                     plc.surface_roles.get(s).copied().unwrap_or(u32::MAX),
                 )
@@ -927,10 +934,13 @@ fn repair_t_junctions(
     region_tags: &mut Vec<[RegionTag; 2]>,
     tol: f64,
 ) {
+    // A vertex the last round put on an edge, for the message.
+    let mut last: Option<[f64; 3]> = None;
     for round in 0.. {
         assert!(
             round < MAX_REPAIR_ROUNDS,
-            "T-junction repair did not converge in {MAX_REPAIR_ROUNDS} rounds",
+            "T-junction repair did not converge in {MAX_REPAIR_ROUNDS} rounds, still at {:?}",
+            last.unwrap_or_default(),
         );
 
         // Unique undirected edges of the current soup, in a spatial grid for
@@ -975,6 +985,11 @@ fn repair_t_junctions(
         if edge_verts.is_empty() {
             break;
         }
+        last = edge_verts
+            .values()
+            .flatten()
+            .min()
+            .map(|&v| vertices[v as usize]);
         // Order each edge's vertices along a -> b (parameter, then index for
         // determinism) so the subdivided chain is monotone.
         for (&(a, b), vs) in edge_verts.iter_mut() {

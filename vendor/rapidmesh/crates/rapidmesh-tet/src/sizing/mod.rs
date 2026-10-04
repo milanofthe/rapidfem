@@ -231,7 +231,22 @@ pub fn angled<E>(
         if sources.is_empty() {
             break;
         }
-        p.size_points.extend(sources);
+        // A place an earlier round refined and still bad takes half the
+        // size it was given there, not half its tets' edges (which the
+        // grading around it keeps larger): it resolves in fewer rounds.
+        let again: Vec<([f64; 3], f64)> = sources
+            .iter()
+            .map(|&(c, h)| {
+                let before = p
+                    .size_points
+                    .iter()
+                    .filter(|(q, hq)| dist(c, *q) <= 2.0 * hq.max(h))
+                    .map(|&(_, hq)| hq)
+                    .fold(f64::INFINITY, f64::min);
+                (c, h.min(ANGLE_SHRINK * before))
+            })
+            .collect();
+        p.size_points.extend(again);
         let Ok(next) = budgeted(model, &p, target_elements, mesher) else {
             rapidmesh_exact::log::info(
                 "mesher.min_angle",

@@ -12,8 +12,9 @@
 //! that follows takes care of the shapes.
 
 use crate::predicates::{inside, orient, P3};
+use crate::simplex::TET_FACES;
 use crate::simplex::{tet_circumcenter, tet_min_dihedral, Ordered};
-use crate::volume::tets::{Tets, FACE, NONE};
+use crate::volume::tets::{Tets, NONE};
 use rapidmesh_geom::vec3::{cross, dist, dot, sub};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BinaryHeap;
@@ -151,7 +152,7 @@ pub fn refine(
         // the region between them narrows to nothing) stays as it is:
         // refining a wedge that closes would not end, and its flat tets
         // keep the material of the region they lie in.
-        let mut others: Vec<u32> = FACE
+        let mut others: Vec<u32> = TET_FACES
             .iter()
             .filter_map(|f| {
                 let mut k = f.map(|j| tv[j]);
@@ -165,7 +166,7 @@ pub fn refine(
             continue;
         }
         let mut inward = [0.0; 3];
-        for (i, f) in FACE.iter().enumerate() {
+        for (i, f) in TET_FACES.iter().enumerate() {
             let mut k = f.map(|j| tv[j]);
             k.sort_unstable();
             if !m.constraint.contains(&k) {

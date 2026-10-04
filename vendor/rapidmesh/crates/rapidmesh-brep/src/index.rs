@@ -212,15 +212,11 @@ impl FacetBvh {
             .1
     }
 
-    /// `min over facets ( target + grading * dist(p, facet) )`: the graded
-    /// distance field that grows the sizing field from the fine wall targets.
-    pub fn graded_min(&self, targets: &Targets, p: V3, grading: f64) -> f64 {
-        self.graded_min_within(targets, p, grading, f64::INFINITY)
-    }
-
-    /// [`FacetBvh::graded_min`], or `bound` if it is not below: the search
-    /// skips every subtree that cannot go below `bound`. Exact whenever the
-    /// result is below `bound`.
+    /// `min over facets ( target + grading * dist(p, facet) )`, the graded
+    /// distance field that grows the sizing field from the fine wall
+    /// targets, or `bound` if it is not below: the search skips every
+    /// subtree that cannot go below `bound`. Exact whenever the result is
+    /// below `bound`.
     pub fn graded_min_within(&self, targets: &Targets, p: V3, grading: f64, bound: f64) -> f64 {
         let nodes = self.bvh.nodes();
         // Lower bound for anything in a subtree: the finest target plus the
@@ -314,7 +310,7 @@ mod tests {
             [0.5, 0.5, 0.05],
             [0.95, 0.5, 0.5],
         ] {
-            let got = bvh.graded_min(&tg, p, g);
+            let got = bvh.graded_min_within(&tg, p, g, f64::INFINITY);
             let want = brute_graded(&f, p, g);
             assert!(
                 (got - want).abs() < 1e-12,
@@ -355,7 +351,9 @@ mod tests {
                 "nearest at {p:?}"
             );
             assert!(
-                (bvh.graded_min(&tg, p, 0.5) - brute_graded(&f, p, 0.5)).abs() < 1e-9,
+                (bvh.graded_min_within(&tg, p, 0.5, f64::INFINITY) - brute_graded(&f, p, 0.5))
+                    .abs()
+                    < 1e-9,
                 "graded at {p:?}"
             );
         }

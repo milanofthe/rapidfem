@@ -222,9 +222,10 @@ pub fn boundary_keeping(
     // Faces flipped but not remeshed, whose regions the next round checks.
     let mut recheck: Vec<usize> = Vec::new();
     let mut rounds = 0;
-    // The edges missed at the round before, and the rounds in a row that
-    // missed more.
+    // The edges missed at the round before, the fewest any round missed,
+    // and the rounds in a row that missed more.
     let mut before = usize::MAX;
+    let mut fewest = usize::MAX;
     let mut grew = 0;
     loop {
         let t = rapidmesh_exact::clock::Instant::now();
@@ -257,7 +258,11 @@ pub fn boundary_keeping(
         );
         grew = if left > before { grew + 1 } else { 0 };
         before = left;
-        if grew >= DIVERGED_ROUNDS {
+        fewest = fewest.min(left);
+        // Rounds that keep missing more, or fewer of them that already
+        // miss far more than the best round did: splitting makes more.
+        let far = left as f64 > DIVERGED_GROWTH * fewest as f64;
+        if grew >= DIVERGED_ROUNDS || (grew + 1 >= DIVERGED_ROUNDS && far) {
             return Err(BoundaryError::Diverged { left, near });
         }
         if (missing.is_empty() && inside.is_empty()) || rounds == MAX_SPLIT_ROUNDS {
@@ -1031,18 +1036,24 @@ fn broken_face(
     None
 }
 
-/// The front side of face `fi`: the summed normal of its facets, turned to
-/// match its regions.
-fn face_front(model: &Model, fi: usize) -> P3 {
+/// The facets of face `fi`, each wound toward the face's front (the side
+/// of its first region).
+pub(crate) fn front_facets(model: &Model, fi: usize) -> impl Iterator<Item = [P3; 3]> + '_ {
     let (plc, face) = (&model.plc, &model.brep.faces[fi]);
-    face.facets.iter().fold([0.0; 3], |s, &t| {
+    face.facets.iter().map(move |&t| {
         let p = plc.triangles[t as usize].map(|i| plc.vertices[i as usize]);
-        let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-        let n = if plc.region_tags[t as usize] == face.regions {
-            n
+        if plc.region_tags[t as usize] == face.regions {
+            p
         } else {
-            n.map(|x| -x)
-        };
+            [p[0], p[2], p[1]]
+        }
+    })
+}
+
+/// The front side of face `fi`: the summed normal of its facets.
+fn face_front(model: &Model, fi: usize) -> P3 {
+    front_facets(model, fi).fold([0.0; 3], |s, p| {
+        let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
         [s[0] + n[0], s[1] + n[1], s[2] + n[2]]
     })
 }
@@ -1060,8 +1071,10 @@ const MAX_REFINES: usize = 8;
 const MAX_SPLIT_ROUNDS: usize = 40;
 
 /// Rounds in a row that miss more edges than the one before, after which
-/// the boundary gives up.
+/// the boundary gives up; a round fewer where the last misses this many
+/// times as many as the best round did.
 const DIVERGED_ROUNDS: usize = 3;
+const DIVERGED_GROWTH: f64 = 1.5;
 
 /// The axis and coordinate of a plane normal to an axis (to a rounding of
 /// its normal), if it is one.
@@ -1085,7 +1098,7 @@ fn faces_on(
     face_coedges: &[Vec<u32>],
     face_corners: &[Vec<u32>],
     cache: &mut [Option<FaceMesh>],
-    dirty: &[usize],
+    dirty: &mut Vec<usize>,
     required: &[Vec<P3>],
     copies: &[Option<(usize, P3)>],
     comps: &crate::surface::topology::Composites,
@@ -1240,6 +1253,16 @@ fn faces_on(
         .flatten()
         .collect();
     if !needed.is_empty() {
+        // The faces that meshed keep their meshes: only the faces on the
+        // edges that take the samples are meshed again.
+        let mut meshed: FxHashSet<usize> = FxHashSet::default();
+        for (fi, m) in fresh {
+            if let Ok(m) = m {
+                cache[fi] = Some(m);
+                meshed.insert(fi);
+            }
+        }
+        dirty.retain(|f| !meshed.contains(f));
         return Err(BoundaryError::Refine(needed));
     }
     for (fi, m) in fresh {
@@ -1852,7 +1875,7 @@ fn mesh_composite(
     domain: &DomainTree,
     params: &MeshParams,
 ) -> Result<FaceOut, BoundaryError> {
-    let (plc, brep) = (&model.plc, &model.brep);
+    let brep = &model.brep;
     let root = members[0];
     let (loops, inner_coedges) = comps.outline(brep, root);
     let rings: Vec<Vec<u32>> = loops
@@ -1885,17 +1908,7 @@ fn mesh_composite(
         .collect();
     let facets: Vec<[P3; 3]> = members
         .iter()
-        .flat_map(|&f| {
-            let face = &brep.faces[f];
-            face.facets.iter().map(move |&t| {
-                let p = plc.triangles[t as usize].map(|i| plc.vertices[i as usize]);
-                if plc.region_tags[t as usize] == face.regions {
-                    p
-                } else {
-                    [p[0], p[2], p[1]]
-                }
-            })
-        })
+        .flat_map(|&f| front_facets(model, f))
         .collect();
     let mut corners: Vec<u32> = members
         .iter()
@@ -1945,7 +1958,7 @@ fn mesh_face(
     domain: &DomainTree,
     params: &MeshParams,
 ) -> Result<FaceOut, BoundaryError> {
-    let (plc, brep) = (&model.plc, &model.brep);
+    let brep = &model.brep;
     let face = &brep.faces[fi];
     // The loops, the edges inside the face (a crease, a sheet meeting it)
     // and the corners it only touches, as global ids.
@@ -1988,17 +2001,9 @@ fn mesh_face(
     };
     // Which way the face's front lies from its carrier's normal (measured
     // on its facets: a full barrel's normals sum to nothing).
-    let side: f64 = face
-        .facets
-        .iter()
-        .map(|&t| {
-            let p = plc.triangles[t as usize].map(|i| plc.vertices[i as usize]);
+    let side: f64 = front_facets(model, fi)
+        .map(|p| {
             let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-            let n = if plc.region_tags[t as usize] == face.regions {
-                n
-            } else {
-                n.map(|x| -x)
-            };
             let c: P3 = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
             dot(n, surface.closest(c).1)
         })
@@ -2052,18 +2057,7 @@ fn mesh_face(
                 // over another; the finish then puts every point on the
                 // carrier. One with ridges (a loft round the corners of a
                 // polygon) goes to the atlas, whose pieces part at them.
-                let facets: Vec<[P3; 3]> = face
-                    .facets
-                    .iter()
-                    .map(|&t| {
-                        let p = plc.triangles[t as usize].map(|i| plc.vertices[i as usize]);
-                        if plc.region_tags[t as usize] == face.regions {
-                            p
-                        } else {
-                            [p[0], p[2], p[1]]
-                        }
-                    })
-                    .collect();
+                let facets: Vec<[P3; 3]> = front_facets(model, fi).collect();
                 if matches!(
                     surface,
                     rapidmesh_brep::Surface::Discrete(_) | rapidmesh_brep::Surface::Nurbs(_)
@@ -2130,20 +2124,7 @@ fn mesh_face(
                 return Ok(merge(shared.len(), outs));
             };
             // The chart's normal turned to the front, by the face's facets.
-            let lean: f64 = face
-                .facets
-                .iter()
-                .map(|&t| {
-                    let p = plc.triangles[t as usize].map(|i| plc.vertices[i as usize]);
-                    let n = cross(sub(p[1], p[0]), sub(p[2], p[0]));
-                    let n = if plc.region_tags[t as usize] == face.regions {
-                        n
-                    } else {
-                        n.map(|x| -x)
-                    };
-                    dot(n, chart.n)
-                })
-                .sum();
+            let lean = dot(face_front(model, fi), chart.n);
             chart.front = if lean < 0.0 {
                 chart.n.map(|x| -x)
             } else {

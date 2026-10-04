@@ -4,6 +4,7 @@
 //! bridges). Every defect carries its position, so a corpus run shows where a
 //! mesh is wrong, not only that it is.
 
+use crate::constants::FIDELITY_REL;
 use crate::mesh::TetMesh;
 
 use crate::quality::{quality_stats, QualityStats};
@@ -276,7 +277,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         })
         .collect();
     for &(v, longest, vmax_off, c_off) in offs.iter().flatten() {
-        if longest > 0.0 && vmax_off > 0.25 * longest {
+        if longest > 0.0 && vmax_off > FIDELITY_REL * longest {
             n_straddlers += 1;
             defects.push(Defect {
                 kind: DefectKind::Straddler,
@@ -291,7 +292,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         // some surface), but the face INTERIOR spans far off everything --
         // the cavity-lid class (mold_block), topologically watertight yet
         // geometrically false. Same relative threshold as the straddler.
-        if longest > 0.0 && c_off > 0.25 * longest && vmax_off <= 0.25 * longest {
+        if longest > 0.0 && c_off > FIDELITY_REL * longest && vmax_off <= FIDELITY_REL * longest {
             n_bridge_faces += 1;
             defects.push(Defect {
                 kind: DefectKind::BridgeFace,

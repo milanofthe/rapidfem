@@ -120,7 +120,7 @@ impl Plan {
         let mut stack: Vec<(u32, P3, P3, Vec<u32>)> =
             vec![(0, lo, hi, (0..pts.len() as u32).collect())];
         while let Some((node, lo, hi, inside)) = stack.pop() {
-            match split(domain, pts, &sizes, &inside, lo, hi, block) {
+            match split(domain, pts, &sizes, &inside, lo, hi, block, &plan.cuts) {
                 Some((axis, at)) => {
                     let (below, above): (Vec<u32>, Vec<u32>) =
                         inside.iter().partition(|&&v| pts[v as usize][axis] < at);
@@ -190,7 +190,12 @@ impl Plan {
 /// work: on an axis not much shorter than the longest, between the
 /// quartiles of its work, where it stays farthest from every corner in
 /// that corner's size (up to [`ROOM`] sizes), nearest the median among
-/// equals; none where no place keeps [`CLEAR`] sizes.
+/// equals; none where no place keeps [`CLEAR`] sizes. A place within a
+/// size of a cut already made on the same axis (in another cell) moves onto
+/// it where it keeps clear there too: cells side by side cut in one plane,
+/// not in two a hair apart, whose step along their common face would leave
+/// slivers between the blocks.
+#[allow(clippy::too_many_arguments)]
 fn split(
     domain: &DomainTree,
     pts: &[P3],
@@ -199,6 +204,7 @@ fn split(
     lo: P3,
     hi: P3,
     block: f64,
+    made: &[Cut],
 ) -> Option<(usize, f64)> {
     let longest = (0..3).map(|k| hi[k] - lo[k]).fold(0.0, f64::max);
     let coarsest = inside
@@ -254,7 +260,18 @@ fn split(
             let x = (a * hb + b * ha) / (ha + hb);
             (x > from && x < to).then_some(x)
         }));
+        let planes: Vec<f64> = made
+            .iter()
+            .filter(|c| c.axis == axis && c.at > lo[axis] && c.at < hi[axis])
+            .map(|c| c.at)
+            .collect();
         for x in candidates {
+            let x = planes
+                .iter()
+                .copied()
+                .filter(|&c| (c - x).abs() <= coarsest && room(c) >= CLEAR)
+                .min_by(|a, b| (a - x).abs().total_cmp(&(b - x).abs()))
+                .unwrap_or(x);
             let r = room(x);
             if r < CLEAR {
                 continue;
@@ -545,6 +562,15 @@ impl Blocks {
     /// The source region of region `r` of the cut model.
     pub fn region(&self, r: u32) -> u32 {
         self.region[r as usize]
+    }
+
+    /// Whether face `f` of the cut model is a cut or a piece of a face a
+    /// cut splits: one a cut can be blamed for.
+    pub fn at_cut(&self, f: u32) -> bool {
+        match self.face(f) {
+            None => true,
+            Some(src) => self.face.iter().filter(|&&x| x == Some(src)).count() > 1,
+        }
     }
 
     /// The source face of face `f` of the cut model, `None` on a cut.

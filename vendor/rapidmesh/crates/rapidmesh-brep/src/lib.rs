@@ -250,12 +250,8 @@ impl Model {
             .clone()
     }
 
-    /// Assembles `scene` and builds its model.
-    pub fn of_scene(scene: &Scene) -> Model {
-        Model::new(scene.assemble())
-    }
-
-    /// [`Model::of_scene`], or the input the scene could not assemble.
+    /// Assembles `scene` and builds its model, or names the input the scene
+    /// could not assemble.
     pub fn try_of_scene(scene: &Scene) -> Result<Model, rapidmesh_geom::AssembleError> {
         Ok(Model::new(scene.try_assemble()?))
     }

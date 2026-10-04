@@ -75,7 +75,7 @@ mod default {
         360.0
     }
     pub fn crease_deg() -> f64 {
-        40.0
+        rapidmesh_geom::CREASE_DEG
     }
     pub fn up() -> Up {
         Up::Z

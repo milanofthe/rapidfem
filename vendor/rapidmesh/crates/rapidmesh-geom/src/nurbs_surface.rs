@@ -351,11 +351,8 @@ impl NurbsSurface {
     /// the parameters of a point near it (a search where the answer lies
     /// close, not over the whole surface).
     pub fn closest_param_near(&self, q: V3, start: [f64; 2]) -> [f64; 2] {
-        let d = dot(
-            sub(self.eval(start[0], start[1]), q),
-            sub(self.eval(start[0], start[1]), q),
-        );
-        self.descend(start, d, q).0
+        let r = sub(self.eval(start[0], start[1]), q);
+        self.descend(start, dot(r, r), q).0
     }
 
     /// The parameters of a surface point near `q` by one Gauss-Newton step

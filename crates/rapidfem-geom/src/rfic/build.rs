@@ -460,7 +460,13 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
         built.slabs.push((d.name.clone(), boxes));
     }
 
-    // ── conformal passivation shell and the air prisms over it ──────────
+    // ── conformal passivation shell and the air over it ─────────────────
+    // The shell is the passivation sheet over the footprint and the metal
+    // footprint grown by the sidewall thickness, raised to the shell top;
+    // the conductors, in front of everything, carve the metal out of it and
+    // leave the sidewall ring and the cap. Only the grown outline is new
+    // geometry and nothing has to meet it: the metal edges stay the
+    // conductors' own.
     if let (Some(cl), Some(p)) = (&conf_layer, pass_slab) {
         let pass = &stack.dielectrics[p];
         let pass_mat = stack.slab_material(pass);
@@ -476,27 +482,16 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
             return Err(format!("no polygons on GDS layer {}/{} for the conformal passivation", cl.gds, cl.datatype));
         }
         let expanded = region::offset(&metal, o.pass_t_side);
-        let foot: Region = vec![vec![vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]];
-        let field = region::difference(&foot, &expanded);
-        let ring = region::difference(&expanded, &metal);
-        let mut shell = Vec::new();
-        // the field sheet, everywhere but the expanded metal footprint
-        shell.extend(scene.prisms(&field, zm_lo, t_top, Some(material_for(&pass_mat, None)), Some(h_pass))?);
-        // the sidewall ring, expanded minus metal
-        shell.extend(scene.prisms(&ring, zm_lo, (zm_hi - zm_lo) + t_top, Some(material_for(&pass_mat, None)), Some(h_pass))?);
-        // the cap on the metal top
-        shell.extend(scene.prisms(&metal, zm_hi, t_top, Some(material_for(&pass_mat, None)), Some(h_pass))?);
-        // Air: only the step between the field sheet and the shell top
-        // follows the metal outline, everything above is one plain box (the
-        // outline stamped through the whole air would force the trace width
-        // over its full height).
-        let z_shell_top = zm_hi + t_top;
-        let mut air_low = scene.prisms(&field, zm_lo + t_top, z_shell_top - (zm_lo + t_top), Some(super::Mat::air()), Some(h_air))?;
-        let cap = scene.geo.add_solid(Cuboid::new([wx, wy, z_top - z_shell_top]).at([x0, y0, z_shell_top]), Some(h_air), false);
-        scene.fill(&[cap], super::Mat::air());
-        air_low.push(cap);
+        // the air first, so the shell carves it
+        let z_air = zm_lo + t_top;
+        let air = scene.geo.add_solid(Cuboid::new([wx, wy, z_top - z_air]).at([x0, y0, z_air]), Some(h_air), false);
+        scene.fill(&[air], super::Mat::air());
+        let mut shell = vec![scene.geo.add_solid(Cuboid::new([wx, wy, t_top]).at([x0, y0, zm_lo]), Some(h_pass), false)];
+        shell.extend(scene.prisms(&expanded, zm_lo, zm_hi + t_top - zm_lo, None, Some(h_pass))?);
+        scene.geo.fuse(shell.clone());
+        scene.fill(&shell, material_for(&pass_mat, None));
         built.slabs.push((pass.name.clone(), shell));
-        built.slabs.push((air_slab.name.clone(), air_low));
+        built.slabs.push((air_slab.name.clone(), vec![air]));
     }
 
     // ── air shell around the dielectric stack (6 disjoint boxes) ────────

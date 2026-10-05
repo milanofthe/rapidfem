@@ -150,12 +150,23 @@ def test_sheet_cut_leaves_a_slot_and_fuse_merges_strips():
     assert abs(_sheet_area(g, pec_strip) / (6 * MM**2) - 1) < 1e-6
 
 
-def test_sheet_booleans_need_one_plane_and_sheets():
+def test_fused_sheets_extrude_as_one_solid():
+    g = rf.Geometry(maxh=1 * MM)
+    _air(g)
+    a = g.xy_plate(3 * MM, 1 * MM)
+    g.fuse(a, g.xy_plate(1 * MM, 3 * MM, position=(1 * MM, -1 * MM, 0)))
+    v = g.extrude(a, 1 * MM, material=rf.Dielectric(er=2.0))
+    np.testing.assert_allclose(_box_of(v), np.array([0, -1, 0, 3, 2, 1]) * MM, atol=1e-12)
+    g.mesh()
+    assert g.mesh_stats.n_tets > 0
+
+
+def test_sheet_cuts_need_one_plane_and_sheets():
     g = rf.Geometry(maxh=2 * MM)
     _air(g)
     a = g.xy_plate(2 * MM, 2 * MM)
     with pytest.raises(ValueError, match="one plane"):
-        g.fuse(a, g.xy_plate(2 * MM, 2 * MM, position=(0, 0, 1 * MM)))
+        g.cut(a, g.xy_plate(1 * MM, 1 * MM, position=(0, 0, 1 * MM)))
     with pytest.raises(ValueError, match="sheets only"):
         g.cut(a, g.box(1 * MM, 1 * MM, 1 * MM))
 

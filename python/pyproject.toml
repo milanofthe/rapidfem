@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "rapidfem"
-version = "0.22.1"
+version = "0.23.0"
 description = "Frequency- and time-domain electromagnetic FEM solver in Rust, with a Python API and an optional local web UI."
 readme = { file = "../README.md", content-type = "text/markdown" }
 license = { text = "AGPL-3.0-only" }

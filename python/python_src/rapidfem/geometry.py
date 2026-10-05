@@ -750,9 +750,9 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
         """boolean union ``target`` and ``tools``
 
         Merges the operands into a single connected body assigned back
-        to ``target``. Sheets must lie in one plane; their union may fall
-        apart into several pieces, which stay one object, and the tools are
-        used up.
+        to ``target``. Sheets keep their pieces as one object under one
+        tag, the mesher merges them where they overlap; the tools are used
+        up.
 
 
         Note

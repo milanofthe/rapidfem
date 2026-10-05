@@ -141,8 +141,9 @@ def build(
         approximation). "conformal" models the real deposition: the oxide
         stops at the top metal's bottom, the passivation drapes over the
         exposed metal (``pass_t_top`` on top and field, ``pass_t_side`` on
-        the sidewalls) with air beyond, built as disjoint prisms from a 2D
-        offset decomposition of the metal polygons. "none" drops the sheet.
+        the sidewalls) with air beyond: the sheet and the metal footprint
+        grown by ``pass_t_side``, the conductors carving the metal out.
+        "none" drops the sheet.
     pass_t_side : float
         Sidewall passivation thickness for the conformal mode.
     pass_t_top : float, optional

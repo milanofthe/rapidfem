@@ -42,16 +42,21 @@ pub type ObjId = usize;
 pub enum Item {
     Solid(Shape),
     Sheet(Sheet),
-    /// Several pieces of one sheet, the result of a sheet boolean that
-    /// falls apart; they share the object's tag and transforms.
-    Sheets(Vec<Sheet>),
-    /// The solid a sheet sweeps along `vector`; the sheet stays as its
-    /// bottom face. The object's first `placed` transforms move the sheet
-    /// before the sweep, the rest move both after it.
-    Extrusion { sheet: Sheet, vector: [f64; 3], placed: usize },
+    /// Several pieces of one sheet sharing the object's tag: a sheet union
+    /// (rapidmesh merges overlapping pieces) or a sheet boolean that falls
+    /// apart.
+    Sheets(Vec<Piece>),
+    /// The solid one sheet or several pieces sweep along `vector`, the
+    /// pieces' solids fused; the sheets stay as its bottom face. The
+    /// object's first `placed` transforms move the sheets before the sweep,
+    /// the rest move both after it.
+    Extrusion { pieces: Vec<Piece>, vector: [f64; 3], placed: usize },
     /// Body `body` of the STEP file at `path`, in the file's unit.
     Step { path: std::path::PathBuf, body: usize },
 }
+
+/// A sheet and its own transforms, applied before its object's.
+pub type Piece = (Sheet, Vec<Transform>);
 
 /// A solid or sheet of the scene with its attributes.
 #[derive(Clone, Debug)]
@@ -435,31 +440,44 @@ impl Geometry {
         self.changed();
     }
 
-    /// Combines the sheet `target` with the sheets `tools` in their common
-    /// plane (see [`crate::sheet_ops`]): the target becomes the result, the
-    /// tools are used up.
+    /// Combines the sheet `target` with the sheets `tools`: a union keeps
+    /// every piece under the target's tag and leaves the merge to rapidmesh,
+    /// a difference or intersection goes through [`crate::sheet_ops`] in the
+    /// common plane. The target becomes the result, the tools are used up.
     pub fn sheet_boolean(&mut self, op: SheetOp, target: ObjId, tools: &[ObjId]) -> Result<(), String> {
-        let pieces = |id: ObjId| -> Result<&[Sheet], String> {
-            match &self.objects[id].item {
-                Item::Sheet(s) => Ok(std::slice::from_ref(s)),
-                Item::Sheets(v) => Ok(v),
-                _ => Err(format!("a sheet combines with sheets only, object {id} is a solid")),
-            }
-        };
-        let operand = |id: ObjId| pieces(id).map(|p| (p, self.objects[id].transforms.as_slice()));
-        let tool_ops = tools.iter().map(|&i| operand(i)).collect::<Result<Vec<_>, _>>()?;
-        let (mut sheets, placement) = sheet_ops::boolean(op, operand(target)?, &tool_ops)?;
-        self.objects[target].item = if sheets.len() == 1 {
-            Item::Sheet(sheets.pop().expect("one piece"))
+        let mut pieces = self.pieces(target)?;
+        let others = tools.iter().map(|&i| self.pieces(i)).collect::<Result<Vec<_>, _>>()?;
+        let (item, placement) = if op == SheetOp::Union {
+            pieces.extend(others.into_iter().flatten());
+            (Item::Sheets(pieces), Vec::new())
         } else {
-            Item::Sheets(sheets)
+            let (mut sheets, placement) = sheet_ops::boolean(op, &pieces, &others.concat())?;
+            let item = if sheets.len() == 1 {
+                Item::Sheet(sheets.pop().expect("one piece"))
+            } else {
+                Item::Sheets(sheets.into_iter().map(|s| (s, Vec::new())).collect())
+            };
+            (item, placement)
         };
+        self.objects[target].item = item;
         self.objects[target].transforms = placement;
         for &i in tools {
             self.objects[i].alive = false;
         }
         self.changed();
         Ok(())
+    }
+
+    /// The pieces of a sheet object, each with the object's transforms
+    /// after its own.
+    fn pieces(&self, id: ObjId) -> Result<Vec<Piece>, String> {
+        let o = &self.objects[id];
+        let placed = |own: &[Transform]| own.iter().chain(&o.transforms).copied().collect::<Vec<_>>();
+        match &o.item {
+            Item::Sheet(s) => Ok(vec![(s.clone(), o.transforms.clone())]),
+            Item::Sheets(v) => Ok(v.iter().map(|(s, own)| (s.clone(), placed(own))).collect()),
+            _ => Err(format!("a sheet combines with sheets only, object {id} is a solid")),
+        }
     }
 
     /// Removes an object from the scene.
@@ -599,14 +617,13 @@ impl Geometry {
             self.replace(id, Item::Solid(p.into()));
             return Ok(());
         }
-        let sheet = match &self.objects[id].item {
-            Item::Sheet(sheet) => sheet,
-            Item::Sheets(_) => return Err(format!("sheet {id} has several pieces; extrude them one by one")),
+        let pieces = match &self.objects[id].item {
+            Item::Sheet(sheet) => vec![(sheet.clone(), Vec::new())],
+            Item::Sheets(pieces) => pieces.clone(),
             _ => return Err(format!("object {id} is not a sheet")),
         };
-        let sheet = sheet.clone();
         let placed = self.objects[id].transforms.len();
-        self.replace(id, Item::Extrusion { sheet, vector, placed });
+        self.replace(id, Item::Extrusion { pieces, vector, placed });
         Ok(())
     }
 
@@ -710,21 +727,32 @@ impl Geometry {
                     (vec![s.into()], 0)
                 }
                 Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?.into()], 0),
-                Item::Sheets(sheets) => (
-                    sheets
-                        .iter()
-                        .map(|s| g.add_sheet(s, sheet_tag(i), scaled(o.size())).map(Into::into).map_err(e))
-                        .collect::<Result<Vec<RmObject>, String>>()?,
-                    0,
-                ),
-                Item::Extrusion { sheet, vector, placed } => {
-                    let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
-                    for &tr in &o.transforms[..*placed] {
-                        g.transform(r, tr).map_err(e)?;
+                Item::Sheets(pieces) => {
+                    let mut placed: Vec<RmObject> = Vec::new();
+                    for (sheet, own) in pieces {
+                        let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
+                        for &tr in own {
+                            g.transform(r, tr).map_err(e)?;
+                        }
+                        placed.push(r.into());
                     }
-                    let s = g.extrude(r, *vector, scaled(o.size())).map_err(e)?;
+                    (placed, 0)
+                }
+                Item::Extrusion { pieces, vector, placed } => {
+                    let (mut sheets, mut swept): (Vec<RmObject>, _) = (Vec::new(), Vec::new());
+                    for (sheet, own) in pieces {
+                        let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
+                        for &tr in own.iter().chain(&o.transforms[..*placed]) {
+                            g.transform(r, tr).map_err(e)?;
+                        }
+                        swept.push(g.extrude(r, *vector, scaled(o.size())).map_err(e)?);
+                        sheets.push(r.into());
+                    }
+                    // the pieces' solids are one material, as their sheets are one sheet
+                    let s = g.union(&swept).map_err(e)?;
                     solids[i] = Some(s);
-                    (vec![r.into(), s.into()], *placed)
+                    sheets.extend(swept.into_iter().map(|s| -> RmObject { s.into() }));
+                    (sheets, *placed)
                 }
                 Item::Step { path, body } => {
                     if !steps.contains_key(path.as_path()) {

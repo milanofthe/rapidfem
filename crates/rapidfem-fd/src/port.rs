@@ -31,6 +31,11 @@ pub trait Port {
     /// `k`-th triangle, where it differs from γ.
     fn tri_tensor(&self, _exc: &Excitation, _k: usize) -> Option<[[C64; 3]; 3]> { None }
 
+    /// Whether the Robin term is γ(k₀) times one fixed surface matrix at
+    /// every frequency (no [`Port::tri_tensor`]): the adaptive sweep then
+    /// projects that matrix once instead of per frequency.
+    fn robin_is_scalar(&self) -> bool { true }
+
     /// Power-normalised mode field at a global point (S-parameter
     /// extraction and the excitation); `None` for a passive boundary.
     fn port_mode_3d_global(&self, _x: f64, _y: f64, _z: f64, _exc: &Excitation) -> Option<(f64, f64, f64)> {

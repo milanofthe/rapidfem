@@ -22,7 +22,7 @@ mod common;
 
 use common::{boundary_tris, box_mesh};
 use num_complex::Complex64 as C64;
-use rapidfem_fd::assembly::frequency_sweep;
+use rapidfem_fd::assembly::{frequency_sweep, DrivenSystem};
 use rapidfem_fd::basis::NedelecBasis;
 use rapidfem_fd::excitation::Excitation;
 use rapidfem_fd::interp::eval_field_in_tet;
@@ -87,7 +87,8 @@ fn solve_s(mesh: &Mesh, orders: OrderMap) -> [[C64; 2]; 2] {
     let ports: [&dyn Port; 2] = [&port1, &port2];
     let port_tris: [&[usize]; 2] = [&pt1, &pt2];
 
-    let res = frequency_sweep(mesh, &basis, &ports, &port_tris, &pec, &[FREQ], None, None, None)
+    let mut sys = DrivenSystem::new(mesh, &basis, &ports, &port_tris, &pec, FREQ, None, None);
+    let res = frequency_sweep(&mut sys, &[FREQ], None)
         .expect("the driven solve must succeed")
         .remove(0);
     assert_eq!(res.solutions.len(), 2, "two driven ports -> two excitation solves");

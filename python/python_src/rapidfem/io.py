@@ -109,6 +109,7 @@ def to_hdf5(result: "SweepResult", path: str, group: str = "/") -> None:
         g = f.require_group(group)
         g.create_dataset("frequencies_hz", data=result.frequencies)
         g.create_dataset("sparams", data=result.sparams)
+        g.create_dataset("full_solve_frequencies_hz", data=result.full_solve_frequencies)
         g.attrs["n_driven"] = result.n_driven
         g.attrs["solve_time_s"] = result.solve_time_s
         g.attrs["units"] = "Hz; S complex; reference impedance external"

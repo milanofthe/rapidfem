@@ -27,5 +27,6 @@ pub mod sibc_edge;
 pub mod error_estimator;
 pub mod eigenmode;
 pub mod assembly;
+pub mod adaptive;
 pub mod farfield;
 pub mod simulation;

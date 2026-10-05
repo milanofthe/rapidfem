@@ -121,15 +121,23 @@ impl PySimulation {
     ///
     /// `order` is the uniform element order (1 or 2, default 2) or
     /// "adaptive", the wavelength order policy. `eigenmode` is
-    /// `(target_hz, n_modes)`.
+    /// `(target_hz, n_modes)`. `adaptive_tol` turns on the adaptive sweep
+    /// (full solves at a few frequencies, the rest from a reduced model) with
+    /// at most `adaptive_max_samples` full solves per driven port, converged
+    /// after `adaptive_memory` samples in a row within the tolerance.
     #[new]
-    #[pyo3(signature = (mesh, model, frequencies, *, order=None, eigenmode=None))]
+    #[pyo3(signature = (mesh, model, frequencies, *, order=None, eigenmode=None,
+                        adaptive_tol=None, adaptive_max_samples=20, adaptive_memory=2))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mesh: &PyFemMesh,
         model: &PyModel,
         frequencies: Vec<f64>,
         order: Option<OrderArg>,
         eigenmode: Option<(f64, usize)>,
+        adaptive_tol: Option<f64>,
+        adaptive_max_samples: usize,
+        adaptive_memory: usize,
     ) -> PyResult<Self> {
         if frequencies.is_empty() {
             return Err(PyValueError::new_err("sweep needs at least one frequency"));
@@ -147,7 +155,12 @@ impl PySimulation {
                 return Err(PyValueError::new_err(format!("order must be 1, 2 or 'adaptive', got {name:?}")));
             }
         };
-        let settings = FdSettings { frequencies, order, eigenmode };
+        let adaptive = adaptive_tol.map(|tol| rapidfem_fd::adaptive::AdaptiveSettings {
+            tol,
+            max_samples: adaptive_max_samples,
+            memory: adaptive_memory,
+        });
+        let settings = FdSettings { frequencies, order, eigenmode, adaptive };
         let inner = Simulation::new(mesh.inner.clone(), model.inner.clone(), settings)
             .map_err(PyRuntimeError::new_err)?;
         Ok(PySimulation { inner })
@@ -456,6 +469,13 @@ impl PySweepResult {
     /// Total wall-clock for the sweep in seconds.
     #[getter]
     fn solve_time_s(&self) -> f64 { self.inner.solve_time_s }
+
+    /// The frequencies solved in full (Hz): every frequency of a full sweep,
+    /// the samples of an adaptive one, in the order they were solved.
+    #[getter]
+    fn full_solve_frequencies<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.inner.full_solves.clone().into_pyarray(py)
+    }
 }
 
 #[pymethods]

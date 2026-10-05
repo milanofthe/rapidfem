@@ -1280,6 +1280,7 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
         *,
         cells_across: float | None = None,
         target_elements: int | None = None,
+        min_angle: float | None = None,
     ):
         """tetrahedralize the scene and build the solver mesh
 
@@ -1302,6 +1303,12 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
             thinner than the size then takes flat tets through each layer)
         target_elements : int, optional
             tet budget: the global size is scaled to land near it
+        min_angle : float, optional
+            smallest dihedral angle in degrees to aim at: where tets stay
+            below it (flat tets through a layer far thinner than the size),
+            the size there shrinks over a few remeshes. Slivers cost the
+            direct solver accuracy (see ``mesh_stats.quality_min``); off by
+            default, meshing once
 
 
         Returns
@@ -1309,7 +1316,7 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
         MeshStats
             size and quality of the mesh
         """
-        self._fem_mesh, self.mesh_stats = self._native.mesh(maxh, cells_across, target_elements)
+        self._fem_mesh, self.mesh_stats = self._native.mesh(maxh, cells_across, target_elements, min_angle)
         return self.mesh_stats
 
 

@@ -884,9 +884,10 @@ impl PyGeometry {
     /// Meshes the scene (a loaded mesh is taken as it is), tags every
     /// material and physics object and returns the solver mesh with its
     /// stats. `maxh` and `cells_across` default to `mesh_maxh` and
-    /// `cells_across`; without grading the size jumps.
-    #[pyo3(signature = (maxh=None, cells_across=None, target_elements=None))]
-    fn mesh(&mut self, maxh: Option<f64>, cells_across: Option<f64>, target_elements: Option<usize>) -> PyResult<(PyFemMesh, PyMeshStats)> {
+    /// `cells_across`; without grading the size jumps. `min_angle` is
+    /// rapidmesh's smallest dihedral angle to aim at.
+    #[pyo3(signature = (maxh=None, cells_across=None, target_elements=None, min_angle=None))]
+    fn mesh(&mut self, maxh: Option<f64>, cells_across: Option<f64>, target_elements: Option<usize>, min_angle: Option<f64>) -> PyResult<(PyFemMesh, PyMeshStats)> {
         let tagging = self.setup.tagging();
         let (fm, quality) = match &self.scene {
             Some(scene) => {
@@ -919,6 +920,7 @@ impl PyGeometry {
                     grading: if self.grading { None } else { Some(1e9) },
                     cells_across: cells_across.or(self.cells_across),
                     target_elements,
+                    min_angle,
                     ..Default::default()
                 };
                 let m = self.inner.mesh(&opts).map_err(err)?;

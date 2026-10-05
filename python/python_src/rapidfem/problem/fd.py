@@ -98,14 +98,19 @@ class ProblemFD:
 
     def sweep(self, frequencies: Iterable[float], *,
               order: "int | str" = 2,
-              on_frequency=None):
+              on_frequency=None,
+              adaptive_tol: "float | None" = None,
+              adaptive_max_samples: int = 20,
+              adaptive_memory: int = 2):
         """run a driven frequency sweep and return the SweepResult
 
         Assembles the FEM operator from the geometry's material /
         port / BC registry, then factors and solves at each frequency
         in ``frequencies``. The returned :class:`SweepResult` has
         ``.frequencies``, ``.sparams`` (complex array of shape
-        ``[n_freq, n_port, n_port]``), and ``.solve_time_s``.
+        ``[n_freq, n_port, n_port]``), ``.solve_time_s`` and
+        ``.full_solve_frequencies`` (the frequencies solved in full: all of
+        them, or the samples of an adaptive sweep).
 
 
         Example
@@ -139,6 +144,20 @@ class ProblemFD:
             Useful for progress reporting. When ``None`` and running inside the
             UI, a callback that streams partial results to the viewer is used
             automatically.
+        adaptive_tol : float, optional
+            turns on the adaptive sweep, the method of Palace's adaptive
+            driven solver: full solves at a few frequencies (the band ends,
+            then where a minimal rational interpolant of the solutions puts
+            its next pole), every frequency in ``frequencies`` from the
+            reduced model they span. The sweep stops when
+            ``adaptive_memory`` new samples in a row are reproduced by the
+            reduced model to this relative error. ``None`` (default) solves
+            every frequency in full.
+        adaptive_max_samples : int
+            full solves per driven port at most (default 20)
+        adaptive_memory : int
+            samples in a row within ``adaptive_tol`` that end the sweep
+            (default 2)
 
         Returns
         -------
@@ -147,7 +166,9 @@ class ProblemFD:
         """
         self._native = _NativeSimulation(
             self._fem_mesh, self._geometry._native.model(),
-            [float(f) for f in frequencies], order=order)
+            [float(f) for f in frequencies], order=order,
+            adaptive_tol=adaptive_tol, adaptive_max_samples=adaptive_max_samples,
+            adaptive_memory=adaptive_memory)
         # The native callback is (freq_idx, freq, s_matrix). Compose an optional
         # user `on_frequency` with the UI's per-frequency streaming callback.
         from rapidfem.ui import capture as _show_capture

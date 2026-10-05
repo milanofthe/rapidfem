@@ -410,6 +410,8 @@ impl Port for SurfaceImpedance {
     /// γ = j·k₀·Z₀/Zs.
     fn get_gamma(&self, exc: &Excitation) -> C64 { sheet_gamma(exc, self.surface_impedance(exc)) }
 
+    fn robin_is_scalar(&self) -> bool { self.edges.is_none() || self.zs.is_some() || self.sheet }
+
     /// The edge-corrected admittance tensor of the `k`-th face triangle
     /// (see [`crate::sibc_edge`]); `None` where the scalar γ holds: an
     /// explicit Zs, a sheet, a conductor under 3 δ across, a triangle away

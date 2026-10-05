@@ -45,6 +45,9 @@ pub struct SweepResult {
     pub n_driven: usize,
     /// Total wall-clock for the sweep (s).
     pub solve_time_s: f64,
+    /// The frequencies solved in full: every frequency of a full sweep, the
+    /// samples of an adaptive one.
+    pub full_solves: Vec<f64>,
 }
 
 /// Frequency-independent context for per-frequency S-parameter extraction.
@@ -67,6 +70,9 @@ pub struct FdSettings {
     pub order: OrderPolicy,
     /// `(target frequency in Hz, number of modes)` of an eigenmode analysis.
     pub eigenmode: Option<(f64, usize)>,
+    /// An adaptive sweep: full solves at a few frequencies, the rest from a
+    /// reduced model ([`crate::adaptive`]); `None` solves every frequency.
+    pub adaptive: Option<crate::adaptive::AdaptiveSettings>,
 }
 
 /// Simulation context: a mesh, the model placed on it, the settings, and the
@@ -220,6 +226,7 @@ impl Simulation {
         let mut all_sparams: Vec<Vec<Vec<C64>>> = Vec::with_capacity(frequencies.len());
         let t0 = web_time::Instant::now();
         let results;
+        let full_solves;
         {
             let mut on_solve = |fi: usize, freq: f64, sr: &crate::assembly::SolveResult| -> bool {
                 let t = web_time::Instant::now();
@@ -232,17 +239,24 @@ impl Simulation {
                 all_sparams.push(s);
                 keep_going
             };
-            results = crate::assembly::frequency_sweep(
+            let mut sys = crate::assembly::DrivenSystem::new(
                 &self.mesh,
                 &self.basis,
                 &port_dyn,
                 &port_tri_refs,
                 &self.pec_tris,
-                &frequencies,
+                frequencies[0],
                 self.materials_opt(),
                 self.pml_opt(),
-                Some(&mut on_solve),
-            )?;
+            );
+            (results, full_solves) = match &self.settings.adaptive {
+                Some(a) => crate::adaptive::adaptive_sweep(&mut sys, &frequencies, a, Some(&mut on_solve))?,
+                None => {
+                    let r = crate::assembly::frequency_sweep(&mut sys, &frequencies, Some(&mut on_solve))?;
+                    let solved = frequencies[..r.len()].to_vec();
+                    (r, solved)
+                }
+            };
         }
         let solve_time_s = t0.elapsed().as_secs_f64();
         eprintln!("  S-parameters extracted in {extract_ms:.1}ms (context {ctx_ms:.1}ms)");
@@ -264,6 +278,7 @@ impl Simulation {
             port_impedances,
             n_driven,
             solve_time_s,
+            full_solves,
         })
     }
 

@@ -1173,20 +1173,45 @@ impl Geometry {
 
     /// Tagged face groups (selections) and volume groups (objects) as the
     /// B-rep faces and regions they currently hold.
+    ///
+    /// A region holds one material: where objects of several of the
+    /// `materials` tags share a region (fused solids, each filled on its
+    /// own), it goes to the one in front (higher priority, or equal and
+    /// added later). Other volume groups (a PML) keep every region of their
+    /// objects.
     pub fn groups(
         &self,
         faces: &[(i32, Vec<FaceSel>)],
         volumes: &[(i32, Vec<ObjId>)],
+        materials: &[i32],
     ) -> Result<(Vec<Group>, Vec<Group>), String> {
         let mut fg = Vec::with_capacity(faces.len());
         for (tag, sels) in faces {
             fg.push(Group { tag: *tag, ids: self.resolve(sels)?.iter().map(|f| f.id).collect() });
         }
+        // region -> (priority, object, material tag) of the object in front
+        let mut owner: BTreeMap<u32, (u64, ObjId, i32)> = BTreeMap::new();
+        for (tag, objs) in volumes.iter().filter(|(t, _)| materials.contains(t)) {
+            for &o in objs {
+                let key = (self.objects[o].priority, o, *tag);
+                if let Some(r) = self.region(o)? {
+                    let e = owner.entry(r).or_insert(key);
+                    if (key.0, key.1) > (e.0, e.1) {
+                        *e = key;
+                    }
+                }
+            }
+        }
         let mut vg = Vec::with_capacity(volumes.len());
         for (tag, objs) in volumes {
             let mut ids = Vec::new();
             for &o in objs {
-                ids.extend(self.region(o)?);
+                if let Some(r) = self.region(o)? {
+                    let mine = !materials.contains(tag) || owner.get(&r).is_some_and(|e| e.2 == *tag);
+                    if mine && !ids.contains(&r) {
+                        ids.push(r);
+                    }
+                }
             }
             vg.push(Group { tag: *tag, ids });
         }

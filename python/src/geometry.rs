@@ -1128,7 +1128,8 @@ impl PyGeometry {
                 (*tag, objects)
             })
             .collect();
-        self.inner.groups(&faces, &volumes).map_err(err)
+        let materials: Vec<i32> = t.materials.iter().flatten().copied().collect();
+        self.inner.groups(&faces, &volumes, &materials).map_err(err)
     }
 }
 

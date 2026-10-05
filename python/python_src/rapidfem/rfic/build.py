@@ -88,6 +88,7 @@ def build(
     pass_t_top: float | None = None,
     conformal_over: str | None = None,
     boundary: str = "abc",
+    via_merge: float | None = None,
 ) -> BuiltModel:
     """Build a solve-ready FEM model from a GDS and a full process stack.
 
@@ -138,23 +139,29 @@ def build(
         Pass a `MeshSpec` to take full control instead.
     passivation : {"planar", "conformal", "none"}
         "planar" keeps the stackup-XML sheet (the gds2palace / Momentum
-        approximation). "conformal" models the real deposition: the oxide
-        stops at the top metal's bottom, the passivation drapes over the
-        exposed metal (``pass_t_top`` on top and field, ``pass_t_side`` on
-        the sidewalls) with air beyond: the sheet and the metal footprint
-        grown by ``pass_t_side``, the conductors carving the metal out.
-        "none" drops the sheet.
+        approximation). "conformal" models the real deposition: the
+        dielectrics the XML puts above the exposed metal drape over it, each
+        in its own material, with air beyond. In the field they lie on the
+        metal's bottom level, over the metal on its footprint grown by
+        ``pass_t_side``, and the first of them coats the sidewalls
+        (``pass_t_side`` wide, the metal's height). "none" drops the sheet.
     pass_t_side : float
-        Sidewall passivation thickness for the conformal mode.
+        Sidewall coating thickness for the conformal mode.
     pass_t_top : float, optional
-        Top/field passivation thickness; defaults to the XML sheet's own
-        thickness.
+        Thickness of the passivation sheet (the topmost dielectric under
+        the air) in the conformal mode; defaults to the XML's.
     conformal_over : str, optional
         Layer name the passivation drapes over; defaults to the topmost
         metal present in the stack.
     boundary : {"abc", "pml"}
         Outer termination: first-order absorbing boundary (default), or a
         PML declared on each of the six air-shell boxes.
+    via_merge : float, optional
+        Merge the cells of every via array closer than this (in metres) into
+        one block, as gds2palace's ``merge_polygon_size``: each cell grown by
+        half the spacing, the union shrunk back. The block's conductivity is
+        scaled by the fraction of it the cells fill (gds2palace's fill-factor
+        correction). ``None`` (default) meshes every cell.
 
     Returns
     -------
@@ -167,7 +174,7 @@ def build(
         air=air, air_top=air_top, pec_floor=pec_floor,
         conductor_model=conductor_model, band=band, mesh=mesh,
         passivation=passivation, pass_t_side=pass_t_side, pass_t_top=pass_t_top,
-        conformal_over=conformal_over, boundary=boundary)
+        conformal_over=conformal_over, boundary=boundary, via_merge=via_merge)
     for w in b["warnings"]:
         warnings.warn(w, stacklevel=2)
     g = Geometry._adopt(native)

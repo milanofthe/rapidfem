@@ -74,7 +74,7 @@ fn named<'py>(py: Python<'py>, items: &[(String, Vec<ObjId>)]) -> PyResult<Bound
 /// geometry and a dict of what was built (`conductors`, `slabs`,
 /// `air_shell`, `ports`, `footprint`, `warnings`).
 #[pyfunction]
-#[pyo3(signature = (gds, stack, *, top_cell, ports, margin, air, air_top, pec_floor, conductor_model, band, mesh, passivation, pass_t_side, pass_t_top, conformal_over, boundary))]
+#[pyo3(signature = (gds, stack, *, top_cell, ports, margin, air, air_top, pec_floor, conductor_model, band, mesh, passivation, pass_t_side, pass_t_top, conformal_over, boundary, via_merge))]
 #[allow(clippy::too_many_arguments)]
 pub fn rfic_build<'py>(
     py: Python<'py>,
@@ -94,6 +94,7 @@ pub fn rfic_build<'py>(
     pass_t_top: Option<f64>,
     conformal_over: Option<String>,
     boundary: String,
+    via_merge: Option<f64>,
 ) -> PyResult<(PyGeometry, Bound<'py, PyDict>)> {
     let opts = build::Options {
         top_cell,
@@ -114,6 +115,7 @@ pub fn rfic_build<'py>(
         pass_t_top,
         conformal_over,
         boundary,
+        via_merge,
     };
     let mut g = PyGeometry::fresh(None, true);
     let built = g.build(py, |scene| build::build(scene, &gds, &stack, &opts))?;
@@ -147,7 +149,7 @@ pub fn rfic_from_gds(
 ) -> PyResult<(PyGeometry, String)> {
     let layout = gds::read(&path, top_cell.as_deref()).map_err(PyValueError::new_err)?;
     let mut g = PyGeometry::fresh(None, true);
-    g.build(py, |scene| build::extrude_layout(scene, &layout, &stack, bbox, merge, thin_conductors))?;
+    g.build(py, |scene| build::extrude_layout(scene, &layout, &stack, bbox, merge, thin_conductors, None).map(|(layers, _)| layers))?;
     Ok((g, layout.cell))
 }
 

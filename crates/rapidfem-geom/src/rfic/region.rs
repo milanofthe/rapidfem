@@ -2,8 +2,8 @@
 //
 // Copyright (C) 2024-2026 Milan Rother and rapidfem contributors
 
-//! Planar regions of a layout: polygon sets with holes, their union and
-//! outward offset, by i_overlay. A region is a list of
+//! Planar regions of a layout: polygon sets with holes, their union,
+//! difference and offset, by i_overlay, and the via-array merge built on them. A region is a list of
 //! shapes, a shape its outer contour followed by its holes.
 
 use i_overlay::core::fill_rule::FillRule;
@@ -24,6 +24,11 @@ fn overlay(a: &Region, b: &Region, rule: OverlayRule) -> Region {
 /// The union of possibly overlapping polygons.
 pub fn union(r: &Region) -> Region {
     overlay(r, &Region::new(), OverlayRule::Union)
+}
+
+/// `a` without `b`.
+pub fn difference(a: &Region, b: &Region) -> Region {
+    overlay(a, b, OverlayRule::Difference)
 }
 
 /// Twice the signed area of a contour (positive counter-clockwise).
@@ -75,6 +80,58 @@ pub fn offset(r: &Region, d: f64) -> Region {
     union(&parts)
 }
 
+/// The region shrunk inward by `d` (mitered): its complement in a frame
+/// around it, grown by `d`, taken away.
+pub fn shrink(r: &Region, d: f64) -> Region {
+    let [x0, y0, x1, y1] = bbox(r);
+    let m = 2.0 * d;
+    let frame: Region = vec![vec![vec![[x0 - m, y0 - m], [x1 + m, y0 - m], [x1 + m, y1 + m], [x0 - m, y1 + m]]]];
+    difference(r, &offset(&difference(&frame, r), d))
+}
+
+/// The area of a shape (outer contour minus its holes).
+fn area(shape: &[Vec<P2>]) -> f64 {
+    let a = |c: &Vec<P2>| signed_area2(c).abs() / 2.0;
+    shape.first().map_or(0.0, a) - shape.iter().skip(1).map(a).sum::<f64>()
+}
+
+fn inside(p: P2, c: &[P2]) -> bool {
+    let mut odd = false;
+    for k in 0..c.len() {
+        let (a, b) = (c[k], c[(k + 1) % c.len()]);
+        if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+            odd = !odd;
+        }
+    }
+    odd
+}
+
+/// The via cells closer than `spacing` to each other merged into one shape
+/// per array, as gds2palace's `merge_via_array` does: each cell grown by
+/// half the spacing plus 0.01 um, the union shrunk back. Each shape comes with
+/// its fill factor, the area of the cells inside it over its own area.
+pub fn merge_vias(cells: &[Vec<P2>], spacing: f64) -> Vec<(Vec<Vec<P2>>, f64)> {
+    let o = spacing / 2.0 + 0.01e-6;
+    let r: Region = cells.iter().map(|c| vec![c.clone()]).collect();
+    let merged = shrink(&offset(&union(&r), o), o);
+    merged
+        .into_iter()
+        .map(|shape| {
+            let covered: f64 = cells
+                .iter()
+                .filter(|c| {
+                    let n = c.len() as f64;
+                    let centre = [c.iter().map(|p| p[0]).sum::<f64>() / n, c.iter().map(|p| p[1]).sum::<f64>() / n];
+                    inside(centre, &shape[0]) && !shape[1..].iter().any(|h| inside(centre, h))
+                })
+                .map(|c| signed_area2(c).abs() / 2.0)
+                .sum();
+            let ff = (covered / area(&shape)).min(1.0);
+            (shape, ff)
+        })
+        .collect()
+}
+
 /// The axis-aligned bounding box `(xmin, ymin, xmax, ymax)` of a region.
 pub fn bbox(r: &Region) -> [f64; 4] {
     let mut b = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
@@ -99,6 +156,24 @@ mod tests {
         assert!((area(&grown) - 1.44).abs() < 1e-6, "{}", area(&grown));
         let cw: Region = vec![vec![vec![[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]]]];
         assert!((area(&offset(&cw, 0.1)) - 1.44).abs() < 1e-6, "{}", area(&offset(&cw, 0.1)));
+    }
+
+    #[test]
+    fn a_via_array_merges_into_one_block_with_its_fill_factor() {
+        // 3 x 3 cells of 1 x 1 at a pitch of 2: one 5 x 5 block, 9/25 filled
+        let cells: Vec<Vec<P2>> = (0..9)
+            .map(|k| {
+                let (x, y) = (2.0 * (k % 3) as f64, 2.0 * (k / 3) as f64);
+                vec![[x, y], [x + 1.0, y], [x + 1.0, y + 1.0], [x, y + 1.0]]
+            })
+            .collect();
+        let merged = merge_vias(&cells, 1.5);
+        assert_eq!(merged.len(), 1);
+        let (shape, ff) = &merged[0];
+        assert!((super::area(shape) - 25.0).abs() < 1e-6, "{}", super::area(shape));
+        assert!((ff - 9.0 / 25.0).abs() < 1e-6, "{ff}");
+        // a spacing below the gap leaves the cells apart
+        assert_eq!(merge_vias(&cells, 0.5).len(), 9);
     }
 
     #[test]

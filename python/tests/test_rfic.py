@@ -255,7 +255,7 @@ def test_build_passivation_and_boundary_modes(mini_gds, passv, boundary):
     )
     g = model.geometry
     if passv == "conformal":
-        # the sheet and the grown TopMetal2 footprint raised over it
+        # the passivation in the field and over the grown TopMetal2 footprint
         assert len(model.slabs["Passive"]) >= 2
         assert len(model.slabs["AIR"]) == 1
     elif passv == "none":
@@ -267,6 +267,10 @@ def test_build_passivation_and_boundary_modes(mini_gds, passv, boundary):
         assert len(pmls) == 6 and not abcs
     g.mesh()
     assert g.mesh_stats.n_tets > 0
+    # every material holds tets: none is covered by one in front of it
+    empty = [n for n, c in g.mesh_stats.groups.items()
+             if n.startswith(("air", "dielectric")) and c == 0]
+    assert not empty, empty
 
 
 # ── FEM-JSON bridge ─────────────────────────────────────────────────────────

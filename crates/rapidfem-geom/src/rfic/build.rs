@@ -164,6 +164,10 @@ pub struct Options {
     pub conformal_over: Option<String>,
     /// "abc" or "pml".
     pub boundary: String,
+    /// Merge the cells of every via array closer than this (gds2palace's
+    /// `merge_polygon_size`) into one block, its conductivity scaled by the
+    /// fraction of it the cells fill.
+    pub via_merge: Option<f64>,
 }
 
 impl Default for Options {
@@ -183,6 +187,7 @@ impl Default for Options {
             pass_t_top: None,
             conformal_over: None,
             boundary: "abc".into(),
+            via_merge: None,
         }
     }
 }
@@ -243,10 +248,15 @@ fn material_for(mat: &StackMaterial, maxh: Option<f64>) -> super::Mat {
     }
 }
 
+/// The layers of [`extrude_layout`] in order of appearance with their
+/// objects, and the fill factor of every merged via block.
+pub type Extruded = (Vec<(String, Vec<ObjId>)>, BTreeMap<ObjId, f64>);
+
 /// Every stack layer of the layout as prisms at its height (sheets at its
 /// bottom with `thin_conductors` for metals), named after the layer; with
-/// `merge` the prisms of one layer fuse into one conductor. Returns the
-/// layers in order of appearance with their objects.
+/// `merge` the prisms of one layer fuse into one conductor. With
+/// `via_merge` the cells of a via layer closer than that merge into one
+/// block per array ([`region::merge_vias`]), which carries its fill factor.
 pub fn extrude_layout(
     scene: &mut Scene,
     layout: &Layout,
@@ -254,7 +264,8 @@ pub fn extrude_layout(
     crop: Option<[f64; 4]>,
     merge: bool,
     thin_conductors: bool,
-) -> Result<Vec<(String, Vec<ObjId>)>, String> {
+    via_merge: Option<f64>,
+) -> Result<Extruded, String> {
     let mut per_layer: Vec<(&PdkLayer, Vec<&[[f64; 2]]>)> = Vec::new();
     for p in &layout.polygons {
         let Some(layer) = stack.by_gds(p.layer, p.datatype) else { continue };
@@ -270,9 +281,21 @@ pub fn extrude_layout(
         }
     }
     let mut out = Vec::new();
+    let mut fill = BTreeMap::new();
     for (layer, polys) in per_layer {
         let sheet = thin_conductors && layer.r#type == "metal";
         let mut objs = Vec::new();
+        if let (Some(spacing), "via") = (via_merge, layer.r#type.as_str()) {
+            let cells: Vec<Vec<[f64; 2]>> = polys.iter().map(|p| p.to_vec()).collect();
+            for (shape, ff) in region::merge_vias(&cells, spacing) {
+                let id = scene.prism(&shape, layer.z, Some(layer.thickness), None, None)?;
+                scene.geo.set_name(id, Some(layer.name.clone()));
+                fill.insert(id, ff);
+                objs.push(id);
+            }
+            out.push((layer.name.clone(), objs));
+            continue;
+        }
         for pts in polys {
             if pts.len() < 3 {
                 return Err(format!("a polygon on layer {:?} collapsed to {} unique vertices", layer.name, pts.len()));
@@ -290,7 +313,7 @@ pub fn extrude_layout(
         }
         out.push((layer.name.clone(), objs));
     }
-    Ok(out)
+    Ok((out, fill))
 }
 
 /// The rectangles on a marker layer as (a0, a1, position, axis): the wide
@@ -366,7 +389,7 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
 
     // ── conductors from the GDS ─────────────────────────────────────────
     let layout = gds::read(gds_path, o.top_cell.as_deref())?;
-    let extruded = extrude_layout(scene, &layout, stack, None, true, false)?;
+    let (extruded, fill) = extrude_layout(scene, &layout, stack, None, true, false, o.via_merge)?;
     // in stack order, bottom-up
     let mut conductors: Vec<(String, Vec<ObjId>)> = Vec::new();
     for l in &stack.layers {
@@ -409,11 +432,14 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
             continue;
         }
         if let Some(cl) = &conf_layer
-            && d.z <= cl.z
-            && cl.z < d.z_top()
+            && i != last
         {
+            if d.z >= cl.z {
+                // above the exposed metal's bottom: draped over it below
+                continue;
+            }
             // the oxide stops at the exposed metal's bottom
-            thickness = cl.z - d.z;
+            thickness = thickness.min(cl.z - d.z);
         }
         if i == last && mat.is_air() {
             // the topmost air slab, capped at air_top (the XML often carries
@@ -460,21 +486,38 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
         built.slabs.push((d.name.clone(), boxes));
     }
 
-    // ── conformal passivation shell and the air over it ─────────────────
-    // The shell is the passivation sheet over the footprint and the metal
-    // footprint grown by the sidewall thickness, raised to the shell top;
-    // the conductors, in front of everything, carve the metal out of it and
-    // leave the sidewall ring and the cap. Only the grown outline is new
+    // ── conformal passivation and the air over it ───────────────────────
+    // The dielectrics the planar stack puts above the exposed metal drape
+    // over it, as deposited: in the field they lie on the metal's bottom
+    // level, over the metal on its footprint grown by the sidewall thickness,
+    // and that grown footprint holds the first of them over the metal's
+    // height (the sidewall coating). Built as overlapping solids, later wins:
+    // the air, the field layers, the sidewall, the covers; the conductors, in
+    // front of everything, carve the metal out. Only the grown outline is new
     // geometry and nothing has to meet it: the metal edges stay the
     // conductors' own.
-    if let (Some(cl), Some(p)) = (&conf_layer, pass_slab) {
-        let pass = &stack.dielectrics[p];
-        let pass_mat = stack.slab_material(pass);
+    // the conformal objects in the order they overlap, the later in front
+    let mut conformal: Vec<ObjId> = Vec::new();
+    if let Some(cl) = &conf_layer {
         let air_slab = &stack.dielectrics[last];
-        let h_pass = mesh.slab_h(&pass.name);
         let h_air = mesh.h(mesh.global_h);
-        let t_top = pass_t_top.unwrap();
         let (zm_lo, zm_hi) = (cl.z, cl.z_top());
+        let draped: Vec<(&str, StackMaterial, f64)> = stack
+            .dielectrics
+            .iter()
+            .enumerate()
+            .filter(|&(i, d)| i != last && d.z_top() > zm_hi)
+            .map(|(i, d)| {
+                let t = match (Some(i) == pass_slab, pass_t_top) {
+                    (true, Some(t)) => t,
+                    _ => d.z_top() - d.z.max(zm_hi),
+                };
+                (d.name.as_str(), stack.slab_material(d), t)
+            })
+            .collect();
+        if draped.is_empty() {
+            return Err(format!("no dielectric above {} to drape over it", cl.name));
+        }
         let metal: Region = region::union(
             &layout.on(cl.gds, Some(cl.datatype)).map(|q| vec![q.points.clone()]).collect(),
         );
@@ -482,15 +525,31 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
             return Err(format!("no polygons on GDS layer {}/{} for the conformal passivation", cl.gds, cl.datatype));
         }
         let expanded = region::offset(&metal, o.pass_t_side);
-        // the air first, so the shell carves it
-        let z_air = zm_lo + t_top;
-        let air = scene.geo.add_solid(Cuboid::new([wx, wy, z_top - z_air]).at([x0, y0, z_air]), Some(h_air), false);
+        let air = scene.geo.add_solid(Cuboid::new([wx, wy, z_top - zm_lo]).at([x0, y0, zm_lo]), Some(h_air), false);
         scene.fill(&[air], super::Mat::air());
-        let mut shell = vec![scene.geo.add_solid(Cuboid::new([wx, wy, t_top]).at([x0, y0, zm_lo]), Some(h_pass), false)];
-        shell.extend(scene.prisms(&expanded, zm_lo, zm_hi + t_top - zm_lo, None, Some(h_pass))?);
-        scene.geo.fuse(shell.clone());
-        scene.fill(&shell, material_for(&pass_mat, None));
-        built.slabs.push((pass.name.clone(), shell));
+        let mut parts: Vec<Vec<ObjId>> = Vec::new();
+        let mut z = zm_lo;
+        for (name, _, t) in &draped {
+            parts.push(vec![scene.geo.add_solid(Cuboid::new([wx, wy, *t]).at([x0, y0, z]), Some(mesh.slab_h(name)), false)]);
+            z += t;
+        }
+        conformal.push(air);
+        conformal.extend(parts.iter().flatten());
+        let side = scene.prisms(&expanded, zm_lo, zm_hi - zm_lo, None, Some(mesh.slab_h(draped[0].0)))?;
+        conformal.extend(&side);
+        parts[0].extend(side);
+        let mut z = zm_hi;
+        for ((name, _, t), ids) in draped.iter().zip(parts.iter_mut()) {
+            let cover = scene.prisms(&expanded, z, *t, None, Some(mesh.slab_h(name)))?;
+            conformal.extend(&cover);
+            ids.extend(cover);
+            z += t;
+        }
+        for ((name, mat, _), ids) in draped.iter().zip(parts) {
+            scene.geo.fuse(ids.clone());
+            scene.fill(&ids, material_for(mat, None));
+            built.slabs.push((name.to_string(), ids));
+        }
         built.slabs.push((air_slab.name.clone(), vec![air]));
     }
 
@@ -526,20 +585,29 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
         {
             h = h.min(layer.thickness / 3.0).min(skin_depth(f_hi, layer.sigma));
         }
+        // one material per distinct value: the objects of a layer share it
+        let mut fills: Vec<(super::Mat, Vec<ObjId>)> = Vec::new();
         for &id in ids {
             // a PEC or SIBC conductor becomes a hole and takes no material
             let m = match t {
                 "volume" => {
-                    let s = layer.sigma;
+                    // a merged via block conducts as much as the cells in it
+                    let s = layer.sigma * fill.get(&id).copied().unwrap_or(1.0);
                     Some(super::Mat { cond_diag: Some([VIA_LATERAL_FACTOR * s, VIA_LATERAL_FACTOR * s, s]), ..super::Mat::dielectric(1.0) })
                 }
                 "volume_iso" => Some(super::Mat { conductivity: layer.sigma, ..super::Mat::dielectric(1.0) }),
                 _ => None,
             };
             if let Some(m) = m {
-                scene.fill(&[id], m);
+                match fills.iter_mut().find(|(f, _)| *f == m) {
+                    Some((_, v)) => v.push(id),
+                    None => fills.push((m, vec![id])),
+                }
             }
             scene.geo.set_object_maxh(id, Some(h));
+        }
+        for (m, v) in fills {
+            scene.fill(&v, m);
         }
     }
 
@@ -577,7 +645,14 @@ pub fn build(scene: &mut Scene, gds_path: &Path, stack: &Stack, o: &Options) -> 
     }
 
     // ── one conformal assembly, the later objects on top ─────────────────
-    let mut front: Vec<ObjId> = built.slabs.iter().flat_map(|(_, ids)| ids.iter().copied()).skip(1).collect();
+    let mut front: Vec<ObjId> = built
+        .slabs
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .filter(|id| !conformal.contains(id))
+        .skip(1)
+        .collect();
+    front.extend(&conformal);
     front.extend(&built.air_shell);
     front.extend(conductors.iter().flat_map(|(_, ids)| ids.iter().copied()));
     front.extend(plates.iter().map(|(id, _)| *id));

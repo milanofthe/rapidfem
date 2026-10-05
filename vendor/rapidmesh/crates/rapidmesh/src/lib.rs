@@ -21,7 +21,7 @@
 //! let mesh = g.mesh(&MeshOptions::default())?;
 //! let sets = mesh.sets();
 //! println!("{mesh}: {} tets in the substrate", sets.cells["substrate"].len());
-//! mesh.write_msh("cell.msh")?;
+//! mesh.write_msh("cell.msh", rapidmesh::Order::Linear)?;
 //! # Ok::<(), rapidmesh::Error>(())
 //! ```
 
@@ -33,14 +33,15 @@ mod msh;
 pub mod shapes;
 
 pub use features::{EdgeCut, EdgePick};
-pub use fem::{SecondOrder, TET10_EDGES};
-pub use geometry::{Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions};
+pub use fem::{Order, SecondOrder, TET10_EDGES};
+pub use geometry::{read_step, Geometry, Level, MeshOptions, Scope, Solid, SurfaceOptions};
 pub use geometry::{Object, SheetRef, Transform};
 pub use mesh::{Diagnostics, Labels, Mesh, Run, Sets, SolidInfo, SurfaceMesh, TetView, TriView};
 pub use msh::{load_msh, read_msh};
 pub use rapidmesh_brep::{EdgeFilter, EdgeKind, FaceFilter, Topology};
 pub use rapidmesh_exact::log::{Event, Level as LogLevel};
-pub use rapidmesh_geom::{polygon_union, TaggedPlc};
+pub use rapidmesh_geom::{polygon_union, BoolOp, Surface, TaggedPlc};
+pub use rapidmesh_step::{Body, Step};
 pub use rapidmesh_tet::Fidelity;
 pub use rapidmesh_tet::PeriodicPair;
 pub use rapidmesh_tet::{dorfler_mark, Dorfler, PointClass, QualityStats, SurfaceFace, TetMesh};

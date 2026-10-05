@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 rapidmesh-exact.workspace = true
 rapidmesh-geom.workspace = true
 rapidmesh-csg.workspace = true

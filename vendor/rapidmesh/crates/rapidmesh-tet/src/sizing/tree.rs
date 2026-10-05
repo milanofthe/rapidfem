@@ -10,12 +10,13 @@ use crate::params::MeshParams;
 use crate::simplex::circumradius;
 use crate::sizing::CurvatureLaw;
 use rapidmesh_brep::index::{FacetBvh, Targets};
-use rapidmesh_brep::Surface;
 use rapidmesh_csg::classify::{ray_target, segment_crosses_triangle, RAY_TARGETS};
 use rapidmesh_csg::Tri;
+use rapidmesh_exact::vector::{dist, len, V3};
 use rapidmesh_exact::{Point3, Prepared3};
-use rapidmesh_geom::vec3::{dist, V3};
-use rapidmesh_geom::{SurfaceKind, TaggedPlc};
+use rapidmesh_geom::Surface;
+use rapidmesh_geom::TaggedPlc;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::constants::DOMAIN_MAX_DEPTH as MAX_DEPTH;
@@ -66,6 +67,7 @@ impl DomainTree {
         params: &MeshParams,
         facet_surf: &[f64],
         facet_law: &[CurvatureLaw],
+        edge_tol: &FxHashMap<[[u64; 3]; 2], f64>,
     ) -> DomainTree {
         let mut lo = [f64::MAX; 3];
         let mut hi = [f64::MIN; 3];
@@ -91,11 +93,7 @@ impl DomainTree {
         } else {
             diag / 8.0
         };
-        let grading = if params.grading > 0.0 {
-            params.grading
-        } else {
-            0.5
-        };
+        let grading = params.grade();
 
         let region_of = |p: V3| -> u32 { classify(&walls, bbox, p) };
         let region_cap = |r: u32| -> f64 {
@@ -139,9 +137,10 @@ impl DomainTree {
                 .unwrap_or(CurvatureLaw::Chord(params.tol_surf))
         };
         let curvature_target = |i: usize| -> f64 {
-            let kind = &plc.surfaces[plc.surface_refs[i].0 as usize];
-            let r = Surface::curved(kind)
-                .map_or(f64::INFINITY, |s| s.curvature_radius(facet_centroid(i)));
+            let r = match &plc.surfaces[plc.surface_refs[i].0 as usize] {
+                Some(s) if !s.is_plane() => s.curvature_radius(facet_centroid(i)),
+                _ => f64::INFINITY,
+            };
             law_of(i).surface(r)
         };
 
@@ -182,7 +181,7 @@ impl DomainTree {
             let ct = {
                 let kind = &plc.surfaces[plc.surface_refs[i].0 as usize];
                 let ct = curvature_target(i);
-                if matches!(kind, rapidmesh_geom::SurfaceKind::Discrete(_)) {
+                if matches!(kind, Some(Surface::Discrete(_))) {
                     ct.max(base * 0.25)
                 } else {
                     ct
@@ -207,11 +206,47 @@ impl DomainTree {
                 .unzip()
         };
 
+        // The edges take the resolved bulk size, not `params.edge_cap()` raw: with
+        // `maxh = INFINITY` (per-dimension caps only) the raw cap is infinite,
+        // and the curvature baseline walk inside then never accumulates enough
+        // arc length: on a CLOSED rim loop (a cylinder rim, where every vertex
+        // has exactly two neighbours and no junction ever breaks the walk) it
+        // circles forever.
+        // An edge given a tolerance of its own takes it (as its samples do);
+        // else with a geometric error the finest law of its facets, else the
+        // chord tolerance of the edges.
+        let edge_law = |ends: [V3; 2], facets: &[u32], r: f64| -> f64 {
+            if let Some(&tol) = edge_tol.get(&segment_key(ends)) {
+                CurvatureLaw::Chord(tol).curve(r)
+            } else if params.geom_error > 0.0 {
+                facets
+                    .iter()
+                    .map(|&f| law_of(f as usize).curve(r))
+                    .fold(f64::INFINITY, f64::min)
+            } else {
+                CurvatureLaw::Chord(params.tol_edge).curve(r)
+            }
+        };
+        let edge_segments: Vec<(Tri, f64)> =
+            edge_sizing_segments(plc, &edge_law, params.edge_cap().min(maxh));
         // The finest volume target anywhere: the base spacing `s0` of the
         // sizing tree.
         let mut s0 = targets.iter().copied().fold(f64::MAX, f64::min);
         for &(_, sh) in &params.size_points {
             s0 = s0.min(sh);
+        }
+        // An edge given a finer tolerance than the surfaces sizes the tree
+        // too: else its leaves are too coarse to carry the size down to it.
+        // (Where only its curvature makes it finer, the facet targets
+        // around it resolve the tree well enough.)
+        let finer = |ends: [V3; 2]| match edge_tol.get(&segment_key(ends)) {
+            Some(&tol) => tol < params.tol_surf,
+            None => !(params.geom_error > 0.0) && params.tol_edge < params.tol_surf,
+        };
+        for (t, h) in &edge_segments {
+            if finer([t.v[0], t.v[1]]) {
+                s0 = s0.min(*h);
+            }
         }
         // The global volume cap bounds it too, so the interior refines under
         // it, not only the band along the surface.
@@ -231,26 +266,6 @@ impl DomainTree {
         // (caps and curvature, above), the curved feature edges (their
         // curvature, as segments: a degenerate triangle in a `FacetBvh`) and
         // the point sources.
-        // The edges take the resolved bulk size, not `params.edge_cap()` raw: with
-        // `maxh = INFINITY` (per-dimension caps only) the raw cap is infinite,
-        // and the curvature baseline walk inside then never accumulates enough
-        // arc length: on a CLOSED rim loop (a cylinder rim, where every vertex
-        // has exactly two neighbours and no junction ever breaks the walk) it
-        // circles forever.
-        // With a geometric error an edge takes the finest law of its facets,
-        // else the chord tolerance of the edges.
-        let edge_law = |facets: &[u32], r: f64| -> f64 {
-            if params.geom_error > 0.0 {
-                facets
-                    .iter()
-                    .map(|&f| law_of(f as usize).curve(r))
-                    .fold(f64::INFINITY, f64::min)
-            } else {
-                CurvatureLaw::Chord(params.tol_edge).curve(r)
-            }
-        };
-        let edge_segments: Vec<(Tri, f64)> =
-            edge_sizing_segments(plc, &edge_law, params.edge_cap().min(maxh));
         let edge_bvh = FacetBvh::build(&edge_segments.iter().map(|e| e.0).collect::<Vec<_>>());
         let edge_targets = Targets::new(&edge_bvh, edge_segments.iter().map(|e| e.1).collect());
 
@@ -340,17 +355,12 @@ impl DomainTree {
 /// already wins.
 fn edge_sizing_segments(
     plc: &TaggedPlc,
-    law: &dyn Fn(&[u32], f64) -> f64,
+    law: &dyn Fn([V3; 2], &[u32], f64) -> f64,
     maxh: f64,
 ) -> Vec<(Tri, f64)> {
-    use rustc_hash::FxHashMap;
     let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
-    let is_curved = |sid: u32| {
-        !matches!(
-            plc.surfaces[sid as usize],
-            SurfaceKind::Plane { .. } | SurfaceKind::Facets
-        )
-    };
+    let is_curved =
+        |sid: u32| !matches!(plc.surfaces[sid as usize], None | Some(Surface::Plane(_)));
 
     // Distinct analytic surfaces meeting along each undirected edge, and
     // the triangles on it.
@@ -385,10 +395,17 @@ fn edge_sizing_segments(
     let mut carrier: FxHashMap<u32, Surface> = FxHashMap::default();
     for (fi, t) in plc.triangles.iter().enumerate() {
         let s = plc.surface_refs[fi].0;
-        carrier.entry(s).or_insert_with(|| {
-            let corners = t.map(|v| plc.vertices[v as usize]);
-            Surface::from_kind(&plc.surfaces[s as usize], &corners)
-        });
+        if carrier.contains_key(&s) {
+            continue;
+        }
+        let corners = t.map(|v| plc.vertices[v as usize]);
+        let found = match &plc.surfaces[s as usize] {
+            Some(k) => Some(k.fitted(&corners)),
+            None => Surface::plane_of(&corners),
+        };
+        if let Some(c) = found {
+            carrier.insert(s, c);
+        }
     }
     // Edge-curve neighbours of each feature vertex (its polyline link), and
     // the analytic surfaces meeting along each feature edge, sorted: two
@@ -399,11 +416,17 @@ fn edge_sizing_segments(
         nbr.entry(a).or_default().push(b);
         nbr.entry(b).or_default().push(a);
     }
-    let curve_of = |a: u32, b: u32| -> Vec<u32> {
-        let mut s = edge_surf[&key(a, b)].clone();
-        s.sort_unstable();
-        s
-    };
+    // The surfaces of each feature edge, sorted once: the walks below ask
+    // for them at every step.
+    let curves: FxHashMap<(u32, u32), Vec<u32>> = feature
+        .iter()
+        .map(|&e| {
+            let mut s = edge_surf[&e].clone();
+            s.sort_unstable();
+            (e, s)
+        })
+        .collect();
+    let curve_of = |a: u32, b: u32| -> &[u32] { &curves[&key(a, b)] };
     // Project a point onto the intersection of the analytic surfaces meeting at
     // the edge by alternating projection (POCS) onto BOTH sides -- a plane via its
     // recovered geometry, a curved surface via its closest point. This pulls the faceted
@@ -412,13 +435,12 @@ fn edge_sizing_segments(
     // radius for a genuine curve) -- not the spurious tiny radius a faceted polyline
     // zigzag shows (the over-refinement that fanned out the borders).
     let pocs = |p: V3, sids: &[u32]| -> V3 {
-        let mut q = p;
-        for _ in 0..8 {
-            for &s in sids {
-                q = carrier[&s].closest(q).0;
-            }
+        let on: Vec<&Surface> = sids.iter().filter_map(|s| carrier.get(s)).collect();
+        match on[..] {
+            [] => p,
+            [s] => s.closest(p).0,
+            [a, b, ..] => a.meet(b, p, 1e-12 * (1.0 + len(p))),
         }
-        q
     };
     // Osculating radius at a vertex (only where it has exactly two neighbours -- a
     // smooth interior point; junctions/endpoints stay INFINITY). The radius is
@@ -472,29 +494,44 @@ fn edge_sizing_segments(
                 if curve_of(v, ns[1]) != sids {
                     return f64::INFINITY;
                 }
-                let a = walk(v, ns[0], &sids);
-                let b = walk(v, ns[1], &sids);
+                let a = walk(v, ns[0], sids);
+                let b = walk(v, ns[1], sids);
                 circumradius(
-                    pocs(plc.vertices[a as usize], &sids),
-                    pocs(plc.vertices[v as usize], &sids),
-                    pocs(plc.vertices[b as usize], &sids),
+                    pocs(plc.vertices[a as usize], sids),
+                    pocs(plc.vertices[v as usize], sids),
+                    pocs(plc.vertices[b as usize], sids),
                 )
             }
             _ => f64::INFINITY,
         }
     };
 
+    // Each feature vertex's radius once, in parallel (two projections onto
+    // the curve's surfaces per sample).
+    let radius: FxHashMap<u32, f64> = {
+        use rayon::prelude::*;
+        let mut verts: Vec<u32> = feature.iter().flat_map(|&(a, b)| [a, b]).collect();
+        verts.sort_unstable();
+        verts.dedup();
+        verts.par_iter().map(|&v| (v, vert_radius(v))).collect()
+    };
     let mut out: Vec<(Tri, f64)> = Vec::new();
     for &(a, b) in &feature {
-        let r = vert_radius(a).min(vert_radius(b));
+        let r = radius[&a].min(radius[&b]);
         if r.is_finite() {
             let va = plc.vertices[a as usize];
             let vb = plc.vertices[b as usize];
             // A degenerate tri (va, vb, va) is the segment va-vb for the BVH.
-            out.push((Tri::new(va, vb, va), law(&edge_tris[&(a, b)], r)));
+            out.push((Tri::new(va, vb, va), law([va, vb], &edge_tris[&(a, b)], r)));
         }
     }
     out
+}
+
+/// The key of a segment between two points, whichever way round.
+pub(crate) fn segment_key(ends: [V3; 2]) -> [[u64; 3]; 2] {
+    let [a, b] = ends.map(|p| p.map(f64::to_bits));
+    [a.min(b), a.max(b)]
 }
 
 /// The region containing `p`, by an exact ray cast against the walls.
@@ -661,6 +698,7 @@ mod tests {
             },
             &[],
             &[],
+            &Default::default(),
         );
         let h_at_point = t.h_at([2.0, 2.0, 2.0]);
         let h_away = t.h_at([2.0, 2.0, 3.5]);
@@ -693,6 +731,7 @@ mod tests {
             },
             &[],
             &[],
+            &Default::default(),
         );
         // h is finer inside the small cube than out in the bulk.
         assert!(t.h_at([4.0, 4.0, 4.0]) < t.h_at([0.5, 0.5, 0.5]));

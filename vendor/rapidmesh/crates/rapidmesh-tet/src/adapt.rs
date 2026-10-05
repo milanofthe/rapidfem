@@ -5,7 +5,7 @@
 //! sliver-free. SOLVE and ESTIMATE belong to the solver.
 
 use crate::mesh::SurfaceMesh;
-use rapidmesh_geom::vec3::{len, sub};
+use rapidmesh_exact::vector::{len, sub};
 
 /// The knobs of Dörfler marking and the refinement it asks for.
 #[derive(Clone, Copy, Debug)]

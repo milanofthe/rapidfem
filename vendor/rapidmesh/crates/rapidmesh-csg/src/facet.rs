@@ -48,23 +48,13 @@ impl PlanarFacet {
 
     /// Axis-aligned bounding box over all loops.
     pub fn bbox(&self) -> ([f64; 3], [f64; 3]) {
-        let mut lo = [f64::MAX; 3];
-        let mut hi = [f64::MIN; 3];
-        for loops in std::iter::once(&self.outer).chain(self.holes.iter()) {
-            for v in loops {
-                for k in 0..3 {
-                    lo[k] = lo[k].min(v[k]);
-                    hi[k] = hi[k].max(v[k]);
-                }
-            }
-        }
-        (lo, hi)
+        rapidmesh_exact::vector::bbox(std::iter::once(&self.outer).chain(&self.holes).flatten())
     }
 
     /// Approximate (f64) outward normal of the plane, from the outer loop's
     /// Newell area vector. Not unit length; sign follows the loop winding.
     pub fn normal(&self) -> [f64; 3] {
-        newell(&self.outer)
+        rapidmesh_exact::vector::newell(&self.outer)
     }
 
     /// A copy whose outer loop winds counterclockwise about `n` and whose
@@ -72,7 +62,7 @@ impl PlanarFacet {
     /// projection orientation from.
     pub fn wound_about(&self, n: [f64; 3]) -> PlanarFacet {
         let along = |l: &[[f64; 3]]| {
-            let m = newell(l);
+            let m = rapidmesh_exact::vector::newell(l);
             m[0] * n[0] + m[1] * n[1] + m[2] * n[2] > 0.0
         };
         let wind = |l: &Vec<[f64; 3]>, ccw: bool| {
@@ -118,11 +108,7 @@ impl PlanarFacet {
     /// projection (expansion arithmetic; the (u, v) plane matches orient2d's
     /// drop-axis convention).
     fn shoelace_sign(&self, axis: Axis) -> Sign {
-        let uv = |p: [f64; 3]| match axis {
-            Axis::X => [p[1], p[2]],
-            Axis::Y => [p[2], p[0]],
-            Axis::Z => [p[0], p[1]],
-        };
+        let uv = |p: [f64; 3]| axis.project(p);
         let mut acc = Expansion::from_f64(0.0);
         let m = self.outer.len();
         for i in 0..m {
@@ -203,21 +189,6 @@ impl PlanarFacet {
             .map(|i| Tri::new(p[0], p[i], p[i + 1]))
             .collect()
     }
-}
-
-/// The Newell area vector of a closed loop: normal to its plane, twice
-/// its area long, along the side it winds counterclockwise about.
-fn newell(p: &[[f64; 3]]) -> [f64; 3] {
-    let n = p.len();
-    let mut s = [0.0; 3];
-    for i in 0..n {
-        let a = p[i];
-        let b = p[(i + 1) % n];
-        s[0] += (a[1] - b[1]) * (a[2] + b[2]);
-        s[1] += (a[2] - b[2]) * (a[0] + b[0]);
-        s[2] += (a[0] - b[0]) * (a[1] + b[1]);
-    }
-    s
 }
 
 #[cfg(test)]

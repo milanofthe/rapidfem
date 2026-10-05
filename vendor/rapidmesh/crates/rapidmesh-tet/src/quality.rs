@@ -46,7 +46,7 @@ pub struct RegionQuality {
 }
 
 use crate::simplex::{radius_edge, tet_min_dihedral, tet_volume};
-use rapidmesh_geom::vec3::dist2;
+use rapidmesh_exact::vector::dist2;
 
 /// The quality statistics of a mesh, in one parallel pass over its tets.
 pub fn quality_stats(mesh: &TetMesh) -> QualityStats {

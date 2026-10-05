@@ -17,16 +17,15 @@
 //! the volume are the mesher's, so there is no half-edge/pcurve/shell/region
 //! machinery here.
 
-use rapidmesh_geom::vec3::V3;
+use rapidmesh_exact::vector::V3;
 use rapidmesh_geom::{FaceTag, RegionTag, Scene, TaggedPlc};
 use std::sync::Arc;
 
 pub mod build;
 pub mod index;
-pub mod surface;
 pub mod topology;
 
-pub use surface::Surface;
+use rapidmesh_geom::Surface;
 pub use topology::{
     extract_topology, EdgeFilter, EdgeKind, EdgeTopo, FaceFilter, FaceTopo, Topology,
 };
@@ -47,61 +46,41 @@ id!(SurfaceId);
 
 // ---- geometry (analytic) -------------------------------------------------
 
-/// An analytic edge curve. The edge also stores its on-PLC vertex chain
-/// (`Edge::verts`), so `Polyline` needs no data and `Intersection` uses the chain
-/// as the projection seed. The mesher evaluates these (it owns the curve / chart
-/// machinery); the B-rep only RECOGNISES and stores the form.
+/// The geometry of an edge. The edge also keeps the chain of PLC points it
+/// follows, from its first end to its last: a polyline edge is that chain,
+/// and the chain seeds the projection onto an intersection. The mesher
+/// evaluates these; the B-rep recognises and stores them.
 #[derive(Debug, Clone)]
 pub enum Curve {
-    /// Straight segment through `p0` with unit direction `dir`.
-    Line { p0: V3, dir: V3 },
-    /// Circle: center, unit `axis` (normal), `radius`, in-plane unit `x` axis.
-    Circle {
-        center: V3,
-        axis: V3,
-        radius: f64,
-        x: V3,
-    },
-    /// A 2D profile NURBS lifted to 3D on an extrusion frame at height `z` over the
-    /// parameter range `t`: point = `base + axis*z + u*profile(t).x + v*profile(t).y`.
-    /// Self-contained (the airfoil outline edge); the analytic curvature drives the
-    /// sizing, tessellation-independent.
-    Profile {
-        profile: Arc<rapidmesh_geom::nurbs::NurbsCurve>,
-        base: V3,
-        u: V3,
-        v: V3,
-        axis: V3,
+    /// The piece of a carrier curve between its parameters `t[0]` (at the
+    /// edge's first end) and `t[1]` (at its last): a line, a circle, an
+    /// ellipse, a B-spline (a CAD file's, or a swept profile set in space).
+    Piece {
+        curve: rapidmesh_geom::Curve<3>,
         t: [f64; 2],
-        z: f64,
     },
-    /// Ellipse: an oblique plane section of a cylinder. The point is `center`
-    /// plus `a*cos(t)*major` plus `b*sin(t)*minor`, with `axis = major x minor`
-    /// the section-plane normal. Exact closed form (curvature drives the sizing
-    /// analytically, like `Circle`).
-    Ellipse {
-        center: V3,
-        major: V3,
-        minor: V3,
-        a: f64,
-        b: f64,
-    },
-    /// Intersection of two surfaces, evaluated lazily by projecting the vertex
-    /// chain onto both (the mesher reuses its surface projections). Covers every
-    /// analytic-analytic curve with no closed form (cylinder-cylinder, oblique
-    /// cone sections, torus intersections): the chain is densified and each
-    /// sample pulled onto BOTH carriers by alternating projection, so the edge
-    /// follows the true curve instead of the faceted arrangement chain (whose
-    /// sagitta error is the straddler-sliver root cause).
+    /// Where two carriers meet with no closed form (cylinder on cylinder,
+    /// oblique cone sections, tori): the mesher pulls the chain onto both,
+    /// so the edge follows the true curve, not the faceted chain (whose
+    /// sagitta would leave slivers astride it).
     Intersection { a: SurfaceId, b: SurfaceId },
-    /// A B-spline edge a shape declared (a CAD file's), over the parameter
-    /// range `t` from the edge's first end to its last.
-    Nurbs {
-        curve: Arc<rapidmesh_geom::NurbsCurve<3>>,
-        t: [f64; 2],
-    },
-    /// Faceted fallback: the edge IS its vertex chain (no analytic refinement).
+    /// The edge is its chain (no carrier known).
     Polyline,
+}
+
+impl Curve {
+    /// The carrier curve of a piece.
+    pub fn carrier(&self) -> Option<&rapidmesh_geom::Curve<3>> {
+        match self {
+            Curve::Piece { curve, .. } => Some(curve),
+            _ => None,
+        }
+    }
+
+    /// Whether the edge is a piece of a circle.
+    pub fn is_circle(&self) -> bool {
+        self.carrier().is_some_and(|c| c.as_circle().is_some())
+    }
 }
 
 // ---- topology (non-manifold radial-edge) ---------------------------------
@@ -162,7 +141,7 @@ pub struct Face {
     pub face_tag: FaceTag,
     /// Index of the originating analytic surface in the source `TaggedPlc`
     /// (`plc.surfaces` / `TetMesh.surfaces`): the mesher tags output faces by it
-    /// and reads the `SurfaceKind` for on-surface carriers.
+    /// and reads its [`Surface`] for on-surface carriers.
     pub plc_surface: u32,
     /// Scene-solid owner (parallel to `TaggedPlc::surface_owners`).
     pub owner: u32,

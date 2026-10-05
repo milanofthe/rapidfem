@@ -4,14 +4,13 @@
 //! `rapidmesh_geom::cdt2`, whose decisions are exact; only the relaxation
 //! weights are floats.
 
+use rapidmesh_exact::vector::{segment_dist2, V2};
 use rapidmesh_exact::Sign;
 use rapidmesh_geom::cdt2::orient;
 use rapidmesh_geom::cdt2::{delaunay2, triangulate_constrained, Cdt};
 use rapidmesh_geom::grid::HashGrid;
 
-type P2 = [f64; 2];
-
-fn dist2(a: P2, b: P2) -> f64 {
+fn dist2(a: V2, b: V2) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
 }
 
@@ -25,8 +24,8 @@ const SIZE_SPLIT_RADIUS: f64 = 0.8;
 /// The cosine of the smallest interior angle of triangle (a, b, c): the
 /// largest of the three cosines (an angle is below `deg` exactly where its
 /// cosine is above `cos(deg)`, with no `acos` per angle).
-fn smallest_angle_cos(a: P2, b: P2, c: P2) -> f64 {
-    let cos = |u: P2, v: P2, w: P2| {
+fn smallest_angle_cos(a: V2, b: V2, c: V2) -> f64 {
+    let cos = |u: V2, v: V2, w: V2| {
         let (e1, e2) = ([v[0] - u[0], v[1] - u[1]], [w[0] - u[0], w[1] - u[1]]);
         let n = (e1[0] * e1[0] + e1[1] * e1[1]).sqrt() * (e2[0] * e2[0] + e2[1] * e2[1]).sqrt();
         ((e1[0] * e2[0] + e1[1] * e2[1]) / (n + 1e-30)).clamp(-1.0, 1.0)
@@ -35,7 +34,7 @@ fn smallest_angle_cos(a: P2, b: P2, c: P2) -> f64 {
 }
 
 /// Circumcenter of (a, b, c); `None` if (near-)degenerate.
-fn circumcenter(a: P2, b: P2, c: P2) -> Option<P2> {
+fn circumcenter(a: V2, b: V2, c: V2) -> Option<V2> {
     let d = 2.0 * (a[0] * (b[1] - c[1]) + b[0] * (c[1] - a[1]) + c[0] * (a[1] - b[1]));
     if d.abs() < 1e-30 {
         return None;
@@ -59,11 +58,11 @@ fn circumcenter(a: P2, b: P2, c: P2) -> Option<P2> {
 /// protected (a circumcentre that encroaches one is not inserted).
 #[allow(clippy::too_many_arguments)]
 fn refine_quality(
-    boundary: &[P2],
+    boundary: &[V2],
     segments: &[(usize, usize)],
-    interior: &mut Vec<P2>,
-    target: impl Fn(P2) -> f64,
-    inside: impl Fn(P2) -> bool,
+    interior: &mut Vec<V2>,
+    target: impl Fn(V2) -> f64,
+    inside: impl Fn(V2) -> bool,
     min_angle_deg: f64,
     // Hard cap on refinement passes. Each pass re-triangulates the whole patch,
     // so this bounds the cost: the surface stage runs the full set, a display
@@ -71,19 +70,19 @@ fn refine_quality(
     // rest is marginal interior density).
     max_passes: usize,
 ) {
-    let diam2 = |b: &[P2], u: usize, v: usize| 0.25 * dist2(b[u], b[v]);
-    let mid = |b: &[P2], u: usize, v: usize| [0.5 * (b[u][0] + b[v][0]), 0.5 * (b[u][1] + b[v][1])];
+    let diam2 = |b: &[V2], u: usize, v: usize| 0.25 * dist2(b[u], b[v]);
+    let mid = |b: &[V2], u: usize, v: usize| [0.5 * (b[u][0] + b[v][0]), 0.5 * (b[u][1] + b[v][1])];
     let cos_min = min_angle_deg.to_radians().cos();
     let mut good: rustc_hash::FxHashSet<[[u64; 2]; 3]> = rustc_hash::FxHashSet::default();
     for _ in 0..max_passes {
         let mut all = boundary.to_vec();
         all.extend_from_slice(interior);
         let tris = triangulate_constrained(&all, segments, &inside);
-        let mut inserts: Vec<P2> = Vec::new();
+        let mut inserts: Vec<V2> = Vec::new();
 
         // Bad triangles: below the angle bound, or larger than the field.
         {
-            let mut cand: Vec<P2> = Vec::new();
+            let mut cand: Vec<V2> = Vec::new();
             // Segment lookup grid for the circumcentre encroachment test below:
             // every segment registers the cells its DIAMETRAL DISK overlaps, so a
             // candidate reads exactly one cell and tests only nearby segments --
@@ -158,7 +157,7 @@ fn refine_quality(
                 .map(|&c| 0.5 * target(c))
                 .fold(f64::INFINITY, f64::min)
                 .max(1e-9);
-            let mut grid: HashGrid<P2, 2> = HashGrid::new(gc);
+            let mut grid: HashGrid<V2, 2> = HashGrid::new(gc);
             for &q in boundary.iter().chain(interior.iter()) {
                 grid.insert(q, q);
             }
@@ -196,11 +195,11 @@ fn refine_quality(
 /// the triangle count are preserved. Stops early once the largest move is below a
 /// thousandth of the local edge length.
 fn smooth_mesh(
-    boundary: &[P2],
+    boundary: &[V2],
     segments: &[(usize, usize)],
-    interior: &mut [P2],
-    inside: impl Fn(P2) -> bool,
-    target: impl Fn(P2) -> f64,
+    interior: &mut [V2],
+    inside: impl Fn(V2) -> bool,
+    target: impl Fn(V2) -> f64,
     min_angle_deg: f64,
     max_iters: usize,
 ) {
@@ -209,14 +208,14 @@ fn smooth_mesh(
         return;
     }
     let sarea2 =
-        |a: P2, b: P2, c: P2| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        |a: V2, b: V2, c: V2| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
 
     // ONE live constrained triangulation for the whole smoothing: guarded
     // point moves keep every incident triangle exactly CCW, and a local
     // Lawson pass (`restore`) repairs Delaunayness after each sweep -- the
     // full re-triangulation per iteration (constraint forcing included) was
     // the smoother's dominant, superlinear cost.
-    let mut all: Vec<P2> = boundary.to_vec();
+    let mut all: Vec<V2> = boundary.to_vec();
     all.extend_from_slice(interior);
     let (mut cdt, constraints) = Cdt::new_constrained(&all, segments);
     let mut star: Vec<usize> = Vec::new();
@@ -277,12 +276,12 @@ fn smooth_mesh(
             // the live structure's flip invariants need every alive triangle
             // to stay positively oriented, not just the in-domain ones.
             let bound = min_angle_deg.to_radians().cos();
-            let worst = |at: P2| {
+            let worst = |at: V2| {
                 incident[i]
                     .iter()
                     .map(|&ti| {
                         let t = tris[ti];
-                        let q: [P2; 3] =
+                        let q: [V2; 3] =
                             std::array::from_fn(|j| if t[j] == i { at } else { cdt.point(t[j]) });
                         smallest_angle_cos(q[0], q[1], q[2])
                     })
@@ -292,7 +291,7 @@ fn smooth_mesh(
                 cdt.star(i, &mut star)
                     && star.iter().all(|&ti| {
                         let t = cdt.triangle(ti);
-                        let q: [P2; 3] =
+                        let q: [V2; 3] =
                             std::array::from_fn(|j| if t[j] == i { cand } else { cdt.point(t[j]) });
                         orient(q[0], q[1], q[2]) == Sign::Positive
                     })
@@ -327,14 +326,14 @@ fn smooth_mesh(
 /// incident triangles with a local separation guard (no collapse / sliver seed).
 #[allow(clippy::too_many_arguments)]
 fn cvt_fill(
-    boundary: &[P2],
-    lo: P2,
-    hi: P2,
+    boundary: &[V2],
+    lo: V2,
+    hi: V2,
     step: f64,
-    target: impl Fn(P2) -> f64,
+    target: impl Fn(V2) -> f64,
     iters: usize,
-    inside: impl Fn(P2) -> bool,
-) -> Vec<P2> {
+    inside: impl Fn(V2) -> bool,
+) -> Vec<V2> {
     if !(step.is_finite() && step > 0.0) {
         return Vec::new();
     }
@@ -378,7 +377,7 @@ fn cvt_fill(
         }
     }
     nodes.sort_unstable_by_key(|a| (a.0, a.1));
-    let mut interior: Vec<P2> = Vec::new();
+    let mut interior: Vec<V2> = Vec::new();
     let mut igrid = LevelGrid::new(gc, extent);
     for (i, j, t) in nodes {
         let q = node(i, j);
@@ -400,7 +399,7 @@ fn cvt_fill(
         if interior.is_empty() {
             break;
         }
-        let mut all: Vec<P2> = boundary.to_vec();
+        let mut all: Vec<V2> = boundary.to_vec();
         all.extend_from_slice(&interior);
         let hi: Vec<f64> = interior.iter().map(|&q| target(q)).collect();
         let h_at = |v: usize| if v < nb { hb[v] } else { hi[v - nb] };
@@ -460,7 +459,7 @@ fn cvt_fill(
 struct LevelGrid {
     gc: f64,
     /// Every point inserted, and whether it is still in.
-    pts: Vec<P2>,
+    pts: Vec<V2>,
     alive: Vec<bool>,
     /// Per level `l`, the points in cells of `gc * 2^l`.
     levels: Vec<HashGrid<u32, 2>>,
@@ -484,7 +483,7 @@ impl LevelGrid {
     }
 
     /// Adds `p`; returns its id.
-    fn insert(&mut self, p: P2) -> u32 {
+    fn insert(&mut self, p: V2) -> u32 {
         let id = self.pts.len() as u32;
         self.pts.push(p);
         self.alive.push(true);
@@ -502,7 +501,7 @@ impl LevelGrid {
     /// True if `q` is at least its own radius (`sqrt(r2)`) from every point,
     /// optionally skipping the point `skip` (the query's own during
     /// relaxation). Exact: no point within range is missed.
-    fn clear(&self, q: P2, r2: f64, skip: Option<u32>) -> bool {
+    fn clear(&self, q: V2, r2: f64, skip: Option<u32>) -> bool {
         let r = r2.sqrt();
         let mut level = 0;
         while level + 1 < self.levels.len() && self.gc * ((1u64 << level) as f64) < r {
@@ -525,11 +524,11 @@ impl LevelGrid {
 pub(crate) struct PipRows {
     y0: f64,
     cell: f64,
-    rows: Vec<Vec<(P2, P2)>>,
+    rows: Vec<Vec<(V2, V2)>>,
 }
 
 impl PipRows {
-    pub(crate) fn build(loops: &[Vec<P2>]) -> PipRows {
+    pub(crate) fn build(loops: &[Vec<V2>]) -> PipRows {
         let (mut ylo, mut yhi, mut len_sum, mut n_edges) =
             (f64::INFINITY, f64::NEG_INFINITY, 0.0, 0usize);
         for lp in loops {
@@ -558,7 +557,7 @@ impl PipRows {
             .max((yhi - ylo) / 4096.0)
             .max(1e-12);
         let nrows = (((yhi - ylo) / cell).ceil() as usize + 1).max(1);
-        let mut rows: Vec<Vec<(P2, P2)>> = vec![Vec::new(); nrows];
+        let mut rows: Vec<Vec<(V2, V2)>> = vec![Vec::new(); nrows];
         let row_of =
             |y: f64| (((y - ylo) / cell).floor() as i64).clamp(0, nrows as i64 - 1) as usize;
         for lp in loops {
@@ -582,7 +581,7 @@ impl PipRows {
     }
 
     /// Even-odd membership of `p` (inside the outer loop, outside the holes).
-    pub(crate) fn inside(&self, p: P2) -> bool {
+    pub(crate) fn inside(&self, p: V2) -> bool {
         if self.rows.is_empty() {
             return false;
         }
@@ -603,22 +602,6 @@ impl PipRows {
     }
 }
 
-/// Squared distance from point `p` to segment `a`-`b`.
-fn pt_seg_dist2(p: P2, a: P2, b: P2) -> f64 {
-    let (vx, vy) = (b[0] - a[0], b[1] - a[1]);
-    let (wx, wy) = (p[0] - a[0], p[1] - a[1]);
-    let c1 = vx * wx + vy * wy;
-    if c1 <= 0.0 {
-        return wx * wx + wy * wy;
-    }
-    let c2 = vx * vx + vy * vy;
-    if c2 <= c1 {
-        return (p[0] - b[0]).powi(2) + (p[1] - b[1]).powi(2);
-    }
-    let t = c1 / c2;
-    (p[0] - (a[0] + t * vx)).powi(2) + (p[1] - (a[1] + t * vy)).powi(2)
-}
-
 /// A planar patch meshed: its boundary (points and constraint `segments`), a
 /// sizing `target` and an `inside` predicate in, a graded, sliver-free
 /// triangulation out.
@@ -629,18 +612,60 @@ fn pt_seg_dist2(p: P2, a: P2, b: P2) -> f64 {
 /// the contours, so re-splitting them would only chase the seed points off the
 /// boundary into thin spikes. `step` seeds the CVT grid; `max_passes` and
 /// `cvt_iters` bound the work. The boundary comes back exactly as given. Returns `(points, triangles)`, the boundary first (in
-/// its order), then the interior.
+/// its order), then the interior. The mesh is the same whatever order the
+/// boundary comes in: it is meshed in the order of its points' places.
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_constrained(
-    boundary: Vec<P2>,
+    boundary: Vec<V2>,
     segments: Vec<(usize, usize)>,
-    target: impl Fn(P2) -> f64,
-    inside: impl Fn(P2) -> bool,
+    target: impl Fn(V2) -> f64,
+    inside: impl Fn(V2) -> bool,
     step: f64,
     min_angle_deg: f64,
     cvt_iters: usize,
     max_passes: usize,
-) -> (Vec<P2>, Vec<[usize; 3]>) {
+) -> (Vec<V2>, Vec<[usize; 3]>) {
+    let nb = boundary.len();
+    let mut order: Vec<usize> = (0..nb).collect();
+    order.sort_by(|&a, &b| {
+        let (p, q) = (boundary[a], boundary[b]);
+        p[0].total_cmp(&q[0]).then(p[1].total_cmp(&q[1]))
+    });
+    let mut new = vec![0usize; nb];
+    for (i, &v) in order.iter().enumerate() {
+        new[v] = i;
+    }
+    let placed: Vec<V2> = order.iter().map(|&v| boundary[v]).collect();
+    let mut segs: Vec<(usize, usize)> = segments.iter().map(|&(a, b)| (new[a], new[b])).collect();
+    segs.sort_unstable();
+    let (pts, tris) = mesh_in_order(
+        placed,
+        segs,
+        target,
+        inside,
+        step,
+        min_angle_deg,
+        cvt_iters,
+        max_passes,
+    );
+    let back = |i: usize| if i < nb { order[i] } else { i };
+    let mut out = boundary;
+    out.extend_from_slice(&pts[nb..]);
+    (out, tris.into_iter().map(|t| t.map(back)).collect())
+}
+
+/// [`mesh_constrained`] on the boundary in the order given.
+#[allow(clippy::too_many_arguments)]
+fn mesh_in_order(
+    boundary: Vec<V2>,
+    segments: Vec<(usize, usize)>,
+    target: impl Fn(V2) -> f64,
+    inside: impl Fn(V2) -> bool,
+    step: f64,
+    min_angle_deg: f64,
+    cvt_iters: usize,
+    max_passes: usize,
+) -> (Vec<V2>, Vec<[usize; 3]>) {
     if boundary.len() < 3 {
         return (boundary, Vec::new());
     }
@@ -682,7 +707,7 @@ pub fn mesh_constrained(
                 .in_box([p[0] - r, p[1] - r], [p[0] + r, p[1] + r])
                 .any(|&si| {
                     let (u, v) = segments[si as usize];
-                    pt_seg_dist2(p, boundary[u], boundary[v]) < r2
+                    segment_dist2(p, boundary[u], boundary[v]) < r2
                 })
         });
     }
@@ -719,7 +744,7 @@ mod tests {
     }
 
     /// Even-odd point-in-polygon over one or more loops (test helper).
-    fn pip(p: P2, loops: &[Vec<usize>], pts: &[P2]) -> bool {
+    fn pip(p: V2, loops: &[Vec<usize>], pts: &[V2]) -> bool {
         let mut inside = false;
         for lp in loops {
             let m = lp.len();
@@ -748,7 +773,7 @@ mod tests {
         s
     }
 
-    fn tri_area(t: [usize; 3], pts: &[P2]) -> f64 {
+    fn tri_area(t: [usize; 3], pts: &[V2]) -> f64 {
         let (a, b, c) = (pts[t[0]], pts[t[1]], pts[t[2]]);
         0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs()
     }
@@ -758,7 +783,7 @@ mod tests {
         // Reflex (non-convex) L: an unconstrained Delaunay would triangulate the
         // convex hull (area 4); the constrained one must cover exactly the L
         // (area 3) and contain every boundary edge.
-        let pts: Vec<P2> = vec![
+        let pts: Vec<V2> = vec![
             [0.0, 0.0],
             [2.0, 0.0],
             [2.0, 1.0],
@@ -789,7 +814,7 @@ mod tests {
         // Outer square [0,4]^2 (CCW) with a square hole [1,3]^2 (CW): the meshed
         // region is the annulus, area 16 - 4 = 12, and no triangle centroid may
         // fall in the hole.
-        let pts: Vec<P2> = vec![
+        let pts: Vec<V2> = vec![
             [0.0, 0.0],
             [4.0, 0.0],
             [4.0, 4.0],
@@ -828,7 +853,7 @@ mod tests {
             boundary.push([1.0 - i as f64 / m as f64, 1.0]);
             boundary.push([0.0, 1.0 - i as f64 / m as f64]);
         }
-        let sq = |p: P2| p[0] > 0.0 && p[0] < 1.0 && p[1] > 0.0 && p[1] < 1.0;
+        let sq = |p: V2| p[0] > 0.0 && p[0] < 1.0 && p[1] > 0.0 && p[1] < 1.0;
         let interior = cvt_fill(&boundary, [0.0, 0.0], [1.0, 1.0], 0.2, |_| 0.2, 12, sq);
         assert!(!interior.is_empty());
         let mut all = boundary.to_vec();

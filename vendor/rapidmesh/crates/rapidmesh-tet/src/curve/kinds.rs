@@ -2,10 +2,9 @@
 //! samples are distributed along and the snap projects onto.
 
 use crate::curve::{Curve, PolylineCurve};
-use rapidmesh_brep::{Brep, Curve as BCurve, Edge as BEdge, Surface};
-use rapidmesh_geom::nurbs::NurbsCurve;
-use rapidmesh_geom::vec3::{add, cross, dist, dot, scale, sub, V3};
-use std::sync::Arc;
+use rapidmesh_brep::{Brep, Curve as BCurve, Edge as BEdge};
+use rapidmesh_exact::vector::{cross, dist, dot, scale, sub, V3};
+use rapidmesh_geom::Surface;
 
 /// Arc length along a parametric curve and back: `ts` the parameters
 /// from the curve's first end to its last (rising or falling), `ss` the arc
@@ -55,57 +54,20 @@ impl ArcTable {
     }
 }
 
-struct ProfileCurve {
-    profile: Arc<NurbsCurve>,
-    base: V3,
-    u: V3,
-    v: V3,
-    axis: V3,
-    z: f64,
+/// A piece of a carrier curve by arc length from the edge's first end.
+struct Piece {
+    curve: rapidmesh_geom::Curve<3>,
     arc: ArcTable,
 }
 
-impl ProfileCurve {
-    fn new(
-        profile: Arc<NurbsCurve>,
-        base: V3,
-        u: V3,
-        v: V3,
-        axis: V3,
-        t: [f64; 2],
-        z: f64,
-    ) -> Option<ProfileCurve> {
-        let (lo, hi) = (t[0].min(t[1]), t[0].max(t[1]));
-        let arc = ArcTable::new(lo, hi, 256, |a, b| profile.arc_length(a, b, 2))?;
-        Some(ProfileCurve {
-            profile,
-            base,
-            u,
-            v,
-            axis,
-            z,
-            arc,
-        })
-    }
-    fn s_to_t(&self, s: f64) -> f64 {
-        self.arc.t(s)
-    }
-    fn at3(&self, t: f64) -> V3 {
-        let c = self.profile.eval(t);
-        add(
-            add(self.base, scale(self.axis, self.z)),
-            add(scale(self.u, c[0]), scale(self.v, c[1])),
-        )
+impl Piece {
+    fn new(curve: rapidmesh_geom::Curve<3>, t: [f64; 2]) -> Option<Piece> {
+        let arc = ArcTable::new(t[0], t[1], 256, |a, b| curve.arc_length(a, b))?;
+        Some(Piece { curve, arc })
     }
 }
 
-/// A B-spline edge of a CAD file, by arc length from its first end.
-struct SplineCurve {
-    curve: Arc<NurbsCurve<3>>,
-    arc: ArcTable,
-}
-
-impl Curve for SplineCurve {
+impl Curve for Piece {
     fn length(&self) -> f64 {
         self.arc.length()
     }
@@ -121,33 +83,9 @@ impl Curve for SplineCurve {
         }
     }
     fn ders_at(&self, s: f64) -> [V3; 3] {
-        let (c0, c1, c2) = self.curve.ders2(self.arc.t(s));
+        let (c0, c1, c2) = self.curve.ders(self.arc.t(s));
         let [d1, d2] = arc_ders(c1, c2, self.arc.sign());
         [c0, d1, d2]
-    }
-}
-
-impl Curve for ProfileCurve {
-    fn length(&self) -> f64 {
-        self.arc.length()
-    }
-    fn point_at(&self, s: f64) -> V3 {
-        self.at3(self.s_to_t(s))
-    }
-    fn radius_at(&self, s: f64) -> f64 {
-        let k = self.profile.curvature(self.s_to_t(s));
-        if k > 1e-12 {
-            1.0 / k
-        } else {
-            f64::INFINITY
-        }
-    }
-    fn ders_at(&self, s: f64) -> [V3; 3] {
-        let t = self.s_to_t(s);
-        let (_, c1, c2) = self.profile.ders2(t);
-        let lift = |c: [f64; 2]| add(scale(self.u, c[0]), scale(self.v, c[1]));
-        let [d1, d2] = arc_ders(lift(c1), lift(c2), 1.0);
-        [self.at3(t), d1, d2]
     }
 }
 
@@ -161,190 +99,6 @@ fn arc_ders(c_t: V3, c_tt: V3, sign: f64) -> [V3; 2] {
     let t = scale(c_t, 1.0 / l2.sqrt());
     let k = scale(sub(c_tt, scale(t, dot(c_tt, t))), 1.0 / l2);
     [scale(t, sign), k]
-}
-
-/// A circular arc (or full circle) parametrised by arc length. Radius is constant,
-/// so the sagitta sizing places uniform points; the arc range is taken from the
-/// edge's chain endpoints (a closed rim spans the full `2*pi`).
-struct CircleCurve {
-    center: V3,
-    x: V3,
-    y: V3,
-    radius: f64,
-    a0: f64,
-    span: f64,
-}
-
-impl CircleCurve {
-    fn new(center: V3, axis: V3, x: V3, radius: f64, chain: &[V3]) -> Option<CircleCurve> {
-        if !(radius > 0.0) || chain.len() < 2 {
-            return None;
-        }
-        let y = cross(axis, x);
-        let ang = |p: V3| {
-            let d = sub(p, center);
-            dot(d, y).atan2(dot(d, x))
-        };
-        // Total signed swept angle = sum of per-segment increments (each in
-        // (-pi, pi]); robust for an arc (partial) and a closed rim (sums to +-2*pi).
-        let pi = std::f64::consts::PI;
-        let wrap = |a: f64| (a + pi).rem_euclid(2.0 * pi) - pi;
-        let a0 = ang(chain[0]);
-        let mut span = 0.0;
-        for w in chain.windows(2) {
-            span += wrap(ang(w[1]) - ang(w[0]));
-        }
-        if span.abs() < 1e-9 {
-            return None;
-        }
-        Some(CircleCurve {
-            center,
-            x,
-            y,
-            radius,
-            a0,
-            span,
-        })
-    }
-}
-
-impl Curve for CircleCurve {
-    fn length(&self) -> f64 {
-        self.radius * self.span.abs()
-    }
-    fn point_at(&self, s: f64) -> V3 {
-        let f = (s / self.length()).clamp(0.0, 1.0);
-        let t = self.a0 + self.span * f;
-        let (st, ct) = t.sin_cos();
-        std::array::from_fn(|k| self.center[k] + self.radius * (ct * self.x[k] + st * self.y[k]))
-    }
-    fn radius_at(&self, _s: f64) -> f64 {
-        self.radius
-    }
-    fn ders_at(&self, s: f64) -> [V3; 3] {
-        let f = (s / self.length()).clamp(0.0, 1.0);
-        let (st, ct) = (self.a0 + self.span * f).sin_cos();
-        let radial: V3 = std::array::from_fn(|k| ct * self.x[k] + st * self.y[k]);
-        let along: V3 = std::array::from_fn(|k| -st * self.x[k] + ct * self.y[k]);
-        [
-            add(self.center, scale(radial, self.radius)),
-            scale(along, self.span.signum()),
-            scale(radial, -1.0 / self.radius),
-        ]
-    }
-}
-
-/// An elliptic arc (oblique plane-cylinder section) parametrised by arc length,
-/// via a dense angle->arc-length table (like [`ProfileCurve`]). Curvature is the
-/// exact analytic `R(t) = (a^2 sin^2 t + b^2 cos^2 t)^(3/2) / (a b)`, so the sagitta
-/// sizing refines the high-curvature ends of the major axis.
-struct EllipseCurve {
-    center: V3,
-    major: V3,
-    minor: V3,
-    a: f64,
-    b: f64,
-    /// The angle along the arc, from `t0` to `t0 + span`.
-    arc: ArcTable,
-}
-
-impl EllipseCurve {
-    fn new(center: V3, major: V3, minor: V3, a: f64, b: f64, chain: &[V3]) -> Option<EllipseCurve> {
-        if !(a > 0.0 && b > 0.0) || chain.len() < 2 {
-            return None;
-        }
-        // Angle of a chain point in the ellipse's own (normalised) frame.
-        let ang = |p: V3| {
-            let d = sub(p, center);
-            (dot(d, minor) / b).atan2(dot(d, major) / a)
-        };
-        // Signed swept angle from the chain (each increment in (-pi, pi]), robust
-        // for a partial arc and a closed section (sums to +-2pi) -- as CircleCurve.
-        let pi = std::f64::consts::PI;
-        let wrap = |x: f64| (x + pi).rem_euclid(2.0 * pi) - pi;
-        let t0 = ang(chain[0]);
-        let mut span = 0.0;
-        for w in chain.windows(2) {
-            span += wrap(ang(w[1]) - ang(w[0]));
-        }
-        if span.abs() < 1e-9 {
-            return None;
-        }
-        // Dense arc-length table over [t0, t0+span], by chords.
-        let at = |t: f64| -> V3 {
-            let (st, ct) = t.sin_cos();
-            std::array::from_fn(|k| center[k] + a * ct * major[k] + b * st * minor[k])
-        };
-        let arc = ArcTable::new(t0, t0 + span, 512, |u, w| dist(at(u), at(w)))?;
-        Some(EllipseCurve {
-            center,
-            major,
-            minor,
-            a,
-            b,
-            arc,
-        })
-    }
-    fn s_to_t(&self, s: f64) -> f64 {
-        self.arc.t(s)
-    }
-}
-
-impl Curve for EllipseCurve {
-    fn length(&self) -> f64 {
-        self.arc.length()
-    }
-    fn point_at(&self, s: f64) -> V3 {
-        let t = self.s_to_t(s);
-        let (st, ct) = t.sin_cos();
-        std::array::from_fn(|k| {
-            self.center[k] + self.a * ct * self.major[k] + self.b * st * self.minor[k]
-        })
-    }
-    fn radius_at(&self, s: f64) -> f64 {
-        let t = self.s_to_t(s);
-        let (st, ct) = t.sin_cos();
-        (self.a * self.a * st * st + self.b * self.b * ct * ct).powf(1.5) / (self.a * self.b)
-    }
-    fn ders_at(&self, s: f64) -> [V3; 3] {
-        let t = self.s_to_t(s);
-        let (st, ct) = t.sin_cos();
-        let at = |ca: f64, cb: f64| -> V3 {
-            std::array::from_fn(|k| self.a * ca * self.major[k] + self.b * cb * self.minor[k])
-        };
-        let sign = self.arc.sign();
-        let [d1, d2] = arc_ders(at(-st, ct), at(-ct, -st), sign);
-        [add(self.center, at(ct, st)), d1, d2]
-    }
-}
-
-/// Pulls `p` onto the intersection of two surfaces: a two-tangent-plane Newton
-/// step (solve `p' = p + alpha*n_a + beta*n_b` against both tangent-plane constraints;
-/// quadratic convergence for transversal intersections -- plain alternating
-/// projection converges only linearly, too slow near shallow crossings), falling
-/// back to one alternating-projection step where the surfaces are near-tangential.
-/// The caller guards against divergence.
-fn pocs(sa: &Surface, sb: &Surface, mut p: V3, tol: f64) -> V3 {
-    for _ in 0..32 {
-        let (fa, na) = sa.closest(p);
-        let (fb, nb) = sb.closest(p);
-        let c = dot(na, nb);
-        let det = 1.0 - c * c;
-        let (ra, rb) = (dot(sub(fa, p), na), dot(sub(fb, p), nb));
-        let q: V3 = if det > 1e-6 {
-            let alpha = (ra - c * rb) / det;
-            let beta = (rb - c * ra) / det;
-            std::array::from_fn(|k| p[k] + alpha * na[k] + beta * nb[k])
-        } else {
-            sb.closest(fa).0
-        };
-        let moved = dist(p, q);
-        p = q;
-        if moved < tol {
-            break;
-        }
-    }
-    p
 }
 
 /// The true intersection curve of two analytic carriers: a densely resampled
@@ -368,7 +122,7 @@ impl Curve for IntersectionCurve {
             return self.poly.point_at(s);
         }
         let p0 = self.poly.point_at(s);
-        let p = pocs(&self.sa, &self.sb, p0, self.tol);
+        let p = self.sa.meet(&self.sb, p0, self.tol);
         // Divergence guard, as in the polyline construction.
         if dist(p, p0) <= 0.05 * self.poly.length() {
             p
@@ -417,7 +171,7 @@ fn intersection_polyline(sa: &Surface, sb: &Surface, chain: &[V3]) -> Option<Pol
         for k in 0..n {
             let f = k as f64 / n as f64;
             let p0: V3 = std::array::from_fn(|c| w[0][c] + f * (w[1][c] - w[0][c]));
-            let p = pocs(sa, sb, p0, tol);
+            let p = sa.meet(sb, p0, tol);
             // Divergence guard: a projected point that left the segment's own
             // neighbourhood is a failed projection -- keep the chain point.
             out.push(if dist(p, p0) <= seg.max(0.05 * total) {
@@ -434,39 +188,15 @@ fn intersection_polyline(sa: &Surface, sb: &Surface, chain: &[V3]) -> Option<Pol
     PolylineCurve::new(&out)
 }
 
-/// The analytic curve to distribute points on for a B-rep edge: the exact profile,
-/// circle or ellipse where recovered, the B-spline a CAD file gives it, the
-/// POCS-densified intersection curve of two
-/// analytic carriers, else the faceted chain polyline (a straight `Line` is
-/// exactly a 2-point polyline, so it reduces to uniform spacing).
+/// The analytic curve to distribute points on for a B-rep edge: the piece
+/// of its carrier, the intersection of two carriers pulled onto both, else
+/// the chain.
 pub fn edge_curve(brep: &Brep, edge: &BEdge) -> Option<Box<dyn Curve>> {
+    let chain = || PolylineCurve::new(&edge.chain).map(|c| Box::new(c) as Box<dyn Curve>);
     match &edge.curve {
-        BCurve::Profile {
-            profile,
-            base,
-            u,
-            v,
-            axis,
-            t,
-            z,
-        } => ProfileCurve::new(profile.clone(), *base, *u, *v, *axis, *t, *z)
-            .map(|c| Box::new(c) as Box<dyn Curve>),
-        BCurve::Circle {
-            center,
-            axis,
-            radius,
-            x,
-        } => CircleCurve::new(*center, *axis, *x, *radius, &edge.chain)
-            .map(|c| Box::new(c) as Box<dyn Curve>),
-        BCurve::Ellipse {
-            center,
-            major,
-            minor,
-            a,
-            b,
-        } => EllipseCurve::new(*center, *major, *minor, *a, *b, &edge.chain)
+        BCurve::Piece { curve, t } => Piece::new(curve.clone(), *t)
             .map(|c| Box::new(c) as Box<dyn Curve>)
-            .or_else(|| PolylineCurve::new(&edge.chain).map(|c| Box::new(c) as Box<dyn Curve>)),
+            .or_else(chain),
         BCurve::Intersection { a, b } => {
             let (sa, sb) = (brep.surface(*a), brep.surface(*b));
             match intersection_polyline(sa, sb, &edge.chain) {
@@ -479,20 +209,10 @@ pub fn edge_curve(brep: &Brep, edge: &BEdge) -> Option<Box<dyn Curve>> {
                         tol,
                     }) as Box<dyn Curve>)
                 }
-                None => PolylineCurve::new(&edge.chain).map(|c| Box::new(c) as Box<dyn Curve>),
+                None => chain(),
             }
         }
-        BCurve::Nurbs { curve, t } => {
-            ArcTable::new(t[0], t[1], 256, |a, b| curve.arc_length(a, b, 2))
-                .map(|arc| {
-                    Box::new(SplineCurve {
-                        curve: curve.clone(),
-                        arc,
-                    }) as Box<dyn Curve>
-                })
-                .or_else(|| PolylineCurve::new(&edge.chain).map(|c| Box::new(c) as Box<dyn Curve>))
-        }
-        _ => PolylineCurve::new(&edge.chain).map(|c| Box::new(c) as Box<dyn Curve>),
+        BCurve::Polyline => chain(),
     }
 }
 
@@ -526,7 +246,7 @@ mod curve_tests {
         let e = b
             .edges
             .iter()
-            .find(|e| matches!(e.curve, BCurve::Ellipse { .. }))
+            .find(|e| e.curve.carrier().is_some_and(|c| c.name() == "ellipse"))
             .expect("an ellipse edge");
         let c = edge_curve(&b, e).unwrap();
         let s = distribute_floored(
@@ -579,6 +299,12 @@ mod curve_tests {
         }
     }
 
+    /// The piece of `curve` along `chain`.
+    fn piece(curve: rapidmesh_geom::Curve<3>, chain: &[V3]) -> Piece {
+        let t = curve.piece(chain, 1e-9).unwrap();
+        Piece::new(curve, t).unwrap()
+    }
+
     /// The default numeric derivatives of `point_at`, for comparison.
     struct Numeric<'a>(&'a dyn Curve);
     impl Curve for Numeric<'_> {
@@ -617,8 +343,18 @@ mod curve_tests {
                 [3.0 * t.cos(), 1.2 * t.sin(), 0.5]
             })
             .collect();
-        let ellipse = EllipseCurve::new([0.0, 0.0, 0.5], x, y, 3.0, 1.2, &chain).unwrap();
-        let circle = CircleCurve::new([0.0, 0.0, 0.0], z, x, 2.0, &chain).unwrap();
+        let ellipse = piece(
+            rapidmesh_geom::Curve::Ellipse {
+                c: [0.0, 0.0, 0.5],
+                p: scale(x, 3.0),
+                q: scale(y, 1.2),
+            },
+            &chain,
+        );
+        let circle = piece(
+            rapidmesh_geom::Curve::circle([0.0; 3], z, x, 2.0).unwrap(),
+            &chain,
+        );
         for c in [&ellipse as &dyn Curve, &circle] {
             for f in [0.2, 0.5, 0.8] {
                 let s = f * c.length();
@@ -654,7 +390,14 @@ mod curve_tests {
                 [3.0 * t.cos(), 1.2 * t.sin(), 0.5]
             })
             .collect();
-        let ellipse = EllipseCurve::new([0.0, 0.0, 0.5], x, y, 3.0, 1.2, &chain).unwrap();
+        let ellipse = piece(
+            rapidmesh_geom::Curve::Ellipse {
+                c: [0.0, 0.0, 0.5],
+                p: scale(x, 3.0),
+                q: scale(y, 1.2),
+            },
+            &chain,
+        );
         let smp = samples(&ellipse, 16);
         for p in [[2.5, 1.5, 0.9], [0.3, 0.2, 0.5], [-1.0, 2.0, 0.0]] {
             let d = dist(ellipse.point_at(closest_arc(&ellipse, &smp, p)), p);
@@ -671,7 +414,10 @@ mod curve_tests {
                 [2.0 * t.cos(), 2.0 * t.sin(), 0.0]
             })
             .collect();
-        let circle = CircleCurve::new([0.0; 3], [0.0, 0.0, 1.0], x, 2.0, &ring).unwrap();
+        let circle = piece(
+            rapidmesh_geom::Curve::circle([0.0; 3], [0.0, 0.0, 1.0], x, 2.0).unwrap(),
+            &ring,
+        );
         let smp = samples(&circle, 8);
         let p = [3.0, -0.05, 0.4];
         let q = circle.point_at(closest_arc(&circle, &smp, p));

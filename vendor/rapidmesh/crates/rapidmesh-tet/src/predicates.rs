@@ -12,13 +12,12 @@
 //! Teillaud).
 
 use geometry_predicates::{insphere, orient3d};
-
-pub type P3 = [f64; 3];
+use rapidmesh_exact::vector::V3;
 
 /// The sign of `orient3d`: positive when `d` lies on the side of the plane
 /// `a b c` from which `a b c` turn clockwise (Shewchuk's convention: a
 /// tet `a b c d` with positive orientation).
-pub fn orient(a: P3, b: P3, c: P3, d: P3) -> i8 {
+pub fn orient(a: V3, b: V3, c: V3, d: V3) -> i8 {
     // Four points on one plane of constant coordinate (the faces of layer
     // stacks hold many) make a column of the determinant zero: exactly
     // zero, without the exact stage the adaptive test would reach.
@@ -34,13 +33,13 @@ pub fn orient(a: P3, b: P3, c: P3, d: P3) -> i8 {
 /// perturbation: the answer is a property of the points alone, whatever
 /// their ids, so a tetrahedralization made point by point is the one made
 /// at once.
-pub fn inside(t: [P3; 4], e: P3) -> bool {
+pub fn inside(t: [V3; 4], e: V3) -> bool {
     let s = sign(insphere(t[0], t[1], t[2], t[3], e));
     if s != 0 {
         return s > 0;
     }
     let p = [t[0], t[1], t[2], t[3], e];
-    let lex = |a: P3, b: P3| {
+    let lex = |a: V3, b: V3| {
         a[0].total_cmp(&b[0])
             .then(a[1].total_cmp(&b[1]))
             .then(a[2].total_cmp(&b[2]))
@@ -51,7 +50,7 @@ pub fn inside(t: [P3; 4], e: P3) -> bool {
         // The cofactor of row i on the lifted column: (-1)^(i+3) times the
         // orientation of the other four in their order. Raising the lift of
         // a point by eps changes the determinant by eps times it.
-        let o: Vec<P3> = (0..5).filter(|&j| j != i).map(|j| p[j]).collect();
+        let o: [V3; 4] = std::array::from_fn(|k| p[if k < i { k } else { k + 1 }]);
         let m = orient(o[0], o[1], o[2], o[3]);
         if m != 0 {
             let cof = if (i + 3) % 2 == 0 { m } else { -m };
@@ -75,7 +74,7 @@ fn sign(x: f64) -> i8 {
 mod tests {
     use super::*;
 
-    fn positive(mut q: [P3; 4]) -> [P3; 4] {
+    fn positive(mut q: [V3; 4]) -> [V3; 4] {
         if orient(q[0], q[1], q[2], q[3]) < 0 {
             q.swap(2, 3);
         }
@@ -85,7 +84,7 @@ mod tests {
     /// The unit square turned by `k` quarter turns about its center, its
     /// corners in turn: each turn hands the lexicographic lead to another
     /// corner.
-    fn square(k: usize) -> [P3; 4] {
+    fn square(k: usize) -> [V3; 4] {
         let base = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         std::array::from_fn(|i| {
             let [x, y] = base[(i + k) % 4];

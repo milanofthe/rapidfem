@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "rapidmesh-brep",
  "rapidmesh-exact",
@@ -168,24 +168,26 @@ dependencies = [
  "rapidmesh-step",
  "rapidmesh-tet",
  "rapidmesh-topo",
+ "rustc-hash",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "rapidmesh-brep"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
  "rapidmesh-geom",
  "rayon",
  "rustc-hash",
+ "serde",
 ]
 
 [[package]]
 name = "rapidmesh-csg"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "geometry-predicates",
  "num-rational",
@@ -198,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-exact"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "geometry-predicates",
  "num-bigint",
@@ -210,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-geom"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "i_overlay",
  "num-rational",
@@ -224,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-step"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "rapidmesh-csg",
  "rapidmesh-exact",
@@ -235,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-testutil"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "num-rational",
  "num-traits",
@@ -245,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-tet"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "geometry-predicates",
  "rapidmesh-brep",
@@ -259,10 +261,12 @@ dependencies = [
 
 [[package]]
 name = "rapidmesh-topo"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
+ "rapidmesh-exact",
  "rapidmesh-geom",
  "rapidmesh-tet",
+ "rustc-hash",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 //!
 //! Imported facets are grouped into SMOOTH REGIONS at crease edges (facet
 //! normals turning by more than the crease threshold): each region becomes one
-//! [`SurfaceKind::Discrete`] carrier, so the mesher REMESHES the import against
+//! [`Surface::Discrete`](crate::Surface::Discrete) carrier, so the mesher REMESHES the import against
 //! its own envelope -- creases survive as B-rep feature edges, smooth areas are
 //! free to resample.
 //! Exactly degenerate (collinear) facets are dropped on import; duplicated
@@ -10,10 +10,11 @@
 //! consistently-oriented 2-manifold invariant that [`crate::Scene`] solids
 //! require.
 
-use crate::faceted::{Faceted, SurfaceKind};
-use crate::vec3::{bbox, cross, len};
+use crate::faceted::Faceted;
+use crate::surface::Surface;
 use rapidmesh_csg::Tri;
 use rapidmesh_exact::collinear;
+use rapidmesh_exact::vector::{bbox, cross, len};
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::Path;
@@ -56,7 +57,7 @@ pub const CREASE_DEG: f64 = 40.0;
 /// groups the rest into smooth regions at crease edges (`crease_deg`), and
 /// gives every region ONE carrier: a plane where its facets lie in one (to
 /// the tolerance the B-rep checks planes with), else a
-/// [`SurfaceKind::Discrete`] patch.
+/// [`Surface::Discrete`](crate::Surface::Discrete) patch.
 pub(crate) fn faceted_from_tris(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
     let tris: Vec<Tri> = tris
         .into_iter()
@@ -229,11 +230,25 @@ pub(crate) fn faceted_from_tris(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
     let (lo, hi) = bbox(&points);
     let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
     let flat_tol = 1e-9 * diag.max(1.0);
+    // A facet by its corners' places, and turned to start at its first:
+    // the region's plane is the same however the soup is ordered.
+    let place = |v: u32| points[v as usize].map(f64::to_bits);
+    let facet_key = |fi: u32| {
+        let mut k = conn[fi as usize].map(place);
+        k.sort_unstable();
+        k
+    };
     for members in regions {
-        // Flat: every vertex on the plane of the region's first facet.
-        let first = conn[members[0] as usize];
+        // Flat: every vertex on the plane of the region's first facet (in
+        // the order of places).
+        let Some(&lead) = members.iter().min_by_key(|&&fi| facet_key(fi)) else {
+            continue;
+        };
+        let c = conn[lead as usize];
+        let k = (0..3).min_by_key(|&k| place(c[k])).unwrap_or(0);
+        let first = [c[k], c[(k + 1) % 3], c[(k + 2) % 3]];
         let o = points[first[0] as usize];
-        let n = normals[members[0] as usize];
+        let n = normal(&first);
         let flat = members.iter().all(|&fi| {
             conn[fi as usize].iter().all(|&v| {
                 let p = points[v as usize];
@@ -242,10 +257,7 @@ pub(crate) fn faceted_from_tris(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
             })
         });
         if flat {
-            let s = f.add_surface(SurfaceKind::Plane {
-                point: o,
-                normal: n,
-            });
+            let s = f.add_surface(Surface::plane(o, n));
             for &fi in &members {
                 f.push_tri(tris[fi as usize], s);
             }
@@ -264,7 +276,7 @@ pub(crate) fn faceted_from_tris(tris: Vec<Tri>, crease_deg: f64) -> Faceted {
             });
             l_tris.push(lt);
         }
-        let s = f.add_surface(SurfaceKind::Discrete(std::sync::Arc::new(
+        let s = f.add_surface(Surface::Discrete(std::sync::Arc::new(
             crate::discrete::DiscreteSurface::new(l_pts, l_tris),
         )));
         for &fi in &members {

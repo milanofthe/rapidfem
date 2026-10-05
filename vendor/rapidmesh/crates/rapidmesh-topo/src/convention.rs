@@ -132,13 +132,7 @@ mod tests {
         let centroid = [0.25, 0.25, 0.25];
         for (i, f) in TET_FACE_LOCAL.iter().enumerate() {
             let (a, b, c) = (v[f[0]], v[f[1]], v[f[2]]);
-            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                ab[1] * ac[2] - ab[2] * ac[1],
-                ab[2] * ac[0] - ab[0] * ac[2],
-                ab[0] * ac[1] - ab[1] * ac[0],
-            ];
+            let n = rapidmesh_exact::vector::tri_normal(a, b, c);
             // Vector from the tet centroid to the face centroid must agree with
             // the normal -> the normal points away from the body (outward).
             let fc = [

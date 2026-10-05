@@ -19,7 +19,7 @@ pub(crate) struct Tets {
     pub mark: Vec<u32>,
     pub epoch: u32,
     /// The open edges of a cone, kept between them.
-    links: FxHashMap<(u32, u32), u32>,
+    links: Vec<((u32, u32), u32)>,
 }
 
 impl Tets {
@@ -103,13 +103,18 @@ impl Tets {
                 let (a, b) = (f[e], f[(e + 1) % 3]);
                 // The face of the new tet opposite f's third vertex.
                 let here = nt << 2 | ((e + 2) % 3) as u32;
-                match links.remove(&(a.min(b), a.max(b))) {
+                let key = (a.min(b), a.max(b));
+                match links
+                    .iter()
+                    .position(|l| l.0 == key)
+                    .map(|k| links.swap_remove(k).1)
+                {
                     Some(there) => {
                         self.nbr[nt as usize][(e + 2) % 3] = there;
                         self.nbr[(there >> 2) as usize][(there & 3) as usize] = here;
                     }
                     None => {
-                        links.insert((a.min(b), a.max(b)), here);
+                        links.push((key, here));
                     }
                 }
             }

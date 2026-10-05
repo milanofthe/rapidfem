@@ -10,9 +10,9 @@
 
 use crate::mesh::{Labels, Mesh, Run, SolidInfo};
 use crate::{Error, Result};
+use rapidmesh_exact::vector::cross;
 use rapidmesh_geom::plc::SHEET_OWNER;
-use rapidmesh_geom::vec3::cross;
-use rapidmesh_geom::{FaceTag, RegionTag, SurfaceKind};
+use rapidmesh_geom::{FaceTag, RegionTag};
 use rapidmesh_tet::{quality_stats, CurveEdge, PointClass, SurfaceFace, TetMesh};
 use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
@@ -444,7 +444,7 @@ fn build(raw: Raw) -> std::result::Result<Mesh, String> {
         tets,
         tet_regions,
         faces,
-        surfaces: vec![SurfaceKind::Facets],
+        surfaces: vec![None],
         surface_owners: vec![SHEET_OWNER],
         plc_points: 0,
         point_class,

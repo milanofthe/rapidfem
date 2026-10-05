@@ -23,7 +23,7 @@ pub fn region_points(b: &Boundary, brep: &Brep, r: u32) -> Vec<u32> {
 /// Delaunay tetrahedralization of its points (a segment must be strongly
 /// Delaunay), and edges inside its curved faces that are none (a curved
 /// face is no planar facet: each of its triangles is a facet of its own,
-/// whose edges are segments too).
+/// whose edges are segments too; a planar face is one facet).
 #[derive(Debug, Default, Clone)]
 pub struct Check {
     pub segments: Vec<[u32; 2]>,
@@ -131,15 +131,15 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32, prev: Option<Kept>) -> (
         if !f.regions.iter().any(|x| x.0 == r) {
             continue;
         }
-        // A planar face is a facet of its own only where its points are
-        // exactly in one plane (an axis-aligned one); a tilted plane's
-        // points are off it by their rounding, and its triangles are
-        // facets each, like a curved face's.
-        let planar = matches!(
+        // A planar face is a facet of its own, a tilted plane's too, whose
+        // points are off it by their rounding only: the wrapping takes its
+        // triangles as they are. Asking each inner edge of it to be
+        // Delaunay instead splits without end where two faces nearly meet
+        // (the walls of a sharp notch, #369).
+        if matches!(
             brep.surface(f.surface),
-            rapidmesh_brep::Surface::Plane { .. }
-        ) && exactly_planar(b, tris);
-        if planar {
+            rapidmesh_geom::Surface::Plane { .. }
+        ) {
             continue;
         }
         // The third corner on either side of each edge of the face.
@@ -168,17 +168,6 @@ pub fn check_keeping(b: &Boundary, brep: &Brep, r: u32, prev: Option<Kept>) -> (
         }
     }
     (Check { segments, edges }, kept)
-}
-
-/// Whether the points of `tris` lie exactly in one plane.
-fn exactly_planar(b: &Boundary, tris: &[[u32; 3]]) -> bool {
-    let Some(t0) = tris.first() else {
-        return true;
-    };
-    let p = t0.map(|v| b.points[v as usize]);
-    tris.iter()
-        .flatten()
-        .all(|&v| crate::predicates::orient(p[0], p[1], p[2], b.points[v as usize]) == 0)
 }
 
 /// A kept tetrahedralization that would lose more than this share of its

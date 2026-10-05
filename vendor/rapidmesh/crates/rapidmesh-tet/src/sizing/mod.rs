@@ -10,7 +10,7 @@ use crate::mesh::TetMesh;
 use crate::params::MeshParams;
 use crate::simplex::tet_min_dihedral;
 use crate::sizing::tree::DomainTree;
-use rapidmesh_geom::vec3::{centroid, dist};
+use rapidmesh_exact::vector::{centroid, dist};
 
 /// The mesh of `model` by `mesher`, under a tet budget where one is given:
 /// the sizes scale over a few meshes until the count lands near it.
@@ -125,9 +125,9 @@ pub(crate) fn curvature_laws(
             .iter()
             .map(|&t| {
                 let [a, b, c] = plc.triangles[t as usize].map(|v| plc.vertices[v as usize]);
-                0.5 * rapidmesh_geom::vec3::len(rapidmesh_geom::vec3::cross(
-                    rapidmesh_geom::vec3::sub(b, a),
-                    rapidmesh_geom::vec3::sub(c, a),
+                0.5 * rapidmesh_exact::vector::len(rapidmesh_exact::vector::cross(
+                    rapidmesh_exact::vector::sub(b, a),
+                    rapidmesh_exact::vector::sub(c, a),
                 ))
             })
             .sum()
@@ -210,7 +210,7 @@ pub fn angled<E>(
             .filter_map(|t| {
                 let p = t.map(|v| m.points[v]);
                 let q = tet_min_dihedral(p);
-                let c = centroid(&p);
+                let c = centroid(p);
                 if q < worst.0 {
                     worst = (q, c);
                 }
@@ -369,8 +369,24 @@ pub(crate) fn build_sizing_domain(
         .into_iter()
         .map(|l| l.unwrap_or(CurvatureLaw::Chord(params.tol_surf)))
         .collect();
+    // The segments of the edges given a tolerance of their own, with it.
+    let mut edge_tol: rustc_hash::FxHashMap<[[u64; 3]; 2], f64> = Default::default();
+    for &(ei, tol) in &params.edge_tol {
+        if let Some(e) = brep.edges.get(ei as usize) {
+            for w in e.chain.windows(2) {
+                edge_tol.insert(tree::segment_key([w[0], w[1]]), tol);
+            }
+        }
+    }
     if params.edge_maxh.is_empty() {
-        return DomainTree::build(plc, model.index(), params, &facet_surf, &facet_law);
+        return DomainTree::build(
+            plc,
+            model.index(),
+            params,
+            &facet_surf,
+            &facet_law,
+            &edge_tol,
+        );
     }
     // Per-edge `edge_maxh` -> point sources along the brep edge chain. Only clones
     // the params when an edge override is actually present.
@@ -393,5 +409,5 @@ pub(crate) fn build_sizing_domain(
             pa.size_points.push((last, h));
         }
     }
-    DomainTree::build(plc, model.index(), &pa, &facet_surf, &facet_law)
+    DomainTree::build(plc, model.index(), &pa, &facet_surf, &facet_law, &edge_tol)
 }

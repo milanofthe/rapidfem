@@ -11,7 +11,7 @@
 //! pseudo-random target sequence escapes after a try or two.
 
 use crate::tri::Tri;
-use rapidmesh_exact::{orient2d, orient3d, orient3d_explicit, Point3, Prepared3, Sign};
+use rapidmesh_exact::{orient2d, orient3d, orient3d_explicit, Axis, Point3, Prepared3, Sign};
 
 /// Where a point lies relative to a closed solid surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +82,10 @@ fn signed_crossing(p: &Prepared3, q: [f64; 3], tri: &Tri) -> Option<i64> {
 /// triangles actually near the query point or ray.
 pub struct TriBoxes {
     boxes: Vec<([f64; 3], [f64; 3])>,
+    /// Each triangle's projection axis and orientation there (found once:
+    /// the classification asks for them per query), `None` for one of zero
+    /// area.
+    axes: Vec<Option<(Axis, Sign)>>,
     /// A uniform grid over the boxes: `cells[c]` lists the triangles whose
     /// box overlaps cell `c`, so a query reads only its cells.
     lo: [f64; 3],
@@ -122,6 +126,7 @@ impl TriBoxes {
             std::array::from_fn(|k| ((hi[k] - lo[k]) / dims[k] as f64).max(f64::MIN_POSITIVE));
         let mut grid = TriBoxes {
             boxes,
+            axes: tris.iter().map(Tri::try_projection_axis).collect(),
             lo,
             size,
             dims,
@@ -164,6 +169,12 @@ impl TriBoxes {
     }
 
     /// The triangles whose box contains `p`, ascending.
+    /// The projection axis and orientation of triangle `i` (see
+    /// [`Tri::projection_axis`], which `t` is).
+    pub fn axis(&self, i: usize, t: &Tri) -> (Axis, Sign) {
+        self.axes[i].unwrap_or_else(|| t.projection_axis())
+    }
+
     fn at(&self, p: [f64; 3]) -> Vec<usize> {
         if self.boxes.is_empty()
             || (0..3).any(|k| {
@@ -218,7 +229,7 @@ pub fn on_solid_boundary(
     boxes.at(rep).into_iter().find(|&i| {
         let t = &solid[i];
         orient3d_explicit(t.v[0], t.v[1], t.v[2], p) == Some(Sign::Zero) && {
-            let (axis, orientation) = t.projection_axis();
+            let (axis, orientation) = boxes.axis(i, t);
             t.contains_coplanar(p.point(), axis, orientation)
         }
     })
@@ -331,7 +342,7 @@ pub fn winding_beside(
         .filter(|&i| {
             let t = &solid[i];
             orient3d_explicit(t.v[0], t.v[1], t.v[2], p) == Some(Sign::Zero) && {
-                let (axis, orientation) = t.projection_axis();
+                let (axis, orientation) = boxes.axis(i, t);
                 t.contains_coplanar(p.point(), axis, orientation)
             }
         })
@@ -371,5 +382,136 @@ pub fn classify(
                 Placement::Outside
             }
         }
+    }
+}
+
+/// A point strictly inside the sub-triangle `v`, exactly on the plane of its
+/// facet (`plane`, an explicit triangle there). The barycenter of implicit
+/// vertices has a high degree, and its exact predicates stop being exact once
+/// products of tiny inputs (a sin(pi) of 1e-16) underflow; a point of degree
+/// one on the explicit plane triangle, at the f64 barycenter and certified
+/// inside the sub-triangle, avoids that and is far cheaper. Falls back to the
+/// barycenter when the certificate fails (a sliver below f64 resolution).
+pub(crate) fn representative(v: [&Point3; 3], plane: &Tri) -> Point3 {
+    let bary = || Point3::bary(v[0].clone(), v[1].clone(), v[2].clone());
+    let Some(p) = v
+        .iter()
+        .map(|x| x.approx())
+        .collect::<Option<Vec<[f64; 3]>>>()
+    else {
+        return bary();
+    };
+    let c: [f64; 3] = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
+    let [a, b, t] = plane.v;
+    let (axis, _) = plane.projection_axis();
+    let [i, j] = axis.kept();
+    let (e1, e2, d) = (
+        [b[i] - a[i], b[j] - a[j]],
+        [t[i] - a[i], t[j] - a[j]],
+        [c[i] - a[i], c[j] - a[j]],
+    );
+    let det = e1[0] * e2[1] - e1[1] * e2[0];
+    if det == 0.0 {
+        return bary();
+    }
+    let (u, w) = (
+        (d[0] * e2[1] - d[1] * e2[0]) / det,
+        (e1[0] * d[1] - e1[1] * d[0]) / det,
+    );
+    let q = Point3::pac(a, b, t, u, w);
+    let o = |x: &Point3, y: &Point3, z: &Point3| orient2d(x, y, z, axis);
+    let turn = o(v[0], v[1], v[2]);
+    let inside = matches!(turn, Some(s) if s != Sign::Zero)
+        && o(v[0], v[1], &q) == turn
+        && o(v[1], v[2], &q) == turn
+        && o(v[2], v[0], &q) == turn;
+    if inside {
+        q
+    } else {
+        bary()
+    }
+}
+
+/// A point strictly inside a sub-triangle of a facet: exact (prepared for
+/// the predicates) and its f64 approximation.
+pub struct Sample {
+    pub p: Prepared3,
+    pub rep: [f64; 3],
+}
+
+impl Sample {
+    /// The sample of the sub-triangle `v` of the facet on the plane of
+    /// `plane` (see [`representative`]).
+    pub fn of(v: [&Point3; 3], plane: &Tri) -> Sample {
+        let p = representative(v, plane);
+        let rep = p
+            .approx()
+            .expect("facet representative must be a valid point");
+        Sample {
+            p: Prepared3::new(p),
+            rep,
+        }
+    }
+}
+
+/// Closed solids prepared for placing points against them: the box of them
+/// all (whose outside the rays aim at), and per solid its box padded by a
+/// fat margin against a sample's approximation error (relative ~1e-15, the
+/// margin a million times that) and its triangle boxes. A sample clearly
+/// outside a solid's padded box is outside it: most placements collapse to
+/// three comparisons.
+pub struct Classifier<'a> {
+    solids: Vec<&'a [Tri]>,
+    bbox: ([f64; 3], [f64; 3]),
+    hulls: Vec<([f64; 3], [f64; 3])>,
+    boxes: Vec<TriBoxes>,
+}
+
+impl<'a> Classifier<'a> {
+    pub fn new(solids: Vec<&'a [Tri]>) -> Classifier<'a> {
+        let hull = |tris: &[Tri], pad: f64| {
+            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for t in tris {
+                for v in &t.v {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(v[k] - pad);
+                        hi[k] = hi[k].max(v[k] + pad);
+                    }
+                }
+            }
+            (lo, hi)
+        };
+        let all: Vec<([f64; 3], [f64; 3])> = solids.iter().map(|s| hull(s, 0.0)).collect();
+        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+        for (a, b) in &all {
+            for k in 0..3 {
+                lo[k] = lo[k].min(a[k]);
+                hi[k] = hi[k].max(b[k]);
+            }
+        }
+        let margin = 1e-6 * (0..3).map(|k| hi[k] - lo[k]).fold(1.0_f64, f64::max);
+        Classifier {
+            hulls: solids.iter().map(|s| hull(s, margin)).collect(),
+            boxes: solids.iter().map(|s| TriBoxes::build(s, margin)).collect(),
+            bbox: (lo, hi),
+            solids,
+        }
+    }
+
+    /// Where sample `s` of a facet on the plane of `own` lies against
+    /// solid `j`.
+    pub fn place(&self, j: usize, s: &Sample, own: &Tri) -> Placement {
+        let (lo, hi) = self.hulls[j];
+        if (0..3).any(|k| s.rep[k] < lo[k] || s.rep[k] > hi[k]) {
+            return Placement::Outside;
+        }
+        classify(&s.p, s.rep, own, self.solids[j], &self.boxes[j], self.bbox)
+    }
+
+    /// The winding numbers of solid `j` just in front of and just behind
+    /// sample `s` of its own facet on the plane of `own` (see
+    /// [`winding_beside`]).
+    pub fn beside(&self, j: usize, s: &Sample, own: &Tri) -> (i64, i64) {
+        winding_beside(&s.p, s.rep, own, self.solids[j], &self.boxes[j], self.bbox)
     }
 }

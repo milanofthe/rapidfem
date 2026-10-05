@@ -9,9 +9,8 @@ use crate::mesh::TetMesh;
 
 use crate::quality::{quality_stats, QualityStats};
 use crate::simplex::tet_min_dihedral;
-use rapidmesh_brep::Surface;
-use rapidmesh_geom::vec3::{centroid, dist, V3};
-use rapidmesh_geom::SurfaceKind;
+use rapidmesh_exact::vector::{centroid, dist, V3};
+use rapidmesh_geom::Surface;
 use rayon::prelude::*;
 
 /// The kind of a located mesh defect.
@@ -114,7 +113,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             let p = mesh.tets[t].map(pt);
             Defect {
                 kind: DefectKind::Sliver,
-                pos: centroid(&p),
+                pos: centroid(p),
                 value: tet_min_dihedral(p),
             }
         })
@@ -166,7 +165,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     for &((a, b), cnt) in &nm {
         defects.push(Defect {
             kind: DefectKind::NonManifoldEdge,
-            pos: centroid(&[pt(a), pt(b)]),
+            pos: centroid([pt(a), pt(b)]),
             value: cnt as f64,
         });
     }
@@ -229,7 +228,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             n_loose += 1;
             defects.push(Defect {
                 kind: DefectKind::LooseFace,
-                pos: centroid(&f.tri.map(pt)),
+                pos: centroid(f.tri.map(pt)),
                 value: (ha + hb) as f64,
             });
         }
@@ -248,7 +247,12 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
     // the wrong sphere, and a tagged-only test then reports a phantom straddler for
     // every on-surface vertex it mislabels. Planes and faceted faces are left
     // out: they cannot anchor the fit.
-    let curved: Vec<Surface> = mesh.surfaces.iter().filter_map(Surface::curved).collect();
+    let curved: Vec<&Surface> = mesh
+        .surfaces
+        .iter()
+        .flatten()
+        .filter(|s| !s.is_plane())
+        .collect();
     let nearest_off = |q: V3| -> f64 {
         curved
             .iter()
@@ -262,8 +266,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
         .par_iter()
         .map(|f| {
             let kind = &mesh.surfaces[f.surface as usize];
-            if matches!(kind, SurfaceKind::Plane { .. } | SurfaceKind::Facets) || curved.is_empty()
-            {
+            if matches!(kind, None | Some(Surface::Plane(_))) || curved.is_empty() {
                 return None; // planar faces are exact; deviation is 0
             }
             let v = [pt(f.tri[0]), pt(f.tri[1]), pt(f.tri[2])];
@@ -273,7 +276,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             // straddler: a VERTEX off EVERY analytic surface (a genuinely
             // leaked interior point), not merely off this face's tagged surface.
             let vmax_off = v.iter().map(|&q| nearest_off(q)).fold(0.0f64, f64::max);
-            Some((v, longest, vmax_off, nearest_off(centroid(&v))))
+            Some((v, longest, vmax_off, nearest_off(centroid(v))))
         })
         .collect();
     for &(v, longest, vmax_off, c_off) in offs.iter().flatten() {
@@ -281,7 +284,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             n_straddlers += 1;
             defects.push(Defect {
                 kind: DefectKind::Straddler,
-                pos: centroid(&v),
+                pos: centroid(v),
                 value: vmax_off,
             });
         }
@@ -296,7 +299,7 @@ pub fn diagnose(mesh: &TetMesh) -> MeshDiagnostics {
             n_bridge_faces += 1;
             defects.push(Defect {
                 kind: DefectKind::BridgeFace,
-                pos: centroid(&v),
+                pos: centroid(v),
                 value: c_off,
             });
         }
@@ -353,9 +356,9 @@ mod tests {
 
     #[test]
     fn sphere_is_watertight_and_on_surface() {
-        use rapidmesh_geom::sphere;
+        use rapidmesh_geom::icosphere;
         let mut scene = Scene::new();
-        scene.add_solid(sphere([0.0, 0.0, 0.0], 1.0, 24, 12));
+        scene.add_solid(icosphere([0.0, 0.0, 0.0], 1.0, 3));
         let model = rapidmesh_brep::Model::try_of_scene(&scene).expect("model");
         let m = crate::mesher::mesh_scene(
             &scene,

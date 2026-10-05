@@ -2,7 +2,7 @@
 //!
 //! The missing geometry primitive for consuming general CAD/STEP geometry: a
 //! trimmed NURBS surface is what a boolean of free-form bodies produces, and what
-//! the B-rep layer must be able to carry as a first-class [`crate::SurfaceKind`]
+//! the B-rep layer must be able to carry as a first-class [`crate::Surface`]
 //! sibling. This is the surface analogue of [`crate::nurbs::NurbsCurve`]: the same
 //! clamped knot vectors and rational weights, in two parameter directions.
 //!
@@ -14,7 +14,7 @@
 //! pruned by the convex hull of their control points.
 
 use crate::nurbs::{basis_funs, ders_basis, find_span, MAX_DEGREE};
-use crate::vec3::{cross, dot, scale, sub, V3};
+use rapidmesh_exact::vector::{cross, dot, scale, sub, V3};
 /// A tensor-product rational B-spline surface `S(u,v)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NurbsSurface {
@@ -555,14 +555,16 @@ impl NurbsSurface {
     /// Newton steps toward the point nearest `q` from `t` (at squared
     /// distance `dist`) within the domain, halved until the distance drops,
     /// until a step is small: one more is taken if it helps, the next would
-    /// be smaller than the rounding of the first.
+    /// be smaller than the rounding of the first. A step is tried with the
+    /// derivatives the next one starts from.
     fn descend(&self, mut t: [f64; 2], mut dist: f64, q: V3) -> ([f64; 2], f64) {
         let (ud, vd) = self.domain();
         let (lo, hi) = ([ud[0], vd[0]], [ud[1], vd[1]]);
         let small = [1e-9 * (hi[0] - lo[0]), 1e-9 * (hi[1] - lo[1])];
         let d2 = |x: V3| dot(sub(x, q), sub(x, q));
+        let mut ders = self.ders2(t[0], t[1]);
         for _ in 0..32 {
-            let [s, s_u, s_v, s_uu, s_uv, s_vv] = self.ders2(t[0], t[1]);
+            let [s, s_u, s_v, s_uu, s_uv, s_vv] = ders;
             let r = sub(s, q);
             let g = [dot(r, s_u), dot(r, s_v)];
             let h = [
@@ -607,15 +609,23 @@ impl NurbsSurface {
                     (t[1] - lambda * step[1]).clamp(lo[1], hi[1]),
                 ];
                 let small = (c[0] - t[0]).abs() <= small[0] && (c[1] - t[1]).abs() <= small[1];
-                let d = d2(self.eval(c[0], c[1]));
+                // A small step only needs the point: the descent ends
+                // there whether it helps or not.
+                if small {
+                    let d = d2(self.eval(c[0], c[1]));
+                    if d < dist {
+                        t = c;
+                        dist = d;
+                    }
+                    break;
+                }
+                let at = self.ders2(c[0], c[1]);
+                let d = d2(at[0]);
                 if d < dist {
                     t = c;
                     dist = d;
-                    moved = !small;
-                    break;
-                }
-                // A small step that does not help is rounding: there.
-                if small {
+                    ders = at;
+                    moved = true;
                     break;
                 }
                 lambda *= 0.5;

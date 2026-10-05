@@ -730,7 +730,7 @@ class Geometry(_PrimitivesMixin, _ImportMixin):
 
         Sheets: ``target`` and the tools must lie in one plane; the target
         becomes its outline minus the tools (a slot in a ground plane), the
-        tools are used up. Discs take part as 96-sided polygons.
+        tools are used up. The cut is exact; a disc's rim stays round.
 
 
         Parameters

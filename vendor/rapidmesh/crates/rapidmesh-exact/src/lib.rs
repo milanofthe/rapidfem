@@ -1,4 +1,5 @@
-//! Exact arithmetic foundation: expansions, interval filters, indirect predicates.
+//! Exact arithmetic foundation: expansions, interval filters, indirect predicates;
+//! and the plain float vector algebra every crate shares ([`vector`]).
 //!
 //! The exact mesh CSG (arrangements with implicitly represented intersection
 //! points), the planar triangulations and the inside/outside classification
@@ -52,6 +53,7 @@ pub mod orient;
 pub mod point;
 pub mod proj;
 pub mod ring;
+pub mod vector;
 
 pub use expansion::Expansion;
 pub use interval::Interval;
@@ -79,6 +81,23 @@ impl Axis {
             Axis::Y => 1,
             Axis::Z => 2,
         }
+    }
+
+    /// The two coordinates a projection along the axis keeps, paired
+    /// cyclically (dropping x keeps (y, z), y keeps (z, x), z keeps
+    /// (x, y)): a triangle's projected orientation is then the sign of the
+    /// dropped component of its normal.
+    pub fn kept(self) -> [usize; 2] {
+        match self {
+            Axis::X => [1, 2],
+            Axis::Y => [2, 0],
+            Axis::Z => [0, 1],
+        }
+    }
+
+    /// `p` projected along the axis (see [`Axis::kept`]).
+    pub fn project(self, p: [f64; 3]) -> [f64; 2] {
+        self.kept().map(|k| p[k])
     }
 }
 

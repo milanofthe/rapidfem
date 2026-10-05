@@ -13,10 +13,10 @@
 //! the end-to-end watertightness exercise of the arrangement machinery.
 
 use crate::arrange::{arrange, ArrangeError};
-use crate::classify::{classify, Placement, TriBoxes};
+use crate::classify::{Classifier, Placement, Sample};
 use crate::pool::VertexPool;
 use crate::tri::Tri;
-use rapidmesh_exact::{Point3, Prepared3};
+use rapidmesh_exact::Point3;
 
 /// A closed, outward-oriented triangle mesh.
 #[derive(Debug, Clone)]
@@ -78,43 +78,21 @@ pub fn boolean(a: &Solid, b: &Solid, op: BoolOp) -> Result<BooleanResult, Arrang
     let na = a.tris.len();
     let arr = arrange(&all)?;
 
-    // Scene bounding box for ray targets.
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    for t in &all {
-        for v in &t.v {
-            for k in 0..3 {
-                lo[k] = lo[k].min(v[k]);
-                hi[k] = hi[k].max(v[k]);
-            }
-        }
-    }
-
-    // Padded per-triangle boxes (see TriBoxes; the pad absorbs the
-    // representative's approximation error).
-    let margin = 1e-6 * (0..3).map(|k| hi[k] - lo[k]).fold(1.0_f64, f64::max);
-    let a_boxes = TriBoxes::build(&a.tris, margin);
-    let b_boxes = TriBoxes::build(&b.tris, margin);
-
+    let solids = Classifier::new(vec![&a.tris, &b.tris]);
     let mut pool = VertexPool::default();
     let mut triangles: Vec<[usize; 3]> = Vec::new();
     let mut source_facet: Vec<usize> = Vec::new();
     for (fi, ft) in arr.facets.iter().enumerate() {
         let from_a = fi < na;
-        let other: &[Tri] = if from_a { &b.tris } else { &a.tris };
-        let other_boxes = if from_a { &b_boxes } else { &a_boxes };
+        let other = if from_a { 1 } else { 0 };
         for sub in &ft.triangles {
             let (p0, p1, p2) = (
                 &ft.vertices[sub[0]],
                 &ft.vertices[sub[1]],
                 &ft.vertices[sub[2]],
             );
-            let bary = Point3::bary(p0.clone(), p1.clone(), p2.clone());
-            let rep = bary
-                .approx()
-                .expect("facet representative must be a valid point");
-            let bary = Prepared3::new(bary);
-            let placement = classify(&bary, rep, &all[fi], other, other_boxes, (lo, hi));
+            let sample = Sample::of([p0, p1, p2], &all[fi]);
+            let placement = solids.place(other, &sample, &all[fi]);
             let Some(flip) = keep(op, from_a, placement) else {
                 continue;
             };

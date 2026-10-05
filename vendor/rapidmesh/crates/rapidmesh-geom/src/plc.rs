@@ -1,7 +1,7 @@
 //! Tagged piecewise-linear complex: the central intermediate representation.
 
-use crate::faceted::SurfaceKind;
-use crate::vec3::len;
+use crate::surface::Surface;
+use rapidmesh_exact::vector::len;
 
 /// Identifies the analytic surface a PLC facet originated from, so the
 /// mesher and the second-order nodes follow the exact geometry instead of the
@@ -22,6 +22,12 @@ pub struct RegionTag(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FaceTag(pub u32);
 
+impl FaceTag {
+    /// The tag of the planes a large model is cut into blocks along: faces
+    /// of the cut, no faces of the model.
+    pub const CUT: FaceTag = FaceTag(u32::MAX);
+}
+
 /// Watertight tagged triangle surface complex.
 ///
 /// Coordinates are expected normalized to a unit box by the builder: the
@@ -41,7 +47,7 @@ pub struct TaggedPlc {
     /// Front is the side the triangle normal points into.
     pub region_tags: Vec<[RegionTag; 2]>,
     /// The analytic surfaces referenced by `surface_refs`.
-    pub surfaces: Vec<SurfaceKind>,
+    pub surfaces: Vec<Option<Surface>>,
     /// Per-surface owner: the index of the scene solid (insertion order,
     /// voids included) whose facets produced the surface, or
     /// [SHEET_OWNER] for sheet surfaces. Parallel to `surfaces`.
@@ -52,8 +58,8 @@ pub struct TaggedPlc {
     /// else the scene holds. Parallel to `surfaces`; empty where unknown.
     pub surface_roles: Vec<u32>,
     /// Per scene solid (the owner index): the frame it was built in (see
-    /// [`crate::Frame`]). Empty where unknown.
-    pub owner_frames: Vec<crate::Frame>,
+    /// [`rapidmesh_exact::vector::Affine`]). Empty where unknown.
+    pub owner_frames: Vec<rapidmesh_exact::vector::Affine>,
     /// Triangle edges (vertex pairs, lower index first) that are features
     /// without a change of surface: the input shapes' explicit feature
     /// segments, split where the arrangement split them.
@@ -122,6 +128,44 @@ impl TaggedPlc {
             .map(|(r, (v, s))| (r, 2.0 * v / s))
             .collect()
     }
+}
+
+/// A triangle mesh in an order of its own: the points by where they lie,
+/// the triangles by their points, each turned to start at its first (its
+/// winding kept). Returns the points, the triangles, the new index of each
+/// old point and the old index of each new triangle (to carry what goes
+/// with them).
+pub fn canonical_mesh(
+    points: &[[f64; 3]],
+    tris: &[[u32; 3]],
+) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u32>, Vec<usize>) {
+    let mut by_place: Vec<usize> = (0..points.len()).collect();
+    by_place.sort_by(|&a, &b| {
+        let (p, q) = (points[a], points[b]);
+        p[0].total_cmp(&q[0])
+            .then(p[1].total_cmp(&q[1]))
+            .then(p[2].total_cmp(&q[2]))
+    });
+    let mut new = vec![0u32; points.len()];
+    for (i, &v) in by_place.iter().enumerate() {
+        new[v] = i as u32;
+    }
+    let turned: Vec<[u32; 3]> = tris
+        .iter()
+        .map(|t| {
+            let t = t.map(|v| new[v as usize]);
+            let k = (0..3).min_by_key(|&k| t[k]).unwrap_or(0);
+            [t[k], t[(k + 1) % 3], t[(k + 2) % 3]]
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..tris.len()).collect();
+    order.sort_by_key(|&t| turned[t]);
+    (
+        by_place.iter().map(|&v| points[v]).collect(),
+        order.iter().map(|&t| turned[t]).collect(),
+        new,
+        order,
+    )
 }
 
 #[cfg(test)]

@@ -23,11 +23,11 @@
 //! fall.
 
 use crate::finish::snap::{adopt_face_vertices, Shape, FLOOR_DEG, HALVINGS};
-use crate::finish::P3;
 use crate::finish::{Complex, Face, PointClass};
-use crate::simplex::{tet_min_dihedral, tri_min_angle};
+use crate::simplex::{positive_min_dihedral, tet_min_dihedral, tri_min_angle};
 use geometry_predicates::orient3d;
-use rapidmesh_geom::vec3::{cross, dist, dot, len, sub};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{centroid, cross, dist, dot, len, sub};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
@@ -56,7 +56,7 @@ const RELAX_SWEEPS: usize = 2;
 
 /// Vertex move candidates: these directions (icosahedron vertices) at these
 /// fractions of the vertex's shortest edge.
-const DIRS: [P3; 12] = {
+const DIRS: [V3; 12] = {
     const A: f64 = 0.525_731_112_119_133_6;
     const B: f64 = 0.850_650_808_352_039_9;
     [
@@ -108,6 +108,10 @@ fn sorted3(f: [u32; 3]) -> [u32; 3] {
     s
 }
 
+/// A repair sweep goes on while the one before left fewer bad tets by at
+/// least one in so many, or a better worst one.
+const PROGRESS: usize = 100;
+
 /// Bad tets planned in parallel at a time, between these bounds after the
 /// conflicts of the batch before. A plan reads only the stars of the tet's
 /// vertices, so it stands as long as no change in the batch before it
@@ -138,7 +142,7 @@ enum Plan {
     /// Vertex `v` moved to `x`, with the new qualities of its star.
     Move {
         v: u32,
-        x: P3,
+        x: V3,
         star: Vec<(u32, f64)>,
     },
     /// A peel may apply: planned when applied, peel first.
@@ -161,7 +165,7 @@ enum Mobility {
 
 struct Improver<'a> {
     c: &'a mut Complex,
-    shape: Option<&'a dyn Shape>,
+    shape: &'a dyn Shape,
     /// Faces through each vertex (for the normal check of surface moves).
     vfaces: Vec<SmallVec<[u32; 8]>>,
     alive: Vec<bool>,
@@ -173,12 +177,14 @@ struct Improver<'a> {
     features: FxHashSet<(u32, u32)>,
     /// The neighbours of each vertex inside a curve along it.
     along: FxHashMap<u32, SmallVec<[u32; 2]>>,
-    /// The parameters of each patch vertex on a spline carrier: its
-    /// projections search from there, not over the whole carrier.
-    uv: Vec<Option<[f64; 2]>>,
+    /// The parameters of each surface vertex on the spline carriers of the
+    /// patches it lies on (a vertex on an edge on those of either side): a
+    /// projection onto a patch searches from a vertex's there, not over the
+    /// whole carrier.
+    uv: Vec<SmallVec<[(u32, [f64; 2]); 2]>>,
     mobility: Vec<Mobility>,
-    /// Patches whose faces stay as they are (periodic pairs).
-    frozen: Vec<u32>,
+    /// Per patch: whether its faces stay as they are (periodic pairs).
+    frozen: Vec<bool>,
     /// The sweep (from 1) in which each vertex last saw a change.
     changed: Vec<u32>,
     /// The vertices changed since the last sweep began (with repeats).
@@ -205,7 +211,7 @@ struct Improver<'a> {
 }
 
 impl Improver<'_> {
-    fn p(&self, v: u32) -> P3 {
+    fn p(&self, v: u32) -> V3 {
         self.c.points[v as usize]
     }
 
@@ -512,9 +518,6 @@ impl Improver<'_> {
 
     /// Whether `t` has the two faces a peel needs (and there is a shape).
     fn may_peel(&self, t: u32) -> bool {
-        if self.shape.is_none() {
-            return false;
-        }
         let tv = self.c.tets[t as usize];
         (0..4)
             .filter(|&i| {
@@ -572,7 +575,7 @@ impl Improver<'_> {
         if f0.patch != f1.patch
             || f0.patch == u32::MAX
             || behind(&f1) != Some(s)
-            || self.frozen.contains(&f0.patch)
+            || self.is_frozen(f0.patch)
         {
             return false;
         }
@@ -776,11 +779,11 @@ impl Improver<'_> {
 
     /// Where a vertex would land for the candidate `x`: `x` for a free
     /// vertex, its projection onto the carrier for a surface vertex.
-    fn place(&self, v: u32, x: P3) -> Option<P3> {
+    fn place(&self, v: u32, x: V3) -> Option<V3> {
         match self.mobility[v as usize] {
             Mobility::Free => Some(x),
             Mobility::Surface => self.project_from(self.c.classes[v as usize], x, v),
-            Mobility::Curve => self.shape?.project(self.c.classes[v as usize], x),
+            Mobility::Curve => self.shape.project(self.c.classes[v as usize], x),
             Mobility::Fixed => None,
         }
     }
@@ -788,11 +791,15 @@ impl Improver<'_> {
     /// [`Improver::place`] near enough to compare candidates (see
     /// [`Shape::project_near`] and [`Shape::project_near_from`]): still a
     /// point on the curve or carrier, so the chosen one stays as it is.
-    fn place_near(&self, v: u32, x: P3) -> Option<P3> {
+    fn place_near(&self, v: u32, x: V3) -> Option<V3> {
         let kind = self.c.classes[v as usize];
-        match (self.mobility[v as usize], self.uv[v as usize]) {
-            (Mobility::Curve, _) => self.shape?.project_near(kind, x),
-            (Mobility::Surface, Some(uv)) => self.shape?.project_near_from(kind, x, uv),
+        let uv = match kind {
+            PointClass::Face(p) => self.uv_on(v, p),
+            _ => None,
+        };
+        match (self.mobility[v as usize], uv) {
+            (Mobility::Curve, _) => self.shape.project_near(kind, x),
+            (Mobility::Surface, Some(uv)) => self.shape.project_near_from(kind, x, uv),
             _ => self.place(v, x),
         }
     }
@@ -802,15 +809,13 @@ impl Improver<'_> {
     /// or when a face through `v` would turn. Stops at the first tet at or
     /// below `floor`, so a star sorted worst first rejects most candidates
     /// after a tet or two.
-    fn star_quality(&self, v: u32, star: &[u32], x: P3, floor: f64) -> Option<f64> {
+    fn star_quality(&self, v: u32, star: &[u32], x: V3, floor: f64) -> Option<f64> {
         let mut worst = f64::INFINITY;
         for &t in star {
             let tv = self.c.tets[t as usize];
-            let pts = tv.map(|w| if w == v { x } else { self.p(w) });
-            if !(orient3d(pts[0], pts[1], pts[2], pts[3]) > 0.0) {
-                return None;
-            }
-            let q = tet_min_dihedral(pts);
+            // A tet that does not turn positively has 0, no more than any
+            // floor.
+            let q = positive_min_dihedral(tv.map(|w| if w == v { x } else { self.p(w) }));
             if q <= floor {
                 return None;
             }
@@ -839,7 +844,7 @@ impl Improver<'_> {
     /// at or above `target` drops below it and none below gets worse, their
     /// dihedrals sum to at least what they did (the mean does not fall), and
     /// no face through `v` turns.
-    fn star_accepts(&self, v: u32, star: &[u32], x: P3, target: f64) -> bool {
+    fn star_accepts(&self, v: u32, star: &[u32], x: V3, target: f64) -> bool {
         let (mut sum, mut sum0) = (0.0, 0.0);
         for &t in star {
             let tv = self.c.tets[t as usize];
@@ -859,34 +864,49 @@ impl Improver<'_> {
 
     /// `x` onto the carrier of `kind`, searched from the parameters of
     /// vertex `near` where it has some there.
-    fn project_from(&self, kind: PointClass, x: P3, near: u32) -> Option<P3> {
-        let shape = self.shape?;
-        match self.uv[near as usize] {
-            Some(uv) if self.c.classes[near as usize] == kind => {
-                shape.project_from(kind, x, uv).map(|r| r.0)
-            }
-            _ => shape.project(kind, x),
+    fn project_from(&self, kind: PointClass, x: V3, near: u32) -> Option<V3> {
+        let uv = match kind {
+            PointClass::Face(p) => self.uv_on(near, p),
+            _ => None,
+        };
+        match uv {
+            Some(uv) => self.shape.project_from(kind, x, uv).map(|r| r.0),
+            None => self.shape.project(kind, x),
         }
     }
 
-    /// `x` onto `patch`, searched from a corner of `tri` on it.
-    fn project_on_patch(&self, tri: [u32; 3], x: P3, patch: u32) -> Option<P3> {
+    /// The parameters of vertex `v` on the carrier of `patch`, where it
+    /// lies on the patch and the carrier is a spline.
+    fn uv_on(&self, v: u32, patch: u32) -> Option<[f64; 2]> {
+        self.uv[v as usize]
+            .iter()
+            .find(|x| x.0 == patch)
+            .map(|x| x.1)
+    }
+
+    /// `x` onto `patch`, searched from a corner of `tri` on it (on an edge
+    /// of it too).
+    fn project_on_patch(&self, tri: [u32; 3], x: V3, patch: u32) -> Option<V3> {
         let kind = PointClass::Face(patch);
-        match tri
-            .into_iter()
-            .find(|&w| self.c.classes[w as usize] == kind)
-        {
+        match tri.into_iter().find(|&w| self.uv_on(w, patch).is_some()) {
             Some(w) => self.project_from(kind, x, w),
-            None => self.shape?.project(kind, x),
+            None => self.shape.project(kind, x),
         }
     }
 
-    fn commit_move(&mut self, v: u32, star: &[u32], x: P3) {
-        if let (Some(shape), Some(uv)) = (self.shape, self.uv[v as usize]) {
-            self.uv[v as usize] = shape
-                .project_from(self.c.classes[v as usize], x, uv)
-                .map(|r| r.1);
-        }
+    fn commit_move(&mut self, v: u32, star: &[u32], x: V3) {
+        let shape = self.shape;
+        let mut uv = std::mem::take(&mut self.uv[v as usize]);
+        uv.retain(
+            |(p, at)| match shape.project_from(PointClass::Face(*p), x, *at) {
+                Some((_, to)) => {
+                    *at = to;
+                    true
+                }
+                None => false,
+            },
+        );
+        self.uv[v as usize] = uv;
         self.c.points[v as usize] = x;
         self.touch(v);
         for &t in star {
@@ -917,7 +937,7 @@ impl Improver<'_> {
         let lmin = self.shortest_edge(v, &star);
         // Along a curve only towards its neighbours on it, at the same
         // fractions of the shortest edge.
-        let dirs: SmallVec<[P3; 12]> = match self.mobility[v as usize] {
+        let dirs: SmallVec<[V3; 12]> = match self.mobility[v as usize] {
             Mobility::Curve => self.along.get(&v).map_or(SmallVec::new(), |ns| {
                 ns.iter()
                     .map(|&w| {
@@ -971,7 +991,7 @@ impl Improver<'_> {
 
     /// Whether moving the surface vertex `v` to `x` makes a face through it
     /// a bridge (see [`Improver::bridge`]).
-    fn strays(&self, v: u32, x: P3) -> bool {
+    fn strays(&self, v: u32, x: V3) -> bool {
         self.vfaces[v as usize]
             .iter()
             .filter(|&&f| self.face_alive[f as usize])
@@ -986,20 +1006,30 @@ impl Improver<'_> {
     /// Whether the triangle `new` on `patch` strays from its carrier by
     /// more than [`BRIDGE`] of its longest edge where `old` did not: a
     /// chord across a sharp tip, which the diagnostics call a bridge.
-    fn bridge(&self, tri: [u32; 3], new: [P3; 3], old: [P3; 3], patch: u32) -> bool {
-        if self.shape.is_none() {
-            return false;
-        }
-        let stray = |t: [P3; 3]| -> f64 {
-            let m: P3 = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
+    fn bridge(&self, tri: [u32; 3], new: [V3; 3], old: [V3; 3], patch: u32) -> bool {
+        let longest = |t: [V3; 3]| {
+            (0..3)
+                .map(|k| dist(t[k], t[(k + 1) % 3]))
+                .fold(0.0, f64::max)
+                .max(f64::MIN_POSITIVE)
+        };
+        let stray = |t: [V3; 3]| -> f64 {
+            let m = centroid(t);
             let off = self
                 .project_on_patch(tri, m, patch)
                 .map_or(0.0, |y| dist(m, y));
-            let longest = (0..3)
-                .map(|k| dist(t[k], t[(k + 1) % 3]))
-                .fold(0.0, f64::max);
-            off / longest.max(f64::MIN_POSITIVE)
+            off / longest(t)
         };
+        // A point of the carrier near the centroid is no nearer than the
+        // nearest one: within the bound there, the new face does not stray.
+        let m = centroid(new);
+        let near = tri.into_iter().find_map(|w| {
+            let uv = self.uv_on(w, patch)?;
+            self.shape.project_near_from(PointClass::Face(patch), m, uv)
+        });
+        if near.is_some_and(|y| dist(m, y) / longest(new) <= BRIDGE) {
+            return false;
+        }
         let after = stray(new);
         after > BRIDGE && after > stray(old)
     }
@@ -1026,7 +1056,12 @@ impl Improver<'_> {
 impl<'a> Improver<'a> {
     /// Indexes `c` for local changes. With a `shape`, vertices on one patch
     /// move along its carrier; without one only volume vertices move.
-    fn new(c: &'a mut Complex, shape: Option<&'a dyn Shape>, frozen: &[u32]) -> Improver<'a> {
+    /// Whether the faces of `patch` stay as they are.
+    fn is_frozen(&self, patch: u32) -> bool {
+        self.frozen.get(patch as usize).copied().unwrap_or(false)
+    }
+
+    fn new(c: &'a mut Complex, shape: &'a dyn Shape, frozen: &[u32]) -> Improver<'a> {
         let n = c.points.len();
         let mut vtets: Vec<SmallVec<[u32; 32]>> = vec![SmallVec::new(); n];
         for (ti, t) in c.tets.iter().enumerate() {
@@ -1059,36 +1094,53 @@ impl<'a> Improver<'a> {
                 vfaces[v as usize].push(fi as u32);
             }
         }
+        let mut frozen_patch = Vec::new();
+        for &p in frozen {
+            let p = p as usize;
+            if p >= frozen_patch.len() {
+                frozen_patch.resize(p + 1, false);
+            }
+            frozen_patch[p] = true;
+        }
         let on_frozen = |v: usize| {
-            vfaces[v]
-                .iter()
-                .any(|&f| frozen.contains(&c.faces[f as usize].patch))
+            vfaces[v].iter().any(|&f| {
+                let p = c.faces[f as usize].patch as usize;
+                frozen_patch.get(p).copied().unwrap_or(false)
+            })
         };
         let mobility: Vec<Mobility> = (0..n)
             .map(|v| match c.classes[v] {
                 _ if on_frozen(v) => Mobility::Fixed,
                 PointClass::Interior if vfaces[v].is_empty() => Mobility::Free,
                 PointClass::Face(p)
-                    if shape.is_some()
-                        && vfaces[v].iter().all(|&f| c.faces[f as usize].patch == p) =>
+                    if vfaces[v].iter().all(|&f| c.faces[f as usize].patch == p) =>
                 {
                     Mobility::Surface
                 }
-                PointClass::Edge(_) if shape.is_some_and(|s| s.smooth(c.classes[v])) => {
-                    Mobility::Curve
-                }
+                PointClass::Edge(_) if shape.smooth(c.classes[v]) => Mobility::Curve,
                 _ => Mobility::Fixed,
             })
             .collect();
-        // One search over the whole carrier per patch vertex; every later
-        // projection searches from where the vertex is.
-        let uv: Vec<Option<[f64; 2]>> = {
+        // One search over the whole carrier per surface vertex and patch it
+        // lies on; every later projection searches from where the vertex is.
+        let uv: Vec<SmallVec<[(u32, [f64; 2]); 2]>> = {
             use rayon::prelude::*;
             (0..n)
                 .into_par_iter()
-                .map(|v| match (shape, c.classes[v]) {
-                    (Some(s), k @ PointClass::Face(_)) => s.param(k, c.points[v]),
-                    _ => None,
+                .map(|v| {
+                    let mut patches: SmallVec<[u32; 4]> = vfaces[v]
+                        .iter()
+                        .map(|&f| c.faces[f as usize].patch)
+                        .collect();
+                    patches.sort_unstable();
+                    patches.dedup();
+                    patches
+                        .into_iter()
+                        .filter_map(|p| {
+                            let uv = shape.param(PointClass::Face(p), c.points[v])?;
+                            Some((p, uv))
+                        })
+                        .collect()
                 })
                 .collect()
         };
@@ -1110,7 +1162,7 @@ impl<'a> Improver<'a> {
             along,
             uv,
             mobility,
-            frozen: frozen.to_vec(),
+            frozen: frozen_patch,
             vfaces,
             shape,
             c,
@@ -1144,6 +1196,9 @@ impl<'a> Improver<'a> {
     /// others would fail again with the same neighbourhood).
     fn repair(&mut self, target_deg: f64, passes: usize, all: bool) {
         let start = self.sweep + 1;
+        // The bad tets a sweep began with and the worst of them: a sweep
+        // that neither leaves fewer nor a better worst one only churns.
+        let mut last: Option<(usize, f64)> = None;
         for sweep in start..start + passes as u32 {
             self.sweep = sweep;
             // The first sweep with `all` takes every tet, the others the
@@ -1177,6 +1232,13 @@ impl<'a> Improver<'a> {
                 break;
             }
             bad.sort_by(|&a, &b| self.q[a as usize].total_cmp(&self.q[b as usize]));
+            let now = (bad.len(), self.q[bad[0] as usize]);
+            if let Some((n, worst)) = last {
+                if now.0 * PROGRESS > n * (PROGRESS - 1) && now.1 <= worst {
+                    break;
+                }
+            }
+            last = Some(now);
             let mut changed = false;
             // Worst first; a plan made stale by a change before it in its
             // batch goes to the head of the next batch, planned there in
@@ -1225,8 +1287,8 @@ impl<'a> Improver<'a> {
     /// or the curve; taken where the smallest angle of the faces around it
     /// rises and its star accepts (see [`Improver::star_accepts`]). The full
     /// step, else a half or a quarter of it.
-    fn plan_relax(&self, v: u32, target: f64) -> Option<P3> {
-        let shape = self.shape?;
+    fn plan_relax(&self, v: u32, target: f64) -> Option<V3> {
+        let shape = self.shape;
         let kind = self.c.classes[v as usize];
         let faces: SmallVec<[[u32; 3]; 8]> = self.vfaces[v as usize]
             .iter()
@@ -1235,12 +1297,12 @@ impl<'a> Improver<'a> {
             .collect();
         let on_frozen = self.vfaces[v as usize]
             .iter()
-            .any(|&f| self.frozen.contains(&self.c.faces[f as usize].patch));
+            .any(|&f| self.is_frozen(self.c.faces[f as usize].patch));
         if faces.len() < 3 || on_frozen || !shape.smooth(kind) {
             return None;
         }
         let p0 = self.p(v);
-        let goal: P3 = match (self.mobility[v as usize], kind) {
+        let goal: V3 = match (self.mobility[v as usize], kind) {
             (Mobility::Surface, _) => {
                 let (mut sum, mut area) = ([0.0; 3], 0.0);
                 for t in &faces {
@@ -1267,7 +1329,7 @@ impl<'a> Improver<'a> {
             },
             _ => return None,
         };
-        let angle = |x: P3| -> f64 {
+        let angle = |x: V3| -> f64 {
             faces
                 .iter()
                 .map(|t| {
@@ -1284,13 +1346,13 @@ impl<'a> Improver<'a> {
             .filter(|&&f| self.face_alive[f as usize])
             .map(|&f| self.c.faces[f as usize].patch)
             .collect();
-        let stray = |x: P3| -> f64 {
+        let stray = |x: V3| -> f64 {
             faces
                 .iter()
                 .zip(&patches)
                 .map(|(t, &p)| {
                     let at = |w: u32| if w == v { x } else { self.p(w) };
-                    let c: P3 =
+                    let c: V3 =
                         std::array::from_fn(|k| (at(t[0])[k] + at(t[1])[k] + at(t[2])[k]) / 3.0);
                     self.project_on_patch(*t, c, p).map_or(0.0, |q| dist(c, q))
                 })
@@ -1301,7 +1363,7 @@ impl<'a> Improver<'a> {
         let stray0 = std::cell::OnceCell::new();
         let star: SmallVec<[u32; 32]> = self.live(v).collect();
         for frac in [1.0, 0.5, 0.25] {
-            let x0: P3 = std::array::from_fn(|k| p0[k] + frac * (goal[k] - p0[k]));
+            let x0: V3 = std::array::from_fn(|k| p0[k] + frac * (goal[k] - p0[k]));
             let x = self.project_from(kind, x0, v)?;
             if angle(x) > before + GAIN
                 && stray(x) <= *stray0.get_or_init(|| stray(p0))
@@ -1319,9 +1381,6 @@ impl<'a> Improver<'a> {
     /// changed meanwhile; stops when a sweep moves nothing.
     fn relax_surface(&mut self, sweeps: usize, target: f64) -> usize {
         use rayon::prelude::*;
-        if self.shape.is_none() {
-            return 0;
-        }
         let candidates: Vec<u32> = (0..self.c.points.len() as u32)
             .filter(|&v| !self.vfaces[v as usize].is_empty())
             .collect();
@@ -1331,7 +1390,7 @@ impl<'a> Improver<'a> {
             // After the first sweep only vertices next to one it moved: a
             // plan reads no more than the star, so the others would plan
             // as before and fail again.
-            let plans: Vec<(u32, Option<P3>)> = candidates
+            let plans: Vec<(u32, Option<V3>)> = candidates
                 .par_iter()
                 .filter(|&&v| sweep == 1 || stamp[v as usize] == sweep - 1)
                 .map(|&v| (v, self.plan_relax(v, target)))
@@ -1374,7 +1433,7 @@ impl<'a> Improver<'a> {
     /// the vertices left short of the shape.
     fn snap(&mut self, verts: &[u32]) -> Vec<u32> {
         use rayon::prelude::*;
-        let targets: Vec<Option<P3>> = verts
+        let targets: Vec<Option<V3>> = verts
             .par_iter()
             .map(|&v| self.project_from(self.c.classes[v as usize], self.p(v), v))
             .collect();
@@ -1399,7 +1458,7 @@ impl<'a> Improver<'a> {
                 let mut f = 1.0;
                 let mut moved = false;
                 for _ in 0..=HALVINGS {
-                    let x: P3 = std::array::from_fn(|k| p[k] + f * (q[k] - p[k]));
+                    let x: V3 = std::array::from_fn(|k| p[k] + f * (q[k] - p[k]));
                     if self.star_min(v, &star, x).is_some_and(|w| w >= floor) {
                         self.commit_move(v, &star, x);
                         moved = true;
@@ -1417,7 +1476,7 @@ impl<'a> Improver<'a> {
 
     /// Smallest dihedral over the star of `v` with `v` at `x`, `None` when a
     /// tet would not stay positive.
-    fn star_min(&self, v: u32, star: &[u32], x: P3) -> Option<f64> {
+    fn star_min(&self, v: u32, star: &[u32], x: V3) -> Option<f64> {
         let mut worst = f64::INFINITY;
         for &t in star {
             let pts = self.c.tets[t as usize].map(|w| if w == v { x } else { self.p(w) });
@@ -1482,7 +1541,7 @@ pub fn finish(
     let t = rapidmesh_exact::clock::Instant::now();
     adopt_face_vertices(c);
     let verts: Vec<u32> = (0..c.points.len() as u32).collect();
-    let mut im = Improver::new(c, Some(shape), frozen);
+    let mut im = Improver::new(c, shape, frozen);
     stage("finish.index", t.elapsed().as_secs_f64());
     let t = rapidmesh_exact::clock::Instant::now();
     let mut short = im.snap(&verts);
@@ -1522,7 +1581,15 @@ pub fn finish(
 mod tests {
     use super::*;
 
-    fn complex(points: Vec<P3>, tets: Vec<[u32; 4]>) -> Complex {
+    /// A shape that moves no point.
+    struct Nothing;
+    impl Shape for Nothing {
+        fn project(&self, _: PointClass, _: V3) -> Option<V3> {
+            None
+        }
+    }
+
+    fn complex(points: Vec<V3>, tets: Vec<[u32; 4]>) -> Complex {
         Complex {
             classes: vec![PointClass::Interior; points.len()],
             points,
@@ -1548,7 +1615,7 @@ mod tests {
             ],
             vec![[a, b, p, q], [a, b, q, r], [a, b, r, p], [b, p, q, r]],
         );
-        let im = Improver::new(&mut c, None, &[]);
+        let im = Improver::new(&mut c, &Nothing, &[]);
         for t in 0..3 {
             assert!(im.flip32(t, a, b).is_none(), "tet {t}");
         }
@@ -1560,7 +1627,7 @@ mod tests {
     #[test]
     fn the_tet_across_a_triangle_holds_all_its_corners() {
         let (f0, f1, f2, a, e, c0, c1) = (0u32, 1, 2, 3, 4, 5, 6);
-        let mut points: Vec<P3> = vec![[0.0; 3]; 7];
+        let mut points: Vec<V3> = vec![[0.0; 3]; 7];
         let mut tets = vec![[a, f0, f1, f2], [f1, f2, c0, c1], [f0, f1, f2, e]];
         for k in 0..=LARGE_STAR as u32 {
             let v = points.len() as u32;
@@ -1572,7 +1639,7 @@ mod tests {
             tets.push([f0, v, v + 1, v + 2]);
         }
         let mut c = complex(points, tets);
-        let im = Improver::new(&mut c, None, &[]);
+        let im = Improver::new(&mut c, &Nothing, &[]);
         assert_eq!(im.across(0, [f0, f1, f2]), Some(2));
     }
 }

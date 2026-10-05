@@ -38,14 +38,14 @@ impl Tri {
     /// the chosen projection is also the numerically best-conditioned one.
     /// Panics on exactly degenerate (zero-area) triangles.
     pub fn projection_axis(&self) -> (Axis, Sign) {
+        self.try_projection_axis()
+            .unwrap_or_else(|| panic!("degenerate (zero-area) triangle: {:?}", self.v))
+    }
+
+    /// [`Tri::projection_axis`], `None` for a triangle of zero area.
+    pub fn try_projection_axis(&self) -> Option<(Axis, Sign)> {
         let [a, b, c] = self.v;
-        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-        let n = [
-            u[1] * w[2] - u[2] * w[1],
-            u[2] * w[0] - u[0] * w[2],
-            u[0] * w[1] - u[1] * w[0],
-        ];
+        let n = rapidmesh_exact::vector::tri_normal(a, b, c);
         let mut axes = [Axis::X, Axis::Y, Axis::Z];
         axes.sort_by(|p, q| {
             n[q.index()]
@@ -57,10 +57,10 @@ impl Tri {
             let s = orient2d(&self.point(0), &self.point(1), &self.point(2), axis)
                 .expect("explicit points are always valid");
             if s != Sign::Zero {
-                return (axis, s);
+                return Some((axis, s));
             }
         }
-        panic!("degenerate (zero-area) triangle: {:?}", self.v);
+        None
     }
 
     /// Exact closed containment: true if `p` lies inside this triangle or on

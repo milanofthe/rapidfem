@@ -7,8 +7,11 @@
 //! decisions are exact predicates; for simple non-crossing input every output
 //! vertex is an input vertex.
 
+use crate::grid::HashGrid;
 use rapidmesh_csg::{triangulate_facet, Constraint, ConstraintLine, Tri};
+use rapidmesh_exact::vector::V2;
 use rapidmesh_exact::{orient2d, Axis, Expansion, Point3, Sign};
+use rustc_hash::FxHashSet;
 
 /// Exact orientation of a simple planar polygon (shoelace sign, evaluated in
 /// expansion arithmetic): `Positive` = counterclockwise.
@@ -135,6 +138,71 @@ pub fn triangulate_polygon(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> Vec<[
     // The container is counterclockwise in the z-projection, so kept
     // sub-triangles are too.
     debug_assert_eq!(ft.orientation, Sign::Positive);
+    out
+}
+
+/// The segments (indices into `segments`) that cross another or pass
+/// through a point of it in the plane: an outline whose chords cross (a
+/// face narrower than its samples are apart) has no triangulation.
+pub fn crossings(pts: &[V2], segments: &[(usize, usize)]) -> Vec<usize> {
+    if segments.len() < 2 {
+        return Vec::new();
+    }
+    let mut lens: Vec<f64> = segments
+        .iter()
+        .map(|&(a, b)| (pts[a][0] - pts[b][0]).hypot(pts[a][1] - pts[b][1]))
+        .collect();
+    lens.sort_by(f64::total_cmp);
+    let cell = lens[lens.len() / 2].max(1e-300);
+    let mut grid: HashGrid<usize, 2> = HashGrid::new(cell);
+    for (i, &(a, b)) in segments.iter().enumerate() {
+        let (p, q) = (pts[a], pts[b]);
+        grid.insert_box(
+            [p[0].min(q[0]), p[1].min(q[1])],
+            [p[0].max(q[0]), p[1].max(q[1])],
+            i,
+        );
+    }
+    let orient = |a: V2, b: V2, c: V2| match crate::cdt2::orient(a, b, c) {
+        Sign::Positive => 1.0,
+        Sign::Negative => -1.0,
+        Sign::Zero => 0.0,
+    };
+    // Whether `c` lies inside the segment `a b` it is collinear with.
+    let within = |a: V2, b: V2, c: V2| {
+        let t = (c[0] - a[0]) * (b[0] - a[0]) + (c[1] - a[1]) * (b[1] - a[1]);
+        let l = (b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2);
+        t > 0.0 && t < l
+    };
+    let meet = |i: usize, j: usize| {
+        let ((a, b), (c, d)) = (segments[i], segments[j]);
+        if a == c || a == d || b == c || b == d {
+            return false;
+        }
+        let (pa, pb, pc, pd) = (pts[a], pts[b], pts[c], pts[d]);
+        let (o1, o2) = (orient(pa, pb, pc), orient(pa, pb, pd));
+        let (o3, o4) = (orient(pc, pd, pa), orient(pc, pd, pb));
+        if o1 * o2 < 0.0 && o3 * o4 < 0.0 {
+            return true;
+        }
+        (o1 == 0.0 && within(pa, pb, pc))
+            || (o2 == 0.0 && within(pa, pb, pd))
+            || (o3 == 0.0 && within(pc, pd, pa))
+            || (o4 == 0.0 && within(pc, pd, pb))
+    };
+    let mut out: FxHashSet<usize> = FxHashSet::default();
+    for ids in grid.bins() {
+        for (k, &i) in ids.iter().enumerate() {
+            for &j in &ids[k + 1..] {
+                if meet(i, j) {
+                    out.insert(i);
+                    out.insert(j);
+                }
+            }
+        }
+    }
+    let mut out: Vec<usize> = out.into_iter().collect();
+    out.sort_unstable();
     out
 }
 

@@ -1,10 +1,10 @@
 //! The tube carrier's centerline: a polyline with a [`Bvh`] over its
 //! segments for closest-point queries. The projection
-//! onto a `SurfaceKind::Tube` runs for every point the mesher puts on it; a
+//! onto a `Surface::Tube` runs for every point the mesher puts on it; a
 //! linear scan over a helix path would cost the whole path each time.
 
 use crate::bvh::Bvh;
-use crate::vec3::{bbox, dot, sub, V3};
+use rapidmesh_exact::vector::{bbox, closest_on_segment, dist2, V3};
 
 /// A polyline sweep centerline with an AABB segment tree for closest queries.
 #[derive(Debug)]
@@ -13,23 +13,6 @@ pub struct TubePath {
     pub pts: Vec<V3>,
     /// The tree over the segments (segment `i` from node `i` to `i + 1`).
     bvh: Bvh,
-}
-
-fn d2(a: V3, b: V3) -> f64 {
-    let d = sub(a, b);
-    dot(d, d)
-}
-
-/// Closest point on segment `a -> b` to `p`.
-fn closest_on_seg(p: V3, a: V3, b: V3) -> V3 {
-    let ab = sub(b, a);
-    let len2 = dot(ab, ab);
-    let t = if len2 > 0.0 {
-        (dot(sub(p, a), ab) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    std::array::from_fn(|k| a[k] + t * ab[k])
 }
 
 impl TubePath {
@@ -50,10 +33,10 @@ impl TubePath {
     /// The closest point of the polyline to `p` and its segment (exact; the
     /// tree only prunes).
     fn closest_with_segment(&self, p: V3) -> (V3, usize) {
-        let on = |s: usize| closest_on_seg(p, self.pts[s], self.pts[s + 1]);
+        let on = |s: usize| closest_on_segment(p, self.pts[s], self.pts[s + 1]);
         let s = self
             .bvh
-            .nearest(p, f64::INFINITY, |s| Some(d2(p, on(s as usize))))
+            .nearest(p, f64::INFINITY, |s| Some(dist2(p, on(s as usize))))
             .map_or(0, |(s, _)| s as usize);
         (on(s), s)
     }
@@ -75,8 +58,8 @@ impl TubePath {
     pub fn closest_near(&self, p: V3, start: usize) -> (V3, usize) {
         let n_seg = self.pts.len() - 1;
         let at = |s: usize| {
-            let q = closest_on_seg(p, self.pts[s], self.pts[s + 1]);
-            (d2(q, p), q)
+            let q = closest_on_segment(p, self.pts[s], self.pts[s + 1]);
+            (dist2(q, p), q)
         };
         let mut s = start.min(n_seg - 1);
         let (mut best, mut q) = at(s);
@@ -99,7 +82,7 @@ impl TubePath {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vec3::dist;
+    use rapidmesh_exact::vector::dist;
 
     #[test]
     fn tree_closest_matches_linear_scan() {
@@ -114,9 +97,9 @@ mod tests {
         let linear = |p: V3| -> V3 {
             let mut best = (pts[0], f64::MAX);
             for w in pts.windows(2) {
-                let q = closest_on_seg(p, w[0], w[1]);
-                if d2(p, q) < best.1 {
-                    best = (q, d2(p, q));
+                let q = closest_on_segment(p, w[0], w[1]);
+                if dist2(p, q) < best.1 {
+                    best = (q, dist2(p, q));
                 }
             }
             best.0

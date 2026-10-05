@@ -12,55 +12,12 @@
 //! lower bound (branch and bound).
 
 use rapidmesh_csg::Tri;
+use rapidmesh_exact::vector::{box_d2, closest_on_tri, dist2, V3};
 use rapidmesh_geom::bvh::Bvh;
-use rapidmesh_geom::vec3::{box_d2, dot, sub, V3};
 
-/// Squared distance from point `p` to triangle `t` (closest-point clamp).
+/// Squared distance from point `p` to triangle `t`.
 pub fn point_tri_dist2(p: V3, t: &Tri) -> f64 {
-    let (a, b, c) = (t.v[0], t.v[1], t.v[2]);
-    let ab = sub(b, a);
-    let ac = sub(c, a);
-    let ap = sub(p, a);
-    let d1 = dot(ab, ap);
-    let d2 = dot(ac, ap);
-    if d1 <= 0.0 && d2 <= 0.0 {
-        return dot(ap, ap);
-    }
-    let bp = sub(p, b);
-    let d3 = dot(ab, bp);
-    let d4 = dot(ac, bp);
-    if d3 >= 0.0 && d4 <= d3 {
-        return dot(bp, bp);
-    }
-    let cp = sub(p, c);
-    let d5 = dot(ab, cp);
-    let d6 = dot(ac, cp);
-    if d6 >= 0.0 && d5 <= d6 {
-        return dot(cp, cp);
-    }
-    let vc = d1 * d4 - d3 * d2;
-    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
-        let v = d1 / (d1 - d3);
-        let q: V3 = std::array::from_fn(|k| a[k] + v * ab[k]);
-        return dot(sub(p, q), sub(p, q));
-    }
-    let vb = d5 * d2 - d1 * d6;
-    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
-        let w = d2 / (d2 - d6);
-        let q: V3 = std::array::from_fn(|k| a[k] + w * ac[k]);
-        return dot(sub(p, q), sub(p, q));
-    }
-    let va = d3 * d6 - d5 * d4;
-    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
-        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        let q: V3 = std::array::from_fn(|k| b[k] + w * (c[k] - b[k]));
-        return dot(sub(p, q), sub(p, q));
-    }
-    let denom = 1.0 / (va + vb + vc);
-    let v = vb * denom;
-    let w = vc * denom;
-    let q: V3 = std::array::from_fn(|k| a[k] + ab[k] * v + ac[k] * w);
-    dot(sub(p, q), sub(p, q))
+    dist2(p, closest_on_tri(p, t.v[0], t.v[1], t.v[2]))
 }
 
 pub struct FacetBvh {

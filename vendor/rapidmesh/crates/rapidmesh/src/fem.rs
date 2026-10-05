@@ -7,23 +7,43 @@
 //! (2,3); a tri6 its corners, then (0,1), (1,2), (2,0).
 
 use crate::mesh::Mesh;
-use rapidmesh_brep::Surface;
-use rapidmesh_geom::vec3::{cross, dot, sub};
-use rapidmesh_geom::SurfaceKind;
-use std::collections::{BTreeMap, HashMap};
+use rapidmesh_exact::vector::{cross, dot, len, sub};
+use rapidmesh_geom::Surface;
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 
-type P = [f64; 3];
-
+use rapidmesh_exact::vector::V3;
 pub use rapidmesh_topo::TET10_EDGES;
+
+/// The order of the elements a mesh is written with: linear (four-node
+/// tets, three-node triangles) or quadratic (ten and six nodes, the
+/// mid-edge nodes on the curved boundary, see [`Mesh::second_order`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Order {
+    #[default]
+    Linear,
+    Quadratic,
+}
+
+impl TryFrom<u8> for Order {
+    type Error = String;
+    fn try_from(order: u8) -> Result<Order, String> {
+        match order {
+            1 => Ok(Order::Linear),
+            2 => Ok(Order::Quadratic),
+            o => Err(format!("order {o}, expected 1 or 2")),
+        }
+    }
+}
 
 /// A second-order tet mesh.
 #[derive(Debug, Clone)]
 pub struct SecondOrder {
     /// The corners (the linear mesh's points, in its order), then the
     /// mid-edge nodes.
-    pub points: Vec<P>,
+    pub points: Vec<V3>,
     /// Ten nodes per tet, positively oriented (parallel to the linear tets).
     pub tets: Vec<[u32; 10]>,
     /// Six nodes per surface triangle (parallel to the linear mesh's faces).
@@ -43,32 +63,12 @@ pub struct SecondOrder {
     pub straightened: usize,
 }
 
-fn mid(a: P, b: P) -> P {
+fn mid(a: V3, b: V3) -> V3 {
     std::array::from_fn(|k| 0.5 * (a[k] + b[k]))
 }
 
-/// What a mid-edge node must lie on: a curved carrier, or the plane of a
-/// flat face triangle (a `Plane` kind may gather several walls, so the
-/// triangle's own plane is the one to keep to).
-enum OnSurface {
-    Curved(Surface),
-    Plane(P, P),
-}
-
-impl OnSurface {
-    fn project(&self, p: P) -> P {
-        match self {
-            OnSurface::Curved(s) => s.closest(p).0,
-            OnSurface::Plane(o, n) => {
-                let d = dot(sub(p, *o), *n);
-                std::array::from_fn(|k| p[k] - d * n[k])
-            }
-        }
-    }
-}
-
 /// The determinant of the Jacobian of a tet10 at barycentric `l`.
-fn jacobian(x: &[P; 10], l: [f64; 4]) -> f64 {
+fn jacobian(x: &[V3; 10], l: [f64; 4]) -> f64 {
     // dN/dL for the ten shape functions, then the chain rule with
     // L0 = 1 - xi - eta - zeta.
     let mut dl = [[0.0; 3]; 4]; // d x / d L_i
@@ -84,14 +84,14 @@ fn jacobian(x: &[P; 10], l: [f64; 4]) -> f64 {
             dl[j][k] += 4.0 * l[i] * x[4 + e][k];
         }
     }
-    let col = |m: usize| -> P { std::array::from_fn(|k| dl[m][k] - dl[0][k]) };
+    let col = |m: usize| -> V3 { std::array::from_fn(|k| dl[m][k] - dl[0][k]) };
     let (a, b, c) = (col(1), col(2), col(3));
     dot(a, cross(b, c))
 }
 
 /// Whether a tet10 is valid: its Jacobian at the corners, the mid-edges,
 /// the face centres and the centre at least `share` of the straight tet's.
-fn valid(x: &[P; 10], share: f64) -> bool {
+fn valid(x: &[V3; 10], share: f64) -> bool {
     let corners = [x[0], x[1], x[2], x[3]];
     let lin = dot(
         sub(corners[1], corners[0]),
@@ -120,7 +120,7 @@ fn valid(x: &[P; 10], share: f64) -> bool {
 
 /// A tet's corners in the order Abaqus counts positive: the fourth on the
 /// side the first three's normal points to.
-fn positive(points: &[P], t: &[usize; 4]) -> [usize; 4] {
+fn positive(points: &[V3], t: &[usize; 4]) -> [usize; 4] {
     let [a, b, c, d] = t.map(|v| points[v]);
     if dot(cross(sub(b, a), sub(c, a)), sub(d, a)) < 0.0 {
         [t[0], t[2], t[1], t[3]]
@@ -140,12 +140,16 @@ impl Mesh {
     /// Where that leaves a tet's Jacobian below a fifth of the straight
     /// tet's anywhere it is sampled, its curved nodes go back on their
     /// chords.
-    pub fn second_order(&self) -> SecondOrder {
+    pub fn second_order(&self) -> &SecondOrder {
+        self.second.get_or_init(|| self.make_second_order())
+    }
+
+    fn make_second_order(&self) -> SecondOrder {
         let m: &rapidmesh_tet::TetMesh = self;
         let mut points = m.points.clone();
         let key = |a: usize, b: usize| (a.min(b), a.max(b));
         // the surfaces each surface edge lies on
-        let mut on: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+        let mut on: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
         for (fi, f) in m.faces.iter().enumerate() {
             for k in 0..3 {
                 on.entry(key(f.tri[k], f.tri[(k + 1) % 3]))
@@ -153,22 +157,23 @@ impl Mesh {
                     .push(fi);
             }
         }
-        let carrier = |fi: usize| -> Option<OnSurface> {
+        // What a mid-edge node must lie on: a curved carrier, or the plane of
+        // a flat face triangle (a plane may gather several walls, so the
+        // triangle's own plane is the one to keep to).
+        let carrier = |fi: usize| -> Option<(Surface, bool)> {
             let f = &m.faces[fi];
             match &m.surfaces[f.surface as usize] {
-                SurfaceKind::Discrete(_) | SurfaceKind::Facets => None,
-                SurfaceKind::Plane { .. } => {
+                None | Some(Surface::Discrete(_)) => None,
+                Some(Surface::Plane(_)) => {
                     let [a, b, c] = f.tri.map(|v| m.points[v]);
-                    let n = cross(sub(b, a), sub(c, a));
-                    let l = dot(n, n).sqrt();
-                    (l > 0.0).then(|| OnSurface::Plane(a, n.map(|x| x / l)))
+                    Surface::plane(a, cross(sub(b, a), sub(c, a))).map(|s| (s, false))
                 }
-                kind => Surface::curved(kind).map(OnSurface::Curved),
+                Some(kind) => Some((kind.clone(), true)),
             }
         };
-        let mut node: HashMap<(usize, usize), u32> = HashMap::new();
+        let mut node: HashMap<(usize, usize), u32> = HashMap::default();
         // per mid-edge node: its chord's middle, and whether it moved
-        let mut chord: Vec<(u32, P)> = Vec::new();
+        let mut chord: Vec<(u32, V3)> = Vec::new();
         // The B-rep curve each mesh edge on one lies on, and the projection
         // onto the smooth ones.
         let on_curve: HashMap<(usize, usize), u32> = m
@@ -183,7 +188,7 @@ impl Mesh {
         // The mid-edge node of the edge `k`: the middle of its chord, moved
         // onto the curve the edge lies on (a rim between flat faces too), or
         // onto every curved surface it lies on, in turn.
-        let new_node = |k: (usize, usize), points: &mut Vec<P>, chord: &mut Vec<(u32, P)>| {
+        let new_node = |k: (usize, usize), points: &mut Vec<V3>, chord: &mut Vec<(u32, V3)>| {
             let c = mid(m.points[k.0], m.points[k.1]);
             let curve = on_curve
                 .get(&k)
@@ -197,20 +202,21 @@ impl Mesh {
                 return id;
             }
             let mut p = c;
-            let mut kinds: Vec<OnSurface> = Vec::new();
+            let mut kinds: Vec<Surface> = Vec::new();
             let mut curved = false;
             for &fi in on.get(&k).into_iter().flatten() {
-                if let Some(s) = carrier(fi) {
-                    curved |= matches!(s, OnSurface::Curved(_));
+                if let Some((s, bent)) = carrier(fi) {
+                    curved |= bent;
                     kinds.push(s);
                 }
             }
             if curved {
-                for _ in 0..8 {
-                    for s in &kinds {
-                        p = s.project(p);
-                    }
-                }
+                // On the one carrier, or where the first two meet.
+                p = match &kinds[..] {
+                    [s] => s.closest(p).0,
+                    [a, b, ..] => a.meet(b, p, 1e-12 * (1.0 + len(p))),
+                    [] => p,
+                };
             }
             let id = points.len() as u32;
             points.push(p);
@@ -257,12 +263,12 @@ impl Mesh {
             })
             .collect();
         let curved = chord.len();
-        let on_chord: HashMap<u32, P> = chord.into_iter().collect();
+        let on_chord: HashMap<u32, V3> = chord.into_iter().collect();
         let mut straightened = 0;
         for _ in 0..4 {
             let mut back: Vec<u32> = Vec::new();
             for t in &tets {
-                let x: [P; 10] = t.map(|v| points[v as usize]);
+                let x: [V3; 10] = t.map(|v| points[v as usize]);
                 if !valid(&x, MIN_JACOBIAN) {
                     back.extend(
                         t[4..]
@@ -294,44 +300,48 @@ impl Mesh {
         }
     }
 
-    /// Writes the second-order mesh as a gmsh MSH 4.1 file (see
-    /// [`Mesh::write_msh`]): lines with three nodes, triangles with six,
-    /// tets with ten.
-    pub fn write_msh_second_order(
-        &self,
-        so: &SecondOrder,
-        path: impl AsRef<Path>,
-    ) -> io::Result<()> {
+    /// The mesh of `order` as a gmsh MSH 4.1 file: geometric vertices,
+    /// edges and faces are point, curve and surface entities (tag = id +
+    /// 1), regions volume entities; physical groups are the region groups,
+    /// the named sheet tags and the named faces and edges. Quadratic: lines
+    /// with three nodes, triangles with six, tets with ten.
+    pub fn write_msh(&self, path: impl AsRef<Path>, order: Order) -> io::Result<()> {
         let mut w = io::BufWriter::new(std::fs::File::create(path)?);
-        let o = rapidmesh_topo::export::Order2 {
-            points: &so.points,
-            tets: &so.tets,
-            faces: &so.faces,
-        };
-        rapidmesh_topo::export::write_msh_order2(self, &o, &self.labels.msh_names(true), &mut w)?;
+        let names = self.labels.msh_names(true);
+        match order {
+            Order::Linear => rapidmesh_topo::export::write_msh(self, &names, &mut w)?,
+            Order::Quadratic => {
+                let so = self.second_order();
+                let o = rapidmesh_topo::export::Order2 {
+                    points: &so.points,
+                    tets: &so.tets,
+                    faces: &so.faces,
+                };
+                rapidmesh_topo::export::write_msh_order2(self, &o, &names, &mut w)?
+            }
+        }
         w.flush()
     }
 
-    /// Writes a CalculiX / Abaqus input file of the linear mesh (C3D4).
-    pub fn write_inp(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let m: &rapidmesh_tet::TetMesh = self;
-        let tets: Vec<Vec<u32>> = m
-            .tets
-            .iter()
-            .map(|t| positive(&m.points, t).iter().map(|&v| v as u32).collect())
-            .collect();
-        self.write_inp_of(path.as_ref(), &m.points, &tets, "C3D4")
-    }
-
-    /// Writes a CalculiX / Abaqus input file of the second-order mesh
-    /// (C3D10).
-    pub fn write_inp_second_order(
-        &self,
-        so: &SecondOrder,
-        path: impl AsRef<Path>,
-    ) -> io::Result<()> {
-        let tets: Vec<Vec<u32>> = so.tets.iter().map(|t| t.to_vec()).collect();
-        self.write_inp_of(path.as_ref(), &so.points, &tets, "C3D10")
+    /// A CalculiX / Abaqus input file of the mesh of `order` (C3D4 or
+    /// C3D10).
+    pub fn write_inp(&self, path: impl AsRef<Path>, order: Order) -> io::Result<()> {
+        match order {
+            Order::Linear => {
+                let m: &rapidmesh_tet::TetMesh = self;
+                let tets: Vec<Vec<u32>> = m
+                    .tets
+                    .iter()
+                    .map(|t| positive(&m.points, t).iter().map(|&v| v as u32).collect())
+                    .collect();
+                self.write_inp_of(path.as_ref(), &m.points, &tets, "C3D4")
+            }
+            Order::Quadratic => {
+                let so = self.second_order();
+                let tets: Vec<Vec<u32>> = so.tets.iter().map(|t| t.to_vec()).collect();
+                self.write_inp_of(path.as_ref(), &so.points, &tets, "C3D10")
+            }
+        }
     }
 
     /// The input file: nodes; elements per region group (`ELSET`); per
@@ -340,7 +350,7 @@ impl Mesh {
     fn write_inp_of(
         &self,
         path: &Path,
-        points: &[P],
+        points: &[V3],
         tets: &[Vec<u32>],
         kind: &str,
     ) -> io::Result<()> {
@@ -466,7 +476,7 @@ impl SecondOrder {
         self.tets
             .iter()
             .map(|t| {
-                let x: [P; 10] = t.map(|v| self.points[v as usize]);
+                let x: [V3; 10] = t.map(|v| self.points[v as usize]);
                 rule.iter().map(|&(w, l)| w * jacobian(&x, l)).sum()
             })
             .collect()
@@ -474,7 +484,7 @@ impl SecondOrder {
 
     /// Writes a VTK XML unstructured grid of the quadratic tets (cell type
     /// 24) with cell data `region`.
-    pub fn write_vtu(&self, regions: &[u32], path: impl AsRef<Path>) -> io::Result<()> {
+    pub(crate) fn write_vtu(&self, regions: &[u32], path: impl AsRef<Path>) -> io::Result<()> {
         use rapidmesh_topo::export::{write_vtu_grid, VTK_QUADRATIC_TET};
         let mut w = io::BufWriter::new(std::fs::File::create(path)?);
         let cells = self
@@ -515,7 +525,7 @@ fn inp_name(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn straight() -> [P; 10] {
+    fn straight() -> [V3; 10] {
         let c = [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],

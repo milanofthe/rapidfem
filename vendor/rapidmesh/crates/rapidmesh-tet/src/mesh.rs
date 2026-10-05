@@ -1,7 +1,7 @@
 //! The mesher's output: [`TetMesh`] and [`SurfaceMesh`], and what their
 //! faces, edges and points carry.
 
-use rapidmesh_geom::{FaceTag, RegionTag, SurfaceKind};
+use rapidmesh_geom::{FaceTag, RegionTag, Surface};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
@@ -20,7 +20,7 @@ pub struct SurfaceMesh {
     /// The triangulation of every patch, tagged.
     pub faces: Vec<SurfaceFace>,
     /// The analytic surfaces referenced by [SurfaceFace::surface].
-    pub surfaces: Vec<SurfaceKind>,
+    pub surfaces: Vec<Option<Surface>>,
     /// Per-surface owner solid index, parallel to `surfaces`.
     pub surface_owners: Vec<u32>,
     /// The mesh edges on B-rep edges.
@@ -105,7 +105,7 @@ pub struct TetMesh {
     /// The mesh faces tiling the PLC patches, with tags.
     pub faces: Vec<SurfaceFace>,
     /// The analytic surfaces referenced by [SurfaceFace::surface].
-    pub surfaces: Vec<SurfaceKind>,
+    pub surfaces: Vec<Option<Surface>>,
     /// Per-surface owner solid index (scene insertion order, voids included);
     /// `u32::MAX` for sheet surfaces. Parallel to `surfaces`.
     pub surface_owners: Vec<u32>,
@@ -141,7 +141,7 @@ impl TetMesh {
         type FaceKey = (u32, u32, u32, u32, u32);
         let face_key = |sf: &SurfaceFace| -> FaceKey {
             let smooth = match self.surfaces[sf.surface as usize] {
-                SurfaceKind::Plane { .. } | SurfaceKind::Facets => sf.patch,
+                None | Some(Surface::Plane(_)) => sf.patch,
                 _ => u32::MAX,
             };
             let (r0, r1) = (

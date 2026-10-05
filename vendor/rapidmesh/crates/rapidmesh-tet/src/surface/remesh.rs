@@ -11,12 +11,14 @@
 //! the face gets, no part of it can come to lie over another, which a chart
 //! of pieces cannot promise.
 
-use crate::surface::Slot;
+use super::FaceOut;
+use rapidmesh_exact::vector::{
+    bbox, centroid, closest_on_tri, cross, dist, dot, segment_dist2, sub, tri_normal,
+};
+use rapidmesh_exact::vector::{V2, V3};
+use rapidmesh_geom::chart::Slot;
 use rapidmesh_geom::grid::HashGrid;
-use rapidmesh_geom::vec3::{bbox, closest_on_tri, cross, dist, dot, sub};
 use rustc_hash::{FxHashMap, FxHashSet};
-
-type P3 = [f64; 3];
 
 /// Rounds of splits, collapses, flips and smoothing.
 const ROUNDS: usize = 8;
@@ -40,23 +42,12 @@ const SHARP_DEG: f64 = 30.0;
 /// its facets: no tessellation of a smooth surface bends so much.
 const RIDGE_DEG: f64 = 60.0;
 
-/// Ridges this many diagonals of a face's box long make it a ridged face.
-const RIDGE_SPAN: f64 = 2.0;
-
 /// A facet edge is a crease where its bend implies a radius below this
 /// share of the size.
 const CREASE_RADIUS: f64 = 0.5;
 
 /// A change may move the surface by this share of the size at most.
 const DEVIATION: f64 = 0.1;
-
-/// The face's mesh: a slot per point, the face's own points, triangles over
-/// the points, wound to the face's front.
-pub(crate) struct Remeshed {
-    pub slots: Vec<Slot>,
-    pub own: Vec<P3>,
-    pub tris: Vec<[usize; 3]>,
-}
 
 /// Remeshes the face whose `facets` (wound to its front) carry the loops
 /// `rings` and the edges inside it `inner` (global ids of `points`; their
@@ -66,17 +57,17 @@ pub(crate) struct Remeshed {
 /// it has one, else on the facets.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn remesh(
-    facets: &[[P3; 3]],
+    facets: &[[V3; 3]],
     rings: &[Vec<u32>],
     inner: &[Vec<u32>],
-    chains: &[&[P3]],
+    chains: &[&[V3]],
     corners: &[u32],
-    required: &[P3],
-    points: &[P3],
-    size: &dyn Fn(P3) -> f64,
+    required: &[V3],
+    points: &[V3],
+    size: &dyn Fn(V3) -> f64,
     spacing: f64,
-    carrier: Option<&rapidmesh_brep::Surface>,
-) -> Result<Remeshed, &'static str> {
+    carrier: Option<&rapidmesh_geom::Surface>,
+) -> Result<FaceOut, &'static str> {
     if facets.is_empty() {
         return Err("no facets");
     }
@@ -107,7 +98,7 @@ pub(crate) fn remesh(
             across.entry(key(t[k], t[(k + 1) % 3])).or_default().push(i);
         }
     }
-    let centroid = |t: [u32; 3]| -> P3 {
+    let centroid = |t: [u32; 3]| -> V3 {
         let q = t.map(|v| m.pt(v));
         std::array::from_fn(|k| (q[0][k] + q[1][k] + q[2][k]) / 3.0)
     };
@@ -124,7 +115,7 @@ pub(crate) fn remesh(
             }
             let (cx, cy) = (centroid(m.tris[x]), centroid(m.tris[y]));
             let radius = dist(cx, cy) / c.clamp(-1.0, 1.0).acos();
-            let mid: P3 = std::array::from_fn(|k| 0.5 * (cx[k] + cy[k]));
+            let mid: V3 = std::array::from_fn(|k| 0.5 * (cx[k] + cy[k]));
             if c < cos_ridge || radius < CREASE_RADIUS * size(mid) {
                 creases.push(*e);
             }
@@ -133,7 +124,7 @@ pub(crate) fn remesh(
     m.sharp.extend(creases);
 
     // ---- the samples into the locked edges
-    let mut fixed: Vec<(u32, P3)> = Vec::new();
+    let mut fixed: Vec<(u32, V3)> = Vec::new();
     for &g in rings
         .iter()
         .flatten()
@@ -148,7 +139,7 @@ pub(crate) fn remesh(
     // ---- the PLC points between samples collapsed away
     m.straighten()?;
     // ---- the required points, where they are clear of the fixed ones
-    let mut own: Vec<P3> = Vec::new();
+    let mut own: Vec<V3> = Vec::new();
     if !required.is_empty() {
         let mut near = point_grid(&m);
         for &p in required {
@@ -198,35 +189,6 @@ enum Mobility {
     Pinned,
 }
 
-/// Whether `facets` (wound alike) run along ridges: edges bending more
-/// than [`RIDGE_DEG`] as long together as [`RIDGE_SPAN`] diagonals of their
-/// box (a loft round the corners of a polygon: about 3.5), not the noisy
-/// spikes of a scan (below 1).
-pub(crate) fn ridged(facets: &[[P3; 3]]) -> bool {
-    let cos_ridge = RIDGE_DEG.to_radians().cos();
-    let bits = |p: P3| p.map(f64::to_bits);
-    let mut at: FxHashMap<([u64; 3], [u64; 3]), P3> = FxHashMap::default();
-    let mut ridge = 0.0;
-    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
-    for t in facets {
-        let n = unit_or_z(normal(t[0], t[1], t[2]));
-        for k in 0..3 {
-            for i in 0..3 {
-                lo[i] = lo[i].min(t[k][i]);
-                hi[i] = hi[i].max(t[k][i]);
-            }
-            let (a, b) = (bits(t[k]), bits(t[(k + 1) % 3]));
-            let e = if a < b { (a, b) } else { (b, a) };
-            if let Some(m) = at.insert(e, n) {
-                if dot(m, n) < cos_ridge {
-                    ridge += dist(t[k], t[(k + 1) % 3]);
-                }
-            }
-        }
-    }
-    ridge >= RIDGE_SPAN * dist(lo, hi)
-}
-
 fn key(a: u32, b: u32) -> (u32, u32) {
     (a.min(b), a.max(b))
 }
@@ -234,18 +196,27 @@ fn key(a: u32, b: u32) -> (u32, u32) {
 /// The facets, for the point on them nearest a place, among those facing
 /// its way (a thin part's other side faces away).
 struct Reference {
-    tris: Vec<[P3; 3]>,
-    normals: Vec<P3>,
+    tris: Vec<[V3; 3]>,
+    normals: Vec<V3>,
     grid: HashGrid<u32>,
     /// The true surface where the face has one (a B-spline band): it, not
     /// the facets, is what a triangle must lie on and a point goes to, so
-    /// the facets' resolution does not matter; with the sign that turns its
-    /// normal to the face's front.
-    carrier: Option<(rapidmesh_brep::Surface, f64)>,
+    /// the facets' resolution does not matter.
+    carrier: Option<Carrier>,
+}
+
+/// A face's carrier with the sign that turns its normal to the face's
+/// front and, on one whose nearest point is a search, the parameters of
+/// each facet's centroid: a search for a point near a facet starts there,
+/// not over the whole surface.
+struct Carrier {
+    surface: rapidmesh_geom::Surface,
+    sign: f64,
+    starts: Vec<V2>,
 }
 
 impl Reference {
-    fn new(facets: &[[P3; 3]], carrier: Option<&rapidmesh_brep::Surface>) -> Reference {
+    fn new(facets: &[[V3; 3]], carrier: Option<&rapidmesh_geom::Surface>) -> Reference {
         let mean = facets
             .iter()
             .map(|t| dist(t[0], t[1]) + dist(t[1], t[2]) + dist(t[2], t[0]))
@@ -261,40 +232,117 @@ impl Reference {
             tris: facets.to_vec(),
             normals: facets
                 .iter()
-                .map(|t| unit_or_z(normal(t[0], t[1], t[2])))
+                .map(|t| unit_or_z(tri_normal(t[0], t[1], t[2])))
                 .collect(),
             grid,
             carrier: carrier.map(|s| {
+                let hinted = hinted(s);
+                let starts: Vec<V2> = if hinted {
+                    facets
+                        .iter()
+                        .map(|t| s.search_start(centroid(*t)))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // The facets face the front: the surface's normal agrees
                 // with them or opposes them throughout.
                 let agree: f64 = facets
                     .iter()
-                    .map(|t| {
-                        let c = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
-                        dot(s.closest(c).1, normal(t[0], t[1], t[2]))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let m = if hinted {
+                            s.normal(starts[i])
+                        } else {
+                            s.closest(centroid(*t)).1
+                        };
+                        dot(m, tri_normal(t[0], t[1], t[2]))
                     })
                     .sum();
-                (s.clone(), if agree < 0.0 { -1.0 } else { 1.0 })
+                Carrier {
+                    surface: s.clone(),
+                    sign: if agree < 0.0 { -1.0 } else { 1.0 },
+                    starts,
+                }
             }),
         }
+    }
+
+    /// The facet facing `n` nearest `p` and the point on it, searched a
+    /// few cells around it.
+    fn nearest(&self, p: V3, n: V3) -> Option<(u32, V3)> {
+        let c = self.grid.key(p);
+        let mut best: Option<(f64, u32, V3)> = None;
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        for r in 0..=2i64 {
+            for &t in self.grid.ring(c, r) {
+                if !seen.insert(t) || dot(self.normals[t as usize], n) <= 0.0 {
+                    continue;
+                }
+                let [a, b, cc] = self.tris[t as usize];
+                let q = closest_on_tri(p, a, b, cc);
+                let d = dist(p, q);
+                if best.is_none_or(|x| d < x.0) {
+                    best = Some((d, t, q));
+                }
+            }
+            // Nothing beyond ring `r` is nearer than `r` cells.
+            if best.is_some_and(|x| x.0 <= r as f64 * self.grid.cell()) {
+                break;
+            }
+        }
+        best.map(|(_, t, q)| (t, q))
+    }
+
+    /// The point of the carrier nearest `p`, a place near the facets facing
+    /// `n`, and its normal (turned to the front): searched from the
+    /// parameters of a facet near it (in the innermost ring of cells that
+    /// holds one facing `n`, the one whose centroid is nearest), over the
+    /// whole surface where there is none or the search stops short of the
+    /// nearest point (on a side of the domain, as across the seam of a
+    /// closed band).
+    fn on_carrier(&self, c: &Carrier, p: V3, n: V3) -> (V3, V3) {
+        let s = &c.surface;
+        let key = self.grid.key(p);
+        let start = (!c.starts.is_empty())
+            .then(|| {
+                (0..=2i64).find_map(|r| {
+                    self.grid
+                        .ring(key, r)
+                        .filter(|&&t| dot(self.normals[t as usize], n) > 0.0)
+                        .map(|&t| (dist(p, centroid(self.tris[t as usize])), t))
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                        .map(|(_, t)| c.starts[t as usize])
+                })
+            })
+            .flatten();
+        let near = start.and_then(|uv0| {
+            let (q, uv) = s.closest_near(p, uv0);
+            let m = s.normal(uv);
+            // The nearest point is where `p` lies along the normal.
+            let off = cross(sub(p, q), m);
+            (dot(off, off).sqrt() <= SEARCH_TOL * self.grid.cell()).then_some((q, m))
+        });
+        let (q, m) = near.unwrap_or_else(|| s.closest(p));
+        (q, m.map(|x| c.sign * x))
     }
 
     /// Whether triangle `t` lies on the facets as it faces: some facet within
     /// a quarter of its longest edge from its centroid faces within 60
     /// degrees of it. A triangle folded over, or across a thin part to its
     /// other side, finds none.
-    fn fits(&self, t: [P3; 3]) -> bool {
-        let n = normal(t[0], t[1], t[2]);
+    fn fits(&self, t: [V3; 3]) -> bool {
+        let n = tri_normal(t[0], t[1], t[2]);
         let l = dot(n, n).sqrt();
         if !(l > 0.0) {
             return false;
         }
         let n = n.map(|x| x / l);
-        let c: P3 = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
+        let c: V3 = std::array::from_fn(|k| (t[0][k] + t[1][k] + t[2][k]) / 3.0);
         let reach = 0.25 * dist(t[0], t[1]).max(dist(t[1], t[2])).max(dist(t[2], t[0]));
-        if let Some((s, sign)) = &self.carrier {
-            let (q, m) = s.closest(c);
-            return dist(c, q) <= reach && sign * dot(m, n) >= FIT_COS;
+        if let Some(carrier) = &self.carrier {
+            let (q, m) = self.on_carrier(carrier, c, n);
+            return dist(c, q) <= reach && dot(m, n) >= FIT_COS;
         }
         let cc = self.grid.key(c);
         let r = (reach / self.grid.cell()).ceil() as i64 + 1;
@@ -309,42 +357,33 @@ impl Reference {
         })
     }
 
-    /// The point on the facets facing `n` nearest `p`, searched a few
-    /// cells around it; `p` itself when none is near.
-    fn project(&self, p: P3, n: P3) -> P3 {
-        if let Some((s, _)) = &self.carrier {
-            return s.closest(p).0;
+    /// The point on the facets facing `n` nearest `p` (on the carrier where
+    /// there is one); `p` itself when none is near.
+    fn project(&self, p: V3, n: V3) -> V3 {
+        if let Some(carrier) = &self.carrier {
+            return self.on_carrier(carrier, p, n).0;
         }
-        let c = self.grid.key(p);
-        let mut best = (f64::INFINITY, p);
-        let mut seen: FxHashSet<u32> = FxHashSet::default();
-        for r in 0..=2i64 {
-            for &t in self.grid.ring(c, r) {
-                if !seen.insert(t) || dot(self.normals[t as usize], n) <= 0.0 {
-                    continue;
-                }
-                let [a, b, cc] = self.tris[t as usize];
-                let q = closest_on_tri(p, a, b, cc);
-                let d = dist(p, q);
-                if d < best.0 {
-                    best = (d, q);
-                }
-            }
-            // Nothing beyond ring `r` is nearer than `r` cells.
-            if best.0 <= r as f64 * self.grid.cell() {
-                break;
-            }
-        }
-        best.1
+        self.nearest(p, n).map_or(p, |(_, q)| q)
     }
 }
+
+/// Whether the nearest point of `s` is a search worth starting near the
+/// answer, with its normal at the parameters found: a spline carrier.
+fn hinted(s: &rapidmesh_geom::Surface) -> bool {
+    use rapidmesh_geom::Surface as S;
+    s.searches() && !matches!(s, S::Tube { .. } | S::Discrete(_))
+}
+
+/// A search from a facet's parameters ends at the nearest point when `p`
+/// is off it along the normal within this share of a grid cell.
+const SEARCH_TOL: f64 = 1e-6;
 
 /// A triangle mesh under local changes: points, what is fixed of them,
 /// triangles (dead ones kept as holes), the triangles at each point and the
 /// locked edges.
 struct Mesh {
     refs: Reference,
-    p: Vec<P3>,
+    p: Vec<V3>,
     slot: Vec<Option<Slot>>,
     tris: Vec<[u32; 3]>,
     alive: Vec<bool>,
@@ -358,9 +397,9 @@ struct Mesh {
 }
 
 impl Mesh {
-    fn of(facets: &[[P3; 3]], carrier: Option<&rapidmesh_brep::Surface>) -> Mesh {
+    fn of(facets: &[[V3; 3]], carrier: Option<&rapidmesh_geom::Surface>) -> Mesh {
         let mut id: FxHashMap<[u64; 3], u32> = FxHashMap::default();
-        let mut p: Vec<P3> = Vec::new();
+        let mut p: Vec<V3> = Vec::new();
         let mut tris = Vec::with_capacity(facets.len());
         for t in facets {
             let v = t.map(|x| {
@@ -392,12 +431,12 @@ impl Mesh {
         }
     }
 
-    fn pt(&self, v: u32) -> P3 {
+    fn pt(&self, v: u32) -> V3 {
         self.p[v as usize]
     }
 
-    fn tri_normal(&self, t: [u32; 3]) -> P3 {
-        normal(self.pt(t[0]), self.pt(t[1]), self.pt(t[2]))
+    fn tri_normal(&self, t: [u32; 3]) -> V3 {
+        tri_normal(self.pt(t[0]), self.pt(t[1]), self.pt(t[2]))
     }
 
     /// The triangles on edge `a b`.
@@ -430,7 +469,7 @@ impl Mesh {
     }
 
     /// The vertex normal: the area-weighted normals of its triangles.
-    fn vertex_normal(&self, v: u32) -> P3 {
+    fn vertex_normal(&self, v: u32) -> V3 {
         let mut n = [0.0; 3];
         for &t in &self.star[v as usize] {
             let m = self.tri_normal(self.tris[t as usize]);
@@ -480,7 +519,7 @@ impl Mesh {
         id
     }
 
-    fn add_point(&mut self, q: P3, slot: Option<Slot>) -> u32 {
+    fn add_point(&mut self, q: V3, slot: Option<Slot>) -> u32 {
         self.p.push(q);
         self.slot.push(slot);
         self.star.push(Vec::new());
@@ -491,7 +530,7 @@ impl Mesh {
     }
 
     /// Locks the facet edges along the PLC chains of the edges inside.
-    fn lock_chains(&mut self, chains: &[&[P3]]) {
+    fn lock_chains(&mut self, chains: &[&[V3]]) {
         let id: FxHashMap<[u64; 3], u32> = self
             .p
             .iter()
@@ -515,7 +554,7 @@ impl Mesh {
 
     /// Puts each fixed point into the mesh: onto the point at its place, or
     /// into the locked edge it lies on.
-    fn embed(&mut self, fixed: &[(u32, P3)]) -> Result<(), &'static str> {
+    fn embed(&mut self, fixed: &[(u32, V3)]) -> Result<(), &'static str> {
         let id: FxHashMap<[u64; 3], u32> = self
             .p
             .iter()
@@ -535,7 +574,7 @@ impl Mesh {
             grid.insert_box(lo, hi, i);
         }
         // The points on each locked edge, by their place along it.
-        let mut along: FxHashMap<usize, Vec<(f64, u32, P3)>> = FxHashMap::default();
+        let mut along: FxHashMap<usize, Vec<(f64, u32, V3)>> = FxHashMap::default();
         for &(g, q) in fixed {
             if let Some(&v) = id.get(&q.map(f64::to_bits)) {
                 self.slot[v as usize] = Some(Slot::Global(g));
@@ -544,7 +583,7 @@ impl Mesh {
             let mut best: Option<(f64, usize)> = None;
             for &i in grid.around(grid.key(q), 1) {
                 let (a, b) = edges[i];
-                let d = seg_dist(q, self.pt(a), self.pt(b));
+                let d = segment_dist2(q, self.pt(a), self.pt(b)).sqrt();
                 if best.is_none_or(|x| d < x.0) {
                     best = Some((d, i));
                 }
@@ -574,7 +613,7 @@ impl Mesh {
 
     /// Splits edge `a b` at `q` (a new point with `slot`); a locked edge
     /// stays locked in its halves.
-    fn split(&mut self, a: u32, b: u32, q: P3, slot: Option<Slot>) -> u32 {
+    fn split(&mut self, a: u32, b: u32, q: V3, slot: Option<Slot>) -> u32 {
         let m = self.add_point(q, slot);
         for t in self.on_edge(a, b) {
             let tv = self.tris[t as usize];
@@ -695,9 +734,11 @@ impl Mesh {
         }
     }
 
-    /// Whether the edge `a b` may flip, and the triangles and far corners.
-    /// The new diagonal must lie within `tol` of the old one.
-    fn flip_of(&self, a: u32, b: u32, min_cos: f64, tol: f64) -> Option<([u32; 2], u32, u32)> {
+    /// The triangles on the edge `a b` and their far corners where the
+    /// edge can flip: free, between two triangles, its other diagonal no
+    /// edge yet. Whether the flip keeps the face is [`Mesh::flip_keeps`],
+    /// asked after whether it is wanted.
+    fn flip_pair(&self, a: u32, b: u32) -> Option<([u32; 2], u32, u32)> {
         if self.locked.contains(&key(a, b)) || self.sharp.contains(&key(a, b)) {
             return None;
         }
@@ -722,32 +763,40 @@ impl Mesh {
         if c == d || self.neighbours(c).contains(&d) {
             return None;
         }
+        Some(([t1, t2], c, d))
+    }
+
+    /// Whether flipping the edge `a b` of the pair with far corners `c`
+    /// and `d` keeps the face: the new triangles turn within `min_cos` of
+    /// the pair's mean normal and, with a finite `tol`, the new diagonal
+    /// lies within `tol` of the old one and the triangles on the facets.
+    fn flip_keeps(&self, a: u32, b: u32, c: u32, d: u32, min_cos: f64, tol: f64) -> bool {
         let old = [self.tri_normal([a, b, c]), self.tri_normal([b, a, d])];
         let mean = unit_or_z([
             old[0][0] + old[1][0],
             old[0][1] + old[1][1],
             old[0][2] + old[1][2],
         ]);
-        for t in [[c, a, d], [d, b, c]] {
+        let new = [[c, a, d], [d, b, c]];
+        let turned = new.iter().any(|&t| {
             let n = self.tri_normal(t);
             let l = dot(n, n).sqrt();
-            if !(l > 0.0)
-                || dot(n, mean) < min_cos * l
-                || (tol.is_finite() && !self.refs.fits(t.map(|v| self.pt(v))))
-            {
-                return None;
-            }
+            !(l > 0.0) || dot(n, mean) < min_cos * l
+        });
+        if turned {
+            return false;
         }
         if tol.is_finite() {
             // The distance between the lines of the two diagonals.
             let (pa, pb, pc, pd) = (self.pt(a), self.pt(b), self.pt(c), self.pt(d));
-            let w = normal([0.0; 3], sub(pb, pa), sub(pd, pc));
+            let w = cross(sub(pb, pa), sub(pd, pc));
             let l = dot(w, w).sqrt();
             if l > 0.0 && dot(sub(pc, pa), w).abs() / l > tol {
-                return None;
+                return false;
             }
+            return new.iter().all(|t| self.refs.fits(t.map(|v| self.pt(v))));
         }
-        Some(([t1, t2], c, d))
+        true
     }
 
     fn flip(&mut self, a: u32, b: u32, ts: [u32; 2], c: u32, d: u32) {
@@ -801,8 +850,10 @@ impl Mesh {
             // where they can, so fewer triangles hang on it.
             for v in stuck {
                 for w in self.neighbours(v) {
-                    if let Some((ts, c, d)) = self.flip_of(v, w, OUTLINE_COS, f64::INFINITY) {
-                        self.flip(v, w, ts, c, d);
+                    if let Some((ts, c, d)) = self.flip_pair(v, w) {
+                        if self.flip_keeps(v, w, c, d, OUTLINE_COS, f64::INFINITY) {
+                            self.flip(v, w, ts, c, d);
+                        }
                     }
                 }
             }
@@ -811,7 +862,7 @@ impl Mesh {
     }
 
     /// Whether a fixed point lies within `r` of `p`.
-    fn near_fixed(&self, p: P3, r: f64, near: &Points) -> bool {
+    fn near_fixed(&self, p: V3, r: f64, near: &Points) -> bool {
         let rings = (r / near.cell()).ceil() as i64;
         near.around(near.key(p), rings).any(|&v| {
             let v = v as usize;
@@ -821,7 +872,7 @@ impl Mesh {
 
     /// Puts `p` into the triangle nearest it (onto the facets), or into its
     /// edge where it lies close to one; where the point went, or none.
-    fn insert(&mut self, p: P3, slot: Slot, near: &mut Points) -> Option<P3> {
+    fn insert(&mut self, p: V3, slot: Slot, near: &mut Points) -> Option<V3> {
         let mut cand: Vec<u32> = near
             .around(near.key(p), 2)
             .flat_map(|&v| self.star[v as usize].iter().copied())
@@ -846,7 +897,7 @@ impl Mesh {
         let area2 = dot(old, old).sqrt();
         for k in 0..3 {
             let (a, b) = (tv[k], tv[(k + 1) % 3]);
-            let n = normal(self.pt(a), self.pt(b), q);
+            let n = tri_normal(self.pt(a), self.pt(b), q);
             let height = 2.0 * area2 / (2.0 * dist(self.pt(a), self.pt(b))).max(1e-300);
             let off = dot(n, old) / area2.max(1e-300) / dist(self.pt(a), self.pt(b)).max(1e-300);
             if off < 0.2 * height {
@@ -856,7 +907,7 @@ impl Mesh {
                 let (pa, pb) = (self.pt(a), self.pt(b));
                 let d = sub(pb, pa);
                 let s = (dot(sub(q, pa), d) / dot(d, d).max(1e-300)).clamp(0.1, 0.9);
-                let at: P3 = std::array::from_fn(|i| pa[i] + s * d[i]);
+                let at: V3 = std::array::from_fn(|i| pa[i] + s * d[i]);
                 let at = self.refs.project(at, unit_or_z(old));
                 // Each triangle on the edge splits in two that keep its
                 // side and lie on the facets.
@@ -871,7 +922,9 @@ impl Mesh {
                         let z = tv[(k + 2) % 3];
                         [[self.pt(x), at, self.pt(z)], [at, self.pt(y), self.pt(z)]]
                             .iter()
-                            .all(|q| dot(normal(q[0], q[1], q[2]), n) > 0.0 && self.refs.fits(*q))
+                            .all(|q| {
+                                dot(tri_normal(q[0], q[1], q[2]), n) > 0.0 && self.refs.fits(*q)
+                            })
                     })
                 });
                 if !fits {
@@ -901,7 +954,7 @@ impl Mesh {
     /// The triangles with an angle below `deg`: the longest edge of each
     /// flipped, else its shortest collapsed, where the shape stays within
     /// the deviation (a crease may flip or collapse too, then).
-    fn clean(&mut self, size: &dyn Fn(P3) -> f64, deg: f64) {
+    fn clean(&mut self, size: &dyn Fn(V3) -> f64, deg: f64) {
         let cos_min = deg.to_radians().cos();
         for _ in 0..4 {
             let mut any = false;
@@ -925,7 +978,7 @@ impl Mesh {
                 let h = size(q[0]);
                 let (_, a, b) = edges[2];
                 let crease = self.sharp.remove(&key(a, b));
-                let flip = self.flip_of(a, b, KEEP_COS, DEVIATION * h);
+                let flip = self.flip_pair(a, b);
                 if crease {
                     self.sharp.insert(key(a, b));
                 }
@@ -934,7 +987,7 @@ impl Mesh {
                 let flip = flip.filter(|&(_, c, d)| {
                     let before = self.min_angle([a, b, c]).min(self.min_angle([b, a, d]));
                     let after = self.min_angle([c, a, d]).min(self.min_angle([d, b, c]));
-                    after > before + 1e-9
+                    after > before + 1e-9 && self.flip_keeps(a, b, c, d, KEEP_COS, DEVIATION * h)
                 });
                 if let Some((ts, c, d)) = flip {
                     self.sharp.remove(&key(a, b));
@@ -978,13 +1031,13 @@ impl Mesh {
         out
     }
 
-    fn split_long(&mut self, size: &dyn Fn(P3) -> f64) {
+    fn split_long(&mut self, size: &dyn Fn(V3) -> f64) {
         for (a, b) in self.edges() {
             if self.locked.contains(&(a, b)) {
                 continue;
             }
             let (pa, pb) = (self.pt(a), self.pt(b));
-            let mid: P3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
+            let mid: V3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
             if dist(pa, pb) <= 4.0 / 3.0 * size(mid) {
                 continue;
             }
@@ -1009,7 +1062,7 @@ impl Mesh {
         }
     }
 
-    fn collapse_short(&mut self, size: &dyn Fn(P3) -> f64) {
+    fn collapse_short(&mut self, size: &dyn Fn(V3) -> f64) {
         for (a, b) in self.edges() {
             if self.locked.contains(&(a, b)) || self.star[a as usize].is_empty() {
                 continue;
@@ -1018,7 +1071,7 @@ impl Mesh {
                 continue;
             }
             let (pa, pb) = (self.pt(a), self.pt(b));
-            let mid: P3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
+            let mid: V3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
             let h = size(mid);
             if dist(pa, pb) >= 0.8 * h {
                 continue;
@@ -1046,18 +1099,18 @@ impl Mesh {
         }
     }
 
-    fn flip_valence(&mut self, size: &dyn Fn(P3) -> f64) {
+    fn flip_valence(&mut self, size: &dyn Fn(V3) -> f64) {
         let valence = |m: &Mesh, v: u32| m.neighbours(v).len() as i64;
         let target = |m: &Mesh, v: u32| if m.on_outline(v) { 4 } else { 6 };
         for (a, b) in self.edges() {
-            let h = size(self.pt(a));
-            let Some((ts, c, d)) = self.flip_of(a, b, KEEP_COS, DEVIATION * h) else {
+            let Some((ts, c, d)) = self.flip_pair(a, b) else {
                 continue;
             };
             let dev = |v: u32, change: i64| (valence(self, v) + change - target(self, v)).pow(2);
             let before = dev(a, 0) + dev(b, 0) + dev(c, 0) + dev(d, 0);
             let after = dev(a, -1) + dev(b, -1) + dev(c, 1) + dev(d, 1);
-            if after < before {
+            let h = size(self.pt(a));
+            if after < before && self.flip_keeps(a, b, c, d, KEEP_COS, DEVIATION * h) {
                 self.flip(a, b, ts, c, d);
             }
         }
@@ -1073,7 +1126,11 @@ impl Mesh {
             let (mut c, mut w) = ([0.0; 3], 0.0);
             for &t in &self.star[v as usize] {
                 let tv = self.tris[t as usize].map(|x| self.pt(x));
-                let a = dot(normal(tv[0], tv[1], tv[2]), normal(tv[0], tv[1], tv[2])).sqrt();
+                let a = dot(
+                    tri_normal(tv[0], tv[1], tv[2]),
+                    tri_normal(tv[0], tv[1], tv[2]),
+                )
+                .sqrt();
                 for k in 0..3 {
                     c[k] += a * (tv[0][k] + tv[1][k] + tv[2][k]) / 3.0;
                 }
@@ -1084,10 +1141,10 @@ impl Mesh {
             }
             let p = self.pt(v);
             let n = self.vertex_normal(v);
-            let d: P3 = std::array::from_fn(|k| c[k] / w - p[k]);
+            let d: V3 = std::array::from_fn(|k| c[k] / w - p[k]);
             let dn = dot(d, n);
-            let step: P3 = std::array::from_fn(|k| d[k] - dn * n[k]);
-            let olds: Vec<(u32, P3)> = self.star[v as usize]
+            let step: V3 = std::array::from_fn(|k| d[k] - dn * n[k]);
+            let olds: Vec<(u32, V3)> = self.star[v as usize]
                 .iter()
                 .map(|&t| (t, self.tri_normal(self.tris[t as usize])))
                 .collect();
@@ -1114,21 +1171,18 @@ impl Mesh {
 
     /// Flips each free edge whose opposite angles sum past a half turn, so
     /// the triangles are Delaunay on the face where the flips keep it.
-    fn flip_delaunay(&mut self, size: &dyn Fn(P3) -> f64) {
+    fn flip_delaunay(&mut self, size: &dyn Fn(V3) -> f64) {
         for _ in 0..8 {
             let mut any = false;
             for (a, b) in self.edges() {
-                let h = size(self.pt(a));
-                let Some((ts, c, d)) = self.flip_of(a, b, 0.9, DEVIATION * h) else {
+                let Some((ts, c, d)) = self.flip_pair(a, b) else {
                     continue;
                 };
-                let angle = |x: u32, y: u32, z: u32| {
-                    let (u, w) = (sub(self.pt(y), self.pt(x)), sub(self.pt(z), self.pt(x)));
-                    (dot(u, w) / (dot(u, u) * dot(w, w)).sqrt().max(1e-300))
-                        .clamp(-1.0, 1.0)
-                        .acos()
-                };
-                if angle(c, a, b) + angle(d, a, b) > std::f64::consts::PI + 1e-9 {
+                let h = size(self.pt(a));
+                let p = |v: u32| self.pt(v);
+                if super::across_too_wide(p(a), p(b), p(c), p(d))
+                    && self.flip_keeps(a, b, c, d, 0.9, DEVIATION * h)
+                {
                     self.flip(a, b, ts, c, d);
                     any = true;
                 }
@@ -1141,7 +1195,7 @@ impl Mesh {
 
     /// The mesh as slots, own points (`own` first, then the free points)
     /// and triangles over the points in use.
-    fn out(&self, mut own: Vec<P3>) -> Remeshed {
+    fn out(&self, mut own: Vec<V3>) -> FaceOut {
         let mut local = vec![usize::MAX; self.p.len()];
         let mut slots = Vec::new();
         let mut tris = Vec::new();
@@ -1165,22 +1219,11 @@ impl Mesh {
             });
             tris.push(lt);
         }
-        Remeshed { slots, own, tris }
+        FaceOut { slots, own, tris }
     }
 }
 
-fn normal(a: P3, b: P3, c: P3) -> P3 {
-    let (u, v) = (sub(b, a), sub(c, a));
-    cross(u, v)
-}
-
 /// The unit vector along `a`, +z for a zero one.
-fn unit_or_z(a: P3) -> P3 {
-    rapidmesh_geom::vec3::unit(a).unwrap_or([0.0, 0.0, 1.0])
-}
-
-fn seg_dist(p: P3, a: P3, b: P3) -> f64 {
-    let d = sub(b, a);
-    let t = (dot(sub(p, a), d) / dot(d, d).max(1e-300)).clamp(0.0, 1.0);
-    dist(p, std::array::from_fn(|k| a[k] + t * d[k]))
+fn unit_or_z(a: V3) -> V3 {
+    rapidmesh_exact::vector::unit(a).unwrap_or([0.0, 0.0, 1.0])
 }

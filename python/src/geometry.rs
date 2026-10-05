@@ -237,8 +237,8 @@ impl PyGeometry {
     }
 
     /// A planar polygon with holes, its vertices `(x, y)` (at z = 0) or
-    /// `(x, y, z)`, offset by `position`: an xy polygon, a plate for a
-    /// parallelogram in another plane (see `polygon_sheet`).
+    /// `(x, y, z)`, offset by `position`, in the plane of its vertices (see
+    /// `polygon_sheet`).
     #[pyo3(signature = (points, position=[0.0; 3], holes=Vec::new(), maxh=None))]
     fn add_polygon(&mut self, points: Vec<Vec<f64>>, position: P3, holes: Vec<Vec<Vec<f64>>>, maxh: Option<f64>) -> PyResult<ObjId> {
         let [x0, y0, z0] = position;
@@ -256,12 +256,8 @@ impl PyGeometry {
         }
         let points = lift(points)?;
         let holes = holes.into_iter().map(&lift).collect::<PyResult<Vec<_>>>()?;
-        let sheet = polygon_sheet(&points, &holes).ok_or_else(|| {
-            PyNotImplementedError::new_err(
-                "polygon: a general polygon off the xy plane is not available yet \
-                 (milanofthe/rapidmesh-dev#140); parallelograms work in any plane",
-            )
-        })?;
+        let sheet = polygon_sheet(&points, &holes)
+            .ok_or_else(|| PyValueError::new_err("polygon: the vertices are not in one plane"))?;
         Ok(self.geo()?.add_sheet(sheet, maxh))
     }
 

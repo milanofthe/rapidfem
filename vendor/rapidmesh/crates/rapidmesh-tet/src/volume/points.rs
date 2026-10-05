@@ -4,9 +4,9 @@
 //! grid sized by the mean density does not. Points by distance from a
 //! place, and points in a box.
 
-use crate::predicates::P3;
 use crate::simplex::Ordered;
-use rapidmesh_geom::vec3::{box_d2, dist2};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{box_d2, dist2};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -22,8 +22,8 @@ enum Kind {
 
 #[derive(Clone, Copy)]
 struct Node {
-    lo: P3,
-    hi: P3,
+    lo: V3,
+    hi: V3,
     kind: Kind,
 }
 
@@ -35,7 +35,7 @@ pub struct PointTree {
 }
 
 impl PointTree {
-    pub fn new(pts: &[P3]) -> PointTree {
+    pub fn new(pts: &[V3]) -> PointTree {
         let mut t = PointTree {
             nodes: Vec::new(),
             order: (0..pts.len() as u32).collect(),
@@ -46,7 +46,7 @@ impl PointTree {
         t
     }
 
-    fn build(&mut self, pts: &[P3], a: usize, b: usize) -> u32 {
+    fn build(&mut self, pts: &[V3], a: usize, b: usize) -> u32 {
         let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
         for &i in &self.order[a..b] {
             for k in 0..3 {
@@ -78,7 +78,7 @@ impl PointTree {
 
     /// The points by their distance from `q`, nearest first (ties in no
     /// particular order).
-    pub fn by_distance<'a>(&'a self, pts: &'a [P3], q: P3) -> impl Iterator<Item = u32> + 'a {
+    pub fn by_distance<'a>(&'a self, pts: &'a [V3], q: V3) -> impl Iterator<Item = u32> + 'a {
         // Nodes by the distance of their boxes, points by theirs: a point
         // comes out once nothing left can be nearer.
         let mut heap: BinaryHeap<(Reverse<Ordered>, Reverse<u64>)> = BinaryHeap::new();
@@ -115,7 +115,7 @@ impl PointTree {
     }
 
     /// The points in the box `lo..hi`.
-    pub fn in_box(&self, pts: &[P3], lo: P3, hi: P3, out: &mut Vec<u32>) {
+    pub fn in_box(&self, pts: &[V3], lo: V3, hi: V3, out: &mut Vec<u32>) {
         if self.nodes.is_empty() {
             return;
         }
@@ -149,7 +149,7 @@ mod tests {
     /// scan finds in it.
     #[test]
     fn distance_order_and_boxes_match_a_scan() {
-        let pts: Vec<P3> = (0..500)
+        let pts: Vec<V3> = (0..500)
             .map(|i| {
                 let t = i as f64;
                 let r = (t / 500.0).powi(3) * 10.0;

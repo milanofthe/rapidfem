@@ -43,6 +43,14 @@ struct Pool {
     /// endpoint on its line, a crossing point on both): three points sharing
     /// one are collinear with no arithmetic.
     lines: Vec<Vec<u32>>,
+    /// The points by cell of a grid over their f64 positions: a point
+    /// coinciding with another lies in its cell or a neighbour.
+    cells: rustc_hash::FxHashMap<[i64; 3], Vec<usize>>,
+    /// The points without an f64 position, in no cell.
+    loose: Vec<usize>,
+    /// The grid's origin and cell size.
+    origin: [f64; 3],
+    cell: f64,
 }
 
 impl Pool {
@@ -52,12 +60,33 @@ impl Pool {
             .map(|p| Projected::new(p.clone(), axis))
             .collect();
         let lines = vec![Vec::new(); seed.len()];
-        Pool {
+        let at: Vec<Option<[f64; 3]>> = seed.iter().map(Point3::approx).collect();
+        let known = || at.iter().flatten();
+        let lo: [f64; 3] = std::array::from_fn(|k| known().map(|q| q[k]).fold(f64::MAX, f64::min));
+        let hi: [f64; 3] = std::array::from_fn(|k| known().map(|q| q[k]).fold(f64::MIN, f64::max));
+        let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f64>().sqrt();
+        let mut pool = Pool {
             axis,
-            points: seed,
+            points: Vec::new(),
             prep,
             lines,
+            cells: Default::default(),
+            loose: Vec::new(),
+            origin: lo,
+            cell: (diag / POOL_CELLS).max(f64::MIN_POSITIVE),
+        };
+        for (i, q) in at.iter().enumerate() {
+            match q {
+                Some(q) => pool.cells.entry(pool.cell_of(*q)).or_default().push(i),
+                None => pool.loose.push(i),
+            }
         }
+        pool.points = seed;
+        pool
+    }
+
+    fn cell_of(&self, q: [f64; 3]) -> [i64; 3] {
+        std::array::from_fn(|k| ((q[k] - self.origin[k]) / self.cell).floor() as i64)
     }
 
     fn len(&self) -> usize {
@@ -72,13 +101,39 @@ impl Pool {
         let same = |i: usize| {
             self.points[i] == p || (self.prep[i].may_coincide(&pp) && self.points[i].coincides(&p))
         };
-        if let Some(i) = (0..self.points.len()).find(|&i| same(i)) {
+        // The first coinciding point, among those in the cells around.
+        let Some(q) = p.approx() else {
+            if let Some(i) = (0..self.points.len()).find(|&i| same(i)) {
+                return i;
+            }
+            self.prep.push(pp);
+            self.lines.push(Vec::new());
+            self.points.push(p);
+            self.loose.push(self.points.len() - 1);
+            return self.points.len() - 1;
+        };
+        let c = self.cell_of(q);
+        let mut near: Vec<usize> = Vec::new();
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(v) = self.cells.get(&[c[0] + dx, c[1] + dy, c[2] + dz]) {
+                        near.extend_from_slice(v);
+                    }
+                }
+            }
+        }
+        near.extend_from_slice(&self.loose);
+        near.sort_unstable();
+        if let Some(i) = near.into_iter().find(|&i| same(i)) {
             return i;
         }
         self.prep.push(pp);
         self.lines.push(Vec::new());
         self.points.push(p);
-        self.points.len() - 1
+        let i = self.points.len() - 1;
+        self.cells.entry(c).or_default().push(i);
+        i
     }
 
     /// Records that point `i` lies on constraint line `line`.
@@ -210,8 +265,42 @@ pub fn triangulate_seeded(
         .collect();
 
     // Pre-split: exact crossing points of strictly crossing constraint pairs.
-    for (i, ci) in constraints.iter().enumerate() {
-        for (j, cj) in constraints.iter().enumerate().skip(i + 1) {
+    // Only pairs whose boxes meet can cross: found by a sweep along x,
+    // then taken in the order of their indices as before.
+    let boxes: Vec<([f64; 3], [f64; 3])> = ends
+        .iter()
+        .map(|&(a, b)| {
+            let (pa, pb) = (
+                pool.points[a].approx().unwrap_or([f64::MIN; 3]),
+                pool.points[b].approx().unwrap_or([f64::MAX; 3]),
+            );
+            let pad = 1e-9
+                * (0..3)
+                    .map(|k| (pa[k] - pb[k]).abs())
+                    .fold(f64::MIN_POSITIVE, f64::max);
+            (
+                std::array::from_fn(|k| pa[k].min(pb[k]) - pad),
+                std::array::from_fn(|k| pa[k].max(pb[k]) + pad),
+            )
+        })
+        .collect();
+    let mut by_x: Vec<usize> = (0..constraints.len()).collect();
+    by_x.sort_by(|&a, &b| boxes[a].0[0].total_cmp(&boxes[b].0[0]));
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (n, &i) in by_x.iter().enumerate() {
+        for &j in &by_x[n + 1..] {
+            if boxes[j].0[0] > boxes[i].1[0] {
+                break;
+            }
+            if (1..3).all(|k| boxes[i].0[k] <= boxes[j].1[k] && boxes[j].0[k] <= boxes[i].1[k]) {
+                pairs.push((i.min(j), i.max(j)));
+            }
+        }
+    }
+    pairs.sort_unstable();
+    for (i, j) in pairs {
+        let (ci, cj) = (&constraints[i], &constraints[j]);
+        {
             // Constraints on one line never cross strictly.
             if line_of[i] == line_of[j] {
                 continue;
@@ -264,8 +353,29 @@ pub fn triangulate_seeded(
         let pad = 1e-9 * seg_len.max(f64::MIN_POSITIVE);
         let slo: [f64; 3] = std::array::from_fn(|k| pa[k].min(pb[k]) - pad);
         let shi: [f64; 3] = std::array::from_fn(|k| pa[k].max(pb[k]) + pad);
-        // All pool vertices strictly inside the segment split it into a chain.
-        let mut on_seg: Vec<usize> = (0..pool.len())
+        // All pool vertices strictly inside the segment split it into a chain:
+        // those in the grid cells its box covers (all of them where it
+        // covers many).
+        let (clo, chi) = (pool.cell_of(slo), pool.cell_of(shi));
+        let span: i64 = (0..3).map(|k| chi[k] - clo[k] + 1).product();
+        let candidates: Vec<usize> = if span <= RECOVERY_CELLS {
+            let mut v = Vec::new();
+            for x in clo[0]..=chi[0] {
+                for y in clo[1]..=chi[1] {
+                    for z in clo[2]..=chi[2] {
+                        if let Some(c) = pool.cells.get(&[x, y, z]) {
+                            v.extend_from_slice(c);
+                        }
+                    }
+                }
+            }
+            v.extend_from_slice(&pool.loose);
+            v
+        } else {
+            (0..pool.len()).collect()
+        };
+        let mut on_seg: Vec<usize> = candidates
+            .into_iter()
             .filter(|&k| {
                 k != ia
                     && k != ib
@@ -319,6 +429,13 @@ pub fn triangulate_seeded(
         orientation,
     })
 }
+
+/// Cells of the point grid of a facet along its diagonal.
+const POOL_CELLS: f64 = 256.0;
+
+/// A constraint whose box covers more grid cells than this checks every
+/// point of the pool instead.
+const RECOVERY_CELLS: i64 = 512;
 
 /// No neighbour (a boundary edge of the seed) or no triangle.
 const NO: usize = usize::MAX;

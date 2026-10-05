@@ -9,7 +9,7 @@
 //! incidence (region -> faces -> edges) so a scope can walk down the hierarchy.
 
 use crate::{Brep, Curve};
-use rapidmesh_geom::vec3::{cross, dot, len as norm, sub, V3};
+use rapidmesh_exact::vector::{cross, dist2, len as norm, sub, V3};
 use rapidmesh_geom::TaggedPlc;
 
 /// The kind of an edge's curve, named for the selectors.
@@ -17,35 +17,39 @@ use rapidmesh_geom::TaggedPlc;
 pub enum EdgeKind {
     Line,
     Circle,
-    Profile,
     Intersection,
     Polyline,
     Ellipse,
+    Hyperbola,
+    Parabola,
     Spline,
 }
 
 impl EdgeKind {
     /// Every kind, in the order of their names.
-    pub const ALL: [EdgeKind; 7] = [
+    pub const ALL: [EdgeKind; 8] = [
         EdgeKind::Line,
         EdgeKind::Circle,
         EdgeKind::Ellipse,
+        EdgeKind::Hyperbola,
+        EdgeKind::Parabola,
         EdgeKind::Spline,
-        EdgeKind::Profile,
         EdgeKind::Intersection,
         EdgeKind::Polyline,
     ];
 
-    /// The name of the kind: "line", "circle", "ellipse", "spline",
-    /// "profile" (a swept profile's edge), "intersection" (of two curved
-    /// surfaces) or "polyline" (no analytic curve).
+    /// The name of the kind: "line", "circle", "ellipse", "hyperbola",
+    /// "parabola", "spline" (a B-spline, a swept profile's edge too),
+    /// "intersection" (of two curved surfaces) or "polyline" (no analytic
+    /// curve): the names of [`rapidmesh_geom::Curve::name`] and two more.
     pub fn name(self) -> &'static str {
         match self {
             EdgeKind::Line => "line",
             EdgeKind::Circle => "circle",
             EdgeKind::Ellipse => "ellipse",
+            EdgeKind::Hyperbola => "hyperbola",
+            EdgeKind::Parabola => "parabola",
             EdgeKind::Spline => "spline",
-            EdgeKind::Profile => "profile",
             EdgeKind::Intersection => "intersection",
             EdgeKind::Polyline => "polyline",
         }
@@ -54,6 +58,19 @@ impl EdgeKind {
     /// The kind of a [`EdgeKind::name`].
     pub fn parse(name: &str) -> Option<EdgeKind> {
         EdgeKind::ALL.into_iter().find(|k| k.name() == name)
+    }
+}
+
+/// An edge kind by its name.
+impl<'de> serde::Deserialize<'de> for EdgeKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<EdgeKind, D::Error> {
+        let name = String::deserialize(d)?;
+        EdgeKind::parse(&name).ok_or_else(|| {
+            let names: Vec<&str> = EdgeKind::ALL.iter().map(|k| k.name()).collect();
+            serde::de::Error::custom(format!(
+                "unknown edge kind {name:?} (expected one of {names:?})"
+            ))
+        })
     }
 }
 
@@ -120,7 +137,8 @@ pub struct Topology {
 
 /// Face-selection criteria (`g.surf(id=, tag=, normal=, near=)`). A `None`
 /// field is unconstrained; all present fields must hold (AND).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FaceFilter {
     pub id: Option<u32>,
     pub tag: Option<u32>,
@@ -138,7 +156,8 @@ pub struct FaceFilter {
 }
 
 /// Edge-selection criteria (`g.edge(id=, kind=, between=, near=)`).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct EdgeFilter {
     pub id: Option<u32>,
     pub kind: Option<EdgeKind>,
@@ -241,18 +260,13 @@ impl EdgeFilter {
     }
 }
 
-fn d2(a: V3, b: V3) -> f64 {
-    let d = sub(a, b);
-    dot(d, d)
-}
-
 /// Reduce `ids` to the single entry whose `pos` is nearest `p` (the first on a
 /// tie); a no-op if `p` is `None` or `ids` is empty.
 fn keep_nearest(ids: &mut Vec<u32>, p: Option<V3>, pos: impl Fn(u32) -> V3) {
     if let Some(p) = p {
         if let Some(&best) = ids
             .iter()
-            .min_by(|&&a, &&b| d2(pos(a), p).partial_cmp(&d2(pos(b), p)).unwrap())
+            .min_by(|&&a, &&b| dist2(pos(a), p).partial_cmp(&dist2(pos(b), p)).unwrap())
         {
             *ids = vec![best];
         }
@@ -466,13 +480,11 @@ pub fn extract_topology(plc: &TaggedPlc, brep: &Brep) -> Topology {
             }
             acc += seg;
         }
-        let kind = match e.curve {
-            Curve::Line { .. } => EdgeKind::Line,
-            Curve::Circle { .. } => EdgeKind::Circle,
-            Curve::Profile { .. } => EdgeKind::Profile,
-            Curve::Ellipse { .. } => EdgeKind::Ellipse,
+        let kind = match &e.curve {
+            Curve::Piece { curve, .. } => {
+                EdgeKind::parse(curve.name()).expect("a kind for every carrier curve")
+            }
             Curve::Intersection { .. } => EdgeKind::Intersection,
-            Curve::Nurbs { .. } => EdgeKind::Spline,
             Curve::Polyline => EdgeKind::Polyline,
         };
         let mut faces_of: Vec<u32> = e.coedges.iter().map(|&c| brep.coedge(c).face.0).collect();

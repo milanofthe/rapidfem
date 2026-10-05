@@ -8,10 +8,8 @@ pub(crate) mod improve;
 pub(crate) mod periodic;
 pub(crate) mod snap;
 
-/// A point.
-pub type P3 = [f64; 3];
-
 pub use crate::mesh::PointClass;
+use rapidmesh_exact::vector::V3;
 
 /// A boundary or sheet face of a [`Complex`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +28,7 @@ pub struct Face {
 /// finish works on.
 #[derive(Clone, Debug, Default)]
 pub struct Complex {
-    pub points: Vec<P3>,
+    pub points: Vec<V3>,
     /// What each point lies on in the source model.
     pub classes: Vec<PointClass>,
     /// Positively oriented tets with a nonzero label.

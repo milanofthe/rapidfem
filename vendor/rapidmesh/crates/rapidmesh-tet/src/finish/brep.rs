@@ -8,11 +8,12 @@ use crate::mesh::{SurfaceFace, TetMesh};
 use crate::curve::kinds::edge_curve;
 use crate::curve::{Curve, CurveSamples, PolylineCurve};
 use crate::finish::snap::Shape;
-use crate::finish::P3;
 use crate::finish::{Complex, PointClass};
 use crate::params::MeshParams;
-use rapidmesh_brep::{Brep, Curve as BCurve, Surface};
-use rapidmesh_geom::vec3::{bbox, dist};
+use rapidmesh_brep::{Brep, Curve as BCurve};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{bbox, dist};
+use rapidmesh_geom::Surface;
 use rapidmesh_geom::{RegionTag, TaggedPlc};
 
 /// The analytic shape of a B-rep: face carriers and edge curves.
@@ -77,7 +78,7 @@ impl Shape for BrepShape<'_> {
         }
     }
 
-    fn project(&self, kind: PointClass, p: P3) -> Option<P3> {
+    fn project(&self, kind: PointClass, p: V3) -> Option<V3> {
         match kind {
             PointClass::Face(f) => {
                 let face = self.brep.faces.get(f as usize)?;
@@ -91,7 +92,7 @@ impl Shape for BrepShape<'_> {
         }
     }
 
-    fn param(&self, kind: PointClass, p: P3) -> Option<[f64; 2]> {
+    fn param(&self, kind: PointClass, p: V3) -> Option<[f64; 2]> {
         let PointClass::Face(f) = kind else {
             return None;
         };
@@ -99,7 +100,7 @@ impl Shape for BrepShape<'_> {
         s.searches().then(|| s.search_start(p))
     }
 
-    fn project_from(&self, kind: PointClass, p: P3, uv: [f64; 2]) -> Option<(P3, [f64; 2])> {
+    fn project_from(&self, kind: PointClass, p: V3, uv: [f64; 2]) -> Option<(V3, [f64; 2])> {
         let PointClass::Face(f) = kind else {
             return self.project(kind, p).map(|q| (q, uv));
         };
@@ -110,7 +111,7 @@ impl Shape for BrepShape<'_> {
         Some((q, uv))
     }
 
-    fn project_near_from(&self, kind: PointClass, p: P3, uv: [f64; 2]) -> Option<P3> {
+    fn project_near_from(&self, kind: PointClass, p: V3, uv: [f64; 2]) -> Option<V3> {
         let PointClass::Face(f) = kind else {
             return self.project_from(kind, p, uv).map(|r| r.0);
         };
@@ -118,7 +119,7 @@ impl Shape for BrepShape<'_> {
         Some(self.brep.surface(face.surface).toward(p, uv))
     }
 
-    fn project_near(&self, kind: PointClass, p: P3) -> Option<P3> {
+    fn project_near(&self, kind: PointClass, p: V3) -> Option<V3> {
         let PointClass::Edge(c) = kind else {
             return self.project(kind, p);
         };
@@ -132,7 +133,7 @@ impl Shape for BrepShape<'_> {
 /// exact curve (`None` for a polyline or no curve). Built once, asked per
 /// point (the second-order mesh puts the mid-edge nodes of curved edges
 /// there).
-pub fn edge_projection(brep: &Brep) -> impl Fn(u32, P3) -> Option<P3> + '_ {
+pub fn edge_projection(brep: &Brep) -> impl Fn(u32, V3) -> Option<V3> + '_ {
     let shape = BrepShape::new(brep);
     move |edge, p| {
         let kind = PointClass::Edge(edge);
@@ -164,18 +165,9 @@ pub(crate) fn finish_classified(
     let t = rapidmesh_exact::clock::Instant::now();
     let shape = BrepShape::new(brep);
     rmlog::stage("finish.shape", t.elapsed().as_secs_f64());
-    // The points of periodic faces stay where they are: each is the image
-    // of its partner's.
-    let periodic: std::collections::HashSet<u32> =
-        params.periodic.iter().flat_map(|pp| [pp.a, pp.b]).collect();
-    let mut frozen: Vec<u32> = c
-        .faces
-        .iter()
-        .filter(|f| periodic.contains(&f.patch))
-        .flat_map(|f| f.tri)
-        .collect();
-    frozen.sort_unstable();
-    frozen.dedup();
+    // The faces of periodic pairs stay as they are: each point is the
+    // image of its partner's.
+    let frozen: Vec<u32> = params.periodic.iter().flat_map(|pp| [pp.a, pp.b]).collect();
     let (im, left) = crate::finish::improve::finish(
         &mut c,
         &shape,
@@ -285,8 +277,8 @@ fn periodic_points(m: &TetMesh, pairs: &[crate::params::PeriodicPair]) -> Vec<[u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rapidmesh_geom::SurfaceKind;
-    use rapidmesh_geom::{extrude_spline_profile, icosphere, solid_box, NurbsCurve, Scene};
+    use rapidmesh_geom::Surface;
+    use rapidmesh_geom::{extrude_profile, icosphere, solid_box, ProfileEdge, Scene};
     use std::collections::HashMap;
 
     /// A block with a round hole through it: the hole wall is a full barrel
@@ -386,7 +378,8 @@ mod tests {
         let mut exact_on = 0usize;
         let mut max_dev = 0.0_f64;
         for f in &sm.faces {
-            if let SurfaceKind::Sphere { center, radius, .. } = sm.surfaces[f.surface as usize] {
+            if let Some(Surface::Sphere { frame, radius }) = sm.surfaces[f.surface as usize] {
+                let center = frame.o;
                 curved_faces += 1;
                 for &v in &f.tri {
                     let p = sm.points[v];
@@ -439,25 +432,27 @@ mod tests {
 
     #[test]
     fn extruded_spline_surface_is_on_the_analytic_surface() {
-        // A semicircle profile extruded into a half-cylinder (D-prism). The
-        // curved wall is one Extruded surface; its interior points land
-        // EXACTLY on the cylinder (radial distance == r).
+        // A spline through points of a semicircle, closed by its diameter
+        // and extruded (a D-prism). The curved wall is one Extruded
+        // surface; its points land exactly on it.
         let r = 1.0;
-        let w = 0.5_f64.sqrt();
-        let profile = NurbsCurve::new(
-            2,
-            vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0],
-            vec![[r, 0.0], [r, r], [0.0, r], [-r, r], [-r, 0.0]],
-            vec![1.0, w, 1.0, w, 1.0],
-        );
-        let solid = extrude_spline_profile(
-            profile,
-            24,
+        let arc: Vec<[f64; 2]> = (1..8)
+            .map(|k| {
+                let a = std::f64::consts::PI * k as f64 / 8.0;
+                [r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        let solid = extrude_profile(
+            &[[r, 0.0], [-r, 0.0]],
+            &[ProfileEdge::Spline(arc), ProfileEdge::Line],
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
             [0.0, 1.0, 0.0],
             [0.0, 0.0, 2.0],
-        );
+            None,
+            1e-2,
+        )
+        .unwrap();
         let mut scene = Scene::new();
         scene.add_solid(solid);
         let plc = scene.assemble();
@@ -474,15 +469,12 @@ mod tests {
         let mut exact_on = 0usize;
         let mut max_dev = 0.0_f64;
         for f in &sm.faces {
-            if matches!(
-                sm.surfaces[f.surface as usize],
-                SurfaceKind::Extruded { .. }
-            ) {
+            if let Some(s @ Surface::Extruded { .. }) = &sm.surfaces[f.surface as usize] {
                 curved += 1;
                 for &vtx in &f.tri {
                     let p = sm.points[vtx];
-                    let rad = (p[0] * p[0] + p[1] * p[1]).sqrt();
-                    let dev = (rad - r).abs();
+                    let q = s.closest(p).0;
+                    let dev = rapidmesh_exact::vector::dist(p, q);
                     max_dev = max_dev.max(dev);
                     if dev < 1e-7 {
                         exact_on += 1;
@@ -491,7 +483,7 @@ mod tests {
             }
         }
         assert!(curved > 0, "expected extruded curved faces");
-        assert!(exact_on > 0, "interior points lie on the cylinder");
+        assert!(exact_on > 0, "interior points lie on the extruded spline");
         assert!(
             max_dev < 0.02,
             "no curved vertex grossly off radius, max_dev {max_dev}"

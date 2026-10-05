@@ -10,7 +10,7 @@
 //! deep. Each primitive sits in exactly one leaf; inner nodes carry the box
 //! of their subtree, so the queries prune by a node lower bound.
 
-use crate::vec3::{box_d2, sub, V3};
+use rapidmesh_exact::vector::{box_d2, sub, V3};
 
 /// A node: the box of its subtree, its children (an inner node) or its range
 /// of the primitive order (a leaf, `count > 0`; see [`Bvh::leaf`]). Children come after their

@@ -6,16 +6,16 @@
 //! done in parallel.
 
 use crate::entities::{Bound, Edge, Face, Model, StepError};
-use crate::geometry::{near, Curve, Curve2, Surface, P3};
 use rapidmesh_csg::Tri;
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{bbox, dist, dot, len, segment_dist2, sub, wrap_near};
 use rapidmesh_exact::Sign;
 use rapidmesh_geom::cdt2::triangulate_constrained;
-use rapidmesh_geom::vec3::{bbox, dist, dot, sub, unit};
-use rapidmesh_geom::{polygon_orientation, CurveKind, EdgeCurve, Faceted, SurfaceKind};
+use rapidmesh_geom::chart::uv::{self, area, Join, Mark};
+use rapidmesh_geom::{crossings, polygon_orientation, Curve, EdgeCurve, Faceted, Surface};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::f64::consts::TAU;
-use std::sync::Arc;
 
 /// A body of the file.
 pub struct Body {
@@ -50,7 +50,7 @@ const REFINE_ROUNDS: usize = 4;
 /// parameter of each on the edge's curve.
 struct Samples {
     ts: Vec<f64>,
-    pts: Vec<P3>,
+    pts: Vec<V3>,
 }
 
 struct Tess<'a> {
@@ -61,11 +61,13 @@ struct Tess<'a> {
     fit: f64,
     min_segments: usize,
     samples: Vec<Samples>,
+    /// The model's size (the diagonal of its vertices' box).
+    size: f64,
 }
 
 /// The parameters along an edge's curve from `p0` to `p1` (all of it
 /// when `closed`), with its parameter or, not `forward`, against it.
-fn span(curve: &Curve, p0: P3, p1: P3, forward: bool, closed: bool) -> (f64, f64) {
+fn span(curve: &Curve<3>, p0: V3, p1: V3, forward: bool, closed: bool) -> (f64, f64) {
     let t0 = curve.param(p0);
     let mut t1 = curve.param(p1);
     if let Some(period) = curve.period() {
@@ -90,21 +92,18 @@ impl Tess<'_> {
         let (t0, t1) = span(curve, p0, p1, e.forward, e.ends[0] == e.ends[1]);
         let mut ts: Vec<f64> = match curve {
             Curve::Line { .. } => vec![t0, t1],
-            Curve::Circle { r, .. } => {
-                self.even(t0, t1, parts * self.segments(*r, (t1 - t0).abs()))
-            }
-            Curve::Ellipse { a, b, .. } => self.even(
+            Curve::Ellipse { p, q, .. } => self.even(
                 t0,
                 t1,
-                parts * self.segments(a.min(*b).max(1e-12), (t1 - t0).abs()),
+                parts * self.segments(len(*p).min(len(*q)).max(1e-12), (t1 - t0).abs()),
             ),
-            Curve::Spline(_) | Curve::Hyperbola { .. } | Curve::Parabola { .. } => {
+            Curve::Nurbs(_) | Curve::Hyperbola { .. } | Curve::Parabola { .. } => {
                 // Halved where the curve strays from its chord by more than
                 // the tolerance, from two spans per control point (eight
                 // on a conic).
                 let start = parts
                     * match curve {
-                        Curve::Spline(s) => 2 * s.ctrl.len(),
+                        Curve::Nurbs(s) => 2 * s.ctrl.len(),
                         _ => 8,
                     };
                 let mut ts = self.even(t0, t1, start);
@@ -112,7 +111,7 @@ impl Tess<'_> {
                 while i + 1 < ts.len() && ts.len() < 4000 * parts {
                     let (a, b) = (ts[i], ts[i + 1]);
                     let (pa, pb, pm) = (curve.eval(a), curve.eval(b), curve.eval(0.5 * (a + b)));
-                    let mid: P3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
+                    let mid: V3 = std::array::from_fn(|k| 0.5 * (pa[k] + pb[k]));
                     if dist(pm, mid) > self.chord {
                         ts.insert(i + 1, 0.5 * (a + b));
                     } else {
@@ -122,7 +121,7 @@ impl Tess<'_> {
                 ts
             }
         };
-        let mut pts: Vec<P3> = ts.iter().map(|&t| curve.eval(t)).collect();
+        let mut pts: Vec<V3> = ts.iter().map(|&t| curve.eval(t)).collect();
         // The ends are the vertices, exactly: the edges meeting there share
         // them.
         let last = pts.len() - 1;
@@ -157,35 +156,53 @@ impl Tess<'_> {
         si: usize,
         e: usize,
         ts: &[f64],
-        pts: &[P3],
+        pts: &[V3],
         prev: Option<[f64; 2]>,
-    ) -> Vec<[f64; 2]> {
-        let on: Vec<&Curve2> = self.m.edges[e]
+        taken: Option<usize>,
+    ) -> (Vec<[f64; 2]>, Option<usize>) {
+        let on: Vec<(usize, &Curve<2>)> = self.m.edges[e]
             .pcurves
             .iter()
-            .filter(|(s, _)| *s == si)
-            .map(|(_, c)| c)
+            .enumerate()
+            .filter(|(_, (s, _))| *s == si)
+            .map(|(k, (_, c))| (k, c))
             .collect();
-        let first = |c: &Curve2| c.eval(ts[0]);
-        let pick = match (on.len(), prev) {
+        let first = |c: &Curve<2>| c.eval(ts[0]);
+        // A seam's second use in the face takes its other curve: where it
+        // starts (at a pole, say) need not tell them apart.
+        let free: Vec<(usize, &Curve<2>)> = match taken {
+            Some(k) if on.len() > 1 => on.iter().copied().filter(|&(j, _)| j != k).collect(),
+            _ => on.clone(),
+        };
+        let pick = match (free.len(), prev) {
             (0, _) => None,
-            (_, None) => Some(on[0]),
-            (_, Some(q)) => on.iter().copied().min_by(|a, b| {
+            (_, None) => Some(free[0]),
+            (_, Some(q)) => free.iter().copied().min_by(|a, b| {
                 let d = |f: [f64; 2]| (f[0] - q[0]).powi(2) + (f[1] - q[1]).powi(2);
-                d(first(a)).total_cmp(&d(first(b)))
+                d(first(a.1)).total_cmp(&d(first(b.1)))
             }),
         };
-        if let Some(c) = pick {
+        if let Some((k, c)) = pick {
             let uv: Vec<[f64; 2]> = ts.iter().map(|&t| c.eval(t)).collect();
             let n = uv.len();
             let fits = [0, n / 2, n - 1]
                 .iter()
                 .all(|&i| dist(surf.eval(uv[i]), pts[i]) <= self.fit);
             if fits {
-                return uv;
+                // A sphere's latitude from the sphere: a file's curve may give
+                // it a turn off (2 pi down, the same point by its sines).
+                let uv = match surf {
+                    Surface::Sphere { .. } => uv
+                        .iter()
+                        .zip(pts)
+                        .map(|(&q, &p)| [q[0], surf.param(p)[1]])
+                        .collect(),
+                    _ => uv,
+                };
+                return (uv, Some(k));
             }
         }
-        pts.iter().map(|&p| surf.param(p)).collect()
+        (pts.iter().map(|&p| surf.param(p)).collect(), None)
     }
 
     /// The facets of face `f`: its carrier and its triangles. With `check`,
@@ -193,15 +210,40 @@ impl Tess<'_> {
     /// chords cutting across a neighbour's where the face is thinner than
     /// they stray from their curves) come back as those sides instead.
     fn face(&self, f: &Face, check: bool) -> Result<FaceOut, StepError> {
-        let err = |message: String| StepError { id: f.id, message };
         let surf = &self.m.surfaces[f.surface];
-        let mut rings: Vec<Vec<P3>> = Vec::new();
+        let b = match self.bounds(f, surf, f.surface)? {
+            Shape::Whole(tris) => return Ok(FaceOut::Facets(Some(surf.clone()), tris)),
+            Shape::Bounds(b) => b,
+        };
+        let part = Part {
+            face: f,
+            b: &b,
+            front: f.same_sense,
+        };
+        Ok(match self.facets(surf, &[part], check)? {
+            Ok(mut per) => FaceOut::Facets(Some(surf.clone()), per.pop().unwrap_or_default()),
+            Err(sides) => FaceOut::Crossing(sides),
+        })
+    }
+
+    /// The bounds of face `f` in the parameters of `surf` (surface `si`,
+    /// the face's own or one it lies on): its rings in space and in the
+    /// parameters, periodic parameters unwrapped and moved into the turn of
+    /// the outer ring, points at a pole split, rings that wind round a
+    /// period joined; or the facets of all of a closed surface where no
+    /// edge bounds it.
+    fn bounds(&self, f: &Face, surf: &Surface, si: usize) -> Result<Shape, StepError> {
+        let err = |message: String| StepError { id: f.id, message };
+        let mut rings: Vec<Vec<V3>> = Vec::new();
         let mut uv: Vec<Vec<[f64; 2]>> = Vec::new();
+        let mut origin: Vec<Vec<Origin>> = Vec::new();
+        // The parameter curve each edge took in this face.
+        let mut taken: FxHashMap<usize, usize> = FxHashMap::default();
         for b in &f.bounds {
             let Bound::Edges(edges) = b else {
                 continue;
             };
-            let (mut ring, mut ring_uv) = (Vec::new(), Vec::new());
+            let (mut ring, mut ring_uv, mut ring_origin) = (Vec::new(), Vec::new(), Vec::new());
             for &(e, along) in edges {
                 let s = &self.samples[e];
                 let (mut ts, mut pts) = (s.ts.clone(), s.pts.clone());
@@ -209,98 +251,67 @@ impl Tess<'_> {
                     ts.reverse();
                     pts.reverse();
                 }
-                let q = self.edge_uv(surf, f.surface, e, &ts, &pts, ring_uv.last().copied());
+                let (q, k) = self.edge_uv(
+                    surf,
+                    si,
+                    e,
+                    &ts,
+                    &pts,
+                    ring_uv.last().copied(),
+                    taken.get(&e).copied(),
+                );
+                if let Some(k) = k {
+                    taken.insert(e, k);
+                }
                 let n = pts.len() - 1;
                 ring.extend_from_slice(&pts[..n]);
                 ring_uv.extend_from_slice(&q[..n]);
+                ring_origin.extend((0..n).map(|j| Origin {
+                    edge: e,
+                    at: if along { j } else { n - j },
+                    along,
+                }));
             }
             if ring.len() >= 3 {
                 rings.push(ring);
                 uv.push(ring_uv);
+                origin.push(ring_origin);
             }
         }
         if rings.is_empty() {
             // Bounded by no edge (a pole's vertex at most): all of a closed
             // surface.
             return match self.whole(surf, f) {
-                Some(tris) => Ok(FaceOut::Facets(surf.kind(), tris)),
+                Some(tris) => Ok(Shape::Whole(tris)),
                 None => Err(err("no bounds".into())),
             };
         }
-        // Periodic parameters unwrapped along each ring (projected points
-        // come back within one period), every ring moved into the turn of
-        // the outer one. A point at a pole has no angle of its own: it is
-        // skipped and then split in two, one with the angle of the point
-        // before it, one with that of the point after, the pole's line
-        // between them.
-        let periods = surf.periods();
-        let poles = surf.poles();
-        let pole_at = |p: P3| {
-            poles
-                .iter()
-                .find(|pole| dist(pole.2, p) <= 1e-2 * self.fit)
-                .map(|pole| (pole.0, pole.1))
-        };
-        for (ring, r) in rings.iter_mut().zip(uv.iter_mut()) {
-            let at: Vec<Option<(usize, f64)>> = ring.iter().map(|&p| pole_at(p)).collect();
-            let mut prev: Option<[f64; 2]> = None;
-            for i in 0..r.len() {
-                if at[i].is_some() {
-                    continue;
-                }
-                if let Some(q) = prev {
-                    for k in 0..2 {
-                        if let Some(period) = periods[k] {
-                            r[i][k] = near(r[i][k], q[k], period);
-                        }
-                    }
-                }
-                prev = Some(r[i]);
-            }
-            if at.iter().all(Option::is_none) {
-                continue;
-            }
-            if at.iter().all(Option::is_some) {
-                return Err(err("a bound lies in a pole".into()));
-            }
-            let n = r.len();
-            let (mut split, mut split_uv) = (Vec::with_capacity(n + 2), Vec::with_capacity(n + 2));
-            for i in 0..n {
-                let Some((fixed, value)) = at[i] else {
-                    split.push(ring[i]);
-                    split_uv.push(r[i]);
-                    continue;
-                };
-                let free = |step: usize| {
-                    let j = (1..n)
-                        .map(|d| (i + step * d) % n)
-                        .find(|&j| at[j].is_none())
-                        .unwrap_or(i);
-                    let mut q = r[j];
-                    q[fixed] = value;
-                    q
-                };
-                let (from, to) = (free(n - 1), free(1));
-                split.push(ring[i]);
-                split_uv.push(from);
-                if from != to {
-                    split.push(ring[i]);
-                    split_uv.push(to);
-                }
-            }
-            *ring = split;
-            *r = split_uv;
-        }
+        let marks: Vec<Vec<Mark<Option<Origin>>>> = rings
+            .iter()
+            .zip(&uv)
+            .zip(&origin)
+            .map(|((ring, r), o)| {
+                ring.iter()
+                    .zip(r)
+                    .zip(o)
+                    .map(|((&p, &uv), &o)| Mark {
+                        tag: Some(o),
+                        p,
+                        uv,
+                    })
+                    .collect()
+            })
+            .collect();
         // The points of a seam between `a` and `b`: halved until each
         // piece keeps to the chord (the seam is no edge, nothing sampled it).
-        let seam = |a: [f64; 2], b: [f64; 2]| -> Vec<([f64; 2], P3)> {
+        let seam = |a: [f64; 2], b: [f64; 2]| -> Vec<([f64; 2], V3)> {
             let at = |w: f64| [a[0] + w * (b[0] - a[0]), a[1] + w * (b[1] - a[1])];
             let mut parts = 1usize;
             while parts < 256
                 && (0..parts).any(|i| {
                     let (w0, w1) = (i as f64 / parts as f64, (i + 1) as f64 / parts as f64);
                     let (p0, p1) = (surf.eval(at(w0)), surf.eval(at(w1)));
-                    let mid: P3 = std::array::from_fn(|k| 0.5 * (p0[k] + p1[k]));
+                    let mid: V3 = std::array::from_fn(|k| 0.5 * (p0[k] + p1[k]));
                     dist(surf.eval(at(0.5 * (w0 + w1))), mid) > self.chord
                 })
             {
@@ -313,71 +324,118 @@ impl Tess<'_> {
                 })
                 .collect()
         };
-        join_windings(&mut rings, &mut uv, periods, &poles, f.same_sense, &seam).map_err(err)?;
-        // A side of a ring along a pole (one point in space) takes points
-        // as closely as a turn of an edge's segment: facets fan into the
-        // pole from next to each other, not from across the face.
-        let turn = TAU / self.min_segments as f64;
-        for (ring, r) in rings.iter_mut().zip(uv.iter_mut()) {
-            let n = r.len();
-            let (mut dense, mut dense_uv) = (Vec::with_capacity(n), Vec::with_capacity(n));
-            for i in 0..n {
-                let j = (i + 1) % n;
-                dense.push(ring[i]);
-                dense_uv.push(r[i]);
-                if ring[i] == ring[j] && r[i] != r[j] {
-                    let span = (r[j][0] - r[i][0]).abs().max((r[j][1] - r[i][1]).abs());
-                    let parts = (span / turn).ceil() as usize;
-                    for m in 1..parts {
-                        let w = m as f64 / parts as f64;
-                        dense.push(ring[i]);
-                        dense_uv.push([
-                            r[i][0] + w * (r[j][0] - r[i][0]),
-                            r[i][1] + w * (r[j][1] - r[i][1]),
-                        ]);
+        let mut own = |_: V3| None;
+        let side = |k: usize, w: i64, _: &[Mark<Option<Origin>>]| face_side(k, w, f.same_sense);
+        let b = uv::bounds(
+            surf.periods(),
+            &surf.poles(),
+            marks,
+            1e-2 * self.fit,
+            &mut Join {
+                seam: &seam,
+                own: &mut own,
+                side: &side,
+                pole_step: TAU / self.min_segments as f64,
+                avoid: &[],
+            },
+        )
+        .map_err(err)?;
+        Ok(Shape::Bounds(Bounds {
+            rings: b
+                .rings
+                .iter()
+                .map(|r| r.iter().map(|m| m.p).collect())
+                .collect(),
+            uv: b
+                .rings
+                .iter()
+                .map(|r| r.iter().map(|m| m.uv).collect())
+                .collect(),
+            outer: b.outer,
+            origin: if b.plain {
+                b.rings
+                    .iter()
+                    .map(|r| r.iter().filter_map(|m| m.tag).collect())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }))
+    }
+
+    /// The facets of the faces `parts` on `surf`, triangulated together in
+    /// its parameters (one face, or faces of several bodies that touch on
+    /// it: where they overlap they take the same triangles), each wound to
+    /// its front: per part its triangles. With `check`, bounds whose sides
+    /// cross or fold come back as those sides instead.
+    #[allow(clippy::type_complexity)]
+    fn facets(
+        &self,
+        surf: &Surface,
+        parts: &[Part],
+        check: bool,
+    ) -> Result<Result<Vec<Vec<Tri>>, Vec<(V3, V3)>>, StepError> {
+        let err = |message: String| StepError {
+            id: parts[0].face.id,
+            message,
+        };
+        // The rings' points, those of several parts at one place in space
+        // taken once, and their sides.
+        let mut pts3: Vec<V3> = Vec::new();
+        let mut pts2: Vec<[f64; 2]> = Vec::new();
+        let mut index: FxHashMap<[u64; 3], usize> = FxHashMap::default();
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seen: rustc_hash::FxHashSet<(usize, usize)> = Default::default();
+        let shared = parts.len() > 1;
+        for part in parts {
+            for (ring, r) in part.b.rings.iter().zip(&part.b.uv) {
+                let ids: Vec<usize> = ring
+                    .iter()
+                    .zip(r)
+                    .map(|(&p, &q)| {
+                        if shared {
+                            if let Some(&i) = index.get(&p.map(f64::to_bits)) {
+                                return i;
+                            }
+                            index.insert(p.map(f64::to_bits), pts3.len());
+                        }
+                        pts3.push(p);
+                        pts2.push(q);
+                        pts3.len() - 1
+                    })
+                    .collect();
+                for i in 0..ids.len() {
+                    let s = (ids[i], ids[(i + 1) % ids.len()]);
+                    if !shared || (s.0 != s.1 && seen.insert((s.0.min(s.1), s.0.max(s.1)))) {
+                        segments.push(s);
                     }
                 }
             }
-            *ring = dense;
-            *r = dense_uv;
         }
-        let mean = |r: &[[f64; 2]], k: usize| r.iter().map(|q| q[k]).sum::<f64>() / r.len() as f64;
-        let outer = uv
+        // Inside a part: in its outer ring and in none of its holes.
+        let within = |part: &Part, q: [f64; 2]| {
+            let b = part.b;
+            contains(&b.uv[b.outer], q)
+                && !b
+                    .uv
+                    .iter()
+                    .enumerate()
+                    .any(|(i, h)| i != b.outer && contains(h, q))
+        };
+        let rings: Vec<&[[f64; 2]]> = parts
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| area(a).abs().total_cmp(&area(b).abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        for k in 0..2 {
-            let Some(period) = periods[k] else {
-                continue;
-            };
-            let m0 = mean(&uv[outer], k);
-            for (i, r) in uv.iter_mut().enumerate() {
-                if i != outer {
-                    let shift = near(mean(r, k), m0, period) - mean(r, k);
-                    r.iter_mut().for_each(|q| q[k] += shift);
-                }
-            }
-        }
-        let mut pts3: Vec<P3> = rings.iter().flatten().copied().collect();
-        let mut pts2: Vec<[f64; 2]> = uv.iter().flatten().copied().collect();
-        let holes: Vec<&[[f64; 2]]> = uv
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != outer)
-            .map(|(_, r)| r.as_slice())
+            .flat_map(|p| p.b.uv.iter().map(|r| r.as_slice()))
             .collect();
-        // The constrained Delaunay of the rings' points and the inner ones
-        // with the rings' sides forced, less what lies outside the outer
-        // ring or in a hole.
-        let mut segments = Vec::with_capacity(pts2.len());
-        let mut first = 0;
-        for r in &uv {
-            segments.extend((0..r.len()).map(|i| (first + i, first + (i + 1) % r.len())));
-            first += r.len();
-        }
-        let (inner, stretch) = self.inner_points(surf, &uv[outer], &holes);
+        let frame: Vec<[f64; 2]> = parts
+            .iter()
+            .flat_map(|p| p.b.uv[p.b.outer].iter().copied())
+            .collect();
+        let (inner, stretch) = self.inner_points(
+            surf,
+            &frame,
+            &|q| parts.iter().any(|p| within(p, q)),
+            &rings,
+        );
         pts2.extend_from_slice(&inner);
         pts3.extend(inner.iter().map(|&q| surf.eval(q)));
         // Triangulated where the parameters are scaled by how far the
@@ -390,27 +448,25 @@ impl Tess<'_> {
             .collect();
         let inside = |q: [f64; 2]| {
             let q = [q[0] / stretch[0], q[1] / stretch[1]];
-            contains(&uv[outer], q) && !holes.iter().any(|h| contains(h, q))
+            parts.iter().any(|p| within(p, q))
         };
         // The sides of the bounds that cross, then those no facet takes
         // (a fold where two bounds leave a point of tangency side by side):
         // the longest of them, whose edges then take more samples (more of
         // both would fold alike).
-        let longest = |sides: Vec<usize>| -> FaceOut {
+        let longest = |sides: Vec<usize>| -> Vec<(V3, V3)> {
             let length = |k: usize| dist(pts3[segments[k].0], pts3[segments[k].1]);
             let most = sides.iter().map(|&k| length(k)).fold(0.0, f64::max);
-            FaceOut::Crossing(
-                sides
-                    .into_iter()
-                    .filter(|&k| length(k) >= 0.95 * most)
-                    .map(|k| (pts3[segments[k].0], pts3[segments[k].1]))
-                    .collect(),
-            )
+            sides
+                .into_iter()
+                .filter(|&k| length(k) >= 0.95 * most)
+                .map(|k| (pts3[segments[k].0], pts3[segments[k].1]))
+                .collect()
         };
         if check {
             let crossed = crossings(&scaled, &segments);
             if !crossed.is_empty() {
-                return Ok(longest(crossed));
+                return Ok(Err(longest(crossed)));
             }
         }
         let mut tris = triangulate_constrained(&scaled, &segments, inside);
@@ -429,7 +485,7 @@ impl Tess<'_> {
                 })
                 .collect();
             if !bare.is_empty() {
-                return Ok(longest(bare));
+                return Ok(Err(longest(bare)));
             }
         }
         if tris.is_empty() {
@@ -442,7 +498,7 @@ impl Tess<'_> {
                     (a[0] - b[0]).hypot(a[1] - b[1])
                 })
                 .sum();
-            let enclosed: f64 = uv
+            let enclosed: f64 = rings
                 .iter()
                 .map(|r| {
                     let r: Vec<[f64; 2]> = r
@@ -455,29 +511,40 @@ impl Tess<'_> {
             if enclosed <= 1e-6 * length * length {
                 rapidmesh_exact::log::debug(
                     "step.facets",
-                    format!("face #{}: its bounds enclose nothing, no facets", f.id),
+                    format!(
+                        "face #{}: its bounds enclose nothing, no facets",
+                        parts[0].face.id
+                    ),
                 );
-                return Ok(FaceOut::Facets(surf.kind(), Vec::new()));
+                return Ok(Ok(vec![Vec::new(); parts.len()]));
             }
             return Err(err("its bounds do not triangulate in its parameters".into()));
         }
         // A new diagonal must keep to the chord: its middle off the surface
-        // by no more than it.
+        // by no more than it; a side of a bound stays.
         let on_surface = |i: usize, j: usize| {
             let mid2 = [
                 0.5 * (pts2[i][0] + pts2[j][0]),
                 0.5 * (pts2[i][1] + pts2[j][1]),
             ];
-            let mid3: P3 = std::array::from_fn(|k| 0.5 * (pts3[i][k] + pts3[j][k]));
+            let mid3: V3 = std::array::from_fn(|k| 0.5 * (pts3[i][k] + pts3[j][k]));
             dist(surf.eval(mid2), mid3) <= self.chord
         };
-        flip_to_shape(&mut tris, &pts2, &pts3, on_surface);
+        let fixed: rustc_hash::FxHashSet<(usize, usize)> = if shared {
+            segments
+                .iter()
+                .map(|&(a, b)| (a.min(b), a.max(b)))
+                .collect()
+        } else {
+            Default::default()
+        };
+        flip_to_shape(&mut tris, &pts2, &pts3, on_surface, &fixed);
         // A facet far off its surface is a face triangulated over the wrong
         // part of its parameters: said, for the diagnosis.
         let far = tris
             .iter()
             .map(|t| {
-                let c: P3 =
+                let c: V3 =
                     std::array::from_fn(|k| (pts3[t[0]][k] + pts3[t[1]][k] + pts3[t[2]][k]) / 3.0);
                 dist(c, surf.eval(surf.param(c)))
             })
@@ -487,29 +554,305 @@ impl Tess<'_> {
                 "step.facets",
                 format!(
                     "face #{}: a facet {far:.3e} off its surface (chord {:.3e})",
-                    f.id, self.chord
+                    parts[0].face.id, self.chord
                 ),
             );
         }
-        let out = tris
-            .into_iter()
-            // A facet on a pole has two corners there: nothing in space.
-            .filter(|t| {
-                pts3[t[0]] != pts3[t[1]] && pts3[t[1]] != pts3[t[2]] && pts3[t[2]] != pts3[t[0]]
+        Ok(Ok(parts
+            .iter()
+            .map(|part| {
+                tris.iter()
+                    // A facet on a pole has two corners there: nothing in space.
+                    .filter(|t| {
+                        pts3[t[0]] != pts3[t[1]]
+                            && pts3[t[1]] != pts3[t[2]]
+                            && pts3[t[2]] != pts3[t[0]]
+                    })
+                    // Of several parts, each takes the facets in it.
+                    .filter(|t| {
+                        !shared || {
+                            let c: [f64; 2] = std::array::from_fn(|k| {
+                                (pts2[t[0]][k] + pts2[t[1]][k] + pts2[t[2]][k]) / 3.0
+                            });
+                            within(part, c)
+                        }
+                    })
+                    .map(|t| {
+                        let [a, b, c] = t.map(|i| pts3[i]);
+                        // Counterclockwise in the parameters is the surface's
+                        // normal; the part's front is it or its opposite.
+                        let ccw = polygon_orientation(&t.map(|i| pts2[i])) == Sign::Positive;
+                        if ccw == part.front {
+                            Tri::new(a, b, c)
+                        } else {
+                            Tri::new(a, c, b)
+                        }
+                    })
+                    .collect()
             })
-            .map(|t| {
-                let [a, b, c] = t.map(|i| pts3[i]);
-                // Counterclockwise in the parameters is the surface's normal;
-                // the face's is it or its opposite.
-                let ccw = polygon_orientation(&t.map(|i| pts2[i])) == Sign::Positive;
-                if ccw == f.same_sense {
-                    Tri::new(a, b, c)
-                } else {
-                    Tri::new(a, c, b)
+            .collect()))
+    }
+
+    /// What each face of `used` comes to (in that order): the faces of a
+    /// group of touching ones triangulated together, the others each alone.
+    fn all_faces(
+        &self,
+        used: &[usize],
+        groups: &[Vec<usize>],
+        check: bool,
+    ) -> Result<Vec<FaceOut>, StepError> {
+        let mut out: FxHashMap<usize, FaceOut> = groups
+            .par_iter()
+            .map(|g| self.group(g, check))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let alone: Vec<(usize, FaceOut)> = used
+            .par_iter()
+            .filter(|f| !out.contains_key(f))
+            .map(|&f| Ok((f, self.face(&self.m.faces[f], check)?)))
+            .collect::<Result<_, StepError>>()?;
+        out.extend(alone);
+        Ok(used
+            .iter()
+            .map(|f| out.remove(f).expect("every face"))
+            .collect())
+    }
+
+    /// The facets of the faces `faces` (indices into the model's faces), of
+    /// several bodies on one carrier, triangulated together in the
+    /// parameters of the first one's surface, so where they overlap they
+    /// take the same triangles. Faces whose bounds need a pole or a seam
+    /// are triangulated each on its own.
+    fn group(&self, faces: &[usize], check: bool) -> Result<Vec<(usize, FaceOut)>, StepError> {
+        let each = || -> Result<Vec<(usize, FaceOut)>, StepError> {
+            faces
+                .iter()
+                .map(|&fi| Ok((fi, self.face(&self.m.faces[fi], check)?)))
+                .collect()
+        };
+        let Some(bounds) = self.group_bounds(faces)? else {
+            return each();
+        };
+        let (si, surf) = self.carrier(faces);
+        let parts: Vec<Part> = faces
+            .iter()
+            .zip(&bounds)
+            .map(|(&fi, b)| {
+                let f = &self.m.faces[fi];
+                Part {
+                    face: f,
+                    b,
+                    front: f.same_sense == self.agrees(f.surface, si, b.rings[b.outer][0]),
                 }
             })
             .collect();
-        Ok(FaceOut::Facets(surf.kind(), out))
+        Ok(match self.facets(surf, &parts, check)? {
+            Ok(per) => faces
+                .iter()
+                .zip(per)
+                .map(|(&fi, tris)| {
+                    let kind = Some(self.m.surfaces[self.m.faces[fi].surface].clone());
+                    (fi, FaceOut::Facets(kind, tris))
+                })
+                .collect(),
+            Err(sides) => faces
+                .iter()
+                .enumerate()
+                .map(|(k, &fi)| {
+                    let sides = if k == 0 { sides.clone() } else { Vec::new() };
+                    (fi, FaceOut::Crossing(sides))
+                })
+                .collect(),
+        })
+    }
+
+    /// The surface of the first face of a group: the parameters it is
+    /// triangulated and imprinted in.
+    fn carrier(&self, faces: &[usize]) -> (usize, &Surface) {
+        let si = self.m.faces[faces[0]].surface;
+        (si, &self.m.surfaces[si])
+    }
+
+    /// Whether surface `a` faces the way surface `b` does at `p` (on both).
+    fn agrees(&self, a: usize, b: usize, p: V3) -> bool {
+        let (sa, sb) = (&self.m.surfaces[a], &self.m.surfaces[b]);
+        dot(sa.normal(sa.param(p)), sb.normal(sb.param(p))) >= 0.0
+    }
+
+    /// The bounds of each face of a group in the parameters of its carrier,
+    /// every face moved into the turn of the first; `None` where one needs
+    /// a pole or a seam (a full turn: its points would meet themselves a
+    /// period apart).
+    fn group_bounds(&self, faces: &[usize]) -> Result<Option<Vec<Bounds>>, StepError> {
+        let (si, surf) = self.carrier(faces);
+        let mut out: Vec<Bounds> = Vec::with_capacity(faces.len());
+        for &fi in faces {
+            match self.bounds(&self.m.faces[fi], surf, si)? {
+                Shape::Bounds(b) if !b.origin.is_empty() => {
+                    // A seam: its points twice, a period apart.
+                    let mut seen: rustc_hash::FxHashSet<[u64; 3]> = Default::default();
+                    if !b
+                        .rings
+                        .iter()
+                        .flatten()
+                        .all(|p| seen.insert(p.map(f64::to_bits)))
+                    {
+                        return Ok(None);
+                    }
+                    out.push(b);
+                }
+                _ => return Ok(None),
+            }
+        }
+        for (k, period) in surf.periods().into_iter().enumerate() {
+            let Some(period) = period else {
+                continue;
+            };
+            let m0 = mean(&out[0].uv[out[0].outer], k);
+            for b in &mut out[1..] {
+                let m = mean(&b.uv[b.outer], k);
+                let shift = wrap_near(m, m0, period) - m;
+                b.uv.iter_mut().flatten().for_each(|q| q[k] += shift);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// What the faces of a group must share before they are triangulated
+    /// together: where a point of one face's bounds lies on a side of
+    /// another's, or two sides cross, the point goes into the edges of
+    /// both (so the bodies' other faces on those edges take it too); a
+    /// point within the tolerance of another's is moved onto it.
+    fn imprints(&self, faces: &[usize], solid_of: &[usize]) -> Result<Vec<Imprint>, StepError> {
+        let Some(bounds) = self.group_bounds(faces)? else {
+            return Ok(Vec::new());
+        };
+        let (_, surf) = self.carrier(faces);
+        // Lengths in the parameters: scaled by how far the surface runs
+        // along each at the first point.
+        let q0 = bounds[0].uv[bounds[0].outer][0];
+        let st = surf.bend(q0).stretch.map(|s| s.max(1e-12));
+        let sc = |q: [f64; 2]| [q[0] * st[0], q[1] * st[1]];
+        let tol = 1e-7 * self.size;
+        // Every side: the scaled ends, the ends in space, and the edge with
+        // the indices of its samples there.
+        struct Side {
+            a: [f64; 2],
+            b: [f64; 2],
+            pa: V3,
+            pb: V3,
+            edge: usize,
+            after: usize,
+        }
+        let sides: Vec<Vec<Side>> = bounds
+            .iter()
+            .map(|bd| {
+                let mut out = Vec::new();
+                for ((ring, r), o) in bd.rings.iter().zip(&bd.uv).zip(&bd.origin) {
+                    let n = ring.len();
+                    for i in 0..n {
+                        let j = (i + 1) % n;
+                        let at = if o[i].along { o[i].at } else { o[i].at - 1 };
+                        out.push(Side {
+                            a: sc(r[i]),
+                            b: sc(r[j]),
+                            pa: ring[i],
+                            pb: ring[j],
+                            edge: o[i].edge,
+                            after: at,
+                        });
+                    }
+                }
+                out
+            })
+            .collect();
+        let points = |k: usize| {
+            bounds[k]
+                .rings
+                .iter()
+                .zip(&bounds[k].uv)
+                .flat_map(|(ring, r)| ring.iter().zip(r).map(|(&p, &q)| (p, sc(q))))
+                .collect::<Vec<_>>()
+        };
+        let mut out = Vec::new();
+        for x in 0..faces.len() {
+            for y in 0..faces.len() {
+                if solid_of[faces[x]] == solid_of[faces[y]] {
+                    continue;
+                }
+                for (p, q) in points(x) {
+                    for s in &sides[y] {
+                        let d = [s.b[0] - s.a[0], s.b[1] - s.a[1]];
+                        let l2 = d[0] * d[0] + d[1] * d[1];
+                        if l2 <= 0.0 {
+                            continue;
+                        }
+                        let w = ((q[0] - s.a[0]) * d[0] + (q[1] - s.a[1]) * d[1]) / l2;
+                        let foot = [s.a[0] + w * d[0], s.a[1] + w * d[1]];
+                        if (foot[0] - q[0]).hypot(foot[1] - q[1]) > tol {
+                            continue;
+                        }
+                        // On an end: the same point (moved onto it where
+                        // apart by less than the tolerance), else inside.
+                        for end in [s.pa, s.pb] {
+                            if p != end && dist(p, end) <= tol && x < y {
+                                out.push(Imprint::Move { from: end, to: p });
+                            }
+                        }
+                        if dist(p, s.pa) > tol && dist(p, s.pb) > tol && w > 0.0 && w < 1.0 {
+                            out.push(Imprint::Insert {
+                                edge: s.edge,
+                                after: s.after,
+                                p,
+                            });
+                        }
+                    }
+                }
+                if x < y {
+                    for s in &sides[x] {
+                        for u in &sides[y] {
+                            let o = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+                                polygon_orientation(&[a, b, c])
+                            };
+                            let apart = |s: Sign, t: Sign| {
+                                matches!(
+                                    (s, t),
+                                    (Sign::Positive, Sign::Negative)
+                                        | (Sign::Negative, Sign::Positive)
+                                )
+                            };
+                            if !(apart(o(s.a, s.b, u.a), o(s.a, s.b, u.b))
+                                && apart(o(u.a, u.b, s.a), o(u.a, u.b, s.b)))
+                            {
+                                continue;
+                            }
+                            // The crossing, on the carrier.
+                            let (d, e) = (
+                                [s.b[0] - s.a[0], s.b[1] - s.a[1]],
+                                [u.b[0] - u.a[0], u.b[1] - u.a[1]],
+                            );
+                            let den = d[0] * e[1] - d[1] * e[0];
+                            let w = ((u.a[0] - s.a[0]) * e[1] - (u.a[1] - s.a[1]) * e[0]) / den;
+                            let c = [(s.a[0] + w * d[0]) / st[0], (s.a[1] + w * d[1]) / st[1]];
+                            let p = surf.eval(c);
+                            out.push(Imprint::Insert {
+                                edge: s.edge,
+                                after: s.after,
+                                p,
+                            });
+                            out.push(Imprint::Insert {
+                                edge: u.edge,
+                                after: u.after,
+                                p,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The facets of all of a closed surface (a sphere, a torus) for face
@@ -519,15 +862,15 @@ impl Tess<'_> {
     fn whole(&self, surf: &Surface, f: &Face) -> Option<Vec<Tri>> {
         use std::f64::consts::{FRAC_PI_2, PI};
         let (nu, nv, v0, wraps) = match surf {
-            Surface::Sphere(_, r) => (
-                self.segments(*r, TAU),
-                self.segments(*r, PI),
+            Surface::Sphere { radius, .. } => (
+                self.segments(*radius, TAU),
+                self.segments(*radius, PI),
                 -FRAC_PI_2,
                 false,
             ),
-            Surface::Torus(_, big, small) => (
-                self.segments(big + small, TAU),
-                self.segments(*small, TAU),
+            Surface::Torus { major, minor, .. } => (
+                self.segments(major + minor, TAU),
+                self.segments(*minor, TAU),
                 -PI,
                 true,
             ),
@@ -535,7 +878,7 @@ impl Tess<'_> {
         };
         let (nu, nv) = (nu.max(3), nv.max(if wraps { 3 } else { 2 }));
         let span = if wraps { TAU } else { PI };
-        let vertices: Vec<P3> = f
+        let vertices: Vec<V3> = f
             .bounds
             .iter()
             .filter_map(|b| match b {
@@ -543,7 +886,7 @@ impl Tess<'_> {
                 Bound::Edges(_) => None,
             })
             .collect();
-        let at = |i: usize, j: usize| -> P3 {
+        let at = |i: usize, j: usize| -> V3 {
             let v = v0 + span * (j % if wraps { nv } else { nv + 1 }) as f64 / nv as f64;
             if !wraps && (j == 0 || j == nv) {
                 let pole = surf.eval([0.0, v]);
@@ -581,14 +924,15 @@ impl Tess<'_> {
     fn inner_points(
         &self,
         surf: &Surface,
-        outer: &[[f64; 2]],
-        holes: &[&[[f64; 2]]],
+        frame: &[[f64; 2]],
+        inside: &dyn Fn([f64; 2]) -> bool,
+        rings: &[&[[f64; 2]]],
     ) -> (Vec<[f64; 2]>, [f64; 2]) {
         if matches!(surf, Surface::Plane(_)) {
             return (Vec::new(), [1.0, 1.0]);
         }
         let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
-        for q in outer {
+        for q in frame {
             for k in 0..2 {
                 lo[k] = lo[k].min(q[k]);
                 hi[k] = hi[k].max(q[k]);
@@ -597,7 +941,6 @@ impl Tess<'_> {
         // How much the surface stretches and bends over the face's box, at
         // most.
         let range = [hi[0] - lo[0], hi[1] - lo[1]].map(|r| r.max(1e-12));
-        let h = range.map(|r| 1e-4 * r);
         let (mut st, mut bend, mut twist) = ([1e-12f64; 2], [0.0f64; 2], 0.0f64);
         for i in 0..=4 {
             for j in 0..=4 {
@@ -605,7 +948,7 @@ impl Tess<'_> {
                     lo[0] + range[0] * i as f64 / 4.0,
                     lo[1] + range[1] * j as f64 / 4.0,
                 ];
-                let b = surf.bend(q, h);
+                let b = surf.bend(q);
                 for k in 0..2 {
                     st[k] = st[k].max(b.stretch[k]);
                     bend[k] = bend[k].max(b.bend[k]);
@@ -648,12 +991,9 @@ impl Tess<'_> {
                     lo[0] + (hi[0] - lo[0]) * i as f64 / n[0] as f64,
                     lo[1] + (hi[1] - lo[1]) * j as f64 / n[1] as f64,
                 ];
-                let inside = contains(outer, q) && !holes.iter().any(|h| contains(h, q));
                 // Clear of the boundary by a third of a step.
-                let clear = std::iter::once(outer)
-                    .chain(holes.iter().copied())
-                    .all(|ring| seg_dist(ring, q, steps) > 0.33);
-                if inside && clear {
+                let clear = rings.iter().all(|ring| seg_dist(ring, q, steps) > 0.33);
+                if inside(q) && clear {
                     out.push(q);
                 }
             }
@@ -666,7 +1006,7 @@ impl Tess<'_> {
 /// along the sides they share: a face the file leaves facing either way (a
 /// sphere swept from a whole circle covers itself twice, facing out and
 /// in) faces as the shell around it.
-fn settle_orientation(faces: &mut [(SurfaceKind, Vec<Tri>)]) {
+fn settle_orientation(faces: &mut [(Option<Surface>, Vec<Tri>)]) {
     type Side = [[u64; 3]; 2];
     let side = |t: &Tri, k: usize| -> Side {
         [t.v[k].map(f64::to_bits), t.v[(k + 1) % 3].map(f64::to_bits)]
@@ -711,51 +1051,213 @@ fn settle_orientation(faces: &mut [(SurfaceKind, Vec<Tri>)]) {
     }
 }
 
-/// What a face comes to.
-enum FaceOut {
-    /// Its carrier and its triangles.
-    Facets(SurfaceKind, Vec<Tri>),
-    /// The sides of its bounds that cross in its parameters, in space.
-    Crossing(Vec<(P3, P3)>),
+/// Where a point of a face's bounds comes from: edge `edge`'s sample `at`
+/// (in the edge's own order), the edge run along itself or against.
+#[derive(Clone, Copy)]
+struct Origin {
+    edge: usize,
+    at: usize,
+    along: bool,
 }
 
-/// The segments (indices into `segments`, sides between `pts`) that cross
-/// another one properly: through each other's inside, not where they share
-/// an end.
-fn crossings(pts: &[[f64; 2]], segments: &[(usize, usize)]) -> Vec<usize> {
-    let orient = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| polygon_orientation(&[a, b, c]);
-    let span = |k: usize, d: usize| {
-        let (a, b) = (pts[segments[k].0][d], pts[segments[k].1][d]);
-        (a.min(b), a.max(b))
+/// A face's bounds in the parameters of a surface: its rings in space and
+/// there, the outer one, and per point where it comes from (empty where a
+/// pole or a seam added points).
+struct Bounds {
+    rings: Vec<Vec<V3>>,
+    uv: Vec<Vec<[f64; 2]>>,
+    outer: usize,
+    origin: Vec<Vec<Origin>>,
+}
+
+/// What a face comes to before it is triangulated: its bounds, or all of a
+/// closed surface's facets.
+enum Shape {
+    Bounds(Bounds),
+    Whole(Vec<Tri>),
+}
+
+/// A face triangulated with others on one surface: its bounds there and
+/// whether its front is the surface's normal.
+struct Part<'a> {
+    face: &'a Face,
+    b: &'a Bounds,
+    front: bool,
+}
+
+/// A change to the edges' samples so faces of several bodies on one
+/// carrier share their points.
+#[derive(Clone, Copy, Debug)]
+enum Imprint {
+    /// Point `p` into edge `edge` after its sample `after`.
+    Insert { edge: usize, after: usize, p: V3 },
+    /// Every sample at `from` to `to`.
+    Move { from: V3, to: V3 },
+}
+
+/// The mean of parameter `k` over a ring.
+fn mean(r: &[[f64; 2]], k: usize) -> f64 {
+    r.iter().map(|q| q[k]).sum::<f64>() / r.len() as f64
+}
+
+/// Rounds of imprints before the faces of a group are triangulated: each
+/// may add points the next finds on another face's sides.
+const IMPRINT_ROUNDS: usize = 4;
+
+/// The groups of faces that touch: faces of different bodies on one
+/// curved carrier (a cylinder, a cone, a sphere, a torus) whose boxes
+/// meet, the points of each on the other's surface; with the faces of
+/// the same bodies that touch those. `samples` the edges' samples, `tol`
+/// how far off a surface a point counts as on it.
+fn contact_groups(m: &Model, samples: &[Samples], solid_of: &[usize], tol: f64) -> Vec<Vec<usize>> {
+    let curved = |f: &Face| {
+        matches!(
+            m.surfaces[f.surface],
+            Surface::Cylinder { .. }
+                | Surface::Cone { .. }
+                | Surface::Sphere { .. }
+                | Surface::Torus { .. }
+        )
     };
-    let mut order: Vec<usize> = (0..segments.len()).collect();
-    order.sort_by(|&a, &b| span(a, 0).0.total_cmp(&span(b, 0).0));
-    let mut out = Vec::new();
-    for (n, &i) in order.iter().enumerate() {
-        let (a, b) = (pts[segments[i].0], pts[segments[i].1]);
-        for &j in &order[n + 1..] {
-            if span(j, 0).0 > span(i, 0).1 {
-                break;
+    // Per candidate face: some points of its bounds and their box.
+    let candidates: Vec<(usize, Vec<V3>, V3, V3)> = (0..m.faces.len())
+        .filter(|&fi| solid_of[fi] != usize::MAX && curved(&m.faces[fi]))
+        .filter_map(|fi| {
+            let pts: Vec<V3> = m.faces[fi]
+                .bounds
+                .iter()
+                .flat_map(|b| match b {
+                    Bound::Edges(es) => es
+                        .iter()
+                        .flat_map(|&(e, _)| samples[e].pts.iter().copied())
+                        .collect(),
+                    Bound::Vertex(_) => Vec::new(),
+                })
+                .collect();
+            if pts.is_empty() {
+                return None;
             }
-            let ((y0, y1), (z0, z1)) = (span(i, 1), span(j, 1));
-            let (c, d) = (pts[segments[j].0], pts[segments[j].1]);
-            if y1 < z0 || z1 < y0 || [a, b].iter().any(|p| *p == c || *p == d) {
+            let (lo, hi) = bbox(&pts);
+            let step = pts.len().div_ceil(16);
+            Some((fi, pts.into_iter().step_by(step).collect(), lo, hi))
+        })
+        .collect();
+    let on = |s: &Surface, pts: &[V3]| pts.iter().all(|&p| dist(s.eval(s.param(p)), p) <= tol);
+    let mut parent: Vec<usize> = (0..m.faces.len()).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut grouped = vec![false; m.faces.len()];
+    for (i, (a, pa, la, ha)) in candidates.iter().enumerate() {
+        for (b, pb, lb, hb) in &candidates[i + 1..] {
+            if solid_of[*a] == solid_of[*b]
+                || (0..3).any(|k| la[k] > hb[k] + tol || lb[k] > ha[k] + tol)
+            {
                 continue;
             }
-            let apart = |s: Sign, t: Sign| {
-                matches!(
-                    (s, t),
-                    (Sign::Positive, Sign::Negative) | (Sign::Negative, Sign::Positive)
-                )
-            };
-            if apart(orient(a, b, c), orient(a, b, d)) && apart(orient(c, d, a), orient(c, d, b)) {
-                out.extend([i, j]);
+            let (sa, sb) = (
+                &m.surfaces[m.faces[*a].surface],
+                &m.surfaces[m.faces[*b].surface],
+            );
+            if on(sa, pb) && on(sb, pa) {
+                let (ra, rb) = (root(&mut parent, *a), root(&mut parent, *b));
+                parent[ra] = rb;
+                grouped[*a] = true;
+                grouped[*b] = true;
             }
         }
     }
+    let mut groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for fi in 0..m.faces.len() {
+        if grouped[fi] {
+            groups.entry(root(&mut parent, fi)).or_default().push(fi);
+        }
+    }
+    let mut out: Vec<Vec<usize>> = groups.into_values().collect();
     out.sort_unstable();
-    out.dedup();
     out
+}
+
+/// Applies `imprints` to the edges' samples: moves first, then each
+/// edge's new points in order along it. Returns how many samples changed.
+fn apply_imprints(m: &Model, samples: &mut [Samples], imprints: &[Imprint], tol: f64) -> usize {
+    let mut changed = 0;
+    for im in imprints {
+        if let Imprint::Move { from, to } = *im {
+            for s in samples.iter_mut() {
+                for p in &mut s.pts {
+                    if *p == from {
+                        *p = to;
+                        changed += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut by_edge: FxHashMap<usize, Vec<(usize, V3)>> = FxHashMap::default();
+    for im in imprints {
+        if let Imprint::Insert { edge, after, p } = *im {
+            by_edge.entry(edge).or_default().push((after, p));
+        }
+    }
+    let mut edges: Vec<usize> = by_edge.keys().copied().collect();
+    edges.sort_unstable();
+    for e in edges {
+        let curve = &m.curves[m.edges[e].curve];
+        let s = &mut samples[e];
+        let mut add: Vec<(f64, V3)> = Vec::new();
+        for &(after, p) in &by_edge[&e] {
+            if after + 1 >= s.pts.len()
+                || s.pts.iter().any(|&q| dist(q, p) <= tol)
+                || add.iter().any(|&(_, q)| dist(q, p) <= tol)
+            {
+                continue;
+            }
+            // Its parameter on the edge's curve, between the samples it
+            // goes between.
+            let (t0, t1) = (s.ts[after], s.ts[after + 1]);
+            let mut t = curve.param(p);
+            if let Some(period) = curve.period() {
+                t = wrap_near(t, 0.5 * (t0 + t1), period);
+            }
+            let t = t.clamp(t0.min(t1), t0.max(t1));
+            add.push((t, p));
+        }
+        if add.is_empty() {
+            continue;
+        }
+        changed += add.len();
+        let dir = (*s.ts.last().unwrap() - s.ts[0]).signum();
+        let mut all: Vec<(f64, V3)> = s.ts.iter().copied().zip(s.pts.iter().copied()).collect();
+        all.extend(add);
+        let (first, last) = (all[0], all[s.ts.len() - 1]);
+        let mut middle: Vec<(f64, V3)> = all
+            .into_iter()
+            .filter(|&(_, p)| p != first.1 && p != last.1)
+            .collect();
+        middle.sort_by(|a, b| (dir * a.0).total_cmp(&(dir * b.0)));
+        s.ts = std::iter::once(first.0)
+            .chain(middle.iter().map(|x| x.0))
+            .chain(std::iter::once(last.0))
+            .collect();
+        s.pts = std::iter::once(first.1)
+            .chain(middle.iter().map(|x| x.1))
+            .chain(std::iter::once(last.1))
+            .collect();
+    }
+    changed
+}
+
+/// What a face comes to.
+enum FaceOut {
+    /// Its carrier and its triangles.
+    Facets(Option<Surface>, Vec<Tri>),
+    /// The sides of its bounds that cross in its parameters, in space.
+    Crossing(Vec<(V3, V3)>),
 }
 
 /// Edges between the same two vertices along the same path (a file may
@@ -776,7 +1278,7 @@ fn share_coincident(m: &Model, samples: &mut [Samples], fit: f64) {
             // a's span.
             let own = &m.curves[m.edges[b].curve];
             let (u0, u1) = (samples[b].ts[0], *samples[b].ts.last().unwrap());
-            let probes: Vec<P3> = [0.25, 0.5, 0.75]
+            let probes: Vec<V3> = [0.25, 0.5, 0.75]
                 .iter()
                 .map(|w| own.eval(u0 + w * (u1 - u0)))
                 .collect();
@@ -786,7 +1288,7 @@ fn share_coincident(m: &Model, samples: &mut [Samples], fit: f64) {
                 probes.iter().all(|&p| {
                     let mut t = curve.param(p);
                     if let Some(period) = curve.period() {
-                        t = near(t, 0.5 * (t0 + t1), period);
+                        t = wrap_near(t, 0.5 * (t0 + t1), period);
                     }
                     t0.min(t1) <= t && t <= t0.max(t1) && dist(curve.eval(t), p) <= fit
                 })
@@ -808,7 +1310,7 @@ fn share_coincident(m: &Model, samples: &mut [Samples], fit: f64) {
                 .map(|(i, &p)| {
                     let guess = t0 + (t1 - t0) * i as f64 / n as f64;
                     match curve.period() {
-                        Some(period) => near(curve.param(p), guess, period),
+                        Some(period) => wrap_near(curve.param(p), guess, period),
                         None => curve.param(p),
                     }
                 })
@@ -818,195 +1320,6 @@ fn share_coincident(m: &Model, samples: &mut [Samples], fit: f64) {
             samples[b] = Samples { ts, pts };
         }
     }
-}
-
-/// Twice the signed area of a ring.
-fn area(r: &[[f64; 2]]) -> f64 {
-    (0..r.len())
-        .map(|i| {
-            let (a, b) = (r[i], r[(i + 1) % r.len()]);
-            a[0] * b[1] - a[1] * b[0]
-        })
-        .sum()
-}
-
-/// Joins the rings (`rings` in space, `uv` unwrapped in the parameters)
-/// that wind once round a period of the surface into one that bounds a
-/// region of the parameters. The two rims of a cylinder face with no seam
-/// edge each run over a whole period, and neither encloses anything: they
-/// become one ring along the first rim, across a seam to the second, back
-/// along it and across the seam again. A rim alone closes through the pole
-/// on the side of the face (a spherical cap): the face lies to the left of
-/// its bounds seen from its normal, which is the surface's where
-/// `same_sense`. The seam's points are those of the rims, twice, a period
-/// apart.
-fn join_windings(
-    rings: &mut Vec<Vec<P3>>,
-    uv: &mut Vec<Vec<[f64; 2]>>,
-    periods: [Option<f64>; 2],
-    poles: &[(usize, f64, P3)],
-    same_sense: bool,
-    seam: &dyn Fn([f64; 2], [f64; 2]) -> Vec<([f64; 2], P3)>,
-) -> Result<(), String> {
-    // The turns of each ring round each period, its closing step included.
-    let turns = |r: &[[f64; 2]], k: usize| -> i64 {
-        let Some(period) = periods[k] else {
-            return 0;
-        };
-        // The steps along the ring add up to last - first; the closing one
-        // takes the first point next to the last.
-        let (a, b) = (r[0][k], r[r.len() - 1][k]);
-        ((near(a, b, period) - a) / period).round() as i64
-    };
-    let winding: Vec<(usize, usize, i64)> = uv
-        .iter()
-        .enumerate()
-        .flat_map(|(i, r)| (0..2).map(move |k| (i, k, turns(r, k))))
-        .filter(|&(_, _, w)| w != 0)
-        .collect();
-    let Some(&(_, k, _)) = winding.first() else {
-        return Ok(());
-    };
-    if winding.iter().any(|w| w.1 != k || w.2.abs() != 1) {
-        return Err("a bound winds round the surface more than once".into());
-    }
-    let period = periods[k].unwrap_or(0.0);
-    let shift = |q: [f64; 2], by: f64| -> [f64; 2] {
-        let mut q = q;
-        q[k] += by;
-        q
-    };
-    // The ring from point `from` on round, ending on the copy of that point
-    // a turn on.
-    let open = |ring: &[P3], r: &[[f64; 2]], from: usize, w: i64| -> (Vec<P3>, Vec<[f64; 2]>) {
-        let n = r.len();
-        let turn = w as f64 * period;
-        let pts = (0..=n).map(|t| ring[(from + t) % n]).collect();
-        let q = (0..=n)
-            .map(|t| {
-                let i = from + t;
-                if i < n {
-                    r[i]
-                } else {
-                    shift(r[i - n], turn)
-                }
-            })
-            .collect();
-        (pts, q)
-    };
-    let (joined, joined_uv) = match *winding.as_slice() {
-        [(a, _, wa), (b, _, wb)] => {
-            if wa == wb {
-                return Err("the rims of a band run the same way round".into());
-            }
-            // The seam is the shortest way between the rims: the pair of
-            // their points nearest each other in space, so it crosses
-            // neither (a rim with a step up in it has points of one angle
-            // at two heights). The first rim opens there, the second is
-            // moved into its turn.
-            let (start, from) = (0..uv[a].len())
-                .flat_map(|i| (0..uv[b].len()).map(move |j| (i, j)))
-                .min_by(|&(i, j), &(x, y)| {
-                    dist(rings[a][i], rings[b][j]).total_cmp(&dist(rings[a][x], rings[b][y]))
-                })
-                .unwrap_or((0, 0));
-            let (mut pts, mut q) = open(&rings[a], &uv[a], start, wa);
-            let end = q[q.len() - 1][k];
-            let by = near(uv[b][from][k], end, period) - uv[b][from][k];
-            let mut moved: Vec<[f64; 2]> = uv[b].iter().map(|&p| shift(p, by)).collect();
-            // Where the other parameter wraps too (a torus), the second rim
-            // goes to the face's side of the first, within a turn: a fillet
-            // round a hole is the quarter between its rims, not the rest.
-            let j = 1 - k;
-            if let Some(turn) = periods[j] {
-                let side = face_side(k, wa, same_sense);
-                let mean = |r: &[[f64; 2]]| r.iter().map(|q| q[j]).sum::<f64>() / r.len() as f64;
-                let (ma, mb) = (mean(&uv[a]), mean(&moved));
-                let ahead = (side * (mb - ma)).rem_euclid(turn);
-                let to = ma + side * ahead;
-                moved.iter_mut().for_each(|q| q[j] += to - mb);
-            }
-            // Across the seam to the second rim, round it, and back across
-            // the seam a turn on: the same points of the surface.
-            let across = seam(q[q.len() - 1], moved[from]);
-            let back: Vec<([f64; 2], P3)> = across
-                .iter()
-                .rev()
-                .map(|&(t, p)| (shift(t, -(wa as f64) * period), p))
-                .collect();
-            let (pts_b, q_b) = open(&rings[b], &moved, from, wb);
-            for (t, p) in across {
-                q.push(t);
-                pts.push(p);
-            }
-            pts.extend(pts_b);
-            q.extend(q_b);
-            for (t, p) in back {
-                q.push(t);
-                pts.push(p);
-            }
-            (pts, q)
-        }
-        [(a, _, wa)] => {
-            let j = 1 - k;
-            let side = face_side(k, wa, same_sense);
-            let mean = uv[a].iter().map(|q| q[j]).sum::<f64>() / uv[a].len() as f64;
-            let Some(&(_, value, pole)) = poles
-                .iter()
-                .filter(|p| p.0 == j && (p.1 - mean) * side > 0.0)
-                .min_by(|x, y| (x.1 - mean).abs().total_cmp(&(y.1 - mean).abs()))
-            else {
-                return Err("a bound winds round the surface alone".into());
-            };
-            let (mut pts, mut q) = open(&rings[a], &uv[a], 0, wa);
-            let (first, last) = (q[0], q[q.len() - 1]);
-            let mut p0 = last;
-            p0[j] = value;
-            let mut p1 = first;
-            p1[j] = value;
-            // Along the seam to the pole and back from it a turn on.
-            let across = seam(last, p0);
-            let back: Vec<([f64; 2], P3)> = across
-                .iter()
-                .rev()
-                .map(|&(t, p)| (shift(t, -(wa as f64) * period), p))
-                .collect();
-            for (t, p) in across {
-                q.push(t);
-                pts.push(p);
-            }
-            pts.extend([pole, pole]);
-            q.extend([p0, p1]);
-            for (t, p) in back {
-                q.push(t);
-                pts.push(p);
-            }
-            (pts, q)
-        }
-        _ => return Err("more than two bounds wind round the surface".into()),
-    };
-    // Rims that touch (a bore cut by another) meet where the seam starts:
-    // a seam of no length leaves the point there twice, once is enough.
-    let (mut joined, mut joined_uv) = (joined, joined_uv);
-    let mut i = 0;
-    while joined.len() > 3 && i < joined.len() {
-        let j = (i + 1) % joined.len();
-        if joined[i] == joined[j] && joined_uv[i] == joined_uv[j] {
-            joined.remove(j);
-            joined_uv.remove(j);
-        } else {
-            i += 1;
-        }
-    }
-    let mut gone: Vec<usize> = winding.iter().map(|w| w.0).collect();
-    gone.sort_unstable();
-    for i in gone.into_iter().rev() {
-        rings.remove(i);
-        uv.remove(i);
-    }
-    rings.push(joined);
-    uv.push(joined_uv);
-    Ok(())
 }
 
 /// The longest a facet of a curved face is in space against its breadth.
@@ -1036,8 +1349,9 @@ fn face_side(k: usize, w: i64, same_sense: bool) -> f64 {
 fn flip_to_shape(
     tris: &mut [[usize; 3]],
     p2: &[[f64; 2]],
-    p3: &[P3],
+    p3: &[V3],
     on_surface: impl Fn(usize, usize) -> bool,
+    fixed: &rustc_hash::FxHashSet<(usize, usize)>,
 ) {
     let ccw = |a: usize, b: usize, c: usize| {
         let (p, q, r) = (p2[a], p2[b], p2[c]);
@@ -1071,7 +1385,7 @@ fn flip_to_shape(
                 let Some(&(s, _)) = at.get(&(b, a)) else {
                     continue;
                 };
-                if touched[s] {
+                if touched[s] || fixed.contains(&(a.min(b), a.max(b))) {
                     continue;
                 }
                 let d = tris[s]
@@ -1120,46 +1434,8 @@ fn seg_dist(r: &[[f64; 2]], q: [f64; 2], steps: [f64; 2]) -> f64 {
     let s = |p: [f64; 2]| [p[0] / steps[0], p[1] / steps[1]];
     let q = s(q);
     (0..r.len())
-        .map(|i| {
-            let (a, b) = (s(r[i]), s(r[(i + 1) % r.len()]));
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let l = d[0] * d[0] + d[1] * d[1];
-            let t = if l > 0.0 {
-                (((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / l).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let p = [a[0] + t * d[0] - q[0], a[1] + t * d[1] - q[1]];
-            (p[0] * p[0] + p[1] * p[1]).sqrt()
-        })
+        .map(|i| segment_dist2(q, s(r[i]), s(r[(i + 1) % r.len()])).sqrt())
         .fold(f64::INFINITY, f64::min)
-}
-
-/// The carrier of a STEP edge curve, where it has one of the kinds the
-/// B-rep keeps (a hyperbola or a parabola has none, nor an invalid
-/// B-spline).
-fn curve_kind(c: &Curve) -> Option<CurveKind> {
-    match c {
-        Curve::Line { p, d } => Some(CurveKind::Line {
-            p0: *p,
-            dir: unit(*d)?,
-        }),
-        Curve::Circle { f, r } => Some(CurveKind::Circle {
-            center: f.o,
-            axis: f.z,
-            x: f.x,
-            radius: *r,
-        }),
-        Curve::Ellipse { f, a, b } => Some(CurveKind::Ellipse {
-            center: f.o,
-            major: f.x,
-            minor: f.y,
-            a: *a,
-            b: *b,
-        }),
-        Curve::Spline(sp) => Some(CurveKind::Nurbs(Arc::new(sp.clone()))),
-        Curve::Hyperbola { .. } | Curve::Parabola { .. } => None,
-    }
 }
 
 /// The bodies of `m`: one per solid, closed, oriented outward and placed
@@ -1173,6 +1449,7 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
         fit: 1e-4 * size,
         min_segments: tol.min_segments,
         samples: Vec::new(),
+        size,
     };
     // Every face of the file once; the edges whose samples cross in a
     // face's parameters sampled twice as finely, until none do.
@@ -1184,7 +1461,26 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
     used.sort_unstable();
     used.dedup();
     let mut parts = vec![1usize; m.edges.len()];
-    let mut facets: FxHashMap<usize, (SurfaceKind, Vec<Tri>)> = FxHashMap::default();
+    let mut facets: FxHashMap<usize, (Option<Surface>, Vec<Tri>)> = FxHashMap::default();
+    // The body of each face (none for a face of a moved body or of
+    // several): faces of different bodies that touch on a carrier are
+    // triangulated together.
+    let mut solid_of = vec![usize::MAX; m.faces.len()];
+    let mut users = vec![0usize; m.faces.len()];
+    for (k, solid) in m.solids.iter().enumerate() {
+        for &fi in &solid.faces {
+            users[fi] += 1;
+            if solid.placement == rapidmesh_exact::vector::Affine::IDENTITY {
+                solid_of[fi] = k;
+            }
+        }
+    }
+    for (fi, &n) in users.iter().enumerate() {
+        if n != 1 {
+            solid_of[fi] = usize::MAX;
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = Vec::new();
     for round in 0..=REFINE_ROUNDS {
         t.samples = m
             .edges
@@ -1193,14 +1489,34 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
             .map(|(e, &k)| t.sample(e, k))
             .collect();
         share_coincident(m, &mut t.samples, t.fit);
+        if round == 0 {
+            groups = contact_groups(m, &t.samples, &solid_of, 1e-6 * size);
+            rapidmesh_exact::log::debug(
+                "step.contact",
+                format!(
+                    "{} groups of touching faces, {} faces",
+                    groups.len(),
+                    groups.iter().map(Vec::len).sum::<usize>()
+                ),
+            );
+        }
+        for _ in 0..IMPRINT_ROUNDS {
+            let imprints: Vec<Imprint> = groups
+                .par_iter()
+                .map(|g| t.imprints(g, &solid_of))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            if apply_imprints(m, &mut t.samples, &imprints, 1e-7 * size) == 0 {
+                break;
+            }
+        }
         let check = round < REFINE_ROUNDS;
-        let outs: Vec<FaceOut> = used
-            .par_iter()
-            .map(|&f| t.face(&m.faces[f], check))
-            .collect::<Result<_, _>>()?;
+        let outs = t.all_faces(&used, &groups, check)?;
         // The edges each pair of neighbouring samples lies on.
         let mut along: FxHashMap<[[u64; 3]; 2], Vec<usize>> = FxHashMap::default();
-        let key = |p: P3, q: P3| {
+        let key = |p: V3, q: V3| {
             let (p, q) = (p.map(f64::to_bits), q.map(f64::to_bits));
             [p.min(q), p.max(q)]
         };
@@ -1222,10 +1538,9 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
         if refine.is_empty() && outs.iter().any(|o| matches!(o, FaceOut::Crossing(_))) {
             // Sides no edge refines (straight ones): as they are.
             facets = used
-                .par_iter()
-                .map(|&f| Ok((f, t.face(&m.faces[f], false)?)))
-                .collect::<Result<Vec<_>, StepError>>()?
-                .into_iter()
+                .iter()
+                .copied()
+                .zip(t.all_faces(&used, &groups, false)?)
                 .filter_map(|(f, o)| match o {
                     FaceOut::Facets(k, tris) => Some((f, (k, tris))),
                     FaceOut::Crossing(_) => None,
@@ -1257,7 +1572,7 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
     }
     let mut out = Vec::with_capacity(m.solids.len());
     for solid in &m.solids {
-        let mut faces: Vec<(SurfaceKind, Vec<Tri>)> =
+        let mut faces: Vec<(Option<Surface>, Vec<Tri>)> =
             solid.faces.iter().map(|fi| facets[fi].clone()).collect();
         settle_orientation(&mut faces);
         let mut f = Faceted::new();
@@ -1268,18 +1583,22 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
             }
         }
         // The solid's vertices are its corners: its edges end there.
-        let mut corners: Vec<P3> = solid
+        // (The samples' ends: a vertex moved onto another body's is where
+        // the edges end.)
+        let mut corners: Vec<V3> = solid
             .faces
             .iter()
             .flat_map(|&fi| &m.faces[fi].bounds)
             .flat_map(|b| match b {
                 Bound::Edges(es) => es
                     .iter()
-                    .flat_map(|&(e, _)| m.edges[e].ends)
+                    .flat_map(|&(e, _)| {
+                        let s = &t.samples[e].pts;
+                        [s[0], s[s.len() - 1]]
+                    })
                     .collect::<Vec<_>>(),
-                Bound::Vertex(v) => vec![*v],
+                Bound::Vertex(v) => vec![m.vertices[*v]],
             })
-            .map(|v| m.vertices[v])
             .collect();
         corners.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         corners.dedup();
@@ -1299,15 +1618,13 @@ pub fn bodies(m: &Model, tol: Tolerance) -> Result<Vec<Body>, StepError> {
         edges.dedup();
         f.curves = edges
             .into_iter()
-            .filter_map(|e| {
-                Some(EdgeCurve {
-                    kind: curve_kind(&m.curves[m.edges[e].curve])?,
-                    points: t.samples[e].pts.clone(),
-                })
+            .map(|e| EdgeCurve {
+                curve: m.curves[m.edges[e].curve].clone(),
+                points: t.samples[e].pts.clone(),
             })
             .collect();
-        if solid.placement != rapidmesh_geom::Frame::IDENTITY {
-            f = f.transformed(solid.placement.linear, solid.placement.offset);
+        if solid.placement != rapidmesh_exact::vector::Affine::IDENTITY {
+            f = f.transformed(&solid.placement);
         }
         out.push(Body {
             name: solid.name.clone(),
@@ -1340,7 +1657,7 @@ mod tests {
     /// A face of a closed shell facing in turns to face out like the rest.
     #[test]
     fn a_face_against_its_neighbours_turns() {
-        let c = |i: usize| -> P3 { [(i & 1) as f64, ((i >> 1) & 1) as f64, ((i >> 2) & 1) as f64] };
+        let c = |i: usize| -> V3 { [(i & 1) as f64, ((i >> 1) & 1) as f64, ((i >> 2) & 1) as f64] };
         // The cube's faces as quads facing out, x = 1 facing in.
         let quads = [
             [0, 2, 3, 1],
@@ -1350,11 +1667,8 @@ mod tests {
             [0, 4, 6, 2],
             [1, 5, 7, 3],
         ];
-        let kind = SurfaceKind::Plane {
-            point: [0.0; 3],
-            normal: [0.0, 0.0, 1.0],
-        };
-        let mut faces: Vec<(SurfaceKind, Vec<Tri>)> = quads
+        let kind = Surface::plane([0.0; 3], [0.0, 0.0, 1.0]);
+        let mut faces: Vec<(Option<Surface>, Vec<Tri>)> = quads
             .iter()
             .map(|q| {
                 let [a, b, c_, d] = q.map(c);

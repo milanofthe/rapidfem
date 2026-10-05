@@ -6,7 +6,7 @@ use crate::convention::{
 };
 use crate::csr::Csr;
 use crate::source::TetSource;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 /// Derived connectivity of a tet mesh. Pure topology -- no coordinates.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -45,10 +45,13 @@ impl TetTopology {
     /// Build the complex in one O(n) pass.
     pub fn build(src: &impl TetSource) -> Self {
         let nt = src.n_tets();
-        let mut edge_id: HashMap<[u32; 2], u32> = HashMap::new();
-        let mut edges: Vec<[u32; 2]> = Vec::new();
-        let mut face_id: HashMap<[u32; 3], u32> = HashMap::new();
-        let mut faces: Vec<[u32; 3]> = Vec::new();
+        // A tet mesh has about 1.2 edges and 2 faces per tet.
+        let mut edge_id: FxHashMap<[u32; 2], u32> =
+            FxHashMap::with_capacity_and_hasher(nt * 6 / 5 + 16, Default::default());
+        let mut edges: Vec<[u32; 2]> = Vec::with_capacity(nt * 6 / 5 + 16);
+        let mut face_id: FxHashMap<[u32; 3], u32> =
+            FxHashMap::with_capacity_and_hasher(2 * nt + 16, Default::default());
+        let mut faces: Vec<[u32; 3]> = Vec::with_capacity(2 * nt + 16);
         let mut tet_edges = vec![[0u32; 6]; nt];
         let mut tet_edge_sign = vec![[0i8; 6]; nt];
         let mut tet_faces = vec![[0u32; 4]; nt];
@@ -156,7 +159,8 @@ pub struct TetGeometry {
 
 impl TetGeometry {
     pub fn build(topo: &TetTopology, coords: &[[f64; 3]]) -> Self {
-        use crate::math::{add, cross, det3, dot, edge_geom, inv3, norm, scale, sub};
+        use crate::edge_geom;
+        use rapidmesh_exact::vector::{add, cross, det3, dot, inverse, len, scale, sub};
 
         let nt = topo.tets.len();
         let mut volume = vec![0.0; nt];
@@ -177,7 +181,7 @@ impl TetGeometry {
                 [e1[2], e2[2], e3[2]],
             ];
             volume[t] = det3(m).abs() / 6.0;
-            if let Some(inv) = inv3(m) {
+            if let Some(inv) = inverse(m) {
                 // lambda_{1,2,3} = (T^{-1}(x - p0))_{0,1,2} -> grad lambda_i = rows of T^{-1}.
                 let (g1, g2, g3) = (inv[0], inv[1], inv[2]);
                 grad[t][1] = g1;
@@ -205,7 +209,7 @@ impl TetGeometry {
                 coords[ic as usize],
             );
             let n = cross(sub(b, a), sub(c, a));
-            let len = norm(n);
+            let len = len(n);
             face_area[f] = 0.5 * len;
             let centroid = scale(add(add(a, b), c), 1.0 / 3.0);
             face_centroid[f] = centroid;

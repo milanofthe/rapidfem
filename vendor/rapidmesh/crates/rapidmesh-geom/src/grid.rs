@@ -205,7 +205,7 @@ mod tests {
         for (i, &p) in pts.iter().enumerate() {
             g.insert(p, i);
         }
-        let d2 = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>();
+        let d2 = rapidmesh_exact::vector::dist2::<3>;
         for q in [[0.1, 0.2, 0.3], [9.0, -9.0, 4.0], [-3.0, 1.0, 0.0]] {
             let (&i, d) = g.nearest(q, 0.0, |&i| d2(pts[i], q)).unwrap();
             let best = pts.iter().map(|&p| d2(p, q)).fold(f64::INFINITY, f64::min);

@@ -10,6 +10,8 @@
 
 pub mod bvh;
 pub mod cdt2;
+pub mod chart;
+pub mod curve;
 pub mod discrete;
 mod faceted;
 pub mod grid;
@@ -20,21 +22,25 @@ pub mod plc;
 pub mod polygon;
 pub mod prim;
 pub mod scene;
+pub mod sheet;
+pub mod surface;
 pub mod tube;
-pub mod vec3;
 
+pub use curve::Curve;
 pub use discrete::DiscreteSurface;
-pub use faceted::{CurveKind, EdgeCurve, Faceted, FlatFacet, Frame, SurfaceKind};
+pub use faceted::{EdgeCurve, Faceted, FlatFacet};
 pub use import::{import_obj, import_stl, validate_closed, ImportError, CREASE_DEG};
 pub use nurbs::NurbsCurve;
 pub use nurbs_surface::NurbsSurface;
 pub use plc::{FaceTag, RegionTag, SurfaceRef, TaggedPlc};
-pub use polygon::{polygon_orientation, polygon_union, triangulate_polygon};
+pub use polygon::{crossings, polygon_orientation, polygon_union, triangulate_polygon};
 pub use prim::{
-    cylinder, cylinder_iso, extrude_polygon, extrude_profile, extrude_sheet,
-    extrude_spline_profile, facet_subdivisions, frustum, frustum_iso, helix, icosphere, loft,
-    mesh_solid, naca0012_profile, pipe, revolve, revolve_at, sheet_disk, sheet_nurbs,
-    sheet_polygon, sheet_rect, solid_box, sphere, torus, wedge, ProfileEdge,
+    cylinder, extrude_polygon, extrude_profile, extrude_sheet, facet_subdivisions, frustum, helix,
+    icosphere, loft, mesh_solid, naca0012_points, pipe, revolve, revolve_at, sheet_disk,
+    sheet_nurbs, sheet_polygon, sheet_rect, solid_box, torus, wedge, ProfileEdge,
 };
+pub use rapidmesh_csg::BoolOp;
 pub use scene::{AssembleError, Scene};
+pub use sheet::sheet_boolean;
+pub use surface::{Bend, Surface};
 pub use tube::TubePath;

@@ -21,22 +21,23 @@ use crate::mesh::PointClass;
 use crate::params::MeshParams;
 use crate::sizing::tree::DomainTree;
 use rapidmesh_brep::Model;
-use rapidmesh_geom::vec3::{bbox, cross, dot, sub};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{bbox, cross, dot, sub};
 use rapidmesh_geom::{sheet_polygon, FaceTag, RegionTag, Scene};
 use rustc_hash::FxHashMap;
 
-type P3 = [f64; 3];
-
 /// The face tag of the cut sheets.
-pub const CUT_TAG: FaceTag = FaceTag(u32::MAX);
+pub const CUT_TAG: FaceTag = FaceTag::CUT;
 
 /// A model of fewer tets stays whole.
 const CUT_FROM: f64 = 500_000.0;
 
-/// The tets of a block: enough blocks for every worker to take several in
-/// turn (a large one last would keep the others waiting), within these
-/// bounds (each cut adds its faces to mesh).
-const BLOCKS_PER_WORKER: f64 = 4.0;
+/// The tets of a block: the work in this many parts, enough for the workers
+/// of a machine to take several in turn (a large one last would keep the
+/// others waiting), within these bounds (each cut adds its faces to mesh).
+/// Not the machine's count of workers: the cuts, and with them the mesh,
+/// are the same on every machine.
+const BLOCK_PARTS: f64 = 32.0;
 const BLOCK_MIN: f64 = 100_000.0;
 const BLOCK_MAX: f64 = 250_000.0;
 
@@ -46,7 +47,10 @@ const TETS_PER_CUBE: f64 = 8.5;
 
 /// A cut keeps at least this many sizes from every corner of the model
 /// along its axis (each corner's size), and a place with up to [`ROOM`]
-/// sizes is taken over one with less.
+/// sizes is taken over one with less. [`CLEAR_WIDE`] first (a cut a size
+/// from a thin layer's wall leaves slivers between them), the least where
+/// no place keeps that.
+const CLEAR_WIDE: f64 = 3.0;
 const CLEAR: f64 = 1.0;
 const ROOM: f64 = 4.0;
 
@@ -69,8 +73,8 @@ enum Node {
 struct Cut {
     axis: usize,
     at: f64,
-    lo: P3,
-    hi: P3,
+    lo: V3,
+    hi: V3,
 }
 
 /// Where the cuts go.
@@ -84,7 +88,7 @@ pub struct Plan {
 impl Plan {
     /// The cuts of `model` at the sizes of `domain` into blocks of about
     /// `block` tets (none where the whole is less than two), by default
-    /// as many as the workers can share evenly (none below [`CUT_FROM`]).
+    /// [`BLOCK_PARTS`] of the work (none below [`CUT_FROM`]).
     pub fn new(model: &Model, domain: &DomainTree, block: Option<f64>) -> Plan {
         let pts = &model.plc.vertices;
         let (lo, hi) = bbox(pts);
@@ -108,8 +112,7 @@ impl Plan {
                 if total < CUT_FROM {
                     return plan;
                 }
-                let workers = rayon::current_num_threads() as f64;
-                (total / (BLOCKS_PER_WORKER * workers)).clamp(BLOCK_MIN, BLOCK_MAX)
+                (total / BLOCK_PARTS).clamp(BLOCK_MIN, BLOCK_MAX)
             }
         };
         let sizes: Vec<f64> = {
@@ -117,7 +120,7 @@ impl Plan {
             pts.par_iter().map(|&p| domain.h_at(p).min(1e300)).collect()
         };
         let mut cells = 0u32;
-        let mut stack: Vec<(u32, P3, P3, Vec<u32>)> =
+        let mut stack: Vec<(u32, V3, V3, Vec<u32>)> =
             vec![(0, lo, hi, (0..pts.len() as u32).collect())];
         while let Some((node, lo, hi, inside)) = stack.pop() {
             match split(domain, pts, &sizes, &inside, lo, hi, block, &plan.cuts) {
@@ -159,7 +162,7 @@ impl Plan {
     }
 
     /// Whether `p` lies within `reach` of a cut.
-    pub fn near(&self, p: P3, reach: f64) -> bool {
+    pub fn near(&self, p: V3, reach: f64) -> bool {
         self.cuts.iter().any(|c| {
             (p[c.axis] - c.at).abs() <= reach
                 && (0..3)
@@ -168,7 +171,7 @@ impl Plan {
     }
 
     /// The cell of `p`; on the cut `(axis, at)` the one above it or below.
-    fn cell(&self, p: P3, on: Option<(usize, f64, bool)>) -> u32 {
+    fn cell(&self, p: V3, on: Option<(usize, f64, bool)>) -> u32 {
         let mut n = 0;
         loop {
             match self.nodes[n] {
@@ -188,7 +191,8 @@ impl Plan {
 /// The cut of the cell `lo..hi` holding the corners `inside` (`sizes` the
 /// size at each corner of the model), if it holds more than two `block`s'
 /// work: on an axis not much shorter than the longest, between the
-/// quartiles of its work, where it stays farthest from every corner in
+/// quartiles of its work (else anywhere a block's work stays on either
+/// side), where it stays farthest from every corner in
 /// that corner's size (up to [`ROOM`] sizes), nearest the median among
 /// equals; none where no place keeps [`CLEAR`] sizes. A place within a
 /// size of a cut already made on the same axis (in another cell) moves onto
@@ -198,11 +202,11 @@ impl Plan {
 #[allow(clippy::too_many_arguments)]
 fn split(
     domain: &DomainTree,
-    pts: &[P3],
+    pts: &[V3],
     sizes: &[f64],
     inside: &[u32],
-    lo: P3,
-    hi: P3,
+    lo: V3,
+    hi: V3,
     block: f64,
     made: &[Cut],
 ) -> Option<(usize, f64)> {
@@ -214,72 +218,86 @@ fn split(
     // The best place so far: its room (sizes), its distance from the
     // median (a share of the cell), the place and its axis.
     let mut best: Option<(f64, f64, f64, usize)> = None;
-    for axis in 0..3 {
-        if hi[axis] - lo[axis] < 0.5 * longest {
-            continue;
-        }
-        let width = (hi[axis] - lo[axis]) / SLICES as f64;
-        let work = work(domain, lo, hi, axis);
-        let total: f64 = work.iter().sum();
-        if total < 2.0 * block {
-            return None;
-        }
-        // The place below which a share of the work lies.
-        let quantile = |q: f64| {
-            let mut acc = 0.0;
-            for (s, &w) in work.iter().enumerate() {
-                if acc + w >= q * total && w > 0.0 {
-                    return lo[axis] + (s as f64 + (q * total - acc) / w) * width;
-                }
-                acc += w;
-            }
-            hi[axis]
-        };
-        let (from, mid, to) = (quantile(0.25), quantile(0.5), quantile(0.75));
-        let mut corners: Vec<(f64, f64)> = inside
-            .iter()
-            .map(|&i| (pts[i as usize][axis], sizes[i as usize]))
-            .collect();
-        corners.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // The room at `x`: the least distance to a corner in its size; only
-        // corners within ROOM of the coarsest size can bound it below ROOM.
-        let reach = ROOM * coarsest;
-        let room = |x: f64| -> f64 {
-            let start = corners.partition_point(|c| c.0 < x - reach);
-            corners[start..]
-                .iter()
-                .take_while(|c| c.0 <= x + reach)
-                .map(|&(c, h)| (x - c).abs() / h)
-                .fold(ROOM, f64::min)
-        };
-        // The candidates: the ends and the median, and between each two
-        // corners the place as far from both in their sizes.
-        let mut candidates = vec![from, mid, to];
-        candidates.extend(corners.windows(2).filter_map(|w| {
-            let ((a, ha), (b, hb)) = (w[0], w[1]);
-            let x = (a * hb + b * ha) / (ha + hb);
-            (x > from && x < to).then_some(x)
-        }));
-        let planes: Vec<f64> = made
-            .iter()
-            .filter(|c| c.axis == axis && c.at > lo[axis] && c.at < hi[axis])
-            .map(|c| c.at)
-            .collect();
-        for x in candidates {
-            let x = planes
-                .iter()
-                .copied()
-                .filter(|&c| (c - x).abs() <= coarsest && room(c) >= CLEAR)
-                .min_by(|a, b| (a - x).abs().total_cmp(&(b - x).abs()))
-                .unwrap_or(x);
-            let r = room(x);
-            if r < CLEAR {
+    for (clear, wide) in [
+        (CLEAR_WIDE, false),
+        (CLEAR_WIDE, true),
+        (CLEAR, false),
+        (CLEAR, true),
+    ] {
+        for axis in 0..3 {
+            if hi[axis] - lo[axis] < 0.5 * longest {
                 continue;
             }
-            let d = (x - mid).abs() / (hi[axis] - lo[axis]);
-            if best.is_none_or(|(r0, d0, _, _)| r > r0 || (r == r0 && d < d0)) {
-                best = Some((r, d, x, axis));
+            let width = (hi[axis] - lo[axis]) / SLICES as f64;
+            let work = work(domain, lo, hi, axis);
+            let total: f64 = work.iter().sum();
+            if total < 2.0 * block {
+                return None;
             }
+            // The place below which a share of the work lies.
+            let quantile = |q: f64| {
+                let mut acc = 0.0;
+                for (s, &w) in work.iter().enumerate() {
+                    if acc + w >= q * total && w > 0.0 {
+                        return lo[axis] + (s as f64 + (q * total - acc) / w) * width;
+                    }
+                    acc += w;
+                }
+                hi[axis]
+            };
+            // Between the quartiles of the work; where no place there keeps
+            // clear of the corners, anywhere that leaves a block's work on
+            // either side (its pieces split on).
+            let edge = if wide { (block / total).min(0.5) } else { 0.25 };
+            let (from, mid, to) = (quantile(edge), quantile(0.5), quantile(1.0 - edge));
+            let mut corners: Vec<(f64, f64)> = inside
+                .iter()
+                .map(|&i| (pts[i as usize][axis], sizes[i as usize]))
+                .collect();
+            corners.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // The room at `x`: the least distance to a corner in its size; only
+            // corners within ROOM of the coarsest size can bound it below ROOM.
+            let reach = ROOM * coarsest;
+            let room = |x: f64| -> f64 {
+                let start = corners.partition_point(|c| c.0 < x - reach);
+                corners[start..]
+                    .iter()
+                    .take_while(|c| c.0 <= x + reach)
+                    .map(|&(c, h)| (x - c).abs() / h)
+                    .fold(ROOM, f64::min)
+            };
+            // The candidates: the ends and the median, and between each two
+            // corners the place as far from both in their sizes.
+            let mut candidates = vec![from, mid, to];
+            candidates.extend(corners.windows(2).filter_map(|w| {
+                let ((a, ha), (b, hb)) = (w[0], w[1]);
+                let x = (a * hb + b * ha) / (ha + hb);
+                (x > from && x < to).then_some(x)
+            }));
+            let planes: Vec<f64> = made
+                .iter()
+                .filter(|c| c.axis == axis && c.at > lo[axis] && c.at < hi[axis])
+                .map(|c| c.at)
+                .collect();
+            for x in candidates {
+                let x = planes
+                    .iter()
+                    .copied()
+                    .filter(|&c| (c - x).abs() <= coarsest && room(c) >= clear)
+                    .min_by(|a, b| (a - x).abs().total_cmp(&(b - x).abs()))
+                    .unwrap_or(x);
+                let r = room(x);
+                if r < clear {
+                    continue;
+                }
+                let d = (x - mid).abs() / (hi[axis] - lo[axis]);
+                if best.is_none_or(|(r0, d0, _, _)| r > r0 || (r == r0 && d < d0)) {
+                    best = Some((r, d, x, axis));
+                }
+            }
+        }
+        if best.is_some() {
+            break;
         }
     }
     best.map(|(_, _, x, axis)| (axis, x))
@@ -287,7 +305,7 @@ fn split(
 
 /// The estimated tets of each of [`SLICES`] slices of the box `lo..hi`
 /// along `axis`, from the size at [`ACROSS`] squared points in each.
-fn work(domain: &DomainTree, lo: P3, hi: P3, axis: usize) -> Vec<f64> {
+fn work(domain: &DomainTree, lo: V3, hi: V3, axis: usize) -> Vec<f64> {
     let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
     let width = (hi[axis] - lo[axis]) / SLICES as f64;
     let volume: f64 = (0..3).map(|k| hi[k] - lo[k]).product();
@@ -364,7 +382,7 @@ impl Blocks {
         let mut keep = vec![true; plc.triangles.len()];
         for (ti, t) in plc.triangles.iter().enumerate() {
             let [a, b, c] = t.map(|v| plc.vertices[v as usize]);
-            let centre: P3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
+            let centre: V3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
             let [front, back] = plc.region_tags[ti].map(|r| r.0);
             let cells = if plc.face_tags[ti] == CUT_TAG {
                 if front == 0 && back == 0 {
@@ -429,6 +447,22 @@ impl Blocks {
         plc.features
             .retain(|e| used[e[0] as usize] && used[e[1] as usize]);
         plc.corners.retain(|&v| used[v as usize]);
+        // Every corner of the source stays one (a circle's seam point too,
+        // which a cut through the circle would leave inside an arc).
+        let at: FxHashMap<[u64; 3], u32> = plc
+            .vertices
+            .iter()
+            .enumerate()
+            .filter(|&(v, _)| used[v])
+            .map(|(v, p)| (p.map(f64::to_bits), v as u32))
+            .collect();
+        for c in &source.brep.vertices {
+            if let Some(&v) = at.get(&c.pos.map(f64::to_bits)) {
+                plc.corners.push(v);
+            }
+        }
+        plc.corners.sort_unstable();
+        plc.corners.dedup();
         let model = Model::new(plc);
         let blocks = Blocks::name(model, source, region);
         if blocks.is_none() {
@@ -458,7 +492,7 @@ impl Blocks {
                 }
                 let t = *f.facets.first()?;
                 let tv = model.plc.triangles[t as usize].map(|v| model.plc.vertices[v as usize]);
-                let centre: P3 = std::array::from_fn(|k| (tv[0][k] + tv[1][k] + tv[2][k]) / 3.0);
+                let centre: V3 = std::array::from_fn(|k| (tv[0][k] + tv[1][k] + tv[2][k]) / 3.0);
                 let on = model.plc.surface_refs[t as usize];
                 index
                     .nearest_where(centre, &|s| source.plc.surface_refs[s as usize] == on)
@@ -628,8 +662,8 @@ impl Blocks {
 }
 
 /// The point halfway along a polyline.
-fn midpoint(chain: &[P3]) -> P3 {
-    let len = |w: &[P3]| dot(sub(w[1], w[0]), sub(w[1], w[0])).sqrt();
+fn midpoint(chain: &[V3]) -> V3 {
+    let len = |w: &[V3]| dot(sub(w[1], w[0]), sub(w[1], w[0])).sqrt();
     let total: f64 = chain.windows(2).map(len).sum();
     let mut left = 0.5 * total;
     for w in chain.windows(2) {
@@ -644,13 +678,13 @@ fn midpoint(chain: &[P3]) -> P3 {
 }
 
 /// The distance from `p` to a polyline.
-fn polyline_dist(chain: &[P3], p: P3) -> f64 {
+fn polyline_dist(chain: &[V3], p: V3) -> f64 {
     chain
         .windows(2)
         .map(|w| {
             let d = sub(w[1], w[0]);
             let t = (dot(sub(p, w[0]), d) / dot(d, d).max(1e-300)).clamp(0.0, 1.0);
-            let q: P3 = std::array::from_fn(|k| w[0][k] + t * d[k]);
+            let q: V3 = std::array::from_fn(|k| w[0][k] + t * d[k]);
             dot(sub(p, q), sub(p, q)).sqrt()
         })
         .fold(f64::INFINITY, f64::min)

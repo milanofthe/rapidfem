@@ -19,7 +19,6 @@
 pub mod convention;
 pub mod csr;
 pub mod foam;
-mod math;
 mod source;
 mod tet;
 mod tri;
@@ -42,3 +41,18 @@ pub use tri::{TriGeometry, TriTopology};
 
 #[cfg(feature = "mesher")]
 pub use classes::{Classification, TriClassification};
+
+/// Per edge its length and midpoint, for the surface and volume builders.
+pub(crate) fn edge_geom(
+    edges: &[[u32; 2]],
+    coords: &[rapidmesh_exact::vector::V3],
+) -> (Vec<f64>, Vec<rapidmesh_exact::vector::V3>) {
+    use rapidmesh_exact::vector::{dist, mid};
+    edges
+        .iter()
+        .map(|&[a, b]| {
+            let (pa, pb) = (coords[a as usize], coords[b as usize]);
+            (dist(pa, pb), mid(pa, pb))
+        })
+        .unzip()
+}

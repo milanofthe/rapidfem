@@ -9,17 +9,16 @@
 //! material interface, or two solids sharing a face) are merged into one
 //! facet with combined tags. Vertices are exact until the final snap to f64.
 
-use crate::faceted::{Faceted, SurfaceKind};
+use crate::faceted::Faceted;
 use crate::plc::{FaceTag, RegionTag, SurfaceRef, TaggedPlc, SHEET_OWNER};
-use rapidmesh_csg::{
-    arrange_facets, classify, winding_beside, Placement, PlanarInput, Tri, TriBoxes, VertexPool,
-};
-use rapidmesh_exact::{Point3, Prepared3};
+use crate::surface::Surface;
+use rapidmesh_csg::{arrange_facets, Classifier, Placement, PlanarInput, Sample, Tri, VertexPool};
+use rapidmesh_exact::Point3;
 // Deterministic (seedless) hashers: the weld/merge stages ITERATE these maps,
 // and that order decides which coincident vertex wins -- std's RandomState would
 // make the assembled PLC (and the whole mesh) vary run to run.
 use crate::grid::HashGrid;
-use crate::vec3::{cross, dot};
+use rapidmesh_exact::vector::{cross, dot};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 /// Relative (to the scene bounding-box diagonal) tolerance for welding f64
@@ -38,57 +37,6 @@ const SNAP_PLANE_POINTS: usize = 3;
 /// an off-corner vertex on it) before the pass declares divergence. A handful
 /// suffices for real geometry; this is a loud backstop, not a silent abandon.
 const MAX_REPAIR_ROUNDS: usize = 64;
-
-/// A point strictly inside the sub-triangle `v`, exactly on the plane of its
-/// facet (`plane`, an explicit triangle there). The barycenter of implicit
-/// vertices has a high degree, and its exact predicates stop being exact once
-/// products of tiny inputs (a sin(pi) of 1e-16) underflow; a point of degree
-/// one on the explicit plane triangle, at the f64 barycenter and certified
-/// inside the sub-triangle, avoids that and is far cheaper. Falls back to the
-/// barycenter when the certificate fails (a sliver below f64 resolution).
-fn representative(v: [&Point3; 3], plane: &Tri) -> Point3 {
-    let bary = || Point3::bary(v[0].clone(), v[1].clone(), v[2].clone());
-    let Some(p) = v
-        .iter()
-        .map(|x| x.approx())
-        .collect::<Option<Vec<[f64; 3]>>>()
-    else {
-        return bary();
-    };
-    let c: [f64; 3] = std::array::from_fn(|k| (p[0][k] + p[1][k] + p[2][k]) / 3.0);
-    let [a, b, t] = plane.v;
-    let (axis, _) = plane.projection_axis();
-    let (i, j) = match axis {
-        rapidmesh_exact::Axis::X => (1, 2),
-        rapidmesh_exact::Axis::Y => (2, 0),
-        rapidmesh_exact::Axis::Z => (0, 1),
-    };
-    let (e1, e2, d) = (
-        [b[i] - a[i], b[j] - a[j]],
-        [t[i] - a[i], t[j] - a[j]],
-        [c[i] - a[i], c[j] - a[j]],
-    );
-    let det = e1[0] * e2[1] - e1[1] * e2[0];
-    if det == 0.0 {
-        return bary();
-    }
-    let (u, w) = (
-        (d[0] * e2[1] - d[1] * e2[0]) / det,
-        (e1[0] * d[1] - e1[1] * d[0]) / det,
-    );
-    let q = Point3::pac(a, b, t, u, w);
-    let o = |x: &Point3, y: &Point3, z: &Point3| rapidmesh_exact::orient2d(x, y, z, axis);
-    let turn = o(v[0], v[1], v[2]);
-    let inside = matches!(turn, Some(s) if s != rapidmesh_exact::Sign::Zero)
-        && o(v[0], v[1], &q) == turn
-        && o(v[1], v[2], &q) == turn
-        && o(v[2], v[0], &q) == turn;
-    if inside {
-        q
-    } else {
-        bary()
-    }
-}
 
 /// True if every vertex of the facet's loops and helper triangles lies exactly
 /// on the plane of its first helper triangle.
@@ -186,6 +134,11 @@ impl Scene {
     /// priority.
     pub fn replace_solid(&mut self, i: usize, f: Faceted) {
         self.solids[i] = f;
+    }
+
+    /// How many sheets were added.
+    pub fn sheet_count(&self) -> usize {
+        self.sheets.len()
     }
 
     /// The shape of sheet `i`, in the order they were added.
@@ -372,14 +325,14 @@ impl Scene {
         let mut facets: Vec<PlanarInput> = Vec::new();
         let mut src: Vec<Src> = Vec::new();
         let mut rep_tri: Vec<Tri> = Vec::new();
-        let mut surfaces: Vec<SurfaceKind> = Vec::new();
+        let mut surfaces: Vec<Option<Surface>> = Vec::new();
         let mut surface_owners: Vec<u32> = Vec::new();
         let mut surface_roles: Vec<u32> = Vec::new();
-        let mut owner_frames: Vec<crate::Frame> = Vec::new();
+        let mut owner_frames: Vec<rapidmesh_exact::vector::Affine> = Vec::new();
         let mut flatten = |f: &Faceted, solid: Option<usize>, tag: FaceTag| {
             if let Some(k) = solid {
                 if owner_frames.len() <= k {
-                    owner_frames.resize(k + 1, crate::Frame::IDENTITY);
+                    owner_frames.resize(k + 1, rapidmesh_exact::vector::Affine::IDENTITY);
                 }
                 owner_frames[k] = f.frame;
             }
@@ -446,20 +399,6 @@ impl Scene {
         rapidmesh_exact::log::stat("assemble.input_facets", facets.len() as f64);
         let t1 = rapidmesh_exact::clock::Instant::now();
 
-        // Scene bounding box for ray targets, over every facet's geometry.
-        let mut lo = [f64::MAX; 3];
-        let mut hi = [f64::MIN; 3];
-        for f in &facets {
-            for t in &f.helpers {
-                for v in &t.v {
-                    for k in 0..3 {
-                        lo[k] = lo[k].min(v[k]);
-                        hi[k] = hi[k].max(v[k]);
-                    }
-                }
-            }
-        }
-
         // --------------------------------------------- classify and keep
         let mut pool = VertexPool::default();
         let mut triangles: Vec<[u32; 3]> = Vec::new();
@@ -470,38 +409,7 @@ impl Scene {
         // coincident survivors.
         let mut emitted: HashMap<[u32; 3], usize> = HashMap::default();
 
-        // Per-solid bounding boxes (exact: the input tessellations are
-        // explicit f64), padded by a fat safety margin against the
-        // representative point's approximation error (relative error
-        // ~1e-15; the margin is a million times that). A representative
-        // clearly outside a solid's padded box is outside the solid, so the
-        // ray-parity classification of most (fragment, solid) pairs
-        // collapses to three float comparisons.
-        let margin = 1e-6 * (0..3).map(|k| hi[k] - lo[k]).fold(1.0_f64, f64::max);
-        let solid_bbox: Vec<([f64; 3], [f64; 3])> = self
-            .solids
-            .iter()
-            .map(|f| {
-                let mut slo = [f64::MAX; 3];
-                let mut shi = [f64::MIN; 3];
-                for t in &f.tris {
-                    for v in &t.v {
-                        for k in 0..3 {
-                            slo[k] = slo[k].min(v[k] - margin);
-                            shi[k] = shi[k].max(v[k] + margin);
-                        }
-                    }
-                }
-                (slo, shi)
-            })
-            .collect();
-        // Padded per-triangle boxes, once per solid (see TriBoxes).
-        let solid_boxes: Vec<TriBoxes> = self
-            .solids
-            .iter()
-            .map(|f| TriBoxes::build(&f.tris, margin))
-            .collect();
-
+        let solids = Classifier::new(self.solids.iter().map(|f| f.tris.as_slice()).collect());
         // Flat list of every sub-triangle (facet index, sub index): the
         // region resolution below is read-only and dominates assembly on
         // boolean-heavy scenes, so it runs in parallel; the cheap emission
@@ -520,7 +428,7 @@ impl Scene {
                 let ft = &arr.facets[fi];
                 let s = &src[fi];
                 let sub = &ft.triangles[si];
-                let bary = representative(
+                let sample = Sample::of(
                     [
                         &ft.vertices[sub[0]],
                         &ft.vertices[sub[1]],
@@ -528,10 +436,6 @@ impl Scene {
                     ],
                     &rep_tri[fi],
                 );
-                let rep = bary
-                    .approx()
-                    .expect("facet representative must be a valid point");
-                let bary = Prepared3::new(bary);
 
                 // Per-side region resolution, highest-priority solid first.
                 let mut front: Option<u32> = None;
@@ -545,14 +449,7 @@ impl Scene {
                         // Own boundary: the winding just beside it, so a
                         // facet inside an overlap of the solid's own shells
                         // has the solid on both sides.
-                        let (wf, wb) = winding_beside(
-                            &bary,
-                            rep,
-                            &rep_tri[fi],
-                            &self.solids[j].tris,
-                            &solid_boxes[j],
-                            (lo, hi),
-                        );
+                        let (wf, wb) = solids.beside(j, &sample, &rep_tri[fi]);
                         if wf > 0 {
                             front.get_or_insert(region);
                         }
@@ -561,18 +458,7 @@ impl Scene {
                         }
                         continue;
                     }
-                    let (blo, bhi) = solid_bbox[j];
-                    if (0..3).any(|k| rep[k] < blo[k] || rep[k] > bhi[k]) {
-                        continue; // clearly outside solid j
-                    }
-                    let (in_front, in_back) = match classify(
-                        &bary,
-                        rep,
-                        &rep_tri[fi],
-                        &self.solids[j].tris,
-                        &solid_boxes[j],
-                        (lo, hi),
-                    ) {
+                    let (in_front, in_back) = match solids.place(j, &sample, &rep_tri[fi]) {
                         Placement::Inside => (true, true),
                         Placement::Outside => (false, false),
                         // Coincident facets: j's interior lies behind j's
@@ -619,7 +505,11 @@ impl Scene {
                 // Coincident facet already emitted: merge tags. Solid
                 // interfaces win the region pair (they are equal up to
                 // orientation anyway); sheets contribute their face tag.
+                // The carrier first by geometry stays.
                 face_tags[e] = face_tags[e].max(s.tag);
+                if first_carrier(&surfaces, s.surface, surface_refs[e].0) {
+                    surface_refs[e] = SurfaceRef(s.surface);
+                }
                 continue;
             }
             emitted.insert(key, triangles.len());
@@ -719,6 +609,9 @@ impl Scene {
                 // Coincident after welding: merge tags like the exact
                 // coincident-survivor merge above.
                 out_face_tags[e] = out_face_tags[e].max(face_tags[i]);
+                if first_carrier(&surfaces, surface_refs[i].0, out_surface_refs[e].0) {
+                    out_surface_refs[e] = surface_refs[i];
+                }
                 continue;
             }
             emitted_snapped.insert(key, out_triangles.len());
@@ -786,6 +679,16 @@ impl Scene {
             corners,
             curves,
         })
+    }
+}
+
+/// Whether surface `a` of `surfaces` comes before surface `b` by geometry
+/// (see [`Surface::geometry_order`]); a carrier before none.
+fn first_carrier(surfaces: &[Option<Surface>], a: u32, b: u32) -> bool {
+    match (&surfaces[a as usize], &surfaces[b as usize]) {
+        (Some(x), Some(y)) => x.geometry_order(y).is_lt(),
+        (Some(_), None) => true,
+        _ => false,
     }
 }
 

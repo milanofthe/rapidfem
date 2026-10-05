@@ -20,16 +20,20 @@
 //! tangent contact would leave.
 
 use crate::{Error, Result};
-use rapidmesh_brep::{Brep, Curve, Model, Surface};
-use rapidmesh_geom::vec3::{add, cross, dot, normalize as unit, scale, sub, V3};
+use rapidmesh_brep::{Brep, Model};
+use rapidmesh_exact::vector::{
+    add, angle_about, cross, dot, mid, normalize as unit, scale, sub, wrap_pm, V3,
+};
 use rapidmesh_geom::{extrude_profile, revolve_at, Faceted, ProfileEdge};
-use std::f64::consts::{PI, TAU};
+use rapidmesh_geom::{Curve, Surface};
+use std::f64::consts::TAU;
 
 /// Which edges of a solid, its faces by their role in it: every edge of
 /// its faces, those of one face, the one between two of its faces, or the
 /// one between its face and a face of another solid (the rim of a hole cut
 /// into it: the void's index and the role of its face).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgePick {
     All,
     Of(u32),
@@ -39,7 +43,8 @@ pub enum EdgePick {
 
 /// How an edge is cut: a flat chamfer `distance` into both faces, or a
 /// fillet of `radius` tangent to both.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgeCut {
     Chamfer(f64),
     Fillet(f64),
@@ -238,20 +243,10 @@ fn cutter(
     let size = cut.size();
     // A point of the edge, on its exact curve, and the tangent there.
     let k = (chain.len() - 1) / 2;
-    let (p, t) = match edge.curve {
-        Curve::Line { p0, dir } => {
-            let m = scale(add(chain[k], chain[k + 1]), 0.5);
-            (add(p0, scale(dir, dot(sub(m, p0), dir))), dir)
-        }
-        Curve::Circle {
-            center,
-            axis,
-            radius,
-            ..
-        } => {
-            let d = sub(chain[k], center);
-            let radial = unit(sub(d, scale(axis, dot(d, axis))));
-            (add(center, scale(radial, radius)), cross(axis, radial))
+    let (p, t) = match edge.curve.carrier() {
+        Some(c) if matches!(c, Curve::Line { .. }) || c.as_circle().is_some() => {
+            let (q, d, _) = c.ders(c.param(mid(chain[k], chain[k + 1])));
+            (q, unit(d))
         }
         _ => return Err("only straight and circular edges take one".into()),
     };
@@ -263,8 +258,12 @@ fn cutter(
     if !(dot(a.into, b.normal) < 0.0 && dot(b.into, a.normal) < 0.0) {
         return Err("it is not convex; the cut would add material".into());
     }
-    let section = match edge.curve {
-        Curve::Line { .. } => {
+    let circle = edge
+        .curve
+        .carrier()
+        .and_then(|c| Some((c.as_circle()?, c.axis()?)));
+    let section = match (edge.curve.carrier(), circle) {
+        (Some(Curve::Line { .. }), _) => {
             if !matches!(a.surface, Surface::Plane { .. })
                 || !matches!(b.surface, Surface::Plane { .. })
             {
@@ -285,14 +284,14 @@ fn cutter(
                 h: scale(t, len),
             }
         }
-        Curve::Circle {
-            center,
-            axis,
-            radius,
-            ..
-        } => {
+        (_, Some(((center, radius), axis))) => {
             for s in [&a, &b] {
-                if !straight_meridian(&s.surface, center, axis, radius) {
+                // A plane square to the axis, a cylinder or a cone about it.
+                let tol = 1e-9 * radius.max(1.0);
+                if !matches!(
+                    s.surface.meridian(center, axis, tol),
+                    Some(Curve::Line { .. })
+                ) {
                     return Err("a circle takes one between a plane square to its axis, \
                          a cylinder or a cone about it"
                         .into());
@@ -304,7 +303,7 @@ fn cutter(
             let y = cross(axis, x);
             let angle = |q: V3| {
                 let d = radial_of(q);
-                dot(d, y).atan2(dot(d, x))
+                angle_about(d, x, y)
             };
             let full = chain[0] == chain[chain.len() - 1];
             let angles = if full {
@@ -320,7 +319,7 @@ fn cutter(
                 // both ends like a straight edge.
                 let mut a = vec![0.0];
                 for w in chain.windows(2) {
-                    let step = (angle(w[1]) - angle(w[0]) + PI).rem_euclid(TAU) - PI;
+                    let step = wrap_pm(angle(w[1]) - angle(w[0]));
                     a.push(a[a.len() - 1] + step);
                 }
                 if a[a.len() - 1] < 0.0 {
@@ -334,7 +333,7 @@ fn cutter(
             };
             // Mirrored arcs ran backwards: turn them with a mirrored frame.
             let backwards = !full && chain.len() > 1 && {
-                let step = (angle(chain[1]) - angle(chain[0]) + PI).rem_euclid(TAU) - PI;
+                let step = wrap_pm(angle(chain[1]) - angle(chain[0]));
                 step < 0.0
             };
             let axis = if backwards { scale(axis, -1.0) } else { axis };
@@ -442,24 +441,4 @@ fn side(model: &Model, f: usize, region: u32, seg: [V3; 2], p: V3, t: V3) -> Opt
         into,
         surface,
     })
-}
-
-/// A plane square to `axis` or a cylinder or cone about the axis through
-/// `center`: a surface of revolution about it with a straight meridian.
-fn straight_meridian(s: &Surface, center: V3, axis: V3, radius: f64) -> bool {
-    let tol = 1e-9 * radius.max(1.0);
-    let on_axis = |q: V3| {
-        let d = sub(q, center);
-        let off = sub(d, scale(axis, dot(d, axis)));
-        dot(off, off).sqrt() <= tol
-    };
-    let along = |b: V3| dot(unit(b), axis).abs() >= 1.0 - 1e-9;
-    match s {
-        Surface::Plane { normal, .. } => along(*normal),
-        Surface::Cylinder {
-            center: c, axis: a, ..
-        } => along(*a) && on_axis(*c),
-        Surface::Cone { apex, axis: a, .. } => along(*a) && on_axis(*apex),
-        _ => false,
-    }
 }

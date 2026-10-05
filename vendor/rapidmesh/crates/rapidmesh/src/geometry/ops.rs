@@ -1,14 +1,11 @@
 //! Operations on what a geometry holds: moving, copying and arraying solids
-//! and sheets, and intersecting solids.
+//! and sheets, intersecting solids and the booleans of sheets.
 
 use super::{Geometry, Solid};
 use crate::mesh::SolidInfo;
-use crate::shapes::Sheet;
 use crate::{Error, Result};
-use rapidmesh_geom::vec3::{add, cross, dot, len, sub};
-use rapidmesh_geom::{extrude_sheet, FaceTag, Faceted, SurfaceKind};
-
-type P3 = [f64; 3];
+use rapidmesh_exact::vector::{Affine, V3};
+use rapidmesh_geom::{extrude_sheet, FaceTag, Faceted};
 
 /// A sheet added to a [`Geometry`]: its index among the sheets (insertion
 /// order) and its face tag.
@@ -41,61 +38,63 @@ impl From<SheetRef> for Object {
 /// carrier; a stretch keeps them only when uniform (unequal factors keep
 /// planes, discrete patches and NURBS; the other curved faces become
 /// faceted).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub enum Transform {
-    Translate(P3),
+    Translate(V3),
     /// By `angle` radians about the axis along `axis` through `center`
     /// (right-handed).
     Rotate {
         angle: f64,
-        axis: P3,
-        center: P3,
+        axis: V3,
+        center: V3,
     },
     /// Across the plane through `point` with normal `normal`.
     Mirror {
-        normal: P3,
-        point: P3,
+        normal: V3,
+        point: V3,
     },
     /// By `factors` along x, y and z about `center`.
     Stretch {
-        factors: P3,
-        center: P3,
+        factors: V3,
+        center: V3,
     },
 }
 
 impl Transform {
-    /// `f` transformed, or why it cannot be.
-    pub(crate) fn apply(&self, f: &Faceted) -> Result<Faceted> {
-        let nonzero = |v: P3, what: &str| {
-            if v.iter().all(|c| c.is_finite()) && v.iter().any(|&c| c != 0.0) {
-                Ok(())
-            } else {
-                Err(Error::Invalid(format!("{what} must be a nonzero vector")))
-            }
+    /// The affine map of this step, or why it is none (a zero axis or
+    /// normal, a stretch factor that is zero or not finite).
+    pub fn affine(&self) -> Result<Affine> {
+        let nonzero = |v: V3, what: &str| {
+            Error::Invalid(format!("{what} {v:?} must be a finite nonzero vector"))
         };
-        Ok(match *self {
-            Transform::Translate(v) => f.translated(v),
+        let finite = |v: V3| v.iter().all(|c| c.is_finite());
+        match *self {
+            Transform::Translate(v) => Ok(Affine::translation(v)),
             Transform::Rotate {
                 angle,
                 axis,
                 center,
-            } => {
-                nonzero(axis, "a rotation axis")?;
-                f.rotated(center, axis, angle)
-            }
-            Transform::Mirror { normal, point } => {
-                nonzero(normal, "a mirror normal")?;
-                f.mirrored(normal, point)
-            }
+            } => Affine::rotation(center, axis, angle)
+                .filter(|_| finite(axis))
+                .ok_or_else(|| nonzero(axis, "a rotation axis")),
+            Transform::Mirror { normal, point } => Affine::mirror(point, normal)
+                .filter(|_| finite(normal))
+                .ok_or_else(|| nonzero(normal, "a mirror normal")),
             Transform::Stretch { factors, center } => {
                 if factors.iter().any(|&k| !(k.is_finite() && k != 0.0)) {
                     return Err(Error::Invalid(format!(
                         "stretch factors {factors:?} must be finite and nonzero"
                     )));
                 }
-                f.scaled(factors, center)
+                Ok(Affine::stretch(center, factors))
             }
-        })
+        }
+    }
+
+    /// `f` transformed, or why it cannot be.
+    pub(crate) fn apply(&self, f: &Faceted) -> Result<Faceted> {
+        Ok(f.transformed(&self.affine()?))
     }
 
     /// This step taken `k` times, in one go (no drift from repeating it).
@@ -118,50 +117,6 @@ impl Transform {
                 factors: factors.map(|c| c.powi(k as i32)),
                 center,
             },
-        }
-    }
-
-    /// The linear part (a direction maps by it).
-    pub(crate) fn linear(&self) -> [[f64; 3]; 3] {
-        let id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let probe = |d: P3| -> P3 {
-            // Map the direction as the difference of two mapped points.
-            let at = |p: P3| self.point(p);
-            let (a, b) = (at([0.0; 3]), at(d));
-            [b[0] - a[0], b[1] - a[1], b[2] - a[2]]
-        };
-        let cols = id.map(probe);
-        std::array::from_fn(|i| std::array::from_fn(|j| cols[j][i]))
-    }
-
-    /// Where the point `p` goes.
-    pub(crate) fn point(&self, p: P3) -> P3 {
-        match *self {
-            Transform::Translate(v) => add(p, v),
-            Transform::Rotate {
-                angle,
-                axis,
-                center,
-            } => {
-                let l = dot(axis, axis).sqrt();
-                let u = axis.map(|c| c / l);
-                let d = sub(p, center);
-                let (s, c) = angle.sin_cos();
-                let along = dot(u, d);
-                let cr = cross(u, d);
-                let r: P3 =
-                    std::array::from_fn(|k| d[k] * c + cr[k] * s + u[k] * along * (1.0 - c));
-                add(center, r)
-            }
-            Transform::Mirror { normal, point } => {
-                let l = dot(normal, normal).sqrt();
-                let n = normal.map(|c| c / l);
-                let off = dot(sub(p, point), n);
-                sub(p, n.map(|c| 2.0 * off * c))
-            }
-            Transform::Stretch { factors, center } => {
-                std::array::from_fn(|k| center[k] + factors[k] * (p[k] - center[k]))
-            }
         }
     }
 }
@@ -188,7 +143,6 @@ impl Geometry {
                     .ok_or_else(|| Error::Invalid(format!("no sheet {i}")))?;
                 let moved = t.apply(f)?;
                 self.scene_mut().replace_sheet(i, moved);
-                self.sheets[i].1.push(t);
             }
         }
         Ok(())
@@ -238,9 +192,8 @@ impl Geometry {
                     .ok_or_else(|| Error::Invalid(format!("no sheet {i}")))?
                     .clone();
                 self.scene_mut().add_sheet(f, FaceTag(s.tag));
-                self.sheets.push(self.sheets[i].clone());
                 Ok(Object::Sheet(SheetRef {
-                    index: self.sheets.len() as u32 - 1,
+                    index: self.scene.sheet_count() as u32 - 1,
                     tag: s.tag,
                 }))
             }
@@ -297,34 +250,54 @@ impl Geometry {
         Ok(target)
     }
 
+    /// `target` becomes its exact boolean `op` with every tool in turn
+    /// (`Union`, `Difference` or `Intersection`); all lie in one plane. The
+    /// target keeps its tag and its input points bit for bit where the plane
+    /// is square to an axis; a round rim that is left (a disc's, a hole one
+    /// cut) stays a circle, and extrudes into a cylinder. The tools are used
+    /// up (they hold nothing after).
+    pub fn sheet_boolean(
+        &mut self,
+        op: rapidmesh_geom::BoolOp,
+        target: SheetRef,
+        tools: &[SheetRef],
+    ) -> Result<SheetRef> {
+        let sheet = |g: &Geometry, i: u32| {
+            g.scene
+                .sheet(i as usize)
+                .cloned()
+                .ok_or_else(|| Error::Invalid(format!("no sheet {i}")))
+        };
+        let mut f = sheet(self, target.index)?;
+        for t in tools {
+            if t.index == target.index {
+                return Err(Error::Invalid("a sheet cannot be its own tool".into()));
+            }
+            f = rapidmesh_geom::sheet_boolean(&f, &sheet(self, t.index)?, op)
+                .map_err(|e| Error::Invalid(format!("sheet boolean: {e}")))?;
+        }
+        self.scene_mut().replace_sheet(target.index as usize, f);
+        for t in tools {
+            self.scene_mut()
+                .replace_sheet(t.index as usize, Faceted::new());
+        }
+        Ok(target)
+    }
+
     /// The solid `sheet` sweeps along `vector` (not in its plane), in a
     /// region of its own with target size `maxh`. The sheet stays as it is,
     /// the solid's bottom face on it. Surfaces: bottom, top, then the walls
-    /// (for a disc one cylinder, which needs the vector along its axis); the
+    /// (along a circle the sheet declares, a disc's rim or a round hole cut
+    /// by one, the cylinder, which needs the vector along its axis); the
     /// first two named `bottom` and `top`.
-    pub fn extrude(&mut self, sheet: SheetRef, vector: P3, maxh: Option<f64>) -> Result<Solid> {
+    pub fn extrude(&mut self, sheet: SheetRef, vector: V3, maxh: Option<f64>) -> Result<Solid> {
         let i = sheet.index as usize;
         let f = self
             .scene
             .sheet(i)
             .ok_or_else(|| Error::Invalid(format!("no sheet {i}")))?
             .clone();
-        let (desc, ops) = self.sheets[i].clone();
-        let rim = match desc {
-            Sheet::Disc {
-                radius,
-                center,
-                axis,
-                ..
-            } => Some(disc_rim(radius, center, axis, &ops, vector)?),
-            Sheet::Nurbs { .. } => {
-                return Err(Error::Invalid(
-                    "a NURBS sheet does not extrude (it is not flat)".into(),
-                ))
-            }
-            _ => None,
-        };
-        let solid = extrude_sheet(&f, vector, rim).map_err(Error::Invalid)?;
+        let solid = extrude_sheet(&f, vector).map_err(Error::Invalid)?;
         let region = self.scene_mut().add_solid(solid).0;
         if let Some(h) = maxh {
             self.solid_maxh.push((region, h));
@@ -337,44 +310,4 @@ impl Geometry {
         });
         Ok(Solid { region, index })
     }
-}
-
-/// The cylinder under a disc of `radius` about `center` square to `axis`,
-/// taken where `ops` moved it and swept along `vector`.
-fn disc_rim(
-    radius: f64,
-    center: P3,
-    axis: P3,
-    ops: &[Transform],
-    vector: P3,
-) -> Result<SurfaceKind> {
-    let unit = |v: P3| {
-        let l = len(v);
-        v.map(|c| c / l)
-    };
-    let (mut c, mut a, mut r) = (center, unit(axis), radius);
-    for t in ops {
-        if let Transform::Stretch { factors, .. } = t {
-            let s = factors[0].abs();
-            if factors.iter().any(|k| k.abs() != s) {
-                return Err(Error::Invalid(
-                    "a disc stretched unevenly is an ellipse; it does not extrude".into(),
-                ));
-            }
-            r *= s;
-        }
-        let l = t.linear();
-        c = t.point(c);
-        a = unit(std::array::from_fn(|i| {
-            (0..3).map(|j| l[i][j] * a[j]).sum()
-        }));
-    }
-    let v = unit(vector);
-    let cross = cross(a, v);
-    if cross.iter().map(|x| x * x).sum::<f64>().sqrt() > 1e-9 {
-        return Err(Error::Invalid(
-            "a disc extrudes along its axis only (an oblique sweep is an elliptic cylinder)".into(),
-        ));
-    }
-    Ok(SurfaceKind::cylinder(c, a, r))
 }

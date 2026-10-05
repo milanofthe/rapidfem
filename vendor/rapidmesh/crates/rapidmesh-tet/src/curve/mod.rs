@@ -21,8 +21,10 @@
 pub(crate) mod kinds;
 
 use crate::simplex::circumradius;
+use rapidmesh_exact::vector::{
+    add, bbox, closest_on_segment, dist, dist2, dot, normalize, scale, sub, V3,
+};
 use rapidmesh_geom::bvh::Bvh;
-use rapidmesh_geom::vec3::{add, bbox, dist, dist2, dot, normalize, scale, sub, V3};
 /// A general edge curve, parametrized by arc length `s in [0, length()]`.
 /// `Send + Sync` supertraits: curve evaluators are plain data, and the
 /// refiner is shared across rayon workers for its read-only stages.
@@ -140,14 +142,7 @@ impl CurveSamples {
     pub fn nearest_on_polyline(&self, p: V3) -> Option<V3> {
         let foot = |j: u32| {
             let (a, b) = (self.samples[j as usize].1, self.samples[j as usize + 1].1);
-            let d = sub(b, a);
-            let dd = dot(d, d);
-            let t = if dd > 0.0 {
-                (dot(sub(p, a), d) / dd).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            add(a, scale(d, t))
+            closest_on_segment(p, a, b)
         };
         let (j, _) = self
             .bvh
@@ -277,26 +272,29 @@ impl Curve for PolylineCurve {
     }
 }
 
-/// `curve` with a known radius of curvature (a circle sampled along the
-/// polyline of its facets): the sampling reads the radius from here, not
-/// from the facets, whose irregular spacing shows spurious small radii.
-pub struct WithRadius<'a> {
-    pub curve: &'a dyn Curve,
-    pub radius: f64,
+/// A curve sampled along another: the points of `along` (the chain of
+/// facets an edge follows), the radius of `by` (its own curve) at the same
+/// share of the length. The facets' irregular spacing shows spurious small
+/// radii; the curve's own are the ones the sampling wants.
+pub struct Guided<'a> {
+    pub along: &'a dyn Curve,
+    pub by: &'a dyn Curve,
 }
 
-impl Curve for WithRadius<'_> {
+impl Curve for Guided<'_> {
     fn length(&self) -> f64 {
-        self.curve.length()
+        self.along.length()
     }
     fn point_at(&self, s: f64) -> V3 {
-        self.curve.point_at(s)
+        self.along.point_at(s)
     }
-    fn radius_at(&self, _s: f64) -> f64 {
-        self.radius
+    fn radius_at(&self, s: f64) -> f64 {
+        let len = self.along.length();
+        let share = if len > 0.0 { s / len } else { 0.0 };
+        self.by.radius_at(share * self.by.length())
     }
     fn ders_at(&self, s: f64) -> [V3; 3] {
-        self.curve.ders_at(s)
+        self.along.ders_at(s)
     }
 }
 
@@ -306,9 +304,11 @@ const MAX_TURN: f64 = std::f64::consts::TAU / 3.0;
 
 /// Arc-length samples of `curve` spaced by the target `size(s)` at arc
 /// length `s`, refined where the curvature needs it (`bent(r)`: the size
-/// at radius of curvature `r`, see `sizing::CurvatureLaw`), and graded by `grad`. A hard size FLOOR: a
-/// curvature-radius spike (the sharp turn of an intersection curve, a
-/// micro-rim) may not drive the sampling below `minh`. `0` = off.
+/// at radius of curvature `r`, see `sizing::CurvatureLaw`), and graded by `grad`. A FLOOR on
+/// the bend: a curvature-radius spike of the curve (the sharp turn of an
+/// intersection curve, a micro-rim) may not drive the sampling below
+/// `minh`; the size it is given (`size`, which the faces beside it take
+/// too) it follows however fine. `0` = off.
 pub fn distribute_floored(
     curve: &dyn Curve,
     bent: &dyn Fn(f64) -> f64,
@@ -333,13 +333,14 @@ pub fn distribute_floored(
         let s = (i as f64) * ds;
         let r = curve.radius_at(s);
         let target = size(s);
-        h[i] = if r.is_finite() {
-            bent(r).min(target)
+        // The floor holds the curve's own bend (a spike of its radius), not
+        // the size it is given: the faces beside it take that size too.
+        let bend = if r.is_finite() {
+            bent(r).max(minh)
         } else {
-            target
-        }
-        .max(minh)
-        .max(1e-12);
+            f64::INFINITY
+        };
+        h[i] = bend.min(target).max(1e-12);
     }
     // Multiplicative gradient limit: h cannot grow faster than the ratio (1+grad)
     // per element of its own length. Over a sub-element sample step `ds`, that is
@@ -435,6 +436,22 @@ mod tests {
             5.0,
         );
         assert_eq!(ss.len(), 2, "{ss:?}");
+    }
+
+    /// The floor holds a curve's own bend, not the size it is given: a
+    /// straight edge along a band whose faces are finer than the floor (a
+    /// thin fillet at a fine geometric error) takes the faces' size (#299).
+    #[test]
+    fn a_size_below_the_floor_is_kept() {
+        let line = PolylineCurve::new(&[[0.0, 0.0, 0.0], [6.0, 0.0, 0.0]]).unwrap();
+        let ss = distribute_floored(
+            &line,
+            &|r| CurvatureLaw::Chord(0.05).curve(r),
+            &|_| 0.5,
+            0.5,
+            5.0,
+        );
+        assert_eq!(ss.len(), 13, "{ss:?}");
     }
 
     fn circle(r: f64, n: usize) -> PolylineCurve {

@@ -13,10 +13,10 @@
 //! and planes into a composite that holds a discrete face (a scan's single
 //! flat facet between creases); planes alone never join.
 
-use rapidmesh_brep::{Brep, Model, Surface};
+use rapidmesh_brep::{Brep, Model};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_geom::Surface;
 use rustc_hash::FxHashMap;
-
-type P3 = [f64; 3];
 
 /// A face whose facets span less than this share of the size at its centre
 /// joins a neighbour.
@@ -31,7 +31,8 @@ pub(crate) struct Composites {
     pub internal: Vec<bool>,
 }
 
-fn find(p: &mut [usize], mut x: usize) -> usize {
+/// The root of `x` in the forest `p` (halving the path on the way).
+pub(crate) fn find(p: &mut [usize], mut x: usize) -> usize {
     while p[x] != x {
         p[x] = p[p[x]];
         x = p[x];
@@ -52,7 +53,7 @@ impl Composites {
     /// join (a size of their own, a periodic side).
     pub(crate) fn new(
         model: &Model,
-        size: &dyn Fn(P3) -> f64,
+        size: &dyn Fn(V3) -> f64,
         kept: &dyn Fn(usize) -> bool,
     ) -> Composites {
         let (plc, brep) = (&model.plc, &model.brep);
@@ -71,7 +72,7 @@ impl Composites {
                 )
         };
         // Each face's span (the diagonal of its facets' box) and centre.
-        let spans: Vec<(f64, P3)> = brep
+        let spans: Vec<(f64, V3)> = brep
             .faces
             .iter()
             .map(|f| {

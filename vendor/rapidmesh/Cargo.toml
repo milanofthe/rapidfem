@@ -1,5 +1,5 @@
 # Vendored copy of rapidmesh (milanofthe/rapidmesh-dev) at commit
-# df2d8a40, written by rapidfem's scripts/vendor_rapidmesh.py: the
+# 40bee347, written by rapidfem's scripts/vendor_rapidmesh.py: the
 # library crates behind the `rapidmesh` facade, without tests,
 # benches, examples, binaries or dev-dependencies. The own [workspace]
 # keeps the vendored tree out of the consuming workspace.
@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.2.0"
+version = "3.0.0"
 edition = "2021"
 publish = false
 license = "AGPL-3.0-only"

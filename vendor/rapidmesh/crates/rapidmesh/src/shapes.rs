@@ -19,29 +19,34 @@
 //! `new`, and an unknown field is an error.
 
 use crate::{Error, Result};
-use rapidmesh_geom::vec3::{cross, len};
+use rapidmesh_exact::vector::Affine;
+use rapidmesh_exact::vector::{cross, len, scale, Frame};
+use rapidmesh_exact::vector::{V2, V3};
 pub use rapidmesh_geom::ProfileEdge;
 use rapidmesh_geom::{
-    cylinder, cylinder_iso, extrude_polygon, extrude_spline_profile, facet_subdivisions, frustum,
-    frustum_iso, helix, icosphere, import_obj, import_stl, loft, mesh_solid, naca0012_profile,
-    pipe, revolve, sheet_disk, sheet_nurbs, sheet_polygon, sheet_rect, solid_box, torus,
-    validate_closed, wedge, Faceted, NurbsSurface,
+    extrude_polygon, extrude_profile, facet_subdivisions, frustum, helix, icosphere, import_obj,
+    import_stl, loft, mesh_solid, naca0012_points, pipe, revolve, sheet_disk, sheet_nurbs,
+    sheet_polygon, sheet_rect, solid_box, torus, validate_closed, wedge, Faceted, NurbsSurface,
 };
 use serde::Deserialize;
 use std::f64::consts::TAU;
 use std::path::PathBuf;
 
-type P3 = [f64; 3];
-type P2 = [f64; 2];
-
 /// The defaults of the shapes' fields, shared by `new` and [`Shape::of_kind`].
 mod default {
-    use super::{Up, P3};
+    use super::Up;
+    use rapidmesh_exact::vector::V3;
 
-    pub fn origin() -> P3 {
+    pub fn origin() -> V3 {
         [0.0; 3]
     }
-    pub fn z() -> P3 {
+    pub fn x() -> V3 {
+        [1.0, 0.0, 0.0]
+    }
+    pub fn y() -> V3 {
+        [0.0, 1.0, 0.0]
+    }
+    pub fn z() -> V3 {
         [0.0, 0.0, 1.0]
     }
     pub fn segments() -> usize {
@@ -52,9 +57,6 @@ mod default {
     }
     pub fn n_per_side() -> usize {
         40
-    }
-    pub fn n_seg() -> usize {
-        120
     }
     pub fn torus_segments() -> usize {
         32
@@ -83,7 +85,7 @@ mod default {
 }
 
 /// `v` scaled to unit length; an error for the zero vector.
-pub(crate) fn unit(v: P3) -> Result<P3> {
+pub(crate) fn unit(v: V3) -> Result<V3> {
     let n = len(v);
     if n == 0.0 {
         return Err(Error::Invalid("axis must be nonzero".into()));
@@ -106,20 +108,20 @@ fn square_rows(height: f64, radius: f64, segments: usize) -> usize {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cuboid {
-    pub size: P3,
+    pub size: V3,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
 }
 
 impl Cuboid {
-    pub fn new(size: P3) -> Cuboid {
+    pub fn new(size: V3) -> Cuboid {
         Cuboid {
             size,
             position: default::origin(),
         }
     }
 
-    pub fn at(self, position: P3) -> Cuboid {
+    pub fn at(self, position: V3) -> Cuboid {
         Cuboid { position, ..self }
     }
 }
@@ -134,9 +136,9 @@ pub struct Cylinder {
     pub radius: f64,
     pub height: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::z")]
-    pub axis: P3,
+    pub axis: V3,
     #[serde(default = "default::segments")]
     pub segments: usize,
     #[serde(default)]
@@ -158,11 +160,11 @@ impl Cylinder {
         }
     }
 
-    pub fn at(self, position: P3) -> Cylinder {
+    pub fn at(self, position: V3) -> Cylinder {
         Cylinder { position, ..self }
     }
 
-    pub fn along(self, axis: P3) -> Cylinder {
+    pub fn along(self, axis: V3) -> Cylinder {
         Cylinder { axis, ..self }
     }
 }
@@ -174,7 +176,7 @@ impl Cylinder {
 pub struct Sphere {
     pub radius: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::segments")]
     pub segments: usize,
 }
@@ -188,7 +190,7 @@ impl Sphere {
         }
     }
 
-    pub fn at(self, position: P3) -> Sphere {
+    pub fn at(self, position: V3) -> Sphere {
         Sphere { position, ..self }
     }
 }
@@ -199,7 +201,7 @@ impl Sphere {
 pub struct Icosphere {
     pub radius: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::subdivisions")]
     pub subdivisions: usize,
 }
@@ -213,7 +215,7 @@ impl Icosphere {
         }
     }
 
-    pub fn at(self, position: P3) -> Icosphere {
+    pub fn at(self, position: V3) -> Icosphere {
         Icosphere { position, ..self }
     }
 }
@@ -227,13 +229,11 @@ pub struct Naca0012 {
     pub chord: f64,
     pub span: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::z")]
-    pub span_axis: P3,
+    pub span_axis: V3,
     #[serde(default = "default::n_per_side")]
     pub n_per_side: usize,
-    #[serde(default = "default::n_seg")]
-    pub n_seg: usize,
 }
 
 impl Naca0012 {
@@ -244,11 +244,10 @@ impl Naca0012 {
             position: default::origin(),
             span_axis: default::z(),
             n_per_side: default::n_per_side(),
-            n_seg: default::n_seg(),
         }
     }
 
-    pub fn at(self, position: P3) -> Naca0012 {
+    pub fn at(self, position: V3) -> Naca0012 {
         Naca0012 { position, ..self }
     }
 }
@@ -262,9 +261,9 @@ pub struct Cone {
     pub r2: f64,
     pub height: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::z")]
-    pub axis: P3,
+    pub axis: V3,
     #[serde(default = "default::segments")]
     pub segments: usize,
     #[serde(default)]
@@ -287,11 +286,11 @@ impl Cone {
         }
     }
 
-    pub fn at(self, position: P3) -> Cone {
+    pub fn at(self, position: V3) -> Cone {
         Cone { position, ..self }
     }
 
-    pub fn along(self, axis: P3) -> Cone {
+    pub fn along(self, axis: V3) -> Cone {
         Cone { axis, ..self }
     }
 }
@@ -301,16 +300,16 @@ impl Cone {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prism {
-    pub points: Vec<P2>,
+    pub points: Vec<V2>,
     #[serde(default)]
-    pub holes: Vec<Vec<P2>>,
+    pub holes: Vec<Vec<V2>>,
     pub height: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
 }
 
 impl Prism {
-    pub fn new(points: Vec<P2>, height: f64) -> Prism {
+    pub fn new(points: Vec<V2>, height: f64) -> Prism {
         Prism {
             points,
             holes: Vec::new(),
@@ -319,7 +318,7 @@ impl Prism {
         }
     }
 
-    pub fn at(self, position: P3) -> Prism {
+    pub fn at(self, position: V3) -> Prism {
         Prism { position, ..self }
     }
 }
@@ -331,9 +330,9 @@ pub struct Torus {
     pub major_radius: f64,
     pub minor_radius: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::z")]
-    pub axis: P3,
+    pub axis: V3,
     #[serde(default = "default::torus_segments")]
     pub segments: usize,
     #[serde(default = "default::tube_segments")]
@@ -352,7 +351,7 @@ impl Torus {
         }
     }
 
-    pub fn at(self, position: P3) -> Torus {
+    pub fn at(self, position: V3) -> Torus {
         Torus { position, ..self }
     }
 }
@@ -362,15 +361,15 @@ impl Torus {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Wedge {
-    pub size: P3,
+    pub size: V3,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default)]
     pub top_x: f64,
 }
 
 impl Wedge {
-    pub fn new(size: P3) -> Wedge {
+    pub fn new(size: V3) -> Wedge {
         Wedge {
             size,
             position: default::origin(),
@@ -378,7 +377,7 @@ impl Wedge {
         }
     }
 
-    pub fn at(self, position: P3) -> Wedge {
+    pub fn at(self, position: V3) -> Wedge {
         Wedge { position, ..self }
     }
 }
@@ -387,14 +386,14 @@ impl Wedge {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sweep {
-    pub path: Vec<P3>,
+    pub path: Vec<V3>,
     pub radius: f64,
     #[serde(default = "default::sweep_segments")]
     pub segments: usize,
 }
 
 impl Sweep {
-    pub fn new(path: Vec<P3>, radius: f64) -> Sweep {
+    pub fn new(path: Vec<V3>, radius: f64) -> Sweep {
         Sweep {
             path,
             radius,
@@ -413,7 +412,7 @@ pub struct Helix {
     pub turns: f64,
     pub wire_radius: f64,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::points_per_turn")]
     pub points_per_turn: usize,
     #[serde(default = "default::helix_segments")]
@@ -433,7 +432,7 @@ impl Helix {
         }
     }
 
-    pub fn at(self, position: P3) -> Helix {
+    pub fn at(self, position: V3) -> Helix {
         Helix { position, ..self }
     }
 }
@@ -443,8 +442,8 @@ impl Helix {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Loft {
-    pub profile_a: Vec<P3>,
-    pub profile_b: Vec<P3>,
+    pub profile_a: Vec<V3>,
+    pub profile_b: Vec<V3>,
 }
 
 /// Solid of revolution: the closed profile `points` (`(r, z)`, `r >= 0`,
@@ -456,15 +455,15 @@ pub struct Loft {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Revolve {
-    pub points: Vec<P2>,
+    pub points: Vec<V2>,
     /// The edges of the profile (straight where none are given): `"line"`,
     /// `{"arc": bulge}` or `{"spline": interior points}` by name.
     #[serde(default, deserialize_with = "profile_edges")]
     pub edges: Vec<ProfileEdge>,
     #[serde(default = "default::origin")]
-    pub position: P3,
+    pub position: V3,
     #[serde(default = "default::z")]
-    pub axis: P3,
+    pub axis: V3,
     #[serde(default = "default::full_turn")]
     pub angle: f64,
     #[serde(default = "default::segments")]
@@ -473,7 +472,7 @@ pub struct Revolve {
 
 impl Revolve {
     /// A full turn about z of the polygon `points`.
-    pub fn new(points: Vec<P2>) -> Revolve {
+    pub fn new(points: Vec<V2>) -> Revolve {
         Revolve {
             edges: vec![ProfileEdge::Line; points.len()],
             points,
@@ -490,7 +489,7 @@ impl Revolve {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Triangles {
-    pub verts: Vec<P3>,
+    pub verts: Vec<V3>,
     pub tris: Vec<[u32; 3]>,
 }
 
@@ -622,7 +621,7 @@ fn profile_edges<'de, D: serde::Deserializer<'de>>(
     enum Edge {
         Line,
         Arc(f64),
-        Spline(Vec<P2>),
+        Spline(Vec<V2>),
     }
     Ok(Vec::<Edge>::deserialize(d)?
         .into_iter()
@@ -650,6 +649,8 @@ impl Shape {
         let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect();
         match self {
             Shape::Cuboid(_) => names(&BOX_ROLES),
+            // A cone up to its apex has no top.
+            Shape::Cone(c) if c.r2 == 0.0 => names(&["side", "bottom"]),
             Shape::Cylinder(_) | Shape::Cone(_) => names(&AXIAL_ROLES),
             Shape::Prism(_) => names(&CAP_ROLES),
             Shape::Revolve(r) => {
@@ -667,7 +668,7 @@ impl Shape {
     /// The faceted solid; `maxh` is the target size at the solid, which
     /// sets the facet density of a sphere.
     pub(crate) fn faceted(&self, maxh: Option<f64>) -> Result<Faceted> {
-        let scaled = |axis: P3, h: f64| unit(axis).map(|a| a.map(|c| c * h));
+        let scaled = |axis: V3, h: f64| unit(axis).map(|a| a.map(|c| c * h));
         Ok(match self {
             Shape::Cuboid(b) => {
                 let (p, s) = (b.position, b.size);
@@ -675,14 +676,13 @@ impl Shape {
             }
             Shape::Cylinder(c) => {
                 let ax = scaled(c.axis, c.height)?;
-                if c.uniform {
-                    let rows = c
+                let rows = match c.uniform {
+                    true => c
                         .rows
-                        .unwrap_or_else(|| square_rows(c.height, c.radius, c.segments));
-                    cylinder_iso(c.position, ax, c.radius, c.segments, rows)
-                } else {
-                    cylinder(c.position, ax, c.radius, c.segments)
-                }
+                        .unwrap_or_else(|| square_rows(c.height, c.radius, c.segments)),
+                    false => 1,
+                };
+                frustum(c.position, ax, c.radius, c.radius, c.segments, rows)
             }
             // Faceted geodesically: isotropic and pole-free, the level from
             // the target size (`segments` only a floor).
@@ -692,27 +692,38 @@ impl Shape {
             }
             Shape::Icosphere(s) => icosphere(s.position, s.radius, s.subdivisions),
             Shape::Naca0012(a) => {
-                let h = scaled(a.span_axis, a.span)?;
-                let profile = naca0012_profile(a.chord, a.n_per_side);
-                extrude_spline_profile(
-                    profile,
-                    a.n_seg,
+                // The section in the plane square to the span, the chord
+                // along x: a spline round the leading edge, the blunt
+                // trailing edge straight.
+                let f = Frame::new(a.position, a.span_axis, Some([1.0, 0.0, 0.0]))
+                    .ok_or_else(|| Error::Invalid("naca0012: span_axis is zero".into()))?;
+                let pts = naca0012_points(a.chord, a.n_per_side);
+                let ends = [pts[0], pts[pts.len() - 1]];
+                let edges = [
+                    ProfileEdge::Spline(pts[1..pts.len() - 1].to_vec()),
+                    ProfileEdge::Line,
+                ];
+                extrude_profile(
+                    &ends,
+                    &edges,
                     a.position,
-                    [1.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0],
-                    h,
+                    f.x,
+                    f.y,
+                    scale(f.z, a.span),
+                    maxh,
+                    1e-2,
                 )
+                .map_err(Error::Invalid)?
             }
             Shape::Cone(c) => {
                 let ax = scaled(c.axis, c.height)?;
-                if c.uniform {
-                    let rows = c
+                let rows = match c.uniform {
+                    true => c
                         .rows
-                        .unwrap_or_else(|| square_rows(c.height, 0.5 * (c.r1 + c.r2), c.segments));
-                    frustum_iso(c.position, ax, c.r1, c.r2, c.segments, rows)
-                } else {
-                    frustum(c.position, ax, c.r1, c.r2, c.segments)
-                }
+                        .unwrap_or_else(|| square_rows(c.height, 0.5 * (c.r1 + c.r2), c.segments)),
+                    false => 1,
+                };
+                frustum(c.position, ax, c.r1, c.r2, c.segments, rows)
             }
             Shape::Prism(p) => extrude_polygon(
                 &p.points,
@@ -774,10 +785,10 @@ impl Shape {
                 let f = match i.up {
                     Up::Z => f,
                     // y up to z up: +90 degrees about x, (x, y, z) -> (x, -z, y).
-                    Up::Y => f.transformed(
-                        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
-                        [0.0; 3],
-                    ),
+                    Up::Y => f.transformed(&Affine {
+                        linear: [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+                        offset: [0.0; 3],
+                    }),
                 };
                 validate_closed(&f).map_err(|e| Error::Invalid(format!("{name}: {e}")))?;
                 f
@@ -790,19 +801,23 @@ impl Shape {
 #[derive(Clone, Debug)]
 pub enum Sheet {
     /// The parallelogram from `corner` spanned by `u` and `v`.
-    Rect { corner: P3, u: P3, v: P3 },
+    Rect { corner: V3, u: V3, v: V3 },
     /// A disc of `radius` centred at `center`, normal to `axis`.
     Disc {
         radius: f64,
-        center: P3,
-        axis: P3,
+        center: V3,
+        axis: V3,
         segments: usize,
     },
-    /// The polygon `points` with `holes` in the xy plane at `position`.
+    /// The polygon `points` with `holes` in the plane through `position`
+    /// spanned by `u` and `v` (x and y for the xy plane): a point `[a, b]`
+    /// lies at `position + a u + b v`.
     Polygon {
-        points: Vec<P2>,
-        holes: Vec<Vec<P2>>,
-        position: P3,
+        points: Vec<V2>,
+        holes: Vec<Vec<V2>>,
+        position: V3,
+        u: V3,
+        v: V3,
     },
     /// A NURBS patch, tessellated `segments` per parameter direction and
     /// carried by the exact surface.
@@ -827,34 +842,38 @@ impl Sheet {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Rect {
-            corner: P3,
-            u: P3,
-            v: P3,
+            corner: V3,
+            u: V3,
+            v: V3,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Disc {
             radius: f64,
             #[serde(default = "default::origin")]
-            center: P3,
+            center: V3,
             #[serde(default = "default::z")]
-            axis: P3,
+            axis: V3,
             #[serde(default = "default::segments")]
             segments: usize,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Polygon {
-            points: Vec<P2>,
+            points: Vec<V2>,
             #[serde(default = "default::origin")]
-            position: P3,
+            position: V3,
             #[serde(default)]
-            holes: Vec<Vec<P2>>,
+            holes: Vec<Vec<V2>>,
+            #[serde(default = "default::x")]
+            u: V3,
+            #[serde(default = "default::y")]
+            v: V3,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Nurbs {
-            ctrl: Vec<Vec<P3>>,
+            ctrl: Vec<Vec<V3>>,
             degree: [usize; 2],
             weights: Option<Vec<Vec<f64>>>,
             knots: Option<[Vec<f64>; 2]>,
@@ -879,6 +898,8 @@ impl Sheet {
                     points: p.points,
                     holes: p.holes,
                     position: p.position,
+                    u: p.u,
+                    v: p.v,
                 }
             }
             "nurbs" => {
@@ -890,27 +911,27 @@ impl Sheet {
     }
 
     /// A rectangle in an xy plane: `width` along x, `height` along y.
-    pub fn xy(width: f64, height: f64, position: P3) -> Sheet {
+    pub fn xy(width: f64, height: f64, position: V3) -> Sheet {
         Sheet::plate(position, [width, 0.0, 0.0], [0.0, height, 0.0])
     }
 
     /// A rectangle in an xz plane: `width` along x, `height` along z.
-    pub fn xz(width: f64, height: f64, position: P3) -> Sheet {
+    pub fn xz(width: f64, height: f64, position: V3) -> Sheet {
         Sheet::plate(position, [width, 0.0, 0.0], [0.0, 0.0, height])
     }
 
     /// A rectangle in a yz plane: `width` along y, `height` along z.
-    pub fn yz(width: f64, height: f64, position: P3) -> Sheet {
+    pub fn yz(width: f64, height: f64, position: V3) -> Sheet {
         Sheet::plate(position, [0.0, width, 0.0], [0.0, 0.0, height])
     }
 
     /// The parallelogram from `corner` spanned by `u` and `v`.
-    pub fn plate(corner: P3, u: P3, v: P3) -> Sheet {
+    pub fn plate(corner: V3, u: V3, v: V3) -> Sheet {
         Sheet::Rect { corner, u, v }
     }
 
     /// A disc of `radius` at `center`, normal to `axis`, 24 segments.
-    pub fn disc(radius: f64, center: P3, axis: P3) -> Sheet {
+    pub fn disc(radius: f64, center: V3, axis: V3) -> Sheet {
         Sheet::Disc {
             radius,
             center,
@@ -920,11 +941,19 @@ impl Sheet {
     }
 
     /// A polygon in the xy plane at `position`.
-    pub fn polygon(points: Vec<P2>, position: P3) -> Sheet {
+    pub fn polygon(points: Vec<V2>, position: V3) -> Sheet {
+        Sheet::polygon_on(points, position, default::x(), default::y())
+    }
+
+    /// A polygon in the plane through `origin` spanned by `u` and `v`: a
+    /// point `[a, b]` lies at `origin + a u + b v`.
+    pub fn polygon_on(points: Vec<V2>, origin: V3, u: V3, v: V3) -> Sheet {
         Sheet::Polygon {
             points,
             holes: Vec::new(),
-            position,
+            position: origin,
+            u,
+            v,
         }
     }
 
@@ -933,7 +962,7 @@ impl Sheet {
     /// and clamped uniform knots when none are given. The tessellation takes
     /// four segments per knot span, at least 8 and at most 64 per direction.
     pub fn nurbs(
-        ctrl: Vec<Vec<P3>>,
+        ctrl: Vec<Vec<V3>>,
         degree: [usize; 2],
         weights: Option<Vec<Vec<f64>>>,
         knots: Option<[Vec<f64>; 2]>,
@@ -1003,7 +1032,14 @@ impl Sheet {
                 points,
                 holes,
                 position,
-            } => sheet_polygon(points, holes, *position, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                u,
+                v,
+            } => {
+                unit(cross(*u, *v)).map_err(|_| {
+                    Error::Invalid("a polygon's axes u and v must span a plane".into())
+                })?;
+                sheet_polygon(points, holes, *position, *u, *v)
+            }
             Sheet::Nurbs { surface, segments } => sheet_nurbs(surface, *segments),
         })
     }

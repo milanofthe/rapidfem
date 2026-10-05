@@ -56,6 +56,10 @@ mod tests {
             ("turned_part.step", 1),
             // Bounds that fold where a pad's rim touches a hole's.
             ("castellated_module.step", 1),
+            // Two bodies touching on a half cylinder, sharing no edge.
+            ("touching_insert.step", 2),
+            // Balls closed at their poles by a seam, run there and back.
+            ("ball_grid.step", 1),
         ] {
             let s = read(&fixture(name), Tolerance::default())
                 .unwrap_or_else(|e| panic!("{name}: {e}"));

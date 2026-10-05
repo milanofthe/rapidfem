@@ -7,12 +7,12 @@
 //! moved, is the member's point at `phase + dir * s`). A split of a member
 //! is a split of the root, and so of the whole class.
 
-use crate::curve::{closest_arc, Curve, PolylineCurve};
+use crate::curve::{closest_arc, Curve};
 use crate::params::PeriodicPair;
+use crate::surface::topology::find;
 use rapidmesh_brep::Brep;
-use rapidmesh_geom::vec3::{add, dist};
-
-type P3 = [f64; 3];
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{add, dist};
 
 /// How an edge is the image of the root of its class.
 #[derive(Clone, Copy, Debug)]
@@ -28,15 +28,7 @@ struct Image {
 pub(crate) struct Classes {
     image: Vec<Option<Image>>,
     /// Per face: the face it copies and the shift from that face onto it.
-    pub copy_of: Vec<Option<(usize, P3)>>,
-}
-
-fn find(p: &mut [usize], mut x: usize) -> usize {
-    while p[x] != x {
-        p[x] = p[p[x]];
-        x = p[x];
-    }
-    x
+    pub copy_of: Vec<Option<(usize, V3)>>,
 }
 
 impl Classes {
@@ -45,7 +37,7 @@ impl Classes {
     /// closer than `tol` are one.
     pub(crate) fn new(
         brep: &Brep,
-        curves: &[Option<PolylineCurve>],
+        curves: &[Option<Box<dyn Curve>>],
         face_edges: &[Vec<usize>],
         pairs: &[PeriodicPair],
         tol: f64,
@@ -76,13 +68,13 @@ impl Classes {
                         continue;
                     }
                     let phases: Vec<f64> = if closed(d) {
-                        let samples: Vec<(f64, P3)> = (0..=256)
+                        let samples: Vec<(f64, V3)> = (0..=256)
                             .map(|i| {
                                 let s = ld * i as f64 / 256.0;
                                 (s, cd.point_at(s))
                             })
                             .collect();
-                        vec![closest_arc(cd, &samples, at(0.0)).rem_euclid(ld)]
+                        vec![closest_arc(&**cd, &samples, at(0.0)).rem_euclid(ld)]
                     } else {
                         vec![0.0, ld]
                     };
@@ -186,7 +178,7 @@ impl Classes {
     pub(crate) fn sync(
         &self,
         arcs: &mut [Vec<f64>],
-        curves: &[Option<PolylineCurve>],
+        curves: &[Option<Box<dyn Curve>>],
         spaced: &dyn Fn(&mut Vec<f64>, f64),
     ) {
         let len = |e: usize| curves[e].as_ref().map_or(0.0, |c| c.length());

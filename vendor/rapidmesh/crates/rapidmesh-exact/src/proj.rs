@@ -34,11 +34,7 @@ pub struct Projected {
 impl Projected {
     /// Prepares `point` for predicates in the projection dropping `drop`.
     pub fn new(point: Point3, drop: Axis) -> Projected {
-        let explicit = point.as_explicit().map(|p| match drop {
-            Axis::X => [p[1], p[2]],
-            Axis::Y => [p[2], p[0]],
-            Axis::Z => [p[0], p[1]],
-        });
+        let explicit = point.as_explicit().map(|p| drop.project(p));
         let interval = point.hom2::<Interval>(drop);
         let affine = match explicit {
             Some([u, v]) => Some([Interval::point(u), Interval::point(v)]),

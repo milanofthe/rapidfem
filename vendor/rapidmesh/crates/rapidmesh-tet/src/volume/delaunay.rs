@@ -8,10 +8,11 @@
 //! neighbours; a boundary face the point does not see strictly from inside
 //! takes the tet behind it too, so the cavity stays star-shaped.
 
-use crate::predicates::{inside, orient, P3};
+use crate::predicates::{inside, orient};
 use crate::simplex::TET_FACES;
 use crate::volume::tets::{Tets, NONE};
-use rapidmesh_geom::vec3::bbox;
+use rapidmesh_exact::vector::bbox;
+use rapidmesh_exact::vector::V3;
 
 /// Steps of a point location walk per tet before it gives up and scans
 /// (a stochastic walk ends long before; the scan is the guarantee).
@@ -20,7 +21,7 @@ const WALK_STEPS_PER_TET: usize = 4;
 /// A Delaunay tetrahedralization. Vertices `0..4` are the corners of the
 /// enclosing tet; point `i` of the input is vertex `i + 4`.
 pub struct Delaunay {
-    pts: Vec<P3>,
+    pts: Vec<V3>,
     t: Tets,
     last: u32,
     /// Buffers of an insertion, kept between them: the cavity, its
@@ -29,15 +30,15 @@ pub struct Delaunay {
     boundary: Vec<(u32, usize)>,
     made: Vec<u32>,
     /// The box of the first points; later ones must lie in it.
-    lo: P3,
-    hi: P3,
+    lo: V3,
+    hi: V3,
 }
 
 impl Delaunay {
     /// The tetrahedralization of `points` (distinct).
-    pub fn new(points: &[P3]) -> Delaunay {
+    pub fn new(points: &[V3]) -> Delaunay {
         let (lo, hi) = bbox(points);
-        let c: P3 = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
+        let c: V3 = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
         let r = (0..3).map(|k| hi[k] - lo[k]).fold(1e-300, f64::max) * 50.0;
         let mut d = Delaunay {
             pts: vec![
@@ -76,8 +77,8 @@ impl Delaunay {
     /// `None` (and the tetrahedralization unusable) where an added point
     /// falls outside the box the enclosing tet was made for, or a removal
     /// cannot close its hole, so the caller makes it afresh.
-    pub fn update(&mut self, gone: &[u32], points: &[P3]) -> Option<Vec<u32>> {
-        let inside_box = |p: &P3| (0..3).all(|k| p[k] >= self.lo[k] && p[k] <= self.hi[k]);
+    pub fn update(&mut self, gone: &[u32], points: &[V3]) -> Option<Vec<u32>> {
+        let inside_box = |p: &V3| (0..3).all(|k| p[k] >= self.lo[k] && p[k] <= self.hi[k]);
         if !points.iter().all(inside_box) {
             return None;
         }
@@ -176,7 +177,7 @@ impl Delaunay {
                 kept.push(i);
             }
         }
-        let corners: Vec<P3> = self.pts[..4].to_vec();
+        let corners: Vec<V3> = self.pts[..4].to_vec();
         self.pts = corners
             .into_iter()
             .chain(kept.iter().map(|&i| self.pts[i as usize + 4]))
@@ -306,7 +307,7 @@ impl Delaunay {
     }
 
     /// A live tet holding `x` (on its faces included), by trying them all.
-    fn scan(&self, x: P3) -> Option<u32> {
+    fn scan(&self, x: V3) -> Option<u32> {
         (0..self.t.alive.len() as u32).find(|&t| {
             self.t.alive[t as usize]
                 && (0..4).all(|i| {
@@ -389,7 +390,7 @@ fn closes(fill: &[[u32; 4]], hole: &rustc_hash::FxHashMap<[u32; 3], u32>) -> boo
 }
 
 /// The Morton code of `p` on a 1024 grid over the box `lo..hi`.
-fn morton_key(p: P3, lo: P3, hi: P3) -> u64 {
+fn morton_key(p: V3, lo: V3, hi: V3) -> u64 {
     let q = |x: f64, k: usize| {
         (((x - lo[k]) / (hi[k] - lo[k]).max(1e-300)) * 1023.0).clamp(0.0, 1023.0) as u64
     };
@@ -410,6 +411,7 @@ fn morton(x: u64, y: u64, z: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rapidmesh_exact::vector::{det3, sub};
 
     /// Every tet as its corners' coordinates, sorted: a tetrahedralization
     /// as a property of its points, whatever their numbering.
@@ -456,7 +458,7 @@ mod tests {
     #[test]
     fn an_update_is_the_tetrahedralization_made_afresh() {
         let n = 5;
-        let mut grid: Vec<P3> = Vec::new();
+        let mut grid: Vec<V3> = Vec::new();
         for i in 0..n {
             for j in 0..n {
                 for k in 0..n {
@@ -466,7 +468,7 @@ mod tests {
         }
         let mut d = Delaunay::new(&grid);
         let gone: Vec<u32> = (0..grid.len() as u32).filter(|i| i % 7 == 3).collect();
-        let added: Vec<P3> = (0..20)
+        let added: Vec<V3> = (0..20)
             .map(|i| {
                 let t = i as f64;
                 [
@@ -477,7 +479,7 @@ mod tests {
             })
             .collect();
         let kept = d.update(&gone, &added).expect("inside the box");
-        let rest: Vec<P3> = kept
+        let rest: Vec<V3> = kept
             .iter()
             .map(|&i| grid[i as usize])
             .chain(added.iter().copied())
@@ -487,16 +489,11 @@ mod tests {
 
     /// The volume of positive tets (Shewchuk's orientation: the triple
     /// product of `b - a`, `c - a`, `d - a` is negative).
-    fn volume(pts: &[P3], tets: &[[u32; 4]]) -> f64 {
+    fn volume(pts: &[V3], tets: &[[u32; 4]]) -> f64 {
         tets.iter()
             .map(|t| {
                 let [a, b, c, d] = t.map(|v| pts[v as usize]);
-                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                let w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
-                (u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0])
-                    + u[2] * (v[0] * w[1] - v[1] * w[0]))
-                    / -6.0
+                det3([sub(b, a), sub(c, a), sub(d, a)]) / -6.0
             })
             .sum()
     }
@@ -513,7 +510,7 @@ mod tests {
             s ^= s << 17;
             (s >> 11) as f64 / (1u64 << 53) as f64
         };
-        let mut pts: Vec<P3> = (0..8)
+        let mut pts: Vec<V3> = (0..8)
             .map(|i| [(i & 1) as f64, (i >> 1 & 1) as f64, (i >> 2 & 1) as f64])
             .collect();
         pts.extend((0..200).map(|_| [0.05 + 0.9 * r(), 0.05 + 0.9 * r(), 0.05 + 0.9 * r()]));
@@ -528,7 +525,7 @@ mod tests {
     #[test]
     fn a_degenerate_grid_is_tetrahedralized_exactly() {
         let n = 4;
-        let pts: Vec<P3> = (0..n * n * n)
+        let pts: Vec<V3> = (0..n * n * n)
             .map(|i| [(i % n) as f64, (i / n % n) as f64, (i / n / n) as f64])
             .collect();
         let d = Delaunay::new(&pts);

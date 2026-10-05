@@ -17,31 +17,31 @@
 //! but name: it becomes a vertex of that patch first, and snaps with the
 //! rest.
 
-use crate::finish::P3;
 use crate::finish::{Complex, PointClass};
+use rapidmesh_exact::vector::V3;
 
 /// The true shape behind a discrete model.
 pub trait Shape: Sync {
     /// The point of the shape a vertex of `kind` at `p` belongs at: on its
     /// patch's carrier or its curve. `None` leaves the vertex where it is.
-    fn project(&self, kind: PointClass, p: P3) -> Option<P3>;
+    fn project(&self, kind: PointClass, p: V3) -> Option<V3>;
 
     /// [`Shape::project`] to within a small share of the local size, where
     /// that is much cheaper (a curve's dense samples instead of the curve):
     /// for comparing candidate places, the chosen one projected exactly.
-    fn project_near(&self, kind: PointClass, p: P3) -> Option<P3> {
+    fn project_near(&self, kind: PointClass, p: V3) -> Option<V3> {
         self.project(kind, p)
     }
 
     /// The parameters of `p` on the carrier of `kind` where a search from
     /// them is cheaper than [`Shape::project`] (a spline carrier).
-    fn param(&self, _kind: PointClass, _p: P3) -> Option<[f64; 2]> {
+    fn param(&self, _kind: PointClass, _p: V3) -> Option<[f64; 2]> {
         None
     }
 
     /// [`Shape::project`] searched from `uv`, the parameters of a point
     /// near the answer, with the parameters of the answer.
-    fn project_from(&self, kind: PointClass, p: P3, uv: [f64; 2]) -> Option<(P3, [f64; 2])> {
+    fn project_from(&self, kind: PointClass, p: V3, uv: [f64; 2]) -> Option<(V3, [f64; 2])> {
         self.project(kind, p).map(|q| (q, uv))
     }
 
@@ -49,7 +49,7 @@ pub trait Shape: Sync {
     /// from `uv` like [`Shape::project_from`] but only as exact as a
     /// candidate needs (one step on a spline carrier); the point lies on the
     /// shape.
-    fn project_near_from(&self, kind: PointClass, p: P3, uv: [f64; 2]) -> Option<P3> {
+    fn project_near_from(&self, kind: PointClass, p: V3, uv: [f64; 2]) -> Option<V3> {
         self.project_from(kind, p, uv).map(|r| r.0)
     }
 

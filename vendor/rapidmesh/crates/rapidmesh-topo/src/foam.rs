@@ -10,18 +10,17 @@
 //! (by owner, then neighbour, owner the smaller cell), then the boundary
 //! faces patch after patch.
 
-use crate::math::{add, cross, dot, norm, scale, sub};
 use crate::{TetTopology, NONE};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{add, cross, dot, len, scale, sub};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 
-type P = [f64; 3];
-
 /// Cells bounded by polygonal faces.
 #[derive(Debug, Clone, Default)]
 pub struct PolyMesh {
-    pub points: Vec<P>,
+    pub points: Vec<V3>,
     /// The corners of every face, normal from owner to neighbour (out of the
     /// mesh on the boundary).
     pub faces: Vec<Vec<u32>>,
@@ -62,7 +61,7 @@ pub struct FvmQuality {
     pub max_openness: f64,
 }
 
-fn mean(points: &[P], ids: &[u32]) -> P {
+fn mean(points: &[V3], ids: &[u32]) -> V3 {
     let n = ids.len() as f64;
     ids.iter()
         .fold([0.0; 3], |c, &i| add(c, scale(points[i as usize], 1.0 / n)))
@@ -70,7 +69,7 @@ fn mean(points: &[P], ids: &[u32]) -> P {
 
 /// A face's centre and area vector as OpenFOAM computes them: triangles
 /// fanned from the corners' mean, the centre their area-weighted centroid.
-fn face_geometry(points: &[P], face: &[u32]) -> (P, P) {
+fn face_geometry(points: &[V3], face: &[u32]) -> (V3, V3) {
     if face.len() == 3 {
         let [a, b, c] = [0, 1, 2].map(|k| points[face[k] as usize]);
         let s = scale(cross(sub(b, a), sub(c, a)), 0.5);
@@ -84,7 +83,7 @@ fn face_geometry(points: &[P], face: &[u32]) -> (P, P) {
             points[face[(k + 1) % face.len()] as usize],
         );
         let s = scale(cross(sub(a, m), sub(b, m)), 0.5);
-        let w = norm(s);
+        let w = len(s);
         area = add(area, s);
         centre = add(centre, scale(add(add(a, b), m), w / 3.0));
         weight += w;
@@ -105,9 +104,9 @@ impl PolyMesh {
 
     /// Every cell's centre and volume, by pyramids from the mean of its face
     /// centres to its faces.
-    pub fn cells(&self) -> (Vec<P>, Vec<f64>) {
+    pub fn cells(&self) -> (Vec<V3>, Vec<f64>) {
         let n = self.n_cells();
-        let geo: Vec<(P, P)> = self
+        let geo: Vec<(V3, V3)> = self
             .faces
             .iter()
             .map(|f| face_geometry(&self.points, f))
@@ -163,12 +162,12 @@ impl PolyMesh {
             for (cell, sign) in [(self.owner[f], 1.0), (self.neighbour[f], -1.0)] {
                 if cell != NONE {
                     sum_s[cell as usize] = add(sum_s[cell as usize], scale(s, sign));
-                    sum_a[cell as usize] += norm(s);
+                    sum_a[cell as usize] += len(s);
                 }
             }
         }
         q.max_openness = (0..self.n_cells())
-            .map(|c| norm(sum_s[c]) / sum_a[c].max(f64::MIN_POSITIVE))
+            .map(|c| len(sum_s[c]) / sum_a[c].max(f64::MIN_POSITIVE))
             .fold(0.0, f64::max);
         let (mut sum, mut internal) = (0.0, 0usize);
         for f in 0..nf {
@@ -178,7 +177,7 @@ impl PolyMesh {
             let (fc, s) = face_geometry(&self.points, &self.faces[f]);
             let (co, cn) = (cc[self.owner[f] as usize], cc[self.neighbour[f] as usize]);
             let d = sub(cn, co);
-            let cos = (dot(d, s) / (norm(d) * norm(s)).max(f64::MIN_POSITIVE)).clamp(-1.0, 1.0);
+            let cos = (dot(d, s) / (len(d) * len(s)).max(f64::MIN_POSITIVE)).clamp(-1.0, 1.0);
             let angle = cos.acos().to_degrees();
             // where the line between the centres crosses the face, weighted
             // by their distances from the face plane
@@ -186,7 +185,7 @@ impl PolyMesh {
             let d_nei = dot(sub(fc, cn), s).abs();
             let w = d_nei / (d_own + d_nei).max(f64::MIN_POSITIVE);
             let at = add(scale(co, w), scale(cn, 1.0 - w));
-            let skew = norm(sub(fc, at)) / norm(d).max(f64::MIN_POSITIVE);
+            let skew = len(sub(fc, at)) / len(d).max(f64::MIN_POSITIVE);
             q.non_orthogonality[f] = angle;
             q.skewness[f] = skew;
             q.max_non_orthogonality = q.max_non_orthogonality.max(angle);
@@ -201,8 +200,8 @@ impl PolyMesh {
 
     /// The tets as cells, the tet faces as faces. `zone` is every tet's
     /// zone, `patch` every topology face's patch (read on the boundary only).
-    pub fn from_tets(points: &[P], topo: &TetTopology, zone: &[u32], patch: &[u32]) -> PolyMesh {
-        let cc: Vec<P> = topo.tets.iter().map(|t| mean(points, t)).collect();
+    pub fn from_tets(points: &[V3], topo: &TetTopology, zone: &[u32], patch: &[u32]) -> PolyMesh {
+        let cc: Vec<V3> = topo.tets.iter().map(|t| mean(points, t)).collect();
         let mut m = PolyMesh {
             points: points.to_vec(),
             cell_zone: zone.to_vec(),
@@ -232,7 +231,7 @@ impl PolyMesh {
     /// its two edge midpoints and the triangle's centroid. `zone` is every
     /// tet's zone, `patch` every topology face's patch (read on the boundary
     /// only).
-    pub fn dual(points: &[P], topo: &TetTopology, zone: &[u32], patch: &[u32]) -> PolyMesh {
+    pub fn dual(points: &[V3], topo: &TetTopology, zone: &[u32], patch: &[u32]) -> PolyMesh {
         let nf = topo.faces.len();
         // A face the dual stops at: on the boundary, or between zones.
         let breaks = |f: usize| {
@@ -273,7 +272,7 @@ impl PolyMesh {
         let tet_centre = |t: u32| mean(points, &topo.tets[t as usize]);
         // The face between the cells `a` and `b`: its points turned so the
         // normal runs along `along` from `a` to `b`, owner the smaller cell.
-        let push = |m: &mut PolyMesh, mut face: Vec<u32>, pts: &[P], a: u32, b: u32, along: P| {
+        let push = |m: &mut PolyMesh, mut face: Vec<u32>, pts: &[V3], a: u32, b: u32, along: V3| {
             let (_, s) = face_geometry(pts, &face);
             if dot(s, along) < 0.0 {
                 face.reverse();
@@ -419,9 +418,9 @@ enum At {
 
 /// The dual's points, made as they are first used.
 struct DualPoints<'a> {
-    points: &'a [P],
+    points: &'a [V3],
     topo: &'a TetTopology,
-    pts: Vec<P>,
+    pts: Vec<V3>,
     index: HashMap<At, u32>,
 }
 
@@ -606,8 +605,8 @@ mod tests {
 
     /// A cube split into six tets around its diagonal, the lower half zone
     /// 0, the upper zone 1 when `two`.
-    fn cube(two: bool) -> (Vec<P>, TetTopology, Vec<u32>) {
-        let points: Vec<P> = (0..8)
+    fn cube(two: bool) -> (Vec<V3>, TetTopology, Vec<u32>) {
+        let points: Vec<V3> = (0..8)
             .map(|i| [(i & 1) as f64, ((i >> 1) & 1) as f64, ((i >> 2) & 1) as f64])
             .collect();
         let tets = [
@@ -638,7 +637,7 @@ mod tests {
             }
         }
         for s in sum {
-            assert!(norm(s) < 1e-12, "{s:?}");
+            assert!(len(s) < 1e-12, "{s:?}");
         }
         let (_, vol) = m.cells();
         assert!(vol.iter().all(|&v| v > 0.0), "{vol:?}");

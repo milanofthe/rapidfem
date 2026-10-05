@@ -1,67 +1,55 @@
-//! Charts: the plane a face is meshed in, and the way back onto the face.
-//!
-//! A planar face is its own chart. A curved face whose normals stay within
-//! [`MAX_TILT_DEG`] of their mean is a height field over the plane through
+//! Height field charts: a curved face (or a piece of one) whose normals
+//! stay within [`MAX_TILT_DEG`] of their mean is a height field over the
+//! plane through
 //! its centre square to that mean: it is meshed in that plane, with sizes
 //! shrunk by the tilt so the lifted triangles keep theirs, and a point is
 //! lifted through the face's own PLC facets (the one it falls in, by its
 //! barycentric coordinates) and then onto the face's carrier.
 
-use rapidmesh_brep::{Model, Surface};
+use rapidmesh_brep::Model;
+use rapidmesh_exact::vector::{add, centroid, cross, dot, perp, sub, unit};
+use rapidmesh_exact::vector::{V2, V3};
 use rapidmesh_geom::grid::HashGrid;
-use rapidmesh_geom::vec3::{add, cross, dot, perp, sub, unit};
-
-type P2 = [f64; 2];
-type P3 = [f64; 3];
+use rapidmesh_geom::Surface;
 
 /// The largest angle between a facet's normal and the mean normal of a
 /// curved face charted as a height field.
 pub const MAX_TILT_DEG: f64 = 60.0;
 
-/// A chart of one face: the plane `o + x u + y v` with normal `n`, and for a
-/// curved face its facets projected into it.
-pub struct Chart<'a> {
-    pub o: P3,
-    pub u: P3,
-    pub v: P3,
-    pub n: P3,
+/// A height field chart: the plane `o + x u + y v` with normal `n`, and
+/// the facets projected into it.
+pub struct FacetChart<'a> {
+    pub o: V3,
+    pub u: V3,
+    pub v: V3,
+    pub n: V3,
     /// The chart's normal turned to the face's front (set by the caller
     /// that knows the front; `n` until then).
-    pub front: P3,
-    curved: Option<Curved<'a>>,
+    pub front: V3,
+    curved: Curved<'a>,
 }
 
 struct Curved<'a> {
     surface: &'a Surface,
     /// The facets: corners in 3D and in the chart, and the cosine of the
     /// tilt of each.
-    tris: Vec<([P3; 3], [P2; 3], f64)>,
+    tris: Vec<([V3; 3], [V2; 3], f64)>,
     /// Facets by grid cell of the chart.
     grid: HashGrid<u32, 2>,
 }
 
-impl<'a> Chart<'a> {
+impl<'a> FacetChart<'a> {
     /// The chart of face `fi`, or none when the face is too curved for one.
-    pub fn of(model: &'a Model, fi: usize) -> Option<Chart<'a>> {
+    pub fn of(model: &'a Model, fi: usize) -> Option<FacetChart<'a>> {
         let (plc, brep) = (&model.plc, &model.brep);
         let face = &brep.faces[fi];
         let surface = brep.surface(face.surface);
-        if let Surface::Plane { o, u, v, normal } = *surface {
-            return Some(Chart {
-                o,
-                u,
-                v,
-                n: normal,
-                front: normal,
-                curved: None,
-            });
-        }
-        let corners: Vec<[P3; 3]> = face
+        let corners: Vec<[V3; 3]> = face
             .facets
             .iter()
             .map(|&t| plc.triangles[t as usize].map(|i| plc.vertices[i as usize]))
             .collect();
-        let normals: Vec<P3> = corners
+        let normals: Vec<V3> = corners
             .iter()
             .map(|p| cross(sub(p[1], p[0]), sub(p[2], p[0])))
             .collect();
@@ -82,26 +70,21 @@ impl<'a> Chart<'a> {
         if !corners.iter().all(|p| flat.try_add(*p)) {
             return None;
         }
-        Chart::of_facets(surface, corners, n)
+        FacetChart::of_facets(surface, corners, n)
     }
 
     /// The height field chart of `corners` (facets of a curved carrier)
     /// over the plane square to `n`, which they must all face.
-    pub fn of_facets(surface: &'a Surface, corners: Vec<[P3; 3]>, n: P3) -> Option<Chart<'a>> {
+    fn of_facets(surface: &'a Surface, corners: Vec<[V3; 3]>, n: V3) -> Option<FacetChart<'a>> {
         let tilts: Vec<f64> = corners
             .iter()
             .map(|p| unit(cross(sub(p[1], p[0]), sub(p[2], p[0]))).map_or(1.0, |x| dot(x, n)))
             .collect();
-        let count = (3 * corners.len()).max(1) as f64;
-        let o: P3 = corners
-            .iter()
-            .flatten()
-            .fold([0.0; 3], |s, x| add(s, *x))
-            .map(|x| x / count);
+        let o: V3 = centroid(corners.iter().flatten());
         let u = unit(perp(n))?;
         let v = cross(n, u);
-        let to2 = |p: P3| [dot(sub(p, o), u), dot(sub(p, o), v)];
-        let tris: Vec<([P3; 3], [P2; 3], f64)> = corners
+        let to2 = |p: V3| [dot(sub(p, o), u), dot(sub(p, o), v)];
+        let tris: Vec<([V3; 3], [V2; 3], f64)> = corners
             .iter()
             .zip(&tilts)
             .map(|(p, &c)| (*p, p.map(to2), c))
@@ -131,58 +114,30 @@ impl<'a> Chart<'a> {
             );
             grid.insert_box(a, b, ti as u32);
         }
-        Some(Chart {
+        Some(FacetChart {
             o,
             u,
             v,
             n,
             front: n,
-            curved: Some(Curved {
+            curved: Curved {
                 surface,
                 tris,
                 grid,
-            }),
+            },
         })
     }
 
-    /// Whether `q` falls in one of the charted facets (a planar face's
-    /// chart covers everything).
-    pub fn contains(&self, q: P2) -> bool {
-        match &self.curved {
-            None => true,
-            Some(c) => {
-                let (_, _, inside) = self.locate_full(c, q);
-                inside
-            }
-        }
-    }
-
-    /// Whether the face is curved (not its own chart).
-    pub fn is_curved(&self) -> bool {
-        self.curved.is_some()
-    }
-
     /// A point in the chart.
-    pub fn to2(&self, p: P3) -> P2 {
+    pub fn to2(&self, p: V3) -> V2 {
         let d = sub(p, self.o);
         [dot(d, self.u), dot(d, self.v)]
     }
 
-    /// The point of the chart plane at `p`.
-    pub fn plane_point(&self, p: P2) -> P3 {
-        std::array::from_fn(|k| self.o[k] + p[0] * self.u[k] + p[1] * self.v[k])
-    }
-
     /// The facet under `p` and its barycentric coordinates (the nearest
     /// facet, clamped, where `p` falls between them).
-    fn locate(&self, c: &Curved<'_>, p: P2) -> (usize, [f64; 3]) {
-        let (t, l, _) = self.locate_full(c, p);
-        (t, l)
-    }
-
-    /// [`Chart::locate`], and whether `p` falls in the facet (closed).
-    fn locate_full(&self, c: &Curved<'_>, p: P2) -> (usize, [f64; 3], bool) {
-        let bary = |q: [P2; 3]| bary(q, p);
+    fn locate(&self, c: &Curved<'_>, p: V2) -> (usize, [f64; 3]) {
+        let bary = |q: [V2; 3]| bary(q, p);
         let home = c.grid.key(p);
         let mut best = (usize::MAX, [1.0, 0.0, 0.0], f64::NEG_INFINITY);
         for r in 0..=2 {
@@ -214,30 +169,23 @@ impl<'a> Chart<'a> {
                 .unwrap_or(0);
             best = (t, bary(c.tris[t].1), 0.0);
         }
-        let inside = best.2 >= -1e-9;
         let l = best.1.map(|x| x.max(0.0));
         let s = (l[0] + l[1] + l[2]).max(1e-300);
-        (best.0, l.map(|x| x / s), inside)
+        (best.0, l.map(|x| x / s))
     }
 
     /// The face's point at `p`.
-    pub fn lift(&self, p: P2) -> P3 {
-        let Some(c) = &self.curved else {
-            return self.plane_point(p);
-        };
-        c.surface.closest(self.on_facets(p)).0
+    pub fn lift(&self, p: V2) -> V3 {
+        self.curved.surface.closest(self.on_facets(p)).0
     }
 
-    /// The point of the charted facets at `p` (the chart plane's for a
-    /// planar face).
+    /// The point of the charted facets at `p`.
     ///
-    /// Past the facets (the carrier bulges past its facets, and the cuts of
-    /// an atlas are on the carrier) the plane of the nearest facet goes on:
+    /// Past the facets (the carrier bulges past its facets) the plane of the
+    /// nearest facet goes on:
     /// clamped to it, every point beside a facet would land on its edge.
-    pub fn on_facets(&self, p: P2) -> P3 {
-        let Some(c) = &self.curved else {
-            return self.plane_point(p);
-        };
+    pub fn on_facets(&self, p: V2) -> V3 {
+        let c = &self.curved;
         let (t, _) = self.locate(c, p);
         let (q, q2) = (c.tris[t].0, c.tris[t].1);
         let l = bary(q2, p);
@@ -245,11 +193,9 @@ impl<'a> Chart<'a> {
     }
 
     /// The factor a size is scaled by in the chart at `p`: the cosine of the
-    /// tilt of the face there (1 for a planar face).
-    pub fn shrink(&self, p: P2) -> f64 {
-        let Some(c) = &self.curved else {
-            return 1.0;
-        };
+    /// tilt of the face there.
+    pub fn shrink(&self, p: V2) -> f64 {
+        let c = &self.curved;
         let (t, _) = self.locate(c, p);
         c.tris[t].2.clamp(0.25, 1.0)
     }
@@ -258,15 +204,15 @@ impl<'a> Chart<'a> {
 /// Triangles projected into a plane (`u`, `v`), none overlapping another:
 /// what keeps a chart a height field while it grows.
 pub(crate) struct Flat {
-    u: P3,
-    v: P3,
-    tris: Vec<[P2; 3]>,
+    u: V3,
+    v: V3,
+    tris: Vec<[V2; 3]>,
     grid: HashGrid<u32, 2>,
 }
 
 impl Flat {
     /// An empty plane for triangles the size of `like`.
-    pub(crate) fn new(like: &[[P3; 3]], u: P3, v: P3) -> Flat {
+    pub(crate) fn new(like: &[[V3; 3]], u: V3, v: V3) -> Flat {
         let mean = like
             .iter()
             .map(|p| dot(sub(p[1], p[0]), sub(p[1], p[0])).sqrt())
@@ -281,7 +227,7 @@ impl Flat {
     }
 
     /// Adds triangle `p` unless its projection overlaps one already in.
-    pub(crate) fn try_add(&mut self, p: [P3; 3]) -> bool {
+    pub(crate) fn try_add(&mut self, p: [V3; 3]) -> bool {
         let q = p.map(|x| [dot(x, self.u), dot(x, self.v)]);
         let (lo, hi) = (
             [
@@ -309,7 +255,7 @@ impl Flat {
 
 /// Whether the insides of two triangles in the plane overlap (touching
 /// along an edge or at a corner is no overlap).
-fn overlap(a: &[P2; 3], b: &[P2; 3]) -> bool {
+fn overlap(a: &[V2; 3], b: &[V2; 3]) -> bool {
     let scale = a
         .iter()
         .chain(b)
@@ -317,10 +263,10 @@ fn overlap(a: &[P2; 3], b: &[P2; 3]) -> bool {
         .fold(0.0, f64::max)
         .max(1e-300);
     let eps = 1e-10 * scale * scale;
-    let side = |p: P2, q: P2, r: P2| (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1]);
+    let side = |p: V2, q: V2, r: V2| (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1]);
     // Separated by the line of an edge of one: the other lies on its far
     // side (or on it).
-    let apart = |a: &[P2; 3], b: &[P2; 3]| {
+    let apart = |a: &[V2; 3], b: &[V2; 3]| {
         let s = side(a[0], a[1], a[2]).signum();
         (0..3).any(|k| {
             let (p, q) = (a[k], a[(k + 1) % 3]);
@@ -331,7 +277,7 @@ fn overlap(a: &[P2; 3], b: &[P2; 3]) -> bool {
 }
 
 /// The barycentric coordinates of `p` in the triangle `q` (unclamped).
-fn bary(q: [P2; 3], p: P2) -> [f64; 3] {
+fn bary(q: [V2; 3], p: V2) -> [f64; 3] {
     let d = (q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]);
     if d.abs() < 1e-300 {
         return [1.0, 0.0, 0.0];

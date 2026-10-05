@@ -12,16 +12,17 @@
 //! wrapping never needs another point (Shewchuk). Nothing outside the
 //! region is ever built, so there is nothing to carve.
 
-use crate::predicates::{inside, orient, P3};
+use crate::predicates::{inside, orient};
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{bbox, cross, dist2, dot, sub};
 use rapidmesh_geom::grid::HashGrid;
-use rapidmesh_geom::vec3::{bbox, cross, dist2, dot, sub};
 use rustc_hash::FxHashMap;
 
 /// Why a region has no constrained Delaunay tetrahedralization here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CdtError {
     /// An open face without a valid apex (global ids) and a corner of it.
-    Stuck { face: [u32; 3], at: P3 },
+    Stuck { face: [u32; 3], at: V3 },
 }
 
 impl std::fmt::Display for CdtError {
@@ -42,7 +43,7 @@ impl std::error::Error for CdtError {}
 /// orientations; on the Delaunay tetrahedralization `dt` of the region's
 /// points where it was made on exactly these.
 pub fn tetrahedralize_on(
-    points: &[P3],
+    points: &[V3],
     faces: &[[u32; 3]],
     dt: Option<crate::volume::region::Kept>,
 ) -> Result<Filled, CdtError> {
@@ -82,7 +83,7 @@ pub fn tetrahedralize_on(
     let (ids, dt) = match kept {
         Some(x) => x,
         None => {
-            let pts: Vec<P3> = ids.iter().map(|&g| points[g as usize]).collect();
+            let pts: Vec<V3> = ids.iter().map(|&g| points[g as usize]).collect();
             let dt = crate::volume::delaunay::Delaunay::new(&pts);
             (ids, dt)
         }
@@ -92,7 +93,7 @@ pub fn tetrahedralize_on(
         .enumerate()
         .map(|(i, &g)| (g, i as u32))
         .collect();
-    let pts: Vec<P3> = ids.iter().map(|&g| points[g as usize]).collect();
+    let pts: Vec<V3> = ids.iter().map(|&g| points[g as usize]).collect();
     let (dts, nbrs) = dt.tets_and_neighbours();
     let conflict = conflicts(&pts, &dts, &nbrs, faces, &local);
     let (cavity_of, cavity_corners) = cavities(&dts, &nbrs, &conflict, pts.len());
@@ -198,7 +199,7 @@ pub fn tetrahedralize_on(
 /// from [`STEINER`] on over the points the wrapping added (in order).
 pub struct Filled {
     pub tets: Vec<[u32; 4]>,
-    pub steiner: Vec<P3>,
+    pub steiner: Vec<V3>,
 }
 
 /// The first id of a point the wrapping added, before the caller numbers
@@ -217,7 +218,7 @@ const MAX_STEINER: usize = 64;
 /// other than in shared vertices and edges. Only constraints that are no
 /// Delaunay face can: each is followed through the tets around it.
 fn conflicts(
-    pts: &[P3],
+    pts: &[V3],
     dts: &[[u32; 4]],
     nbrs: &[[u32; 4]],
     faces: &[[u32; 3]],
@@ -303,7 +304,7 @@ fn cavities(
 
 /// Whether the tet `t` and the triangle `g` (vertex ids over `pts`) share a
 /// point other than in common vertices and edges.
-fn tet_meets_tri(pts: &[P3], t: [u32; 4], g: [u32; 3]) -> bool {
+fn tet_meets_tri(pts: &[V3], t: [u32; 4], g: [u32; 3]) -> bool {
     let pt = t.map(|v| pts[v as usize]);
     let edges = [
         [t[0], t[1]],
@@ -353,9 +354,9 @@ fn canon(f: [u32; 3]) -> [u32; 3] {
 
 /// A grid over a region's box, about two points a cell (flat boxes counted
 /// by their largest faces), for the open faces.
-fn front_grid(pts: &[P3]) -> HashGrid<[u32; 3]> {
+fn front_grid(pts: &[V3]) -> HashGrid<[u32; 3]> {
     let (lo, hi) = bbox(pts);
-    let ext: P3 = std::array::from_fn(|k| (hi[k] - lo[k]).max(0.0));
+    let ext: V3 = std::array::from_fn(|k| (hi[k] - lo[k]).max(0.0));
     let span = ext.iter().copied().fold(0.0, f64::max).max(1e-300);
     let vol = ext.iter().map(|&x| x.max(1e-3 * span)).product::<f64>();
     let cell = (2.0 * vol / pts.len().max(1) as f64)
@@ -365,7 +366,7 @@ fn front_grid(pts: &[P3]) -> HashGrid<[u32; 3]> {
 }
 
 struct Wrap {
-    pts: Vec<P3>,
+    pts: Vec<V3>,
     /// The Delaunay apex and tet on the positive side of each Delaunay face,
     /// and the tets that meet a constraint missing from the tetrahedralization.
     dt_tet: FxHashMap<[u32; 3], (u32, u32)>,
@@ -396,7 +397,7 @@ struct Wrap {
 }
 
 impl Wrap {
-    fn p(&self, v: u32) -> P3 {
+    fn p(&self, v: u32) -> V3 {
         self.pts[v as usize]
     }
 
@@ -457,7 +458,7 @@ impl Wrap {
         let positive = |v: u32| !f.contains(&v) && orient(a, b, c, self.p(v)) > 0;
         // A first valid vertex, nearest first: in chunks, each in sphere
         // order (a nearer sphere leaves fewer candidates below).
-        let centre: P3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
+        let centre: V3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
         let n0 = self.n0;
         let mut nearest = self.tree.by_distance(&self.pts[..n0], centre);
         let mut chunk: Vec<u32> = self
@@ -513,7 +514,7 @@ impl Wrap {
         }
         // The positive side lies against the triangle's right-hand normal.
         let n = n.map(|x| -x / l);
-        let cen: P3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
+        let cen: V3 = std::array::from_fn(|k| (a[k] + b[k] + c[k]) / 3.0);
         let short = [dist2(a, b), dist2(b, c), dist2(c, a)]
             .into_iter()
             .fold(f64::INFINITY, f64::min)
@@ -521,7 +522,7 @@ impl Wrap {
         let q = self.pts.len() as u32;
         for k in 0..24 {
             let d = 0.5 * short * 0.5f64.powi(k);
-            let p: P3 = std::array::from_fn(|i| cen[i] + d * n[i]);
+            let p: V3 = std::array::from_fn(|i| cen[i] + d * n[i]);
             if orient(a, b, c, p) <= 0 {
                 continue;
             }
@@ -634,17 +635,17 @@ impl Wrap {
 
 /// A box around the sphere through the four points, padded for the
 /// rounding of its centre (the order it bounds is exact).
-fn sphere_box(t: [P3; 4]) -> (P3, P3) {
+fn sphere_box(t: [V3; 4]) -> (V3, V3) {
     let [a, b, c, d] = t;
     let (u, v, w) = (sub(b, a), sub(c, a), sub(d, a));
     let det = 2.0 * dot(u, cross(v, w));
     let (uu, vv, ww) = (dot(u, u), dot(v, v), dot(w, w));
-    let num: P3 =
+    let num: V3 =
         std::array::from_fn(|k| uu * cross(v, w)[k] + vv * cross(w, u)[k] + ww * cross(u, v)[k]);
     if !(det.abs() > 0.0) {
         return ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]);
     }
-    let o: P3 = std::array::from_fn(|k| a[k] + num[k] / det);
+    let o: V3 = std::array::from_fn(|k| a[k] + num[k] / det);
     let r = dot(sub(o, a), sub(o, a)).sqrt();
     let pad = r * 1e-6 + 1e-12 * (dot(u, u) + dot(v, v) + dot(w, w)).sqrt();
     if !(r.is_finite()) {
@@ -654,7 +655,7 @@ fn sphere_box(t: [P3; 4]) -> (P3, P3) {
 }
 
 /// Whether `x` lies strictly inside the positive tet `t`.
-fn strictly_inside(t: [P3; 4], x: P3) -> bool {
+fn strictly_inside(t: [V3; 4], x: V3) -> bool {
     orient(t[0], t[1], t[2], x) > 0
         && orient(t[0], t[3], t[1], x) > 0
         && orient(t[0], t[2], t[3], x) > 0
@@ -663,7 +664,7 @@ fn strictly_inside(t: [P3; 4], x: P3) -> bool {
 
 /// Whether the closed segment `e` and the closed triangle `t` (vertex ids
 /// over `pts`) share a point other than a common vertex.
-fn seg_meets_tri(pts: &[P3], e: [u32; 2], t: [u32; 3]) -> bool {
+fn seg_meets_tri(pts: &[V3], e: [u32; 2], t: [u32; 3]) -> bool {
     let mut buf = [0u32; 2];
     let mut n = 0;
     for v in e {
@@ -712,7 +713,7 @@ fn seg_meets_tri(pts: &[P3], e: [u32; 2], t: [u32; 3]) -> bool {
 }
 
 /// [`seg_meets_tri`] for a segment in the plane of the triangle.
-fn coplanar_seg_meets_tri(pts: &[P3], e: [u32; 2], t: [u32; 3], shared: &[u32]) -> bool {
+fn coplanar_seg_meets_tri(pts: &[V3], e: [u32; 2], t: [u32; 3], shared: &[u32]) -> bool {
     let p = |v: u32| pts[v as usize];
     let [t0, t1, t2] = t.map(p);
     // Drop the axis the triangle's normal points along most.
@@ -730,7 +731,7 @@ fn coplanar_seg_meets_tri(pts: &[P3], e: [u32; 2], t: [u32; 3], shared: &[u32]) 
     } else {
         2
     };
-    let q = |x: P3| -> [f64; 2] {
+    let q = |x: V3| -> [f64; 2] {
         match drop {
             0 => [x[1], x[2]],
             1 => [x[2], x[0]],
@@ -804,22 +805,18 @@ mod tests {
     use crate::params::MeshParams;
     use crate::surface::{boundary, Boundary};
     use rapidmesh_brep::Model;
+    use rapidmesh_exact::vector::{det3, sub};
     use rapidmesh_geom::{solid_box, Scene};
 
     fn region_faces(model: &Model, b: &Boundary, r: u32) -> Vec<[u32; 3]> {
         crate::mesher::region_faces(&model.brep, b, r)
     }
 
-    fn volume(points: &[P3], tets: &[[u32; 4]]) -> f64 {
+    fn volume(points: &[V3], tets: &[[u32; 4]]) -> f64 {
         tets.iter()
             .map(|t| {
                 let [a, b, c, d] = t.map(|v| points[v as usize]);
-                let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-                let w = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
-                (u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0])
-                    + u[2] * (v[0] * w[1] - v[1] * w[0]))
-                    / -6.0
+                det3([sub(b, a), sub(c, a), sub(d, a)]) / -6.0
             })
             .sum()
     }

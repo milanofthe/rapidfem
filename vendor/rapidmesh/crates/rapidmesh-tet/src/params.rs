@@ -15,7 +15,8 @@ pub struct MeshParams {
     /// Interfaces and creases follow the finer adjacent region; transitions
     /// into coarser regions grade naturally.
     pub region_maxh: Vec<(u32, f64)>,
-    /// The volume refinement adds at most this many points to each region.
+    /// The volume refinement adds at most this many points over the whole
+    /// mesh, each region and block its share.
     pub max_points: usize,
     /// Size grading: the target edge length may grow by at most this factor
     /// per unit distance from finer features (h(x) is Lipschitz with this
@@ -138,6 +139,16 @@ fn lookup(table: &[(u32, f64)], id: usize) -> Option<f64> {
 }
 
 impl MeshParams {
+    /// The grading sizes follow: [`grading`](Self::grading), 0.5 where it
+    /// is not positive.
+    pub fn grade(&self) -> f64 {
+        if self.grading > 0.0 {
+            self.grading
+        } else {
+            0.5
+        }
+    }
+
     /// A copy with every size target scaled by `s`: lengths by `s`, chord
     /// tolerances by `s^2` (size is proportional to sqrt(tol)). The element-budget
     /// loop retunes the global scale with this while preserving the relative

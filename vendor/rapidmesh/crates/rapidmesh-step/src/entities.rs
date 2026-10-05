@@ -3,11 +3,13 @@
 //! structure; whatever reads the model after that sees Rust types, and an
 //! entity that does not decode is named with the reason.
 
-use crate::geometry::{extruded, revolved, Axes, Curve, Curve2, Surface, P3};
+use crate::geometry::{cone, extruded, placement, revolved, Reparam};
 use crate::part21::{Exchange, Record, Value};
-use rapidmesh_geom::vec3::{bbox, normalize, scale};
-use rapidmesh_geom::NurbsSurface;
-use rapidmesh_geom::{Frame, NurbsCurve};
+use rapidmesh_exact::vector::Frame;
+use rapidmesh_exact::vector::V3;
+use rapidmesh_exact::vector::{bbox, normalize, scale};
+use rapidmesh_exact::vector::{mul, mul_vec, sub as vsub, transpose, Affine};
+use rapidmesh_geom::{Curve, NurbsCurve, NurbsSurface, Surface};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -43,8 +45,9 @@ pub struct Edge {
     pub ends: [usize; 2],
     pub curve: usize,
     pub forward: bool,
-    /// (surface, its parameter curve), the parameter the curve's own.
-    pub pcurves: Vec<(usize, Curve2)>,
+    /// (surface, its parameter curve in the surface's parameters), the
+    /// parameter the curve's own.
+    pub pcurves: Vec<(usize, Curve<2>)>,
 }
 
 /// A bound of a face: its edges in turn, each along itself or against, or
@@ -67,19 +70,12 @@ pub struct Face {
 
 /// The map from the axes `from` onto the axes `to`: a point with
 /// coordinates `a, b, c` in `from` goes to the point with the same in `to`.
-fn between(from: &Axes, to: &Axes) -> Frame {
-    let f = [from.x, from.y, from.z];
-    let t = [to.x, to.y, to.z];
-    let linear: [[f64; 3]; 3] =
-        std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| t[k][i] * f[k][j]).sum()));
-    let m = Frame {
+fn between(from: &Frame, to: &Frame) -> Affine {
+    let (f, t) = ([from.x, from.y, from.z], [to.x, to.y, to.z]);
+    let linear = mul(transpose(t), f);
+    Affine {
         linear,
-        offset: [0.0; 3],
-    };
-    let o = m.apply(from.o);
-    Frame {
-        linear,
-        offset: std::array::from_fn(|i| to.o[i] - o[i]),
+        offset: vsub(to.o, mul_vec(linear, from.o)),
     }
 }
 
@@ -89,15 +85,15 @@ pub struct Solid {
     pub name: String,
     pub faces: Vec<usize>,
     /// Where the assembly places it.
-    pub placement: Frame,
+    pub placement: Affine,
 }
 
 /// The typed model of a file.
 #[derive(Debug, Default)]
 pub struct Model {
     pub metres_per_unit: f64,
-    pub vertices: Vec<P3>,
-    pub curves: Vec<Curve>,
+    pub vertices: Vec<V3>,
+    pub curves: Vec<Curve<3>>,
     pub surfaces: Vec<Surface>,
     pub edges: Vec<Edge>,
     pub faces: Vec<Face>,
@@ -203,6 +199,9 @@ struct Decoder<'a> {
     /// The surfaces whose normal runs against the file's (swept ones read
     /// as a torus, say): the faces on them turn.
     flipped: rustc_hash::FxHashSet<usize>,
+    /// The surfaces whose parameters are not the file's (a cone), with how
+    /// the file's map to them: their parameter curves are carried over.
+    reparam: FxHashMap<usize, Reparam>,
 }
 
 impl<'a> Decoder<'a> {
@@ -221,6 +220,7 @@ impl<'a> Decoder<'a> {
             edge_of: FxHashMap::default(),
             face_of: FxHashMap::default(),
             flipped: Default::default(),
+            reparam: FxHashMap::default(),
         }
     }
 
@@ -257,15 +257,15 @@ impl<'a> Decoder<'a> {
         Ok(std::array::from_fn(|k| c.get(k).copied().unwrap_or(0.0)))
     }
 
-    fn point(&self, id: u32) -> R<P3> {
+    fn point(&self, id: u32) -> R<V3> {
         self.coords(id, "CARTESIAN_POINT")
     }
 
-    fn direction(&self, id: u32) -> R<P3> {
+    fn direction(&self, id: u32) -> R<V3> {
         self.coords(id, "DIRECTION")
     }
 
-    fn placement(&self, id: u32) -> R<Axes> {
+    fn placement(&self, id: u32) -> R<Frame> {
         let r = self.rec(id, "AXIS2_PLACEMENT_3D")?;
         let o = self.point(r.refr(1)?)?;
         let z = match r.get(2)?.as_ref() {
@@ -276,7 +276,7 @@ impl<'a> Decoder<'a> {
             Some(d) => Some(self.direction(d)?),
             None => None,
         };
-        Ok(Axes::new(o, z, x))
+        placement(o, z, x).map_or_else(|| fail(id, "a placement along no direction"), Ok)
     }
 
     /// B-spline data of a curve: degree, control point ids, knots, weights.
@@ -323,21 +323,26 @@ impl<'a> Decoder<'a> {
 
     /// The 3D curve of an edge (through SURFACE_CURVE, SEAM_CURVE and
     /// TRIMMED_CURVE to their basis).
-    fn curve3(&self, id: u32) -> R<Curve> {
+    fn curve3(&self, id: u32) -> R<Curve<3>> {
         if self.x.record(id, "B_SPLINE_CURVE").is_some()
             || self.x.kind(id) == Some("B_SPLINE_CURVE_WITH_KNOTS")
         {
             let (degree, ids, knots, weights) = self.spline_parts(id)?;
-            let ctrl: Vec<P3> = ids.iter().map(|&p| self.point(p)).collect::<R<_>>()?;
+            let ctrl: Vec<V3> = ids.iter().map(|&p| self.point(p)).collect::<R<_>>()?;
             let weights = weights.unwrap_or_else(|| vec![1.0; ctrl.len()]);
-            return Ok(Curve::Spline(NurbsCurve {
+            return Ok(Curve::Nurbs(Arc::new(NurbsCurve {
                 degree,
                 knots,
                 ctrl,
                 weights,
-            }));
+            })));
         }
         let r = self.any(id)?;
+        // A conic by its centre and the vectors along its placement's axes.
+        let conic = |a: f64, b: f64| -> R<(V3, V3, V3)> {
+            let f = self.placement(r.refr(1)?)?;
+            Ok((f.o, scale(f.x, a), scale(f.y, b)))
+        };
         match r.r.name.as_str() {
             "SURFACE_CURVE" | "SEAM_CURVE" | "INTERSECTION_CURVE" | "TRIMMED_CURVE" => {
                 self.curve3(r.refr(1)?)
@@ -351,30 +356,29 @@ impl<'a> Decoder<'a> {
                     d: scale(normalize(d), v.num(2)?),
                 })
             }
-            "CIRCLE" => Ok(Curve::Circle {
-                f: self.placement(r.refr(1)?)?,
-                r: r.num(2)?,
-            }),
-            "ELLIPSE" => Ok(Curve::Ellipse {
-                f: self.placement(r.refr(1)?)?,
-                a: r.num(2)?,
-                b: r.num(3)?,
-            }),
-            "HYPERBOLA" => Ok(Curve::Hyperbola {
-                f: self.placement(r.refr(1)?)?,
-                a: r.num(2)?,
-                b: r.num(3)?,
-            }),
-            "PARABOLA" => Ok(Curve::Parabola {
-                f: self.placement(r.refr(1)?)?,
-                focal: r.num(2)?,
-            }),
+            "CIRCLE" => {
+                let (c, p, q) = conic(r.num(2)?, r.num(2)?)?;
+                Ok(Curve::Ellipse { c, p, q })
+            }
+            "ELLIPSE" => {
+                let (c, p, q) = conic(r.num(2)?, r.num(3)?)?;
+                Ok(Curve::Ellipse { c, p, q })
+            }
+            "HYPERBOLA" => {
+                let (c, p, q) = conic(r.num(2)?, r.num(3)?)?;
+                Ok(Curve::Hyperbola { c, p, q })
+            }
+            "PARABOLA" => {
+                let focal = r.num(2)?;
+                let (c, p, q) = conic(focal, 2.0 * focal)?;
+                Ok(Curve::Parabola { c, p, q })
+            }
             other => fail(id, format!("the curve {other} is not read")),
         }
     }
 
     /// A curve in a surface's parameters.
-    fn curve2(&self, id: u32) -> R<Curve2> {
+    fn curve2(&self, id: u32) -> R<Curve<2>> {
         if self.x.record(id, "B_SPLINE_CURVE").is_some()
             || self.x.kind(id) == Some("B_SPLINE_CURVE_WITH_KNOTS")
         {
@@ -384,23 +388,24 @@ impl<'a> Decoder<'a> {
                 .map(|&p| self.coords(p, "CARTESIAN_POINT"))
                 .collect::<R<_>>()?;
             let weights = weights.unwrap_or_else(|| vec![1.0; ctrl.len()]);
-            return Ok(Curve2::Spline(NurbsCurve {
+            return Ok(Curve::Nurbs(Arc::new(NurbsCurve {
                 degree,
                 knots,
                 ctrl,
                 weights,
-            }));
+            })));
         }
         let r = self.any(id)?;
-        let frame2 = |pl: u32| -> R<([f64; 2], [f64; 2])> {
-            let a = self.rec(pl, "AXIS2_PLACEMENT_2D")?;
-            let o: [f64; 2] = self.coords(a.refr(1)?, "CARTESIAN_POINT")?;
-            let x: [f64; 2] = match a.get(2)?.as_ref() {
-                Some(d) => self.coords(d, "DIRECTION")?,
+        // A conic by its centre and the vectors along its placement's axes
+        // (`y` the `x` turned a quarter).
+        let conic = |a: f64, b: f64| -> R<([f64; 2], [f64; 2], [f64; 2])> {
+            let pl = self.rec(r.refr(1)?, "AXIS2_PLACEMENT_2D")?;
+            let o: [f64; 2] = self.coords(pl.refr(1)?, "CARTESIAN_POINT")?;
+            let x: [f64; 2] = match pl.get(2)?.as_ref() {
+                Some(d) => normalize(self.coords(d, "DIRECTION")?),
                 None => [1.0, 0.0],
             };
-            let l = (x[0] * x[0] + x[1] * x[1]).sqrt().max(1e-300);
-            Ok((o, [x[0] / l, x[1] / l]))
+            Ok((o, scale(x, a), scale([-x[1], x[0]], b)))
         };
         match r.r.name.as_str() {
             "TRIMMED_CURVE" => self.curve2(r.refr(1)?),
@@ -408,25 +413,18 @@ impl<'a> Decoder<'a> {
                 let p: [f64; 2] = self.coords(r.refr(1)?, "CARTESIAN_POINT")?;
                 let v = self.rec(r.refr(2)?, "VECTOR")?;
                 let d: [f64; 2] = self.coords(v.refr(1)?, "DIRECTION")?;
-                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-300);
-                let m = v.num(2)? / l;
-                Ok(Curve2::Line {
+                Ok(Curve::Line {
                     p,
-                    d: [d[0] * m, d[1] * m],
+                    d: scale(normalize(d), v.num(2)?),
                 })
             }
             "CIRCLE" => {
-                let (o, x) = frame2(r.refr(1)?)?;
-                Ok(Curve2::Circle { o, x, r: r.num(2)? })
+                let (c, p, q) = conic(r.num(2)?, r.num(2)?)?;
+                Ok(Curve::Ellipse { c, p, q })
             }
             "ELLIPSE" => {
-                let (o, x) = frame2(r.refr(1)?)?;
-                Ok(Curve2::Ellipse {
-                    o,
-                    x,
-                    a: r.num(2)?,
-                    b: r.num(3)?,
-                })
+                let (c, p, q) = conic(r.num(2)?, r.num(3)?)?;
+                Ok(Curve::Ellipse { c, p, q })
             }
             other => fail(id, format!("the parameter curve {other} is not read")),
         }
@@ -472,12 +470,24 @@ impl<'a> Decoder<'a> {
             let frame = self.placement(r.refr(1)?)?;
             match r.r.name.as_str() {
                 "PLANE" => Surface::Plane(frame),
-                "CYLINDRICAL_SURFACE" => Surface::Cylinder(frame, r.num(2)?),
+                "CYLINDRICAL_SURFACE" => Surface::Cylinder {
+                    frame,
+                    radius: r.num(2)?,
+                },
                 "CONICAL_SURFACE" => {
-                    Surface::Cone(frame, r.num(2)?, r.num(3)? * self.radians_per_unit)
+                    let (s, map) = cone(frame, r.num(2)?, r.num(3)? * self.radians_per_unit);
+                    self.reparam.insert(self.m.surfaces.len(), map);
+                    s
                 }
-                "SPHERICAL_SURFACE" => Surface::Sphere(frame, r.num(2)?),
-                "TOROIDAL_SURFACE" => Surface::Torus(frame, r.num(2)?, r.num(3)?),
+                "SPHERICAL_SURFACE" => Surface::Sphere {
+                    frame,
+                    radius: r.num(2)?,
+                },
+                "TOROIDAL_SURFACE" => Surface::Torus {
+                    frame,
+                    major: r.num(2)?,
+                    minor: r.num(3)?,
+                },
                 other => return fail(id, format!("the surface {other} is not read")),
             }
         };
@@ -541,7 +551,7 @@ impl<'a> Decoder<'a> {
             None => vec![1.0; ctrl.len()],
         };
         match NurbsSurface::try_new(degree, [ku, kv], [rows.len(), nv], ctrl, weights) {
-            Ok(s) => Ok(Surface::Spline(Arc::new(if lower {
+            Ok(s) => Ok(Surface::Nurbs(Arc::new(if lower {
                 low_degree(s)
             } else {
                 s
@@ -591,7 +601,12 @@ impl<'a> Decoder<'a> {
                     let surface = self.surface(p.refr(1)?)?;
                     let rep = self.rec(p.refr(2)?, "DEFINITIONAL_REPRESENTATION")?;
                     if let Some(&c) = rep.refs(1)?.first() {
-                        pcurves.push((surface, self.curve2(c)?));
+                        let c = self.curve2(c)?;
+                        let c = match self.reparam.get(&surface) {
+                            Some(&(scale, shift)) => c.rescaled(scale, shift),
+                            None => c,
+                        };
+                        pcurves.push((surface, c));
                     }
                 }
             }
@@ -699,7 +714,7 @@ impl<'a> Decoder<'a> {
                 .unwrap_or_else(|| r.name());
             let placement = rep
                 .and_then(|r| places.get(&r).copied())
-                .unwrap_or(Frame::IDENTITY);
+                .unwrap_or(Affine::IDENTITY);
             self.m.solids.push(Solid {
                 name,
                 faces,
@@ -806,9 +821,9 @@ impl<'a> Decoder<'a> {
 
     /// Where the assembly places each shape representation: the maps of
     /// its transforming relationships up to the root, composed.
-    fn placements(&self) -> FxHashMap<u32, Frame> {
+    fn placements(&self) -> FxHashMap<u32, Affine> {
         // child -> (parent, map into the parent)
-        let mut up: FxHashMap<u32, (u32, Frame)> = FxHashMap::default();
+        let mut up: FxHashMap<u32, (u32, Affine)> = FxHashMap::default();
         let mut same: Vec<(u32, u32)> = Vec::new();
         for rel in self.x.all("REPRESENTATION_RELATIONSHIP") {
             let Some(r) = self.x.record(rel, "REPRESENTATION_RELATIONSHIP") else {
@@ -852,12 +867,12 @@ impl<'a> Decoder<'a> {
         }
         let mut out = FxHashMap::default();
         for &rep in up.keys().chain(same.iter().flat_map(|(a, b)| [a, b])) {
-            let mut m = Frame::IDENTITY;
+            let mut m = Affine::IDENTITY;
             let mut at = rep;
             for _ in 0..64 {
                 match up.get(&at) {
                     Some(&(parent, step)) => {
-                        m = m.then(step.linear, step.offset);
+                        m = m.then(&step);
                         at = parent;
                     }
                     None => break,
@@ -1027,17 +1042,17 @@ pub fn decode(x: &Exchange) -> Result<Model, StepError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rapidmesh_geom::vec3::dist;
+    use rapidmesh_exact::vector::dist;
 
     #[test]
     fn a_map_between_frames_takes_one_onto_the_other() {
-        let a = Axes::new([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], Some([1.0, 0.0, 0.0]));
-        let b = Axes::new([-4.0, 0.5, 2.0], [1.0, 0.0, 0.0], Some([0.0, 1.0, 0.0]));
+        let a = placement([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], Some([1.0, 0.0, 0.0])).unwrap();
+        let b = placement([-4.0, 0.5, 2.0], [1.0, 0.0, 0.0], Some([0.0, 1.0, 0.0])).unwrap();
         let m = between(&a, &b);
-        let p = m.apply([1.0, 2.0, 3.0]);
+        let p = m.point([1.0, 2.0, 3.0]);
         assert!((0..3).all(|k| (p[k] - b.o[k]).abs() < 1e-12));
         // a.x maps onto b.x.
-        let q = m.apply([2.0, 2.0, 3.0]);
+        let q = m.point([2.0, 2.0, 3.0]);
         assert!((0..3).all(|k| (q[k] - (b.o[k] + b.x[k])).abs() < 1e-12));
     }
 
@@ -1049,7 +1064,7 @@ mod tests {
         let x = crate::part21::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
         let d = Decoder::new(&x);
         let spline = |s: Surface| match s {
-            Surface::Spline(s) => s,
+            Surface::Nurbs(s) => s,
             _ => panic!("no B-spline"),
         };
         let exact = spline(d.spline_surface_exact(76).unwrap());
@@ -1078,7 +1093,7 @@ mod tests {
             (2,2),(2,2),(0.,1.21),(0.,1.),.PIECEWISE_BEZIER_KNOTS.);\nENDSEC;\n";
         let x = crate::part21::parse(text).unwrap();
         let d = Decoder::new(&x);
-        let Surface::Spline(s) = d.spline_surface(5).unwrap() else {
+        let Surface::Nurbs(s) = d.spline_surface(5).unwrap() else {
             panic!("no B-spline");
         };
         assert_eq!(s.domain(), ([0.0, 1.21], [0.0, 1.0]));

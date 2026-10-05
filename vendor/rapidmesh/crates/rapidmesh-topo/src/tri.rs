@@ -200,7 +200,7 @@ pub struct TriGeometry {
 /// Barycentric gradients of triangle `p` with unit normal `n` and area `a`:
 /// `grad lambda_i = n x (p[i+2] - p[i+1]) / 2a`.
 fn bary_grad(p: [[f64; 3]; 3], n: [f64; 3], a: f64) -> [[f64; 3]; 3] {
-    use crate::math::{cross, scale, sub};
+    use rapidmesh_exact::vector::{cross, scale, sub};
     if !(a > 0.0) {
         return [[0.0; 3]; 3];
     }
@@ -276,7 +276,8 @@ impl TriGeometry {
     /// lengths/midpoints, min interior angle. `inertia` is left empty (see the
     /// field doc).
     pub fn build_3d(topo: &TriTopology, coords: &[[f64; 3]]) -> Self {
-        use crate::math::{add, cross, edge_geom, norm, normalize, scale, sub};
+        use crate::edge_geom;
+        use rapidmesh_exact::vector::{add, cross, len, normalize, scale, sub};
         let nt = topo.tris.len();
         let mut area = vec![0.0; nt];
         let mut centroid = vec![[0.0; 3]; nt];
@@ -291,7 +292,7 @@ impl TriGeometry {
                 coords[ic as usize],
             );
             let n = cross(sub(b, a), sub(c, a));
-            area[t] = 0.5 * norm(n);
+            area[t] = 0.5 * len(n);
             normal[t] = normalize(n); // zero vector for a degenerate triangle
             grad[t] = bary_grad([a, b, c], normal[t], area[t]);
             centroid[t] = scale(add(add(a, b), c), 1.0 / 3.0);
@@ -313,10 +314,10 @@ impl TriGeometry {
 
 /// Minimum interior angle (degrees) of triangle `(a, b, c)` in 3D.
 fn tri_min_angle_deg(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
-    use crate::math::{dot, norm, sub};
+    use rapidmesh_exact::vector::{dot, len, sub};
     let at = |u: [f64; 3], v: [f64; 3], w: [f64; 3]| {
         let (e1, e2) = (sub(v, u), sub(w, u));
-        let cos = dot(e1, e2) / (norm(e1) * norm(e2) + 1e-30);
+        let cos = dot(e1, e2) / (len(e1) * len(e2) + 1e-30);
         cos.clamp(-1.0, 1.0).acos().to_degrees()
     };
     at(a, b, c).min(at(b, c, a)).min(at(c, a, b))
@@ -325,8 +326,8 @@ fn tri_min_angle_deg(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::{dot, sub};
     use crate::source::Tris;
+    use rapidmesh_exact::vector::{dot, sub};
 
     #[test]
     fn single_triangle() {

@@ -5,9 +5,10 @@
 use rapidmesh_brep::Model;
 use rapidmesh_exact::clock::Instant;
 use rapidmesh_exact::log::{Event, Level};
+use rapidmesh_geom::RegionTag;
 use rapidmesh_tet::Fidelity;
+use rapidmesh_tet::{CurveEdge, QualityStats, SurfaceFace, TetMesh};
 use rapidmesh_tet::{Defect, MeshDiagnostics};
-use rapidmesh_tet::{QualityStats, TetMesh};
 use rapidmesh_topo::export::Names;
 use rapidmesh_topo::{
     Classification, TetGeometry, TetTopology, TriClassification, TriGeometry, TriTopology, NONE,
@@ -370,7 +371,11 @@ pub struct Mesh {
     /// The model the mesh was made from, for the fidelity check and the
     /// curves of the second-order mesh.
     pub(crate) model: Option<Arc<Model>>,
+    /// The regions left out of the model's (see [`Mesh::without_regions`]).
+    left_out: Vec<u32>,
     view: OnceLock<TetView>,
+    /// The second-order mesh, made on first use.
+    pub(crate) second: OnceLock<crate::SecondOrder>,
 }
 
 impl Deref for Mesh {
@@ -394,7 +399,109 @@ impl Mesh {
             labels,
             run,
             model,
+            left_out: Vec::new(),
             view: OnceLock::new(),
+            second: OnceLock::new(),
+        }
+    }
+
+    /// The mesh without the tets of `regions` (a hole whose walls carry a
+    /// boundary condition, meshed as a region to place them): the points no
+    /// tet keeps are gone, the others numbered on in their order. A face
+    /// between a region left out and a kept one stays, region 0 on the side
+    /// left out; a face with no kept region beside it goes, and so do the
+    /// curve edges and periodic pairs on it. The solids of those regions
+    /// become voids, so the sets and the MSH groups leave them out; the
+    /// faces keep their geometric ids, names and surfaces.
+    pub fn without_regions(&self, regions: &[u32]) -> Mesh {
+        let m = &self.inner;
+        let out = |r: &RegionTag| regions.contains(&r.0);
+        let tets: Vec<usize> = (0..m.tets.len())
+            .filter(|&t| !out(&m.tet_regions[t]))
+            .collect();
+        let mut used = vec![false; m.points.len()];
+        for &t in &tets {
+            for &v in &m.tets[t] {
+                used[v] = true;
+            }
+        }
+        let mut new = vec![usize::MAX; m.points.len()];
+        for (n, v) in (0..m.points.len()).filter(|&v| used[v]).enumerate() {
+            new[v] = n;
+        }
+        let kept = |v: usize| used[v];
+        let faces: Vec<SurfaceFace> = m
+            .faces
+            .iter()
+            .filter(|f| f.tri.iter().all(|&v| kept(v)))
+            .filter_map(|f| {
+                let sides = f.regions.map(|r| if out(&r) { RegionTag(0) } else { r });
+                let gone = sides == [RegionTag(0); 2] && f.regions.iter().any(out);
+                (!gone).then(|| SurfaceFace {
+                    tri: f.tri.map(|v| new[v]),
+                    regions: sides,
+                    ..f.clone()
+                })
+            })
+            .collect();
+        let on_face: std::collections::HashSet<[usize; 2]> = faces
+            .iter()
+            .flat_map(|f| {
+                (0..3).map(move |k| {
+                    let (a, b) = (f.tri[k], f.tri[(k + 1) % 3]);
+                    [a.min(b), a.max(b)]
+                })
+            })
+            .collect();
+        let curve_edges = m
+            .curve_edges
+            .iter()
+            .filter(|e| e.v.iter().all(|&v| kept(v)))
+            .map(|e| CurveEdge {
+                v: e.v.map(|v| new[v]),
+                edge: e.edge,
+            })
+            .filter(|e| on_face.contains(&[e.v[0].min(e.v[1]), e.v[0].max(e.v[1])]))
+            .collect();
+        let inner = TetMesh {
+            points: (0..m.points.len())
+                .filter(|&v| kept(v))
+                .map(|v| m.points[v])
+                .collect(),
+            tets: tets.iter().map(|&t| m.tets[t].map(|v| new[v])).collect(),
+            tet_regions: tets.iter().map(|&t| m.tet_regions[t]).collect(),
+            faces,
+            surfaces: m.surfaces.clone(),
+            surface_owners: m.surface_owners.clone(),
+            plc_points: (0..m.plc_points).filter(|&v| kept(v)).count(),
+            point_class: (0..m.points.len())
+                .filter(|&v| kept(v))
+                .map(|v| m.point_class[v])
+                .collect(),
+            curve_edges,
+            periodic_points: m
+                .periodic_points
+                .iter()
+                .filter(|p| p.iter().all(|&v| kept(v)))
+                .map(|p| p.map(|v| new[v]))
+                .collect(),
+        };
+        let mut labels = self.labels.clone();
+        for s in labels
+            .solids
+            .iter_mut()
+            .filter(|s| regions.contains(&s.region))
+        {
+            s.region = 0;
+        }
+        let quality = rapidmesh_tet::quality_stats(&inner);
+        let mut left_out = self.left_out.clone();
+        left_out.extend(regions.iter().filter(|&&r| r != 0));
+        left_out.sort_unstable();
+        left_out.dedup();
+        Mesh {
+            left_out,
+            ..Mesh::new(inner, quality, labels, self.run.clone(), self.model.clone())
         }
     }
 
@@ -433,16 +540,6 @@ impl Mesh {
             &mut sets,
         );
         sets
-    }
-
-    /// Writes a gmsh MSH 4.1 file: geometric vertices, edges and faces are
-    /// point, curve and surface entities (tag = id + 1), regions volume
-    /// entities; physical groups are the region groups, the named sheet
-    /// tags and the named faces and edges.
-    pub fn write_msh(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut w = io::BufWriter::new(std::fs::File::create(path)?);
-        self.write_msh_to(&mut w)?;
-        w.flush()
     }
 
     pub fn write_msh_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -569,12 +666,21 @@ impl Mesh {
         self.poly_mesh(polyhedral).quality()
     }
 
-    /// Writes a VTK XML unstructured grid: the tets and the geometric
-    /// faces, with cell data `region`, `patch` and `face_tag`.
-    pub fn write_vtu(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        let mut w = io::BufWriter::new(std::fs::File::create(path)?);
-        rapidmesh_topo::export::write_vtu(&self.inner, &mut w)?;
-        w.flush()
+    /// Writes a VTK XML unstructured grid of the mesh of `order`: linear,
+    /// the tets and the geometric faces with cell data `region`, `patch`
+    /// and `face_tag`; quadratic, the ten-node tets with `region`.
+    pub fn write_vtu(&self, path: impl AsRef<Path>, order: crate::Order) -> io::Result<()> {
+        match order {
+            crate::Order::Linear => {
+                let mut w = io::BufWriter::new(std::fs::File::create(path)?);
+                rapidmesh_topo::export::write_vtu(&self.inner, &mut w)?;
+                w.flush()
+            }
+            crate::Order::Quadratic => {
+                let regions: Vec<u32> = self.tet_regions.iter().map(|r| r.0).collect();
+                self.second_order().write_vtu(&regions, path)
+            }
+        }
     }
 
     /// Quality, conformity and fidelity to the input, with located defects.
@@ -583,7 +689,7 @@ impl Mesh {
             .model
             .as_ref()
             .filter(|_| !self.inner.tets.is_empty())
-            .map(|m| rapidmesh_tet::measure(&self.inner, m));
+            .map(|m| rapidmesh_tet::measure(&self.inner, m, &self.left_out));
         Diagnostics {
             mesh: rapidmesh_tet::diagnose(&self.inner),
             fidelity,
@@ -663,15 +769,14 @@ impl Mesh {
         }
     }
 
-    /// The mesh in the viewer JSON schema, with the located defects.
-    pub fn viewer_json(&self, name: &str) -> String {
-        serde_json::to_string(&self.viewer(name)).expect("serialize")
-    }
-
-    /// [`Mesh::viewer_json`] of the second-order mesh: with the mid-edge
-    /// nodes off their chords, so the viewer draws the curved faces and
-    /// edges of the curved tets (see [`Mesh::second_order`]).
-    pub fn viewer_json_second_order(&self, name: &str) -> String {
+    /// The mesh in the viewer JSON schema, with the located defects; of
+    /// order quadratic with the mid-edge nodes off their chords, so the
+    /// viewer draws the curved faces and edges of the curved tets (see
+    /// [`Mesh::second_order`]).
+    pub fn viewer_json(&self, name: &str, order: crate::Order) -> String {
+        if order == crate::Order::Linear {
+            return serde_json::to_string(&self.viewer(name)).expect("serialize");
+        }
         let so = self.second_order();
         let mut curved = Vec::new();
         let mut seen = std::collections::HashSet::new();

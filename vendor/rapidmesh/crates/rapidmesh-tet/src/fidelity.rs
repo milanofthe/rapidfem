@@ -22,8 +22,8 @@ use crate::mesh::TetMesh;
 use crate::simplex::TET_FACES;
 use rapidmesh_brep::index::FacetBvh;
 use rapidmesh_csg::Tri;
-use rapidmesh_geom::vec3::{centroid, cross, dist, dot, len, sub, V3};
-use rapidmesh_geom::{SurfaceKind, CREASE_DEG};
+use rapidmesh_exact::vector::{centroid, cross, dist, dot, len, sub, V3};
+use rapidmesh_geom::{Surface, CREASE_DEG};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -62,8 +62,16 @@ pub struct Fidelity {
 /// facet carries the surface of its B-rep face, the geometry the mesher is
 /// given: a strip the B-rep absorbed into a neighbour (the faceting of a
 /// tangent contact) is that neighbour's surface, with no seam of its own.
-pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
+/// The regions `left_out` of the mesh (see `rapidmesh::Mesh::without_regions`)
+/// take their facets with them: one with no region beside it that is still
+/// meshed, and an edge of such facets alone, is not looked for.
+pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model, left_out: &[u32]) -> Fidelity {
     let plc = &model.plc;
+    let out = |r: &rapidmesh_geom::RegionTag| left_out.contains(&r.0);
+    let gone = |rs: &[rapidmesh_geom::RegionTag; 2]| {
+        rs.iter().any(out) && rs.iter().all(|r| r.0 == 0 || out(r))
+    };
+    let live: Vec<bool> = plc.region_tags.iter().map(|rs| !gone(rs)).collect();
     let mut label: Vec<u32> = plc.surface_refs.iter().map(|s| s.0).collect();
     for f in &model.brep.faces {
         for &t in &f.facets {
@@ -72,39 +80,48 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
     }
     let mpt = |i: usize| mesh.points[i];
     let ppt = |i: usize| plc.vertices[i];
-    // The curved analytic carrier of each PLC facet's B-rep face: near its
-    // face, the surface is measured there, not on the facets (a mesh finer
-    // than the faceting lies off the facets by their sagitta, and is right).
+    let ptris: Vec<[usize; 3]> = plc
+        .triangles
+        .iter()
+        .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+        .collect();
+    // The analytic carrier of each PLC facet's B-rep face: near its face,
+    // the surface is measured there, not on the facets (a mesh finer than
+    // the faceting lies off the facets by their sagitta, and is right; on a
+    // plane, past the chords of its curved edges).
     let mut facet_face: Vec<u32> = vec![u32::MAX; plc.triangles.len()];
     for (fi, f) in model.brep.faces.iter().enumerate() {
         for &t in &f.facets {
             facet_face[t as usize] = fi as u32;
         }
     }
-    let carrier = |t: u32| -> Option<&rapidmesh_brep::Surface> {
+    let carrier = |t: u32| -> Option<&rapidmesh_geom::Surface> {
         let f = *facet_face.get(t as usize)?;
         let face = model.brep.faces.get(f as usize)?;
         let s = model.brep.surface(face.surface);
-        (!matches!(
-            s,
-            rapidmesh_brep::Surface::Plane { .. } | rapidmesh_brep::Surface::Discrete(_)
-        ))
-        .then_some(s)
+        (!matches!(s, rapidmesh_geom::Surface::Discrete(_))).then_some(s)
     };
     // The distance of `p` from the surface near facet `t` found `d` away:
     // from its carrier where it has one and `p` is within `reach` of it.
+    // A mesh finer than the faceting lies off the facets by as much as the
+    // facets lie off their carriers (a plane's past the chords of its
+    // curved edges): the reach grows by the most any facet does (twice its
+    // middle's distance, about its sagitta).
+    let slack = (0..ptris.len() as u32)
+        .into_par_iter()
+        .filter_map(|t| {
+            let s = carrier(t)?;
+            let mid = centroid(corners(&ppt, &ptris[t as usize]));
+            Some(2.0 * dist(mid, s.closest(mid).0))
+        })
+        .reduce(|| 0.0, f64::max);
     let true_dist = |p: V3, t: u32, d: f64, reach: f64| -> f64 {
         match carrier(t) {
-            Some(s) if d <= reach => d.min(dist(p, s.closest(p).0)),
+            Some(s) if d <= reach + slack => d.min(dist(p, s.closest(p).0)),
             _ => d,
         }
     };
     let mtris = interfaces(mesh);
-    let ptris: Vec<[usize; 3]> = plc
-        .triangles
-        .iter()
-        .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
-        .collect();
     let mut fid = Fidelity::default();
     let plc_area: f64 = ptris.iter().map(|t| area(corners(&ppt, t))).sum();
     if mtris.is_empty() {
@@ -120,34 +137,32 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
             .collect::<Vec<_>>(),
     );
     let mesh_long: Vec<f64> = mtris.iter().map(|t| longest(corners(&mpt, t))).collect();
-    // Per face: its area, its deviation (relative to its size) and where.
-    let faces: Vec<Option<(f64, f64, V3)>> = mtris
+    let faces: Vec<Measured> = mtris
         .par_iter()
         .zip(&mesh_long)
         .map(|(t, &l)| {
             let v = corners(&mpt, t);
-            let c = centroid(&v);
-            let d = plc_bvh
+            let c = centroid(v);
+            let mut d = plc_bvh
                 .nearest(c)
                 .map_or(f64::INFINITY, |(t, d)| true_dist(c, t, d, l));
+            // Off its nearest facet's carrier, the face may lie on another
+            // one's within reach: a cap's rim, between the chord and the
+            // circle, is nearer the wall's facets than its own.
+            if d > FIDELITY_REL * l {
+                let mut near = Vec::new();
+                plc_bvh.facets_near_segment(c, c, l, &mut near);
+                for t in near {
+                    if let Some(s) = carrier(t) {
+                        d = d.min(dist(c, s.closest(c).0));
+                    }
+                }
+            }
             let rel = if l > 0.0 && d.is_finite() { d / l } else { 0.0 };
-            Some((area(v), rel, c))
+            Measured::at(area(v), rel, c)
         })
         .collect();
-    let (mut mesh_area, mut excess) = (0.0, 0.0);
-    for &(a, rel, c) in faces.iter().flatten() {
-        mesh_area += a;
-        fid.mesh_to_plc = fid.mesh_to_plc.max(rel);
-        if rel > FIDELITY_REL {
-            excess += a;
-            fid.defects.push(Defect {
-                kind: DefectKind::Excess,
-                pos: c,
-                value: rel,
-            });
-        }
-    }
-    fid.excess_area = ratio(excess, mesh_area);
+    (fid.excess_area, fid.mesh_to_plc) = tally(&faces, DefectKind::Excess, &mut fid.defects);
 
     // Labels: every labelled face against the PLC facets of its own surface
     // (one index per surface: a filter on one index for all could not prune
@@ -166,33 +181,21 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
             (l, (FacetBvh::build(&tris), ids))
         })
         .collect();
-    let faces: Vec<Option<(f64, f64, V3)>> = mesh
+    let faces: Vec<Measured> = mesh
         .faces
         .par_iter()
         .map(|sf| {
             let v = corners(&mpt, &sf.tri);
             let (a, l) = (area(v), longest(v));
-            let c = centroid(&v);
+            let c = centroid(v);
             let rel = by_label
                 .get(&sf.surface)
                 .and_then(|(bvh, ids)| bvh.nearest(c).map(|(i, d)| (ids[i as usize], d)))
                 .map_or(f64::INFINITY, |(t, d)| true_dist(c, t, d, l) / l);
-            Some((a, if l > 0.0 { rel } else { 0.0 }, c))
+            Measured::at(a, if l > 0.0 { rel } else { 0.0 }, c)
         })
         .collect();
-    let (mut labelled, mut mislabeled) = (0.0, 0.0);
-    for &(a, rel, c) in faces.iter().flatten() {
-        labelled += a;
-        if rel > FIDELITY_REL {
-            mislabeled += a;
-            fid.defects.push(Defect {
-                kind: DefectKind::Mislabeled,
-                pos: c,
-                value: rel,
-            });
-        }
-    }
-    fid.mislabeled_area = ratio(mislabeled, labelled);
+    fid.mislabeled_area = tally(&faces, DefectKind::Mislabeled, &mut fid.defects).0;
     // PLC -> mesh: samples on every PLC facet against the interface faces.
     let mesh_bvh = FacetBvh::build(
         &mtris
@@ -211,51 +214,36 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         &ppt,
         FIDELITY_SAMPLES_PER_FACE * mtris.len(),
     );
-    // Per facet: its uncovered area, its largest deviation and the worst
-    // uncovered sample.
-    let facets: Vec<(f64, f64, Option<(V3, f64)>)> = ptris
+    let facets: Vec<Measured> = ptris
         .par_iter()
         .enumerate()
         .map_init(Vec::new, |samples, (ti, t)| {
+            if !live[ti] {
+                return Measured::default();
+            }
             let v = corners(&ppt, t);
             let k = splits(longest(v), step);
             samples.clear();
             tri_samples(v, k, samples);
             let w = area(v) / samples.len() as f64;
-            let (mut uncovered, mut largest) = (0.0, 0.0f64);
-            let mut worst: Option<(V3, f64)> = None;
             // A sample of a curved facet stands for its carrier's point.
             if let Some(s) = carrier(ti as u32) {
                 for p in samples.iter_mut() {
                     *p = s.closest(*p).0;
                 }
             }
+            let mut m = Measured::default();
             for &p in samples.iter() {
-                let Some(rel) = local(p) else { continue };
-                largest = largest.max(rel);
-                if rel > FIDELITY_REL {
-                    uncovered += w;
-                    if worst.is_none_or(|(_, r)| rel > r) {
-                        worst = Some((p, rel));
-                    }
+                if let Some(rel) = local(p) {
+                    m.add(w, rel, p);
                 }
             }
-            (uncovered, largest, worst)
+            // The whole facet counts, a sample with no face near too.
+            m.weight = area(v);
+            m
         })
         .collect();
-    let mut uncovered = 0.0;
-    for &(u, largest, worst) in &facets {
-        uncovered += u;
-        fid.plc_to_mesh = fid.plc_to_mesh.max(largest);
-        if let Some((pos, value)) = worst {
-            fid.defects.push(Defect {
-                kind: DefectKind::Uncovered,
-                pos,
-                value,
-            });
-        }
-    }
-    fid.uncovered_area = ratio(uncovered, plc_area);
+    (fid.uncovered_area, fid.plc_to_mesh) = tally(&facets, DefectKind::Uncovered, &mut fid.defects);
 
     // Sharp PLC edges against sharp mesh edges. A segment is the degenerate
     // triangle (a, b, b), for which the closest-point clamp is exact.
@@ -268,8 +256,8 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         let (sa, sb) = (label[a as usize], label[b as usize]);
         sa == sb
             && match plc.surfaces[sa as usize] {
-                SurfaceKind::Plane { .. } | SurfaceKind::Facets => false,
-                SurfaceKind::Discrete(_) => cos_bend > cos_crease,
+                None | Some(Surface::Plane(_)) => false,
+                Some(Surface::Discrete(_)) => cos_bend > cos_crease,
                 _ => true,
             }
     };
@@ -281,10 +269,20 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
     let within = |a: u32, b: u32, cos_bend: f64| {
         label[a as usize] != label[b as usize] || seam(a, b, cos_bend)
     };
-    let mut creases: Vec<(V3, V3)> = sharp_edges(&ppt, &ptris, FIDELITY_SHARP_DEG, &within)
-        .into_iter()
-        .map(|e| (ppt(e[0]), ppt(e[1])))
+    // Each crease a piece of a straight segment, or of the curve of a B-rep
+    // edge between two arc lengths (sampled on the curve, not its chord).
+    let kept: Vec<u32> = (0..ptris.len() as u32)
+        .filter(|&t| live[t as usize])
         .collect();
+    let kept_tris: Vec<[usize; 3]> = kept.iter().map(|&t| ptris[t as usize]).collect();
+    let mut creases: Vec<(V3, V3, Option<(usize, f64, f64)>)> =
+        sharp_edges(&ppt, &kept_tris, FIDELITY_SHARP_DEG, &|a, b, cos_bend| {
+            within(kept[a as usize], kept[b as usize], cos_bend)
+        })
+        .into_iter()
+        .map(|e| (ppt(e[0]), ppt(e[1]), None))
+        .collect();
+    let mut curves: Vec<Box<dyn crate::curve::Curve>> = Vec::new();
     let surface_of = |c: &rapidmesh_brep::CoEdgeId| {
         model.brep.faces[model.brep.coedge(*c).face.0 as usize].plc_surface
     };
@@ -295,16 +293,27 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
         if e.coedges.iter().all(|c| Some(surface_of(c)) == first) {
             continue;
         }
-        let pts: Vec<V3> = match crate::curve::kinds::edge_curve(&model.brep, e) {
+        let face =
+            |c: &rapidmesh_brep::CoEdgeId| &model.brep.faces[model.brep.coedge(*c).face.0 as usize];
+        if e.coedges.iter().all(|c| gone(&face(c).regions)) {
+            continue;
+        }
+        match crate::curve::kinds::edge_curve(&model.brep, e) {
             Some(c) => {
                 let n = 2 * e.chain.len().max(2);
-                (0..=n)
-                    .map(|i| c.point_at(c.length() * i as f64 / n as f64))
-                    .collect()
+                let at = |i: usize| c.length() * i as f64 / n as f64;
+                let ci = curves.len();
+                creases.extend((0..n).map(|i| {
+                    (
+                        c.point_at(at(i)),
+                        c.point_at(at(i + 1)),
+                        Some((ci, at(i), at(i + 1))),
+                    )
+                }));
+                curves.push(c);
             }
-            None => e.chain.clone(),
-        };
-        creases.extend(pts.windows(2).map(|w| (w[0], w[1])));
+            None => creases.extend(e.chain.windows(2).map(|w| (w[0], w[1], None))),
+        }
     }
     let mut mesh_sharp = sharp_edges(&mpt, &mtris, FIDELITY_MESH_SHARP_DEG, &|_, _, _| false);
     let labelled: Vec<[usize; 3]> = mesh.faces.iter().map(|f| f.tri).collect();
@@ -315,18 +324,18 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
             .map(|e| Tri::new(mpt(e[0]), mpt(e[1]), mpt(e[1])))
             .collect::<Vec<_>>(),
     );
-    // Per crease: its length, the length missed, the largest deviation and
-    // the worst sample.
-    let per_crease: Vec<(f64, f64, f64, Option<(V3, f64)>)> = creases
+    let per_crease: Vec<Measured> = creases
         .par_iter()
-        .map(|&(a, b)| {
+        .map(|&(a, b, on)| {
             let l = dist(a, b);
             let k = splits(l, step);
-            let (mut missed, mut largest) = (0.0, 0.0f64);
-            let mut worst: Option<(V3, f64)> = None;
+            let mut m = Measured::default();
             for i in 0..k {
                 let s = (i as f64 + 0.5) / k as f64;
-                let p: V3 = std::array::from_fn(|j| a[j] + s * (b[j] - a[j]));
+                let p: V3 = match on {
+                    Some((c, s0, s1)) => curves[c].point_at(s0 + s * (s1 - s0)),
+                    None => std::array::from_fn(|j| a[j] + s * (b[j] - a[j])),
+                };
                 let Some((fi, _)) = mesh_bvh.nearest(p) else {
                     continue;
                 };
@@ -334,33 +343,62 @@ pub fn measure(mesh: &TetMesh, model: &rapidmesh_brep::Model) -> Fidelity {
                 if size <= 0.0 {
                     continue;
                 }
-                let rel = seg_bvh.nearest_dist(p) / size;
-                largest = largest.max(rel);
-                if rel > FIDELITY_REL {
-                    missed += l / k as f64;
-                    if worst.is_none_or(|(_, r)| rel > r) {
-                        worst = Some((p, rel));
-                    }
-                }
+                m.add(l / k as f64, seg_bvh.nearest_dist(p) / size, p);
             }
-            (l, missed, largest, worst)
+            m.weight = l;
+            m
         })
         .collect();
-    let (mut sharp_len, mut missed) = (0.0, 0.0);
-    for &(l, m, largest, worst) in &per_crease {
-        sharp_len += l;
-        missed += m;
-        fid.feature_dev = fid.feature_dev.max(largest);
-        if let Some((pos, value)) = worst {
-            fid.defects.push(Defect {
-                kind: DefectKind::FeatureMissed,
-                pos,
-                value,
-            });
+    (fid.feature_missed, fid.feature_dev) =
+        tally(&per_crease, DefectKind::FeatureMissed, &mut fid.defects);
+    fid
+}
+
+/// One item measured against the other surface: its weight (an area, a
+/// length), the weight off it (farther than [`FIDELITY_REL`] of the size),
+/// its largest deviation and its worst point off it.
+#[derive(Clone, Copy, Default)]
+struct Measured {
+    weight: f64,
+    off: f64,
+    largest: f64,
+    worst: Option<(V3, f64)>,
+}
+
+impl Measured {
+    /// An item of `weight` measured at one point `p`, `rel` off.
+    fn at(weight: f64, rel: f64, p: V3) -> Measured {
+        let mut m = Measured::default();
+        m.add(weight, rel, p);
+        m
+    }
+
+    /// A sample of `weight` at `p`, `rel` off, into the item.
+    fn add(&mut self, weight: f64, rel: f64, p: V3) {
+        self.weight += weight;
+        self.largest = self.largest.max(rel);
+        if rel > FIDELITY_REL {
+            self.off += weight;
+            if self.worst.is_none_or(|(_, r)| rel > r) {
+                self.worst = Some((p, rel));
+            }
         }
     }
-    fid.feature_missed = ratio(missed, sharp_len);
-    fid
+}
+
+/// The share of the weight of `items` off the other surface and the
+/// largest deviation; a defect of `kind` at each item's worst point.
+fn tally(items: &[Measured], kind: DefectKind, defects: &mut Vec<Defect>) -> (f64, f64) {
+    let (mut weight, mut off, mut largest) = (0.0, 0.0, 0.0f64);
+    for m in items {
+        weight += m.weight;
+        off += m.off;
+        largest = largest.max(m.largest);
+        if let Some((pos, value)) = m.worst {
+            defects.push(Defect { kind, pos, value });
+        }
+    }
+    (ratio(off, weight), largest)
 }
 
 /// The mesh interfaces: tet faces where the region changes or the tets end,

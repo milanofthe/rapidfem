@@ -25,7 +25,7 @@ pub mod triangulate;
 
 pub use arrange::{arrange, ArrangeError, Arrangement};
 pub use boolean::{boolean, BoolOp, BooleanResult, Solid};
-pub use classify::{classify, winding_beside, Placement, TriBoxes};
+pub use classify::{classify, winding_beside, Classifier, Placement, Sample, TriBoxes};
 pub use constraint::{Constraint, ConstraintLine};
 pub use facet::PlanarFacet;
 pub use planar::{arrange_facets, PlanarInput};

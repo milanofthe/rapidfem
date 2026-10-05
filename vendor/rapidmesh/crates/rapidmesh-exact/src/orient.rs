@@ -246,11 +246,7 @@ pub fn incircle2d(a: &Point3, b: &Point3, c: &Point3, d: &Point3, drop: Axis) ->
         c.as_explicit(),
         d.as_explicit(),
     ) {
-        let proj = |p: [f64; 3]| match drop {
-            Axis::X => [p[1], p[2]],
-            Axis::Y => [p[2], p[0]],
-            Axis::Z => [p[0], p[1]],
-        };
+        let proj = |p: [f64; 3]| drop.project(p);
         return Some(Sign::of_f64(geometry_predicates::incircle(
             proj(pa),
             proj(pb),
@@ -303,11 +299,7 @@ pub fn incircle2d(a: &Point3, b: &Point3, c: &Point3, d: &Point3, drop: Axis) ->
 pub fn orient2d(a: &Point3, b: &Point3, c: &Point3, drop: Axis) -> Option<Sign> {
     // Fast adaptive path: all points explicit.
     if let (Some(pa), Some(pb), Some(pc)) = (a.as_explicit(), b.as_explicit(), c.as_explicit()) {
-        let proj = |p: [f64; 3]| match drop {
-            Axis::X => [p[1], p[2]],
-            Axis::Y => [p[2], p[0]],
-            Axis::Z => [p[0], p[1]],
-        };
+        let proj = |p: [f64; 3]| drop.project(p);
         return Some(Sign::of_f64(geometry_predicates::orient2d(
             proj(pa),
             proj(pb),

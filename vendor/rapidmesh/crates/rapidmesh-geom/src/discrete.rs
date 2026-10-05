@@ -11,7 +11,9 @@
 //! importer's dihedral threshold, not here.
 
 use crate::bvh::Bvh;
-use crate::vec3::{bbox, closest_on_tri, cross, dot, normalize, sub, V3};
+use rapidmesh_exact::vector::{
+    bbox, centroid, closest_on_tri, cross, dist2, dot, normalize, sub, V3,
+};
 
 /// One smooth soup patch with a closest-point accelerator.
 #[derive(Debug)]
@@ -32,15 +34,13 @@ pub struct DiscreteSurface {
     bvh: Bvh,
 }
 
-fn d2(a: V3, b: V3) -> f64 {
-    let d = sub(a, b);
-    dot(d, d)
-}
-
 impl DiscreteSurface {
     /// Builds the patch accelerator. `tris` must be consistently wound (the
-    /// normals give the outward side).
+    /// normals give the outward side). The facets are kept in an order of
+    /// their own (see [`crate::plc::canonical_mesh`]): a scan read with its
+    /// triangles in another order is the same patch.
     pub fn new(points: Vec<V3>, tris: Vec<[u32; 3]>) -> DiscreteSurface {
+        let (points, tris, _, _) = crate::plc::canonical_mesh(&points, &tris);
         let normals: Vec<V3> = tris
             .iter()
             .map(|t| {
@@ -54,12 +54,7 @@ impl DiscreteSurface {
             .collect();
         let centroids: Vec<V3> = tris
             .iter()
-            .map(|t| {
-                std::array::from_fn(|k| {
-                    (points[t[0] as usize][k] + points[t[1] as usize][k] + points[t[2] as usize][k])
-                        / 3.0
-                })
-            })
+            .map(|t| centroid(t.map(|v| points[v as usize])))
             .collect();
         // Per-facet curvature: for every interior edge (two owners inside
         // this smooth patch) the normals turn by theta over the centroid
@@ -94,7 +89,7 @@ impl DiscreteSurface {
                 if theta <= 1e-9 {
                     continue;
                 }
-                let d = d2(centroids[i], centroids[j]).sqrt();
+                let d = dist2(centroids[i], centroids[j]).sqrt();
                 let r = d / theta;
                 curv_r[i] = curv_r[i].min(r);
                 curv_r[j] = curv_r[j].min(r);
@@ -113,7 +108,10 @@ impl DiscreteSurface {
                 }
                 let mut lmax2 = 0.0f64;
                 for e in 0..3 {
-                    lmax2 = lmax2.max(d2(points[t[e] as usize], points[t[(e + 1) % 3] as usize]));
+                    lmax2 = lmax2.max(dist2(
+                        points[t[e] as usize],
+                        points[t[(e + 1) % 3] as usize],
+                    ));
                 }
                 curv_r[i] = curv_r[i].max(4.0 * lmax2.sqrt());
             }
@@ -139,6 +137,13 @@ impl DiscreteSurface {
 
     /// [`DiscreteSurface::closest`] plus the footpoint's facet index.
     pub fn closest_facet(&self, p: V3) -> (V3, V3, usize) {
+        self.closest_facet_near(p, usize::MAX)
+    }
+
+    /// [`DiscreteSurface::closest_facet`] searched from facet `hint`, one
+    /// near the answer: its distance bounds the search from the start, so
+    /// only the facets nearer than it are looked at.
+    pub fn closest_facet_near(&self, p: V3, hint: usize) -> (V3, V3, usize) {
         let on = |ti: usize| {
             let t = self.tris[ti];
             closest_on_tri(
@@ -148,11 +153,15 @@ impl DiscreteSurface {
                 self.points[t[2] as usize],
             )
         };
+        let start = (hint < self.tris.len()).then(|| (hint, on(hint)));
+        let limit = start.map_or(f64::INFINITY, |(_, q)| dist2(p, q));
         match self
             .bvh
-            .nearest(p, f64::INFINITY, |ti| Some(d2(p, on(ti as usize))))
+            .nearest(p, limit, |ti| Some(dist2(p, on(ti as usize))))
+            .map(|(ti, _)| (ti as usize, on(ti as usize)))
+            .or(start)
         {
-            Some((ti, _)) => (on(ti as usize), self.normals[ti as usize], ti as usize),
+            Some((ti, q)) => (q, self.normals[ti], ti),
             None => (p, [0.0, 0.0, 1.0], 0),
         }
     }

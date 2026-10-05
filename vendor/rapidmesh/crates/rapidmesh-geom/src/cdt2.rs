@@ -5,27 +5,58 @@
 //! their charts) and
 //! the tessellation of imported faces in their parameters.
 
+use rapidmesh_exact::vector::V2;
 use rapidmesh_exact::{incircle2d, orient2d, Axis, Point3, Sign};
 
-type P2 = [f64; 2];
-
-fn p3(p: P2) -> Point3 {
+fn p3(p: V2) -> Point3 {
     Point3::explicit(p[0], p[1], 0.0)
 }
 
 /// Orientation of (a, b, c) in the xy plane (exact).
-pub fn orient(a: P2, b: P2, c: P2) -> Sign {
+pub fn orient(a: V2, b: V2, c: V2) -> Sign {
     orient2d(&p3(a), &p3(b), &p3(c), Axis::Z).expect("explicit points are valid")
 }
 
-/// True iff `d` is strictly inside the circumcircle of CCW triangle (a, b, c)
-/// (exact; cocircular -> false, a consistent choice yielding a valid mesh).
-fn in_circumcircle(a: P2, b: P2, c: P2, d: P2) -> bool {
-    incircle2d(&p3(a), &p3(b), &p3(c), &p3(d), Axis::Z) == Some(Sign::Positive)
+/// True iff `d` is inside the circumcircle of CCW triangle (a, b, c), exactly;
+/// four points on one circle decided by a symbolic perturbation of their
+/// heights on the lifting paraboloid, the lexicographically smallest point
+/// lifted most. So the Delaunay triangulation of a grid, whose squares are
+/// cocircular, is one whatever order its points come in.
+fn in_circumcircle(a: V2, b: V2, c: V2, d: V2) -> bool {
+    match incircle2d(&p3(a), &p3(b), &p3(c), &p3(d), Axis::Z) {
+        Some(Sign::Positive) => true,
+        Some(Sign::Negative) | None => false,
+        Some(Sign::Zero) => {
+            let p = [a, b, c, d];
+            // A corner of the triangle itself is on its circle, not in it.
+            if a == d || b == d || c == d {
+                return false;
+            }
+            let mut rank = [0, 1, 2, 3];
+            rank.sort_by(|&i, &j| {
+                p[i][0]
+                    .total_cmp(&p[j][0])
+                    .then(p[i][1].total_cmp(&p[j][1]))
+            });
+            // The lifted determinant grows with the height of point i by
+            // (-1)^i times the orientation of the other three, in order.
+            rank.into_iter()
+                .find_map(|i| {
+                    let o: Vec<V2> = (0..4).filter(|&j| j != i).map(|j| p[j]).collect();
+                    let s = match orient(o[0], o[1], o[2]) {
+                        Sign::Positive => 1,
+                        Sign::Negative => -1,
+                        Sign::Zero => return None,
+                    };
+                    Some(if i % 2 == 0 { s } else { -s } > 0)
+                })
+                .unwrap_or(false)
+        }
+    }
 }
 
 /// The triangle reordered to CCW.
-fn ccw(t: [usize; 3], pts: &[P2]) -> [usize; 3] {
+fn ccw(t: [usize; 3], pts: &[V2]) -> [usize; 3] {
     if orient(pts[t[0]], pts[t[1]], pts[t[2]]) == Sign::Negative {
         [t[0], t[2], t[1]]
     } else {
@@ -40,11 +71,11 @@ const NONE2: usize = usize::MAX;
 /// linear scan if the walk does not converge (degenerate connectivity).
 fn locate2(
     start: usize,
-    p: P2,
+    p: V2,
     tris: &[[usize; 3]],
     nbr: &[[usize; 3]],
     alive: &[bool],
-    pts: &[P2],
+    pts: &[V2],
 ) -> usize {
     let mut t = start;
     for _ in 0..tris.len() * 2 + 16 {
@@ -75,6 +106,56 @@ fn locate2(
         .unwrap_or(start)
 }
 
+/// The order points go into a triangulation: biased randomized insertion
+/// (rounds of doubling size, drawn at random, each in Morton order). In
+/// their given order the samples of a boundary, along a line one after the
+/// other, take time quadratic in their number.
+///
+/// Of points at one place only the first is in it, as in the given order.
+fn insertion_order(points: &[V2]) -> Vec<usize> {
+    let mut seen: rustc_hash::FxHashSet<[u64; 2]> = rustc_hash::FxHashSet::default();
+    let mut order: Vec<usize> = (0..points.len())
+        .filter(|&i| seen.insert(points[i].map(f64::to_bits)))
+        .collect();
+    let n = order.len();
+    // A fixed xorshift: the same points give the same triangulation.
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    for i in (1..n).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        order.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for p in points {
+        for k in 0..2 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    let key = |p: V2| {
+        let q = |k: usize| {
+            let span = (hi[k] - lo[k]).max(1e-300);
+            (((p[k] - lo[k]) / span * 65535.0) as u64).min(65535)
+        };
+        let spread = |mut v: u64| {
+            v = (v | (v << 8)) & 0x00FF_00FF;
+            v = (v | (v << 4)) & 0x0F0F_0F0F;
+            v = (v | (v << 2)) & 0x3333_3333;
+            (v | (v << 1)) & 0x5555_5555
+        };
+        spread(q(0)) | (spread(q(1)) << 1)
+    };
+    // Rounds from the end: the last half, the quarter before, and so on.
+    let mut end = n;
+    while end > 0 {
+        let start = if end <= 64 { 0 } else { end / 2 };
+        order[start..end].sort_by_key(|&i| key(points[i]));
+        end = start;
+    }
+    order
+}
+
 /// Links the directed p-edge `(u, v)` at edge slot `es` of triangle `slot` to
 /// the neighbouring new triangle that owns the reverse edge `(v, u)`.
 fn link_pedge(
@@ -101,7 +182,7 @@ fn link_pedge(
 /// super-triangle lets a constraint walk and the exterior flood-fill terminate.
 /// Triangles are CCW index triples; exact predicates throughout.
 pub struct Cdt {
-    pts: Vec<P2>,
+    pts: Vec<V2>,
     /// Number of real points; super-triangle vertices are `n, n+1, n+2`.
     pub n: usize,
     tris: Vec<[usize; 3]>,
@@ -116,7 +197,7 @@ pub struct Cdt {
 
 impl Cdt {
     /// Builds the Delaunay triangulation of `points` (super-triangle retained).
-    pub fn new(points: &[P2]) -> Cdt {
+    pub fn new(points: &[V2]) -> Cdt {
         let n = points.len();
         let mut lo = points.first().copied().unwrap_or([0.0, 0.0]);
         let mut hi = lo;
@@ -129,7 +210,7 @@ impl Cdt {
         let d = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-12);
         let mid = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])];
         let big = 1000.0 * d;
-        let mut pts: Vec<P2> = points.to_vec();
+        let mut pts: Vec<V2> = points.to_vec();
         let (s0, s1, s2) = (n, n + 1, n + 2);
         pts.push([mid[0] - big, mid[1] - big]);
         pts.push([mid[0] + big, mid[1] - big]);
@@ -149,7 +230,7 @@ impl Cdt {
         let mut edge_map: rustc_hash::FxHashMap<(usize, usize), (usize, usize)> =
             rustc_hash::FxHashMap::default();
 
-        for i in 0..n {
+        for i in insertion_order(points) {
             let p = pts[i];
             let start = locate2(last, p, &tris, &nbr, &alive, &pts);
             let tv = tris[start];
@@ -275,7 +356,7 @@ impl Cdt {
     /// incremental consumers (the mesh smoother) can move points and re-restore
     /// locally instead of re-triangulating from scratch.
     pub fn new_constrained(
-        points: &[P2],
+        points: &[V2],
         segments: &[(usize, usize)],
     ) -> (Cdt, DSet<(usize, usize)>) {
         let mut cdt = Cdt::new(points);
@@ -289,7 +370,7 @@ impl Cdt {
 
     /// [`Cdt::triangles`] filtered by the region membership of the centroid:
     /// the conforming triangulation of the face (exterior + holes dropped).
-    pub fn kept_triangles(&self, inside: impl Fn(P2) -> bool) -> Vec<[usize; 3]> {
+    pub fn kept_triangles(&self, inside: impl Fn(V2) -> bool) -> Vec<[usize; 3]> {
         self.triangles()
             .into_iter()
             .filter(|t| {
@@ -308,14 +389,14 @@ impl Cdt {
     }
 
     /// Position of vertex `i` (real or super).
-    pub fn point(&self, i: usize) -> P2 {
+    pub fn point(&self, i: usize) -> V2 {
         self.pts[i]
     }
 
     /// Moves vertex `i` in place. The caller guarantees the move keeps every
     /// incident alive triangle positively oriented (guarded moves); Delaunayness
     /// is repaired afterwards via [`Cdt::restore`].
-    pub fn set_point(&mut self, i: usize, p: P2) {
+    pub fn set_point(&mut self, i: usize, p: V2) {
         self.pts[i] = p;
     }
 
@@ -616,7 +697,7 @@ impl Cdt {
 
 /// Incremental 2D Delaunay triangulation of `points` (super-triangle removed),
 /// CCW triples into `points`. Backs the relaxation passes (`cvt_fill`).
-pub fn delaunay2(points: &[P2]) -> Vec<[usize; 3]> {
+pub fn delaunay2(points: &[V2]) -> Vec<[usize; 3]> {
     if points.len() < 3 {
         return Vec::new();
     }
@@ -636,13 +717,54 @@ pub type DSet<T> =
 /// non-convex, holed) face: exactly the 2D analogue of the boundary-constrained
 /// volume (\cref{prop:watertight}).
 pub fn triangulate_constrained(
-    points: &[P2],
+    points: &[V2],
     segments: &[(usize, usize)],
-    inside: impl Fn(P2) -> bool,
+    inside: impl Fn(V2) -> bool,
 ) -> Vec<[usize; 3]> {
     if points.len() < 3 {
         return Vec::new();
     }
     let (cdt, _constraints) = Cdt::new_constrained(points, segments);
     cdt.kept_triangles(inside)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The triangles of `tris` over `pts` by their corners' places, each
+    /// sorted.
+    fn by_place(pts: &[V2], tris: &[[usize; 3]]) -> Vec<[[u64; 2]; 3]> {
+        let mut out: Vec<[[u64; 2]; 3]> = tris
+            .iter()
+            .map(|t| {
+                let mut k = t.map(|i| pts[i].map(f64::to_bits));
+                k.sort_unstable();
+                k
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn a_grid_triangulates_alike_in_any_order() {
+        // Every square of a grid is cocircular: its diagonal is a tie.
+        let grid: Vec<V2> = (0..12)
+            .flat_map(|i| (0..9).map(move |j| [i as f64 * 0.5, j as f64 * 0.5]))
+            .collect();
+        let want = by_place(&grid, &delaunay2(&grid));
+        assert_eq!(want.len(), 2 * 11 * 8);
+        let mut x: u64 = 1;
+        for _ in 0..6 {
+            let mut shuffled = grid.clone();
+            for i in (1..shuffled.len()).rev() {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                shuffled.swap(i, (x >> 33) as usize % (i + 1));
+            }
+            assert_eq!(by_place(&shuffled, &delaunay2(&shuffled)), want);
+        }
+    }
 }

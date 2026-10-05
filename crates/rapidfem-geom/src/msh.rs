@@ -196,7 +196,7 @@ mod tests {
         g.name(&face([0.0, 0.0, 1.0]), "port_out").unwrap();
         let m = g.mesh(&MeshOptions::default()).unwrap();
         let path = std::env::temp_dir().join(format!("rapidfem-msh-{}.msh", std::process::id()));
-        m.write_msh(&path).unwrap();
+        m.write_msh(&path, rapidmesh::Order::Linear).unwrap();
         let s = MeshScene::load(&path).unwrap();
         std::fs::remove_file(&path).ok();
 

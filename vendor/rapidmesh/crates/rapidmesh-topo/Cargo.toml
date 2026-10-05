@@ -13,7 +13,9 @@ default = []
 mesher = ["dep:rapidmesh-tet", "dep:rapidmesh-geom"]
 
 [dependencies]
+rustc-hash.workspace = true
 rapidmesh-tet = { workspace = true, optional = true }
+rapidmesh-exact.workspace = true
 rapidmesh-geom = { workspace = true, optional = true }
 
 [lints]

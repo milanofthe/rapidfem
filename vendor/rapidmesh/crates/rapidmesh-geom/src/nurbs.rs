@@ -10,16 +10,7 @@
 //! (the exact circle/ellipse) need the rational form, so the type carries
 //! weights throughout and de-homogenizes with the quotient rule.
 
-#[cfg(test)]
-type P2 = [f64; 2];
-
-fn dot<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
-    (0..N).map(|k| a[k] * b[k]).sum()
-}
-
-fn dist<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
-    (0..N).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt()
-}
+use rapidmesh_exact::vector::{dist, dot};
 
 /// Highest supported degree. Basis evaluation runs on fixed-size stack
 /// arrays, so evaluating a curve or surface never allocates.
@@ -73,12 +64,14 @@ pub(crate) fn basis_funs(span: usize, u: f64, p: usize, knots: &[f64]) -> [f64; 
 /// of degree `p` (Piegl & Tiller A2.3). Returns `ders[k][j]`, `k` in `0..=2`, `j` in
 /// `0..=degree` for control point `span - degree + j`.
 pub(crate) fn ders_basis(knots: &[f64], p: usize, span: usize, u: f64) -> [[f64; W]; 3] {
-    // The triangle of basis values takes (p + 1)^2 entries: on a table for
-    // the common low degrees, not one for the highest on every call.
-    if p < 8 {
-        ders_basis_in::<8>(knots, p, span, u)
-    } else {
-        ders_basis_in::<W>(knots, p, span, u)
+    // The triangle of basis values takes (p + 1)^2 entries: on a table
+    // about the degree's size (a CAD loft's sections give degrees past 8),
+    // not one for the highest on every call.
+    match p {
+        0..4 => ders_basis_in::<4>(knots, p, span, u),
+        4..8 => ders_basis_in::<8>(knots, p, span, u),
+        8..16 => ders_basis_in::<16>(knots, p, span, u),
+        _ => ders_basis_in::<W>(knots, p, span, u),
     }
 }
 
@@ -499,8 +492,9 @@ impl<const N: usize> NurbsCurve<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rapidmesh_exact::vector::V2;
 
-    fn norm(p: P2) -> f64 {
+    fn norm(p: V2) -> f64 {
         (p[0] * p[0] + p[1] * p[1]).sqrt()
     }
 
@@ -605,7 +599,7 @@ mod tests {
     /// for points near, far and on the curve.
     #[test]
     fn closest_param_matches_a_dense_scan() {
-        let pts: Vec<P2> = (0..40)
+        let pts: Vec<V2> = (0..40)
             .map(|i| {
                 let t = i as f64 / 39.0 * std::f64::consts::TAU;
                 [t.cos() * (1.0 + 0.3 * (3.0 * t).sin()), 0.6 * t.sin()]
@@ -613,7 +607,7 @@ mod tests {
             .collect();
         let c = NurbsCurve::interpolate(&pts);
         let (lo, hi) = c.domain();
-        let d = |t: f64, q: P2| {
+        let d = |t: f64, q: V2| {
             let x = c.eval(t);
             ((x[0] - q[0]).powi(2) + (x[1] - q[1]).powi(2)).sqrt()
         };

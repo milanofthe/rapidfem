@@ -25,7 +25,7 @@
 
 use std::sync::OnceLock;
 
-use rapidfem_core::geom::{add, cross, dot, norm, scale, sub};
+use rapidfem_core::geom::{cross, dot, norm, scale, sub};
 use rapidmesh::shapes::{Loft, Prism, Revolve, Shape, Sheet, Sweep};
 use std::collections::BTreeMap;
 

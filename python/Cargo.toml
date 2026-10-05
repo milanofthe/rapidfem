@@ -1,6 +1,6 @@
 [package]
 name = "rapidfem-python"
-version = "0.22.1"
+version = "0.23.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 

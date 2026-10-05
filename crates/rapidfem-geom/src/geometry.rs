@@ -25,14 +25,14 @@
 
 use std::sync::OnceLock;
 
-use rapidfem_core::geom::{add, dot, norm, scale, sub};
+use rapidfem_core::geom::{add, cross, dot, norm, scale, sub};
 use rapidmesh::shapes::{Loft, Prism, Revolve, Shape, Sheet, Sweep};
 use std::collections::BTreeMap;
 
 use crate::fem_mesh::Group;
 use crate::path::spline;
 use crate::sheet_ops::{self, SheetOp};
-use rapidmesh::{EdgeCut, EdgePick, FaceFilter, MeshOptions, SurfaceOptions, Object as RmObject, Scope, Solid, Topology, Transform};
+use rapidmesh::{BoolOp, EdgeCut, EdgePick, FaceFilter, MeshOptions, SurfaceOptions, Object as RmObject, Scope, SheetRef, Solid, Topology, Transform};
 
 /// Index of an object in its [`Geometry`].
 pub type ObjId = usize;
@@ -55,8 +55,58 @@ pub enum Item {
     Step { path: std::path::PathBuf, body: usize },
 }
 
-/// A sheet and its own transforms, applied before its object's.
-pub type Piece = (Sheet, Vec<Transform>);
+/// One planar piece of a sheet object.
+#[derive(Clone, Debug)]
+pub enum Piece {
+    /// A sheet and its own transforms, applied before its object's.
+    Sheet(Sheet, Vec<Transform>),
+    /// rapidmesh's exact boolean `op` of the pieces `target` with each tool
+    /// (a tool's pieces merged first) in their common plane, then moved by
+    /// `after`.
+    Boolean { op: SheetOp, target: Vec<Piece>, tools: Vec<Vec<Piece>>, after: Vec<Transform> },
+}
+
+impl Piece {
+    /// The piece moved by `more` after its own transforms.
+    fn then(&self, more: &[Transform]) -> Piece {
+        let mut p = self.clone();
+        match &mut p {
+            Piece::Sheet(_, own) | Piece::Boolean { after: own, .. } => own.extend_from_slice(more),
+        }
+        p
+    }
+
+    /// The piece added to `g` as one sheet with face tag `tag`.
+    fn add(&self, g: &mut rapidmesh::Geometry, tag: u32, maxh: Option<f64>) -> rapidmesh::Result<SheetRef> {
+        let (r, moves) = match self {
+            Piece::Sheet(sheet, own) => (g.add_sheet(sheet, tag, maxh)?, own),
+            Piece::Boolean { op, target, tools, after } => {
+                let t = Piece::merged(target, g, tag, maxh)?;
+                let tools = tools.iter().map(|t| Piece::merged(t, g, tag, maxh)).collect::<Result<Vec<_>, _>>()?;
+                let op = match op {
+                    SheetOp::Union => BoolOp::Union,
+                    SheetOp::Difference => BoolOp::Difference,
+                    SheetOp::Intersection => BoolOp::Intersection,
+                };
+                (g.sheet_boolean(op, t, &tools)?, after)
+            }
+        };
+        for &tr in moves {
+            g.transform(r, tr)?;
+        }
+        Ok(r)
+    }
+
+    /// `pieces` added to `g` and merged into one sheet.
+    fn merged(pieces: &[Piece], g: &mut rapidmesh::Geometry, tag: u32, maxh: Option<f64>) -> rapidmesh::Result<SheetRef> {
+        let refs = pieces.iter().map(|p| p.add(g, tag, maxh)).collect::<Result<Vec<_>, _>>()?;
+        match refs.split_first() {
+            Some((&first, [])) => Ok(first),
+            Some((&first, rest)) => g.sheet_boolean(BoolOp::Union, first, rest),
+            None => Err(rapidmesh::Error::Invalid("an empty sheet operand".into())),
+        }
+    }
+}
 
 /// A solid or sheet of the scene with its attributes.
 #[derive(Clone, Debug)]
@@ -240,31 +290,55 @@ pub fn normalized(a: [f64; 3]) -> [f64; 3] {
     [a[0] / n, a[1] / n, a[2] / n]
 }
 
-/// The sheet of a planar polygon with holes, its vertices in 3D: an xy
-/// polygon where every vertex has the same height, a plate for a
-/// parallelogram in any other plane, `None` for a general polygon off the
-/// xy plane (not available yet, milanofthe/rapidmesh-dev#140).
+/// The sheet of a planar polygon with holes, its vertices in 3D, in the
+/// plane they span: an xy polygon at its height when every vertex has the
+/// same z, the plane's own axes when it is square to x or y, otherwise a
+/// frame in the tilted plane. `None` when the vertices are not in one plane.
 pub fn polygon_sheet(points: &[[f64; 3]], holes: &[Vec<[f64; 3]>]) -> Option<Sheet> {
-    let first = points.first()?;
-    let size = points.iter().flatten().fold(1.0_f64, |m, &c| m.max(c.abs()));
-    let (lo, hi) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p[2]), hi.max(p[2])));
-    if hi - lo <= 1e-12 * size {
-        let xy = |pts: &[[f64; 3]]| pts.iter().map(|p| [p[0], p[1]]).collect::<Vec<_>>();
-        return Some(Sheet::Polygon {
-            points: xy(points),
-            holes: holes.iter().map(|h| xy(h)).collect(),
-            position: [0.0, 0.0, first[2]],
-        });
+    let first = *points.first()?;
+    let all = || points.iter().chain(holes.iter().flatten());
+    let size = all().fold(0.0_f64, |m, p| m.max(norm(sub(*p, first))));
+    if size == 0.0 {
+        return None;
     }
-    if let [a, b, c, d] = points {
-        // numpy's allclose on the diagonal sums
-        let (s, t) = (add(*a, *c), add(*b, *d));
-        let close = (0..3).all(|k| (s[k] - t[k]).abs() <= 1e-8 + 1e-5 * t[k].abs());
-        if holes.is_empty() && close {
-            return Some(Sheet::plate(*a, sub(*b, *a), sub(*d, *a)));
+    let mut n = [0.0; 3];
+    for k in 0..points.len() {
+        let (a, b) = (points[k], points[(k + 1) % points.len()]);
+        n[0] += (a[1] - b[1]) * (a[2] + b[2]);
+        n[1] += (a[2] - b[2]) * (a[0] + b[0]);
+        n[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    if norm(n) == 0.0 {
+        return None;
+    }
+    let n = normalized(n);
+    if all().any(|p| dot(sub(*p, first), n).abs() > 1e-9 * size) {
+        return None;
+    }
+    // an axis plane keeps its coordinates exact: the two other axes in turn
+    let axis = (0..3).find(|&k| all().all(|p| (p[k] - first[k]).abs() <= 1e-12 * size));
+    let (origin, u, v) = match axis {
+        Some(k) => {
+            let unit_along = |i: usize| {
+                let mut e = [0.0; 3];
+                e[i] = 1.0;
+                e
+            };
+            let mut origin = [0.0; 3];
+            origin[k] = first[k];
+            (origin, unit_along((k + 1) % 3), unit_along((k + 2) % 3))
         }
-    }
-    None
+        None => {
+            let far = all().fold(first, |m, p| if norm(sub(*p, first)) > norm(sub(m, first)) { *p } else { m });
+            let u = normalized(sub(far, first));
+            (first, u, cross(n, u))
+        }
+    };
+    let flat = |pts: &[[f64; 3]]| pts.iter().map(|p| {
+        let d = sub(*p, origin);
+        [dot(d, u), dot(d, v)]
+    }).collect::<Vec<_>>();
+    Some(Sheet::Polygon { points: flat(points), holes: holes.iter().map(|h| flat(h)).collect(), position: origin, u, v })
 }
 
 /// A B-rep face of the realised model.
@@ -442,25 +516,22 @@ impl Geometry {
 
     /// Combines the sheet `target` with the sheets `tools`: a union keeps
     /// every piece under the target's tag and leaves the merge to rapidmesh,
-    /// a difference or intersection goes through [`crate::sheet_ops`] in the
-    /// common plane. The target becomes the result, the tools are used up.
+    /// a difference or intersection becomes rapidmesh's exact boolean in the
+    /// common plane, tried once here so a bad operand fails now. The target
+    /// becomes the result, the tools are used up.
     pub fn sheet_boolean(&mut self, op: SheetOp, target: ObjId, tools: &[ObjId]) -> Result<(), String> {
         let mut pieces = self.pieces(target)?;
         let others = tools.iter().map(|&i| self.pieces(i)).collect::<Result<Vec<_>, _>>()?;
-        let (item, placement) = if op == SheetOp::Union {
+        let item = if op == SheetOp::Union {
             pieces.extend(others.into_iter().flatten());
-            (Item::Sheets(pieces), Vec::new())
+            Item::Sheets(pieces)
         } else {
-            let (mut sheets, placement) = sheet_ops::boolean(op, &pieces, &others.concat())?;
-            let item = if sheets.len() == 1 {
-                Item::Sheet(sheets.pop().expect("one piece"))
-            } else {
-                Item::Sheets(sheets.into_iter().map(|s| (s, Vec::new())).collect())
-            };
-            (item, placement)
+            let piece = Piece::Boolean { op, target: pieces, tools: others, after: Vec::new() };
+            piece.add(&mut rapidmesh::Geometry::new(None), 1, None).map_err(|e| e.to_string())?;
+            Item::Sheets(vec![piece])
         };
         self.objects[target].item = item;
-        self.objects[target].transforms = placement;
+        self.objects[target].transforms = Vec::new();
         for &i in tools {
             self.objects[i].alive = false;
         }
@@ -472,10 +543,9 @@ impl Geometry {
     /// after its own.
     fn pieces(&self, id: ObjId) -> Result<Vec<Piece>, String> {
         let o = &self.objects[id];
-        let placed = |own: &[Transform]| own.iter().chain(&o.transforms).copied().collect::<Vec<_>>();
         match &o.item {
-            Item::Sheet(s) => Ok(vec![(s.clone(), o.transforms.clone())]),
-            Item::Sheets(v) => Ok(v.iter().map(|(s, own)| (s.clone(), placed(own))).collect()),
+            Item::Sheet(s) => Ok(vec![Piece::Sheet(s.clone(), o.transforms.clone())]),
+            Item::Sheets(v) => Ok(v.iter().map(|p| p.then(&o.transforms)).collect()),
             _ => Err(format!("a sheet combines with sheets only, object {id} is a solid")),
         }
     }
@@ -592,7 +662,7 @@ impl Geometry {
         let o = &self.objects[id];
         let prism = match &o.item {
             _ if vx != 0.0 || vy != 0.0 || !o.transforms.is_empty() => None,
-            Item::Sheet(Sheet::Polygon { points, holes, position }) => Some(Prism {
+            Item::Sheet(Sheet::Polygon { points, holes, position, u, v }) if *u == [1.0, 0.0, 0.0] && *v == [0.0, 1.0, 0.0] => Some(Prism {
                 points: points.clone(),
                 holes: holes.clone(),
                 height: h,
@@ -618,7 +688,7 @@ impl Geometry {
             return Ok(());
         }
         let pieces = match &self.objects[id].item {
-            Item::Sheet(sheet) => vec![(sheet.clone(), Vec::new())],
+            Item::Sheet(sheet) => vec![Piece::Sheet(sheet.clone(), Vec::new())],
             Item::Sheets(pieces) => pieces.clone(),
             _ => return Err(format!("object {id} is not a sheet")),
         };
@@ -729,22 +799,15 @@ impl Geometry {
                 Item::Sheet(sheet) => (vec![g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?.into()], 0),
                 Item::Sheets(pieces) => {
                     let mut placed: Vec<RmObject> = Vec::new();
-                    for (sheet, own) in pieces {
-                        let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
-                        for &tr in own {
-                            g.transform(r, tr).map_err(e)?;
-                        }
-                        placed.push(r.into());
+                    for piece in pieces {
+                        placed.push(piece.add(&mut g, sheet_tag(i), scaled(o.size())).map_err(e)?.into());
                     }
                     (placed, 0)
                 }
                 Item::Extrusion { pieces, vector, placed } => {
                     let (mut sheets, mut swept): (Vec<RmObject>, _) = (Vec::new(), Vec::new());
-                    for (sheet, own) in pieces {
-                        let r = g.add_sheet(sheet, sheet_tag(i), scaled(o.size())).map_err(e)?;
-                        for &tr in own.iter().chain(&o.transforms[..*placed]) {
-                            g.transform(r, tr).map_err(e)?;
-                        }
+                    for piece in pieces {
+                        let r = piece.then(&o.transforms[..*placed]).add(&mut g, sheet_tag(i), scaled(o.size())).map_err(e)?;
                         swept.push(g.extrude(r, *vector, scaled(o.size())).map_err(e)?);
                         sheets.push(r.into());
                     }
@@ -1356,10 +1419,23 @@ mod tests {
     }
 
     #[test]
-    fn polygons_off_the_xy_plane_are_plates_and_loft() {
+    fn sheet_cuts_need_one_plane_and_keep_a_round_hole() {
+        let mut g = Geometry::new(Some(0.5));
+        let plate = g.add_sheet(Sheet::xy(4.0, 4.0, [0.0, 0.0, 1.5]), None);
+        let above = g.add_sheet(Sheet::xy(1.0, 1.0, [0.0, 0.0, 2.0]), None);
+        let err = g.sheet_boolean(SheetOp::Difference, plate, &[above]).unwrap_err();
+        assert!(err.contains("one plane"), "{err}");
+        let disc = g.add_sheet(Sheet::disc(1.0, [2.0, 2.0, 1.5], [0.0, 0.0, 1.0]), None);
+        g.sheet_boolean(SheetOp::Difference, plate, &[disc]).unwrap();
+        g.remove(above);
+        assert!(g.realized().is_ok());
+    }
+
+    #[test]
+    fn polygons_in_any_plane_loft() {
         let square = |x: f64, s: f64| vec![[x, -s, -s], [x, s, -s], [x, s, s], [x, -s, s]];
         let a = polygon_sheet(&square(0.0, 1.0), &[]).unwrap();
-        assert!(matches!(a, Sheet::Rect { .. }));
+        assert!(matches!(a, Sheet::Polygon { u: [0.0, 1.0, 0.0], v: [0.0, 0.0, 1.0], .. }));
         assert!(polygon_sheet(&[[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0], [0.0, 2.0, 0.5]], &[]).is_none());
         let flat = polygon_sheet(&[[0.0, 0.0, 0.5], [1.0, 0.0, 0.5], [0.0, 1.0, 0.5]], &[]).unwrap();
         assert!(matches!(flat, Sheet::Polygon { position: [_, _, z], .. } if z == 0.5));

@@ -166,4 +166,4 @@ __all__ = [
     "ProblemFD", "ProblemTD", "ErrorIndicator", "GaussianPulse",
     "io", "rfic", "structures", "show", "lambda_maxh",
 ]
-__version__ = "0.23.0"
+__version__ = "0.24.0"
